@@ -19,28 +19,10 @@ MODEL:
   DECODER:
     DIM: 1024
     FROZEN: true
-    DO_CONTACT_TOKENS: true
     DO_KEYPOINT_TOKENS: true
     DO_KEYPOINT3D_TOKENS: true
     CONDITION_TYPE: cliff
     USE_INTRIN_CENTER: false
-  CONTACT_HEAD:
-    # 21 tokens — one per the first 21 MHR70 keypoints (body + toes/heels)
-    NUM_CONTACTS: 21
-    # Extra global token(s) not updated with image features (0 = off)
-    NUM_GLOBAL_TOKENS: 3
-    # 18439 MHR mesh vertices
-    NUM_VERTICES: 18439
-    # NUM_VERTICES: 595
-    MLP_DEPTH: 4
-    MLP_CHANNEL_DIV_FACTOR: 2
-    # Pooling mode: "attention" (pool to 1 vector) or "concat" (flatten all tokens)
-    POOL_MODE: concat
-    # Dropout in contact head MLP
-    DROPOUT: 0.1
-    # K×K grid sampling around each keypoint (1 = original single-point)
-    GRID_SIZE: 5
-    GRID_RADIUS: 0.1
   PROMPT_ENCODER:
     ENABLE: true
     MAX_NUM_CLICKS: 1
@@ -59,17 +41,6 @@ MODEL:
     MLP_DEPTH: 1
     MLP_CHANNEL_DIV_FACTOR: 1
     DEFAULT_SCALE_FACTOR: 1.0
-  LORA:
-    ENABLED: true
-    RANK: 32
-    ALPHA: 32
-    DROPOUT: 0.0
-    TARGET_MODULES:
-      - self_attn
-      - cross_attn
-    TARGET_PROJECTIONS:
-      - q_proj
-      - v_proj
 TRAIN:
   BATCH_SIZE: 32
   VAL_BATCH_SIZE: 32

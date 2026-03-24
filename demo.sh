@@ -1,1 +1,0 @@
-CUDA_VISIBLE_DEVICES=0 python train/inference_demo.py --checkpoint train/output/contact_vert_20260314_201640/final_model.pth --split test --threshold 0.7 --num_samples 20 --threshold 0.8 --seed 27
