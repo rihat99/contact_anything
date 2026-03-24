@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
+from pathlib import Path
 from typing import Optional, Tuple
 
 
@@ -264,6 +265,156 @@ class DamonMHRDataset(Dataset):
             info['focal_length'] = [float(cam_k[0, 0]), float(cam_k[1, 1])]
             info['principal_point'] = [float(cam_k[0, 2]), float(cam_k[1, 2])]
         return info
+
+
+class DamonPrecomputedDataset(Dataset):
+    """Dataset that loads precomputed DINOv3 features + predictions instead of raw images.
+
+    Features are loaded from .pt files, predictions from a merged .npz.
+    This skips the backbone entirely during training.
+
+    Returns per item:
+        (feature, bbox, cam_k, ori_img_size, pred_kp2d, pred_kp3d), contact_label
+            feature      — float16 tensor [C, H, W]  (e.g. [1280, 32, 32])
+            bbox         — float32 tensor [4]
+            cam_k        — float32 tensor [3, 3]
+            ori_img_size — float32 tensor [2]  (H, W)
+            pred_kp2d    — float32 tensor [70, 2] or zeros if no predictions
+            pred_kp3d    — float32 tensor [70, 3] or zeros if no predictions
+        contact_label — int64 tensor [V]
+    """
+
+    def __init__(
+        self,
+        contact_npz_path: str,
+        detect_npz_path: str,
+        features_dir: str,
+        predictions_npz_path: Optional[str] = None,
+        lod: int = 1,
+        data_root: Optional[str] = None,
+    ):
+        super().__init__()
+        if lod not in LOD_VERTEX_COUNTS:
+            raise ValueError(f"lod must be 0–6, got {lod}")
+
+        self.lod = lod
+        self.num_vertices = LOD_VERTEX_COUNTS[lod]
+        self.features_dir = Path(features_dir)
+
+        # --- Load contact NPZ ---
+        print(f"Loading precomputed dataset from {contact_npz_path}")
+        contact_data = np.load(contact_npz_path, allow_pickle=True)
+        self.imgnames = contact_data['imgname']
+        self.contact_labels = contact_data['contact_label']
+        num_samples = len(self.imgnames)
+        assert self.contact_labels.shape == (num_samples, self.num_vertices)
+
+        # --- Load detect NPZ (required for bbox/cam_k) ---
+        detect_data = np.load(detect_npz_path, allow_pickle=True)
+        self.bboxes = detect_data['bbox'].astype(np.float32)
+        self.cam_ks = detect_data['cam_k'].astype(np.float32)
+
+        # --- Resolve data_root to get original image sizes ---
+        if data_root is None:
+            data_root = os.environ.get('DAMON_DATA_ROOT', None)
+            if data_root is None:
+                data_root = os.path.dirname(os.path.dirname(contact_npz_path))
+        self.data_root = data_root
+
+        # --- Precompute original image sizes (needed for ray conditioning) ---
+        # Try to load from a cache file first, otherwise compute from images
+        cache_path = self.features_dir / "ori_img_sizes.npy"
+        if cache_path.exists():
+            self.ori_img_sizes = np.load(str(cache_path)).astype(np.float32)
+            print(f"  Loaded cached ori_img_sizes from {cache_path}")
+        else:
+            print(f"  Computing original image sizes (one-time)...")
+            self.ori_img_sizes = np.zeros((num_samples, 2), dtype=np.float32)
+            for i in range(num_samples):
+                img_path = os.path.join(self.data_root, self.imgnames[i])
+                try:
+                    with Image.open(img_path) as img:
+                        w, h = img.size
+                        self.ori_img_sizes[i] = [h, w]
+                except Exception:
+                    # Fallback: derive from bbox extents
+                    self.ori_img_sizes[i] = [
+                        max(self.bboxes[i][3], 480),
+                        max(self.bboxes[i][2], 640),
+                    ]
+            np.save(str(cache_path), self.ori_img_sizes)
+            print(f"  Cached ori_img_sizes to {cache_path}")
+
+        # --- Load predictions NPZ (optional, for pose supervision) ---
+        self.pred_kp2d = None
+        self.pred_kp3d = None
+        if predictions_npz_path and os.path.exists(predictions_npz_path):
+            print(f"  Loading predictions from {predictions_npz_path}")
+            pred_data = np.load(predictions_npz_path, allow_pickle=True)
+            self.pred_kp2d = pred_data['pred_keypoints_2d'].astype(np.float32)  # [N, 70, 2]
+            self.pred_kp3d = pred_data['pred_keypoints_3d'].astype(np.float32)  # [N, 70, 3]
+            assert self.pred_kp2d.shape[0] == num_samples
+        else:
+            print(f"  No predictions NPZ — pose supervision targets will be zeros")
+
+        # Verify features exist
+        sample_feat = self.features_dir / "0000.pt"
+        assert sample_feat.exists(), f"Feature file not found: {sample_feat}"
+
+        print(f"  {num_samples} samples, features from {features_dir}")
+
+    def __len__(self):
+        return len(self.imgnames)
+
+    def __getitem__(self, idx):
+        # Load precomputed feature
+        feat_path = self.features_dir / f"{idx:04d}.pt"
+        feature = torch.load(str(feat_path), map_location='cpu', weights_only=True)  # [C, H, W] float16
+
+        bbox = torch.from_numpy(self.bboxes[idx]).float()
+        cam_k = torch.from_numpy(self.cam_ks[idx]).float()
+        ori_img_size = torch.from_numpy(self.ori_img_sizes[idx]).float()  # [2] (H, W)
+        contact_label = torch.from_numpy(self.contact_labels[idx]).long()
+
+        if self.pred_kp2d is not None:
+            pred_kp2d = torch.from_numpy(self.pred_kp2d[idx]).float()
+            pred_kp3d = torch.from_numpy(self.pred_kp3d[idx]).float()
+        else:
+            pred_kp2d = torch.zeros(70, 2)
+            pred_kp3d = torch.zeros(70, 3)
+
+        return (feature, bbox, cam_k, ori_img_size, pred_kp2d, pred_kp3d), contact_label
+
+    @classmethod
+    def split_train_val(
+        cls,
+        contact_npz_path: str,
+        detect_npz_path: str,
+        features_dir: str,
+        predictions_npz_path: Optional[str] = None,
+        lod: int = 1,
+        val_ratio: float = 0.2,
+        seed: int = 42,
+        data_root: Optional[str] = None,
+    ):
+        from torch.utils.data import Subset
+
+        full_dataset = cls(
+            contact_npz_path=contact_npz_path,
+            detect_npz_path=detect_npz_path,
+            features_dir=features_dir,
+            predictions_npz_path=predictions_npz_path,
+            lod=lod,
+            data_root=data_root,
+        )
+        n = len(full_dataset)
+        rng = np.random.RandomState(seed)
+        shuffled = rng.permutation(n)
+        n_val = max(1, int(round(n * val_ratio)))
+        val_indices = sorted(shuffled[:n_val].tolist())
+        train_indices = sorted(shuffled[n_val:].tolist())
+        print(f"Split (seed={seed}): {len(train_indices)} train, {len(val_indices)} val")
+        return Subset(full_dataset, train_indices), Subset(full_dataset, val_indices)
 
 
 # ---------------------------------------------------------------------------

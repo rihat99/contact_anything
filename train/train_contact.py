@@ -32,9 +32,10 @@ from sam_3d_body.utils.config import get_config
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "dataset"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "mhr_smpl_conversion"))
-from damon_mhr import DamonMHRDataset
-from dataset_utils import prepare_damon_batch
+from damon_mhr import DamonMHRDataset, DamonPrecomputedDataset
+from dataset_utils import prepare_damon_batch, prepare_damon_batch_precomputed
 from body_converter import BodyConverter
+from losses import ContactLoss
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,39 @@ def damon_collate(batch):
         images,
         torch.stack(bboxes),
         torch.stack(cam_ks),
+        torch.stack(contact_labels),
+    )
+
+
+def damon_precomputed_collate(batch):
+    """
+    batch: list of ((feature, bbox, cam_k, ori_img_size, pred_kp2d, pred_kp3d), contact_label)
+    Returns:
+        features       — tensor [B, C, H, W]
+        bboxes         — tensor [B, 4]
+        cam_ks         — tensor [B, 3, 3]
+        ori_img_sizes  — tensor [B, 2]
+        pred_kp2d      — tensor [B, 70, 2]
+        pred_kp3d      — tensor [B, 70, 3]
+        contact_labels — tensor [B, num_vertices]
+    """
+    features, bboxes, cam_ks, ori_sizes = [], [], [], []
+    pred_kp2ds, pred_kp3ds, contact_labels = [], [], []
+    for (feat, bbox, cam_k, ori_size, kp2d, kp3d), lbl in batch:
+        features.append(feat)
+        bboxes.append(bbox)
+        cam_ks.append(cam_k)
+        ori_sizes.append(ori_size)
+        pred_kp2ds.append(kp2d)
+        pred_kp3ds.append(kp3d)
+        contact_labels.append(lbl)
+    return (
+        torch.stack(features),
+        torch.stack(bboxes),
+        torch.stack(cam_ks),
+        torch.stack(ori_sizes),
+        torch.stack(pred_kp2ds),
+        torch.stack(pred_kp3ds),
         torch.stack(contact_labels),
     )
 
@@ -132,6 +166,8 @@ class ContactTrainer:
             num_vertices=train_num_vertices,
             mlp_depth=train_contact_cfg.get('MLP_DEPTH', 2),
             mlp_channel_div_factor=train_contact_cfg.get('MLP_CHANNEL_DIV_FACTOR', 4),
+            pool_mode=train_contact_cfg.get('POOL_MODE', 'attention'),
+            dropout=train_contact_cfg.get('DROPOUT', 0.0),
         ).to(device)
 
         # ---- Freeze all params; unfreeze contact-related ones ----
@@ -144,6 +180,18 @@ class ContactTrainer:
                 param.requires_grad = True
                 print(f"  Unfrozen: {name}")
 
+        # ---- LoRA injection (before counting trainable params) ----
+        self.use_lora = self.cfg.MODEL.get('LORA', {}).get('ENABLED', False)
+        if self.use_lora:
+            from sam_3d_body.models.modules.lora import apply_lora_to_decoder
+            lora_cfg = self.cfg.MODEL.LORA
+            apply_lora_to_decoder(self.model.decoder, lora_cfg)
+            # LoRA params are created with requires_grad=True by default
+            # Also explicitly ensure they're unfrozen
+            for name, param in self.model.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad = True
+
         # CRITICAL: decoder must stay in train mode so gradients flow to
         # contact query tokens even though decoder weights are frozen.
         for dec in [getattr(self.model, 'decoder', None),
@@ -153,8 +201,8 @@ class ContactTrainer:
                     m.train()
 
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.model.parameters())
-        print(f"Trainable: {trainable:,} / {total:,}")
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Trainable: {trainable:,} / {total_params:,}")
 
         # ---- Datasets ----
         print("Loading datasets...")
@@ -164,14 +212,37 @@ class ContactTrainer:
         lod        = self.cfg.DATASET.get('LOD', 1)
         contact_npz = self.cfg.DATASET.CONTACT_NPZ
         detect_npz  = self.cfg.DATASET.get('DETECT_NPZ', {})
-        self.train_dataset, self.val_dataset = DamonMHRDataset.split_train_val(
-            contact_npz_path=contact_npz.TRAINVAL,
-            detect_npz_path=detect_npz.get('TRAINVAL', None),
-            lod=lod,
-            val_ratio=val_ratio,
-            seed=seed,
-            data_root=data_root,
-        )
+
+        self.use_precomputed = self.cfg.TRAIN.get('USE_PRECOMPUTED_FEATURES', False)
+
+        if self.use_precomputed:
+            features_base = self.cfg.TRAIN.get('PRECOMPUTED_FEATURES_DIR',
+                                               './dataset/damon_mhr_contact/features')
+            predictions_base = self.cfg.TRAIN.get('PRECOMPUTED_PREDICTIONS_DIR',
+                                                  './dataset/damon_mhr_contact/predictions')
+            self.train_dataset, self.val_dataset = DamonPrecomputedDataset.split_train_val(
+                contact_npz_path=contact_npz.TRAINVAL,
+                detect_npz_path=detect_npz.get('TRAINVAL', None),
+                features_dir=os.path.join(features_base, 'trainval'),
+                predictions_npz_path=os.path.join(predictions_base, 'trainval_predictions.npz'),
+                lod=lod,
+                val_ratio=val_ratio,
+                seed=seed,
+                data_root=data_root,
+            )
+            collate_fn = damon_precomputed_collate
+            print(f"  Using precomputed features from {features_base}")
+        else:
+            self.train_dataset, self.val_dataset = DamonMHRDataset.split_train_val(
+                contact_npz_path=contact_npz.TRAINVAL,
+                detect_npz_path=detect_npz.get('TRAINVAL', None),
+                lod=lod,
+                val_ratio=val_ratio,
+                seed=seed,
+                data_root=data_root,
+            )
+            collate_fn = damon_collate
+
         print(f"  Train: {len(self.train_dataset)}  Val: {len(self.val_dataset)}")
 
         self.train_loader = DataLoader(
@@ -181,7 +252,7 @@ class ContactTrainer:
             num_workers=self.cfg.TRAIN.NUM_WORKERS,
             pin_memory=False,
             drop_last=True,
-            collate_fn=damon_collate,
+            collate_fn=collate_fn,
             persistent_workers=self.cfg.TRAIN.NUM_WORKERS > 0,
         )
         self.val_loader = DataLoader(
@@ -190,13 +261,37 @@ class ContactTrainer:
             shuffle=False,
             num_workers=self.cfg.TRAIN.NUM_WORKERS,
             pin_memory=False,
-            collate_fn=damon_collate,
+            collate_fn=collate_fn,
             persistent_workers=self.cfg.TRAIN.NUM_WORKERS > 0,
         )
 
-        # ---- Positive class weight & negative class weight ----
-        self.pos_weight = self._compute_pos_weight()
-        self.neg_weight = self.cfg.TRAIN.get("NEG_WEIGHT", 1.0)
+        # ---- Loss function ----
+        loss_cfg = self.cfg.get("LOSS", {})
+        self.loss_fn = ContactLoss(
+            focal_alpha=loss_cfg.get("FOCAL_ALPHA", 0.25),
+            focal_gamma=loss_cfg.get("FOCAL_GAMMA", 2.0),
+            focal_weight=loss_cfg.get("FOCAL_WEIGHT", 2.0),
+            dice_weight=loss_cfg.get("DICE_WEIGHT", 0.5),
+            dice_eps=loss_cfg.get("DICE_EPS", 1e-5),
+            sparsity_weight=loss_cfg.get("SPARSITY_WEIGHT", 0.01),
+        )
+        self._last_loss_dict: dict = {}
+        print(
+            f"ContactLoss: focal_weight={self.loss_fn.focal_weight}  "
+            f"dice_weight={self.loss_fn.dice_weight}  "
+            f"sparsity_weight={self.loss_fn.sparsity_weight}  "
+            f"alpha={self.loss_fn.focal_alpha}  gamma={self.loss_fn.focal_gamma}"
+        )
+
+        # ---- Pose supervision config ----
+        pose_sup_cfg = self.cfg.TRAIN.get('POSE_SUPERVISION', {})
+        self.use_pose_supervision = pose_sup_cfg.get('ENABLED', False) and self.use_precomputed
+        if self.use_pose_supervision:
+            self.kp2d_weight = pose_sup_cfg.get('KP2D_WEIGHT', 0.1)
+            self.kp3d_weight = pose_sup_cfg.get('KP3D_WEIGHT', 0.1)
+            self.pose_loss_type = pose_sup_cfg.get('LOSS_TYPE', 'smooth_l1')
+            print(f"Pose supervision: kp2d_weight={self.kp2d_weight}, "
+                  f"kp3d_weight={self.kp3d_weight}, loss={self.pose_loss_type}")
 
         # ---- Optimizer & scheduler ----
         self.optimizer = torch.optim.AdamW(
@@ -281,14 +376,25 @@ class ContactTrainer:
     # Batch preparation
     # ------------------------------------------------------------------
 
-    def _prepare_batch(self, images, bboxes, cam_ks):
-        return prepare_damon_batch(
-            images,
-            bboxes,
-            cam_ks,
-            target_size=tuple(self.cfg.MODEL.IMAGE_SIZE),
-            device=self.device,
-        )
+    def _prepare_batch(self, *args):
+        """Prepare batch for model. Accepts either image-based or precomputed-feature args."""
+        if self.use_precomputed:
+            features, bboxes, cam_ks, ori_img_sizes = args
+            # Use the model's own IMAGE_SIZE (from checkpoint config) to match
+            # the resolution at which features were precomputed.
+            model_img_size = tuple(self.model_cfg.MODEL.IMAGE_SIZE)
+            return prepare_damon_batch_precomputed(
+                features, bboxes, cam_ks, ori_img_sizes,
+                target_size=model_img_size,
+                device=self.device,
+            )
+        else:
+            images, bboxes, cam_ks = args
+            return prepare_damon_batch(
+                images, bboxes, cam_ks,
+                target_size=tuple(self.cfg.MODEL.IMAGE_SIZE),
+                device=self.device,
+            )
 
     # ------------------------------------------------------------------
     # Loss & metrics
@@ -301,26 +407,19 @@ class ContactTrainer:
         vertex_weights: torch.Tensor = None,
     ):
         """
-        Per-vertex asymmetric binary cross-entropy.
-
-        pos_weight scales the positive class (combats class imbalance / recall).
-        neg_weight scales the negative class (penalises false positives / precision).
+        Combined contact loss: Focal BCE + Dice + L1 Sparsity.
 
         Args:
-            logits:         [B, num_vertices]
-            targets:        [B, num_vertices] int64 binary
-            vertex_weights: [B, num_vertices] float, optional per-vertex loss weights.
-                            In-bounds vertices should have weight 1.0; OOB vertices
-                            get OOB_VERTEX_WEIGHT (0.0 = ignore, 1.0 = full signal).
+            logits:         [B, num_vertices] raw pre-sigmoid contact logits.
+            targets:        [B, num_vertices] int64 or float binary ground-truth.
+            vertex_weights: [B, num_vertices] float, optional per-vertex weights.
+                            OOB vertices should have weight 0.0; visible vertices 1.0.
+
+        Returns scalar loss. Stores per-component values in self._last_loss_dict.
         """
-        targets_f = targets.float()
-        probs = torch.sigmoid(logits).clamp(min=1e-7, max=1 - 1e-7)
-        pos_loss = -self.pos_weight * targets_f * torch.log(probs)
-        neg_loss = -self.neg_weight * (1 - targets_f) * torch.log(1 - probs)
-        per_vertex_loss = pos_loss + neg_loss  # [B, num_vertices]
-        if vertex_weights is not None:
-            per_vertex_loss = per_vertex_loss * vertex_weights
-        return per_vertex_loss.mean()
+        total_loss, loss_dict = self.loss_fn(logits, targets.float(), vertex_weights)
+        self._last_loss_dict = loss_dict
+        return total_loss
 
     @torch.no_grad()
     def _compute_vertex_weights(self, output: dict, batch: dict) -> torch.Tensor:
@@ -416,12 +515,20 @@ class ContactTrainer:
         total_metrics = {k: 0.0 for k in ('accuracy', 'precision', 'recall', 'f1', 'iou')}
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}")
-        for batch_idx, (images, bboxes, cam_ks, contact_labels) in enumerate(pbar):
-            contact_labels = contact_labels.to(self.device)
-
-            batch = self._prepare_batch(images, bboxes, cam_ks)
-            self.model._initialize_batch(batch)
-            output = self.model.forward_step(batch, decoder_type="body")
+        for batch_idx, batch_data in enumerate(pbar):
+            if self.use_precomputed:
+                features, bboxes, cam_ks, ori_img_sizes, pred_kp2d, pred_kp3d, contact_labels = batch_data
+                contact_labels = contact_labels.to(self.device)
+                batch, precomputed_feats = self._prepare_batch(features, bboxes, cam_ks, ori_img_sizes)
+                self.model._initialize_batch(batch)
+                output = self.model.forward_step(batch, decoder_type="body",
+                                                 precomputed_features=precomputed_feats)
+            else:
+                images, bboxes, cam_ks, contact_labels = batch_data
+                contact_labels = contact_labels.to(self.device)
+                batch = self._prepare_batch(images, bboxes, cam_ks)
+                self.model._initialize_batch(batch)
+                output = self.model.forward_step(batch, decoder_type="body")
 
             if output["contact"] is None:
                 raise RuntimeError(
@@ -432,6 +539,26 @@ class ContactTrainer:
             vw_result = self._compute_vertex_weights(output, batch)
             vertex_weights, oob_frac = vw_result if vw_result is not None else (None, 0.0)
             loss = self._compute_loss(logits, contact_labels, vertex_weights)
+
+            # Pose supervision loss (only with precomputed features + LoRA)
+            pose_loss_val = 0.0
+            if self.use_pose_supervision and output.get("mhr") is not None:
+                mhr_out = output["mhr"]
+                gt_kp2d = pred_kp2d.to(self.device)
+                gt_kp3d = pred_kp3d.to(self.device)
+                # Model outputs are [B, 1, 70, D] — squeeze the person dim
+                p_kp2d = mhr_out["pred_keypoints_2d"].squeeze(1)  # [B, 70, 2]
+                p_kp3d = mhr_out["pred_keypoints_3d"].squeeze(1)  # [B, 70, 3]
+                if self.pose_loss_type == 'smooth_l1':
+                    kp2d_loss = F.smooth_l1_loss(p_kp2d, gt_kp2d)
+                    kp3d_loss = F.smooth_l1_loss(p_kp3d, gt_kp3d)
+                else:
+                    kp2d_loss = F.mse_loss(p_kp2d, gt_kp2d)
+                    kp3d_loss = F.mse_loss(p_kp3d, gt_kp3d)
+                pose_loss = self.kp2d_weight * kp2d_loss + self.kp3d_weight * kp3d_loss
+                loss = loss + pose_loss
+                pose_loss_val = pose_loss.item()
+
             metrics = self._compute_metrics(logits, contact_labels)
 
             self.optimizer.zero_grad()
@@ -446,7 +573,7 @@ class ContactTrainer:
             if self.current_epoch == 0 and batch_idx == 0:
                 print("\n=== Gradient Flow Check ===")
                 for name, param in self.model.named_parameters():
-                    if "contact" in name.lower() and param.requires_grad:
+                    if param.requires_grad and ("contact" in name.lower() or "lora_" in name):
                         status = f"grad_norm={param.grad.norm().item():.6f}" if param.grad is not None else "NO GRAD"
                         print(f"  {name}: {status}")
                 print("=" * 40 + "\n")
@@ -455,15 +582,29 @@ class ContactTrainer:
             for k in total_metrics:
                 total_metrics[k] += metrics[k]
 
-            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'iou': f"{metrics['iou']:.4f}"})
+            d = self._last_loss_dict
+            postfix = {
+                'loss': f"{loss.item():.4f}",
+                'focal': f"{d.get('focal_bce', 0):.4f}",
+                'dice': f"{d.get('dice', 0):.4f}",
+                'iou': f"{metrics['iou']:.4f}",
+            }
+            if pose_loss_val > 0:
+                postfix['pose'] = f"{pose_loss_val:.4f}"
+            pbar.set_postfix(postfix)
 
             if self.writer and self.global_step % self.cfg.OUTPUT.LOG_FREQ == 0:
                 self.writer.add_scalar('train/loss', loss.item(), self.global_step)
+                self.writer.add_scalar('train/loss_focal_bce', d.get('focal_bce', 0), self.global_step)
+                self.writer.add_scalar('train/loss_dice', d.get('dice', 0), self.global_step)
+                self.writer.add_scalar('train/loss_sparsity', d.get('sparsity', 0), self.global_step)
                 self.writer.add_scalar('train/iou', metrics['iou'], self.global_step)
                 self.writer.add_scalar('train/f1', metrics['f1'], self.global_step)
                 self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
                 if oob_frac > 0.0:
                     self.writer.add_scalar('train/oob_vertex_frac', oob_frac, self.global_step)
+                if pose_loss_val > 0:
+                    self.writer.add_scalar('train/loss_pose', pose_loss_val, self.global_step)
 
             self.global_step += 1
 
@@ -479,13 +620,24 @@ class ContactTrainer:
         self.model.eval()
 
         total_loss = 0.0
+        total_loss_components = {'focal_bce': 0.0, 'dice': 0.0, 'sparsity': 0.0}
         total_metrics = {k: 0.0 for k in ('accuracy', 'precision', 'recall', 'f1', 'iou')}
 
-        for images, bboxes, cam_ks, contact_labels in tqdm(self.val_loader, desc="Validation"):
-            contact_labels = contact_labels.to(self.device)
-            batch = self._prepare_batch(images, bboxes, cam_ks)
-            self.model._initialize_batch(batch)
-            output = self.model.forward_step(batch, decoder_type="body")
+        for batch_data in tqdm(self.val_loader, desc="Validation"):
+            if self.use_precomputed:
+                features, bboxes, cam_ks, ori_img_sizes, pred_kp2d, pred_kp3d, contact_labels = batch_data
+                contact_labels = contact_labels.to(self.device)
+                batch, precomputed_feats = self._prepare_batch(features, bboxes, cam_ks, ori_img_sizes)
+                self.model._initialize_batch(batch)
+                output = self.model.forward_step(batch, decoder_type="body",
+                                                 precomputed_features=precomputed_feats)
+            else:
+                images, bboxes, cam_ks, contact_labels = batch_data
+                contact_labels = contact_labels.to(self.device)
+                batch = self._prepare_batch(images, bboxes, cam_ks)
+                self.model._initialize_batch(batch)
+                output = self.model.forward_step(batch, decoder_type="body")
+
             logits = output["contact"]["contact_logits"]
 
             vw_result = self._compute_vertex_weights(output, batch)
@@ -494,10 +646,20 @@ class ContactTrainer:
             metrics = self._compute_metrics(logits, contact_labels)
 
             total_loss += loss.item()
+            for k in total_loss_components:
+                total_loss_components[k] += self._last_loss_dict.get(k, 0.0)
             for k in total_metrics:
                 total_metrics[k] += metrics[k]
 
         n = len(self.val_loader)
+        avg_components = {k: v / n for k, v in total_loss_components.items()}
+
+        if self.writer:
+            self.writer.add_scalar('val/loss', total_loss / n, self.current_epoch)
+            self.writer.add_scalar('val/loss_focal_bce', avg_components['focal_bce'], self.current_epoch)
+            self.writer.add_scalar('val/loss_dice', avg_components['dice'], self.current_epoch)
+            self.writer.add_scalar('val/loss_sparsity', avg_components['sparsity'], self.current_epoch)
+
         return total_loss / n, {k: v / n for k, v in total_metrics.items()}
 
     # ------------------------------------------------------------------

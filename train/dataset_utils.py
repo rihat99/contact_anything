@@ -181,3 +181,78 @@ def prepare_damon_batch(images, bboxes, cam_ks, target_size=(896, 896), device='
             batch[key] = batch[key].to(device)
 
     return batch
+
+
+# ---------------------------------------------------------------------------
+# Precomputed-features helper: skips image loading, uses cached backbone output
+# ---------------------------------------------------------------------------
+
+def prepare_damon_batch_precomputed(
+    features, bboxes, cam_ks, ori_img_sizes, target_size=(896, 896), device='cuda',
+):
+    """
+    Prepare a batch using precomputed backbone features instead of raw images.
+
+    We still need bbox_center, bbox_scale, affine_trans, and a dummy img tensor
+    (for ray conditioning shape) — so we run the transform pipeline on small
+    dummy images with the correct (H, W).
+
+    Args:
+        features:      tensor [B, C, Hf, Wf]  precomputed backbone embeddings
+        bboxes:        tensor [B, 4]
+        cam_ks:        tensor [B, 3, 3]
+        ori_img_sizes: tensor [B, 2]  (H, W) of original images
+        target_size:   (H, W) model input size
+        device:        torch device string
+
+    Returns:
+        (batch_dict, features_tensor)
+            batch_dict: has img (dummy), bbox_center, bbox_scale, affine_trans,
+                        ori_img_size, cam_int, person_valid — all on device
+            features_tensor: [B, C, Hf, Wf] float32 on device
+    """
+    transform = _make_transform(target_size)
+    B = features.shape[0]
+
+    per_sample = []
+    for i in range(B):
+        h, w = int(ori_img_sizes[i, 0].item()), int(ori_img_sizes[i, 1].item())
+        # Minimal dummy image — only bbox geometry matters
+        dummy_img = np.zeros((h, w, 3), dtype=np.uint8)
+        bbox_np = bboxes[i].numpy() if isinstance(bboxes[i], torch.Tensor) else bboxes[i]
+        per_sample.append(_process_one(dummy_img, bbox_np, transform))
+
+    keys_to_stack = ["img", "img_size", "ori_img_size", "bbox_center", "bbox_scale",
+                     "bbox", "affine_trans", "mask", "mask_score"]
+    batch = {}
+    for key in keys_to_stack:
+        if key in per_sample[0]:
+            tensors = [
+                s[key] if isinstance(s[key], torch.Tensor) else torch.as_tensor(s[key])
+                for s in per_sample
+            ]
+            stacked = torch.stack(tensors, dim=0).float()
+            batch[key] = stacked.unsqueeze(1)  # [B, 1, ...]
+
+    if "mask" in batch:
+        batch["mask"] = batch["mask"].unsqueeze(2)
+
+    batch["person_valid"] = torch.ones((B, 1))
+
+    cam_int_list = []
+    for i in range(B):
+        ck = cam_ks[i]
+        if isinstance(ck, torch.Tensor):
+            cam_int_list.append(ck.float())
+        else:
+            cam_int_list.append(torch.tensor(ck, dtype=torch.float32))
+    batch["cam_int"] = torch.stack(cam_int_list, dim=0)
+
+    batch["img_ori"] = [NoCollate(np.zeros((2, 2, 3), dtype=np.uint8))]
+
+    for key in batch:
+        if isinstance(batch[key], torch.Tensor):
+            batch[key] = batch[key].to(device)
+
+    features_out = features.float().to(device)
+    return batch, features_out

@@ -70,35 +70,68 @@ class ContactEvaluator:
             mhr_path=self.cfg.MODEL.MHR_MODEL_PATH,
         )
 
-        # Reinitialize contact modules from train config (checkpoint model_config.yaml
-        # may have different / commented-out CONTACT_HEAD settings).
+        # Reinitialize contact modules from the checkpoint's saved config.yaml
+        # (NOT the current train/config.yaml, which may have different architecture).
+        # Each training run saves config.yaml alongside the checkpoint.
         import torch.nn as nn
-        contact_cfg = self.cfg.MODEL.CONTACT_HEAD
-        num_vertices = contact_cfg.get('NUM_VERTICES', 18439)
-        num_kp  = contact_cfg.get('NUM_CONTACTS', 21)
-        num_gbl = contact_cfg.get('NUM_GLOBAL_TOKENS', 0)
+        import yaml
+
+        ckpt_dir = self.checkpoint_path.parent
+        ckpt_config_path = ckpt_dir / "config.yaml"
+        if ckpt_config_path.exists():
+            print(f"Using checkpoint's saved config: {ckpt_config_path}")
+            with open(ckpt_config_path) as f:
+                ckpt_cfg = yaml.safe_load(f)
+            contact_cfg_dict = ckpt_cfg.get('MODEL', {}).get('CONTACT_HEAD', {})
+        else:
+            print(f"WARNING: No config.yaml found in {ckpt_dir}, falling back to current config")
+            contact_cfg_dict = dict(self.cfg.MODEL.CONTACT_HEAD)
+
+        num_vertices = contact_cfg_dict.get('NUM_VERTICES', 18439)
+        num_kp  = contact_cfg_dict.get('NUM_CONTACTS', 21)
+        num_gbl = contact_cfg_dict.get('NUM_GLOBAL_TOKENS', 0)
         total   = num_kp + num_gbl
         dim     = self.model_cfg.MODEL.DECODER.DIM
         self.model.num_contact_tokens        = num_kp
         self.model.num_global_contact_tokens = num_gbl
         self.model.total_contact_tokens      = total
         self.model.contact_keypoint_indices  = list(range(num_kp))
-        self.model.contact_grid_size         = contact_cfg.get('GRID_SIZE', 1)
-        self.model.contact_grid_radius       = contact_cfg.get('GRID_RADIUS', 0.1)
+        self.model.contact_grid_size         = contact_cfg_dict.get('GRID_SIZE', 1)
+        self.model.contact_grid_radius       = contact_cfg_dict.get('GRID_RADIUS', 0.1)
         self.model.contact_embedding         = nn.Embedding(total, dim).to(device)
         self.model.head_contact              = ContactHead(
             input_dim=dim,
             num_contact_tokens=total,
             num_vertices=num_vertices,
-            mlp_depth=contact_cfg.get('MLP_DEPTH', 2),
-            mlp_channel_div_factor=contact_cfg.get('MLP_CHANNEL_DIV_FACTOR', 4),
+            mlp_depth=contact_cfg_dict.get('MLP_DEPTH', 2),
+            mlp_channel_div_factor=contact_cfg_dict.get('MLP_CHANNEL_DIV_FACTOR', 4),
+            pool_mode=contact_cfg_dict.get('POOL_MODE', 'attention'),
+            dropout=contact_cfg_dict.get('DROPOUT', 0.0),
         ).to(device)
+        print(f"Contact head: tokens={total} (kp={num_kp}, global={num_gbl}), "
+              f"verts={num_vertices}, pool={contact_cfg_dict.get('POOL_MODE', 'attention')}, "
+              f"depth={contact_cfg_dict.get('MLP_DEPTH', 2)}, "
+              f"div={contact_cfg_dict.get('MLP_CHANNEL_DIV_FACTOR', 4)}")
 
         # Load trained checkpoint (contact head weights override the fresh init above)
         print(f"Loading checkpoint: {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location=device)
         state = ckpt.get('model_state_dict', ckpt)
-        self.model.load_state_dict(state, strict=False)
+        missing, unexpected = self.model.load_state_dict(state, strict=False)
+
+        # Sanity check: contact head keys must not be missing
+        contact_missing = [k for k in missing if 'contact' in k.lower()]
+        if contact_missing:
+            print(f"ERROR: Contact head keys MISSING from checkpoint (architecture mismatch?):")
+            for k in contact_missing:
+                print(f"  {k}")
+            raise RuntimeError(
+                f"{len(contact_missing)} contact head keys missing from checkpoint. "
+                f"Check that the checkpoint's config.yaml matches the contact head architecture."
+            )
+        if missing:
+            print(f"  {len(missing)} non-contact keys missing (expected for frozen backbone).")
+
         self.model.eval()
 
         self.lod = self.cfg.DATASET.get('LOD', 1)

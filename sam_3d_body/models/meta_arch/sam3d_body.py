@@ -1214,56 +1214,90 @@ class SAM3DBody(BaseModel):
             batch["img"].dtype
         )  # This is B x num_person x 2 x H x W
 
-    def forward_pose_branch(self, batch: Dict) -> Dict:
-        """Run a forward pass for the crop-image (pose) branch."""
+    def forward_pose_branch(self, batch: Dict, precomputed_features=None) -> Dict:
+        """Run a forward pass for the crop-image (pose) branch.
+
+        Args:
+            batch: standard SAM-3D-Body batch dict.
+            precomputed_features: optional [B*N, C, H, W] backbone embeddings.
+                When provided, the backbone is skipped entirely.
+        """
         batch_size, num_person = batch["img"].shape[:2]
 
-        # Forward backbone encoder
-        x = self.data_preprocess(
-            self._flatten_person(batch["img"]),
-            crop_width=(
-                self.cfg.MODEL.BACKBONE.TYPE
-                in [
-                    "vit_hmr",
-                    "vit",
-                    "vit_b",
-                    "vit_l",
-                    "vit_hmr_512_384",
-                ]
-            ),
-        )
+        if precomputed_features is not None:
+            # --- Skip backbone, use precomputed features ---
+            image_embeddings = precomputed_features
 
-        # Optionally get ray conditioining
-        ray_cond = self.get_ray_condition(batch)  # This is B x num_person x 2 x H x W
-        ray_cond = self._flatten_person(ray_cond)
-        if self.cfg.MODEL.BACKBONE.TYPE in [
-            "vit_hmr",
-            "vit",
-            "vit_b",
-            "vit_l",
-        ]:
-            ray_cond = ray_cond[:, :, :, 32:-32]
-        elif self.cfg.MODEL.BACKBONE.TYPE in [
-            "vit_hmr_512_384",
-        ]:
-            ray_cond = ray_cond[:, :, :, 64:-64]
+            # Resize if precomputed spatial dims don't match expected backbone output.
+            # Expected: input_size / patch_size (e.g. 896/16 = 56).
+            expected_h = self.cfg.MODEL.IMAGE_SIZE[0] // self.ray_cond_emb.patch_size
+            expected_w = self.cfg.MODEL.IMAGE_SIZE[1] // self.ray_cond_emb.patch_size
+            if image_embeddings.shape[-2:] != (expected_h, expected_w):
+                image_embeddings = torch.nn.functional.interpolate(
+                    image_embeddings,
+                    size=(expected_h, expected_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
-        if len(self.body_batch_idx):
-            batch["ray_cond"] = ray_cond[self.body_batch_idx].clone()
-        if len(self.hand_batch_idx):
-            batch["ray_cond_hand"] = ray_cond[self.hand_batch_idx].clone()
-        ray_cond = None
+            # Still need ray conditioning for the decoder
+            ray_cond = self.get_ray_condition(batch)
+            ray_cond = self._flatten_person(ray_cond)
+            if len(self.body_batch_idx):
+                batch["ray_cond"] = ray_cond[self.body_batch_idx].clone()
+            if len(self.hand_batch_idx):
+                batch["ray_cond_hand"] = ray_cond[self.hand_batch_idx].clone()
+        else:
+            # --- Original backbone path ---
+            # Forward backbone encoder
+            x = self.data_preprocess(
+                self._flatten_person(batch["img"]),
+                crop_width=(
+                    self.cfg.MODEL.BACKBONE.TYPE
+                    in [
+                        "vit_hmr",
+                        "vit",
+                        "vit_b",
+                        "vit_l",
+                        "vit_hmr_512_384",
+                    ]
+                ),
+            )
 
-        image_embeddings = self.backbone(
-            x.type(self.backbone_dtype), extra_embed=ray_cond
-        )  # (B, C, H, W)
+            # Optionally get ray conditioining
+            ray_cond = self.get_ray_condition(batch)  # This is B x num_person x 2 x H x W
+            ray_cond = self._flatten_person(ray_cond)
+            if self.cfg.MODEL.BACKBONE.TYPE in [
+                "vit_hmr",
+                "vit",
+                "vit_b",
+                "vit_l",
+            ]:
+                ray_cond = ray_cond[:, :, :, 32:-32]
+            elif self.cfg.MODEL.BACKBONE.TYPE in [
+                "vit_hmr_512_384",
+            ]:
+                ray_cond = ray_cond[:, :, :, 64:-64]
 
-        if isinstance(image_embeddings, tuple):
-            image_embeddings = image_embeddings[-1]
-        image_embeddings = image_embeddings.type(x.dtype)
+            if len(self.body_batch_idx):
+                batch["ray_cond"] = ray_cond[self.body_batch_idx].clone()
+            if len(self.hand_batch_idx):
+                batch["ray_cond_hand"] = ray_cond[self.hand_batch_idx].clone()
+            ray_cond = None
 
-        # Mask condition if available
-        if self.cfg.MODEL.PROMPT_ENCODER.get("MASK_EMBED_TYPE", None) is not None:
+            image_embeddings = self.backbone(
+                x.type(self.backbone_dtype), extra_embed=ray_cond
+            )  # (B, C, H, W)
+
+            if isinstance(image_embeddings, tuple):
+                image_embeddings = image_embeddings[-1]
+            image_embeddings = image_embeddings.type(x.dtype)
+
+        # Mask condition if available (skip for precomputed features — already baked in)
+        if (
+            precomputed_features is None
+            and self.cfg.MODEL.PROMPT_ENCODER.get("MASK_EMBED_TYPE", None) is not None
+        ):
             # v1: non-iterative mask conditioning
             if self.cfg.MODEL.PROMPT_ENCODER.get("MASK_PROMPT", "v1") == "v1":
                 mask_embeddings = self._get_mask_prompt(batch, image_embeddings)
@@ -1339,7 +1373,7 @@ class SAM3DBody(BaseModel):
         return output
 
     def forward_step(
-        self, batch: Dict, decoder_type: str = "body"
+        self, batch: Dict, decoder_type: str = "body", precomputed_features=None,
     ) -> Tuple[Dict, Dict]:
         batch_size, num_person = batch["img"].shape[:2]
 
@@ -1353,7 +1387,7 @@ class SAM3DBody(BaseModel):
             ValueError("Invalid decoder type: ", decoder_type)
 
         # Crop-image (pose) branch
-        pose_output = self.forward_pose_branch(batch)
+        pose_output = self.forward_pose_branch(batch, precomputed_features=precomputed_features)
 
         return pose_output
 
