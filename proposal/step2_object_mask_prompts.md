@@ -29,14 +29,15 @@ By adding an object mask prompt, the model can learn object-specific contact pri
      |  Body Decoder    |          | Interaction     |
      |  (FROZEN)        |          | Decoder         |
      |                  |          |                  |
-     +--------+---------+          | T_contact (K=16)|
-              |                    | T_object (1-2)  | <-- NEW
-         Body Mesh                 |                  |
-                                   | Self-Attention   |
-                                   | Cross-Attn to F  |
-                +---+              | Cross-Attn to    |
-                |SAM|---mask------>| prompt tokens    | <-- NEW
-                +---+              |                  |
+     |  T_pose ---------|--body--->| T_contact (K=16)|
+     |                  |  tokens  | T_object (1-2)  | <-- NEW
+     +--------+---------+          |                  |
+              |                    | Self-Attention   |
+         Body Mesh                 | Cross-Attn to F  |
+                                   | Cross-Attn to    |
+                +---+              |   body T_pose    | (from Step 1)
+                |SAM|---mask------>| Cross-Attn to    |
+                +---+              |   prompt tokens  | <-- NEW
                                    +--------+---------+
                                             |
                                +-----------+-----------+

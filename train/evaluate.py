@@ -37,12 +37,12 @@ os.environ["MOMENTUM_ENABLED"] = "1"
 
 from sam_3d_body.build_models import load_sam_3d_body
 from sam_3d_body.models.heads.contact_head import ContactHead
+from sam_3d_body.models.decoders.interaction_decoder import InteractionDecoder
 from sam_3d_body.utils.config import get_config
 from damon_mhr import DamonMHRDataset
 from damon_smpl import DamonSMPLDataset
 from dataset_utils import prepare_damon_batch
 from train_contact import damon_collate
-from body_converter import BodyConverter
 
 
 # ---------------------------------------------------------------------------
@@ -70,48 +70,44 @@ class ContactEvaluator:
             mhr_path=self.cfg.MODEL.MHR_MODEL_PATH,
         )
 
-        # Reinitialize contact modules from the checkpoint's saved config.yaml
-        # (NOT the current train/config.yaml, which may have different architecture).
+        # Reinitialize contact modules from the checkpoint's saved config.yaml.
         # Each training run saves config.yaml alongside the checkpoint.
-        import torch.nn as nn
         import yaml
 
         ckpt_dir = self.checkpoint_path.parent
         ckpt_config_path = ckpt_dir / "config.yaml"
         if ckpt_config_path.exists():
             print(f"Using checkpoint's saved config: {ckpt_config_path}")
-            with open(ckpt_config_path) as f:
-                ckpt_cfg = yaml.safe_load(f)
-            contact_cfg_dict = ckpt_cfg.get('MODEL', {}).get('CONTACT_HEAD', {})
+            ckpt_cfg = get_config(str(ckpt_config_path))
         else:
             print(f"WARNING: No config.yaml found in {ckpt_dir}, falling back to current config")
-            contact_cfg_dict = dict(self.cfg.MODEL.CONTACT_HEAD)
+            ckpt_cfg = self.cfg
 
-        num_vertices = contact_cfg_dict.get('NUM_VERTICES', 18439)
-        num_kp  = contact_cfg_dict.get('NUM_CONTACTS', 21)
-        num_gbl = contact_cfg_dict.get('NUM_GLOBAL_TOKENS', 0)
-        total   = num_kp + num_gbl
-        dim     = self.model_cfg.MODEL.DECODER.DIM
-        self.model.num_contact_tokens        = num_kp
-        self.model.num_global_contact_tokens = num_gbl
-        self.model.total_contact_tokens      = total
-        self.model.contact_keypoint_indices  = list(range(num_kp))
-        self.model.contact_grid_size         = contact_cfg_dict.get('GRID_SIZE', 1)
-        self.model.contact_grid_radius       = contact_cfg_dict.get('GRID_RADIUS', 0.1)
-        self.model.contact_embedding         = nn.Embedding(total, dim).to(device)
-        self.model.head_contact              = ContactHead(
-            input_dim=dim,
-            num_contact_tokens=total,
-            num_vertices=num_vertices,
-            mlp_depth=contact_cfg_dict.get('MLP_DEPTH', 2),
-            mlp_channel_div_factor=contact_cfg_dict.get('MLP_CHANNEL_DIV_FACTOR', 4),
-            pool_mode=contact_cfg_dict.get('POOL_MODE', 'attention'),
-            dropout=contact_cfg_dict.get('DROPOUT', 0.0),
+        dim = self.model_cfg.MODEL.DECODER.DIM
+        id_cfg = ckpt_cfg.MODEL.INTERACTION_DECODER
+        ch_cfg = ckpt_cfg.MODEL.CONTACT_HEAD
+
+        self.model.interaction_decoder = InteractionDecoder(
+            d_model=id_cfg.get('D_MODEL', dim),
+            image_feat_dim=id_cfg.get('IMAGE_FEAT_DIM', 1280),
+            num_contact_tokens=id_cfg.get('NUM_CONTACT_TOKENS', 16),
+            num_layers=id_cfg.get('NUM_LAYERS', 4),
+            num_heads=id_cfg.get('NUM_HEADS', 8),
+            ffn_dim=id_cfg.get('FFN_DIM', 2048),
+            dropout=id_cfg.get('DROPOUT', 0.0),
         ).to(device)
-        print(f"Contact head: tokens={total} (kp={num_kp}, global={num_gbl}), "
-              f"verts={num_vertices}, pool={contact_cfg_dict.get('POOL_MODE', 'attention')}, "
-              f"depth={contact_cfg_dict.get('MLP_DEPTH', 2)}, "
-              f"div={contact_cfg_dict.get('MLP_CHANNEL_DIV_FACTOR', 4)}")
+        num_vertices = ch_cfg.get('NUM_VERTICES', 18439)
+        self.model.head_contact = ContactHead(
+            input_dim=id_cfg.get('D_MODEL', dim),
+            num_contact_tokens=id_cfg.get('NUM_CONTACT_TOKENS', 16),
+            num_vertices=num_vertices,
+            mlp_depth=ch_cfg.get('MLP_DEPTH', 2),
+            mlp_channel_div_factor=ch_cfg.get('MLP_CHANNEL_DIV_FACTOR', 4),
+            pool_mode=ch_cfg.get('POOL_MODE', 'attention'),
+            dropout=ch_cfg.get('DROPOUT', 0.0),
+        ).to(device)
+        print(f"InteractionDecoder: K={id_cfg.get('NUM_CONTACT_TOKENS', 16)} tokens, "
+              f"{id_cfg.get('NUM_LAYERS', 4)} layers")
 
         # Load trained checkpoint (contact head weights override the fresh init above)
         print(f"Loading checkpoint: {checkpoint_path}")
@@ -119,8 +115,9 @@ class ContactEvaluator:
         state = ckpt.get('model_state_dict', ckpt)
         missing, unexpected = self.model.load_state_dict(state, strict=False)
 
-        # Sanity check: contact head keys must not be missing
-        contact_missing = [k for k in missing if 'contact' in k.lower()]
+        # Sanity check: interaction_decoder / head_contact keys must not be missing
+        contact_missing = [k for k in missing
+                           if 'interaction_decoder' in k or 'head_contact' in k]
         if contact_missing:
             print(f"ERROR: Contact head keys MISSING from checkpoint (architecture mismatch?):")
             for k in contact_missing:
@@ -138,6 +135,7 @@ class ContactEvaluator:
 
         # Contact converter (SMPL mode only — fast, CPU is fine)
         if self.mode == "smpl":
+            from body_converter import BodyConverter
             print("Initialising MHR→SMPL contact converter...")
             self.converter = BodyConverter(device="cpu")
 
@@ -239,7 +237,11 @@ class ContactEvaluator:
             batch = self._prepare_batch(images, bboxes, cam_ks)
             self.model._initialize_batch(batch)
             output = self.model.forward_step(batch, decoder_type="body")
-            logits = output["contact"]["contact_logits"]
+            contact_tokens = self.model.interaction_decoder(
+                output["image_embeddings"],
+                output["body_tokens"],
+            )
+            logits = self.model.head_contact(contact_tokens)
             probs = torch.sigmoid(logits).cpu().float()
 
             all_probs.append(probs.numpy())
@@ -546,7 +548,7 @@ class ContactEvaluator:
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate per-vertex contact head on DAMON")
-    parser.add_argument("--config", type=str, default="train/config.yaml")
+    parser.add_argument("--config", type=str, default="configs/step1_contact.yaml")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to trained checkpoint")
     parser.add_argument("--split", type=str, default="val",

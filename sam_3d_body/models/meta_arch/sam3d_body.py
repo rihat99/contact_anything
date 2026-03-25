@@ -1054,53 +1054,69 @@ class SAM3DBody(BaseModel):
             batch["img"].dtype
         )  # This is B x num_person x 2 x H x W
 
-    def forward_pose_branch(self, batch: Dict) -> Dict:
-        """Run a forward pass for the crop-image (pose) branch."""
+    def forward_pose_branch(self, batch: Dict, precomputed_features=None) -> Dict:
+        """Run a forward pass for the crop-image (pose) branch.
+
+        Args:
+            precomputed_features: Optional pre-extracted backbone features [B, C, H, W].
+                When provided the backbone is skipped entirely.
+        """
         batch_size, num_person = batch["img"].shape[:2]
 
-        # Forward backbone encoder
-        x = self.data_preprocess(
-            self._flatten_person(batch["img"]),
-            crop_width=(
-                self.cfg.MODEL.BACKBONE.TYPE
-                in [
-                    "vit_hmr",
-                    "vit",
-                    "vit_b",
-                    "vit_l",
-                    "vit_hmr_512_384",
-                ]
-            ),
-        )
+        if precomputed_features is not None:
+            # Skip backbone — use cached DINOv3 features directly.
+            image_embeddings = precomputed_features.to(batch["img"].device)
+            # Still need ray conditioning for the decoder condition.
+            ray_cond = self.get_ray_condition(batch)
+            ray_cond = self._flatten_person(ray_cond)
+            if len(self.body_batch_idx):
+                batch["ray_cond"] = ray_cond[self.body_batch_idx].clone()
+            if len(self.hand_batch_idx):
+                batch["ray_cond_hand"] = ray_cond[self.hand_batch_idx].clone()
+        else:
+            # Forward backbone encoder
+            x = self.data_preprocess(
+                self._flatten_person(batch["img"]),
+                crop_width=(
+                    self.cfg.MODEL.BACKBONE.TYPE
+                    in [
+                        "vit_hmr",
+                        "vit",
+                        "vit_b",
+                        "vit_l",
+                        "vit_hmr_512_384",
+                    ]
+                ),
+            )
 
-        # Optionally get ray conditioining
-        ray_cond = self.get_ray_condition(batch)  # This is B x num_person x 2 x H x W
-        ray_cond = self._flatten_person(ray_cond)
-        if self.cfg.MODEL.BACKBONE.TYPE in [
-            "vit_hmr",
-            "vit",
-            "vit_b",
-            "vit_l",
-        ]:
-            ray_cond = ray_cond[:, :, :, 32:-32]
-        elif self.cfg.MODEL.BACKBONE.TYPE in [
-            "vit_hmr_512_384",
-        ]:
-            ray_cond = ray_cond[:, :, :, 64:-64]
+            # Optionally get ray conditioining
+            ray_cond = self.get_ray_condition(batch)  # This is B x num_person x 2 x H x W
+            ray_cond = self._flatten_person(ray_cond)
+            if self.cfg.MODEL.BACKBONE.TYPE in [
+                "vit_hmr",
+                "vit",
+                "vit_b",
+                "vit_l",
+            ]:
+                ray_cond = ray_cond[:, :, :, 32:-32]
+            elif self.cfg.MODEL.BACKBONE.TYPE in [
+                "vit_hmr_512_384",
+            ]:
+                ray_cond = ray_cond[:, :, :, 64:-64]
 
-        if len(self.body_batch_idx):
-            batch["ray_cond"] = ray_cond[self.body_batch_idx].clone()
-        if len(self.hand_batch_idx):
-            batch["ray_cond_hand"] = ray_cond[self.hand_batch_idx].clone()
-        ray_cond = None
+            if len(self.body_batch_idx):
+                batch["ray_cond"] = ray_cond[self.body_batch_idx].clone()
+            if len(self.hand_batch_idx):
+                batch["ray_cond_hand"] = ray_cond[self.hand_batch_idx].clone()
+            ray_cond = None
 
-        image_embeddings = self.backbone(
-            x.type(self.backbone_dtype), extra_embed=ray_cond
-        )  # (B, C, H, W)
+            image_embeddings = self.backbone(
+                x.type(self.backbone_dtype), extra_embed=ray_cond
+            )  # (B, C, H, W)
 
-        if isinstance(image_embeddings, tuple):
-            image_embeddings = image_embeddings[-1]
-        image_embeddings = image_embeddings.type(x.dtype)
+            if isinstance(image_embeddings, tuple):
+                image_embeddings = image_embeddings[-1]
+            image_embeddings = image_embeddings.type(x.dtype)
 
         # Mask condition if available
         if self.cfg.MODEL.PROMPT_ENCODER.get("MASK_EMBED_TYPE", None) is not None:
@@ -1120,6 +1136,7 @@ class SAM3DBody(BaseModel):
 
         # Forward promptable decoder to get updated pose tokens and regression output
         pose_output, pose_output_hand = None, None
+        tokens_output = None
         if len(self.body_batch_idx):
             tokens_output, pose_output = self.forward_decoder(
                 image_embeddings[self.body_batch_idx],
@@ -1141,12 +1158,18 @@ class SAM3DBody(BaseModel):
             )
             pose_output_hand = pose_output_hand[-1]
 
+        # Expose the body decoder's pose token so the InteractionDecoder can cross-attend.
+        # tokens_output[:, 0:1, :] is the single MHR pose token — the richest body representation.
+        body_tokens = None
+        if tokens_output is not None:
+            body_tokens = tokens_output[:, 0:1, :]  # [B, 1, d_model]
+
         output = {
-            # "pose_token": pose_token,
             "mhr": pose_output,  # mhr prediction output
             "mhr_hand": pose_output_hand,  # mhr prediction output
             "condition_info": condition_info,
             "image_embeddings": image_embeddings,
+            "body_tokens": body_tokens,  # [B, 1, d_model] pose token from body decoder
         }
 
         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
@@ -1176,7 +1199,7 @@ class SAM3DBody(BaseModel):
         return output
 
     def forward_step(
-        self, batch: Dict, decoder_type: str = "body"
+        self, batch: Dict, decoder_type: str = "body", precomputed_features=None
     ) -> Tuple[Dict, Dict]:
         batch_size, num_person = batch["img"].shape[:2]
 
@@ -1190,7 +1213,7 @@ class SAM3DBody(BaseModel):
             ValueError("Invalid decoder type: ", decoder_type)
 
         # Crop-image (pose) branch
-        pose_output = self.forward_pose_branch(batch)
+        pose_output = self.forward_pose_branch(batch, precomputed_features=precomputed_features)
 
         return pose_output
 

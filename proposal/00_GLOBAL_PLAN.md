@@ -33,11 +33,15 @@ You have SAM 3D Body with learnable contact query tokens and a contact head trai
 ## Target Architecture (High Level)
 
 ```
-Image --> [SAM3DB Encoder] --> [Fused Features] --> [Body Decoder]  ----\
-                                      |                                  |-- cross-attention
-      [Prompts] --> [Prompt Encoder] -+--> [Interaction Decoder] -------/
+Image --> [SAM3DB Encoder] --> [Image Features F] --> [Body Decoder]
+                                      |                    |
+                                      |              T_pose tokens (detached)
+                                      |                    | (body→contact, from Step 1)
+      [Prompts] --> [Prompt Encoder] -+--> [Interaction Decoder]
+                                      |        |          |
+                                      |   [Contact Field] [Object 6DoF]
                                       |        |
-                                      |    [Contact Field + Correspondences + Object 6DoF]
+                                      |   (contact→body, Step 7 only, gated)
                                       |
                                       +--> [Scene Tokens] --> [Floor/Wall Contact]
 ```
@@ -50,15 +54,15 @@ See `02_FINAL_ARCHITECTURE.md` for details.
 
 Each step is ~1 week of work, builds on the previous, and is independently publishable/evaluable.
 
-| Step | Focus | Key Output | Key Data |
-|------|-------|------------|----------|
-| **Step 1** | Contact tokens + interaction decoder | Binary contact head separated from body decoder | DAMON, HOT |
-| **Step 2** | Object mask prompts | Contact conditioned on which object | DAMON + object masks from SAM |
-| **Step 3** | Contact representation ablation | Best representation: CDF vs. binary vs. correspondence vectors | DAMON, BEHAVE, PICO-db |
-| **Step 4** | Scene contact (floor/wall) | Floor + wall contact prediction | PROX, RICH, COFE, MoYo |
-| **Step 5** | Hand contact integration | Contact tokens feed into hand decoder | BEHAVE, InterCap, DexYCB |
-| **Step 6** | Object position prediction | Object 6DoF relative to body | BEHAVE, InterCap, 3DIR |
-| **Step 7** | Mutual refinement | Iterative cross-attention loop: pose <-> contact <-> object | All datasets combined |
+| Step | Focus | Key Output | Cross-Attention | Key Data |
+|------|-------|------------|-----------------|----------|
+| **Step 1** | Contact tokens + interaction decoder | Binary contact head + body→contact cross-attn | Body T_pose → contact (one-directional) | DAMON, HOT |
+| **Step 2** | Object mask prompts | Contact conditioned on which object | Body→contact (inherited) | DAMON + object masks from SAM |
+| **Step 3** | Contact representation ablation | Best repr: CDF vs. binary vs. correspondence | Body→contact (inherited) | DAMON, BEHAVE, PICO-db |
+| **Step 4** | Scene contact (floor/wall) | Floor + wall contact prediction | Body→contact (inherited) | PROX, RICH, COFE, MoYo |
+| **Step 5** | Hand contact integration | Contact tokens feed into hand decoder | Body→contact + hand↔contact | BEHAVE, InterCap, DexYCB |
+| **Step 6** | Object position prediction | Object 6DoF relative to body | Body→contact + hand↔contact | BEHAVE, InterCap, 3DIR |
+| **Step 7** | Mutual refinement (reverse direction) | Add contact→body, iterative loop | **Bidirectional** body↔contact | All datasets combined |
 
 See individual `step*.md` files for detailed plans.
 
@@ -87,7 +91,7 @@ See individual `step*.md` files for detailed plans.
 | Risk | Mitigation |
 |------|------------|
 | Limited contact data (5.5K DAMON vs. 7M SAM3DB) | Freeze encoder; use HOT 2D as weak supervision via PAL; synthetic data |
-| Interaction decoder hurts body pose | Separate decoders with lightweight cross-attention; ablate |
+| Interaction decoder hurts body pose | Body→contact is risk-free (frozen decoder, detached tokens); contact→body (Step 7) uses gated bridge starting at 0 |
 | Object position from single image is ambiguous | Start with relative position; contact constrains arrangement |
 | Too many loss terms cause instability | Staged curriculum; loss weighting search |
 

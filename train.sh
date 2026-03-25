@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 python train/train_contact.py --config configs/step1_contact.yaml

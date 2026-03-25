@@ -1,20 +1,25 @@
-# Step 7: Mutual Refinement of Pose, Contact, and Objects
+# Step 7: Mutual Refinement — Adding Contact→Body Feedback
 
 **Duration**: ~1-2 weeks
 **Depends on**: All previous steps (Step 1-6)
-**Goal**: Enable iterative cross-attention between body decoder and interaction decoder so pose, contact, and object predictions mutually refine each other
+**Goal**: Complete the bidirectional loop by adding contact→body cross-attention and unfreezing the body decoder, enabling iterative mutual refinement of pose, contact, and objects
 
 ---
 
 ## Motivation
 
-This is the core architectural contribution of the project. All previous steps built the components independently. Now we connect them in a feedback loop.
+Steps 1-6 established **one-directional** body→contact cross-attention: the interaction decoder reads body pose tokens (T_pose) to inform contact prediction. This already helps contact quality significantly.
 
-**Why this matters**:
-- Contact constrains pose: if the right hand touches a table, the arm should reach toward it
-- Pose constrains contact: if the arm is extended, only fingertip contact is plausible, not palm
-- Object constrains both: if the object is small, contact area should be limited
-- These mutual constraints should improve all three predictions iteratively
+This step adds the **reverse direction**: body decoder tokens attend to contact/object tokens from the interaction decoder. This enables:
+
+- **Contact constrains pose**: if the right hand touches a table, the arm should reach toward it
+- **Object constrains pose**: if the object is at a specific 6DoF, pose should be consistent
+- **Iterative refinement**: multiple rounds of body↔contact exchange improve both predictions
+
+**What changed vs. the original plan**: The body→contact direction was already established in Step 1, so this step is specifically about:
+1. Adding contact→body cross-attention (the risky direction — requires unfreezing body decoder)
+2. Making the loop iterative (T iterations)
+3. End-to-end finetuning of all components
 
 **Evidence it works**:
 - PICO shows 3-stage optimization (body -> contact -> object) improves all metrics
@@ -39,8 +44,8 @@ Iteration t = 1, 2, ..., T  (T = 3-6)
 | body_t = CrossAttn|<-- image F         | inter_t = CrossAttn|<-- image F
 |   (body_t, F)     |                    |   (inter_t, F)    |
 |                   |                    |                   |
-| body_t = CrossAttn|<-- contact tokens  | inter_t = CrossAttn|<-- body tokens
-|   (body_t,        |    (NEW)           |   (inter_t,       |    (NEW)
+| body_t = CrossAttn|<-- contact tokens  | inter_t = CrossAttn|<-- body T_pose
+|   (body_t,        |    (NEW in S7)     |   (inter_t,       |    (from Step 1)
 |    contact_t)     |                    |    body_t)        |
 |                   |                    |                   |
 +--------+----------+                    +--------+----------+
@@ -55,45 +60,54 @@ Iteration t = 1, 2, ..., T  (T = 3-6)
     L_body_t                                L_contact_t + L_obj_t
 ```
 
-**Each iteration**: Both decoders run one layer and exchange information via cross-attention. The key is bidirectional: body tokens inform contact, contact tokens inform body.
+**Step 1-6 already had**: inter_t cross-attends to body T_pose tokens (body→contact).
+**New in Step 7**: body_t cross-attends to contact/object/scene tokens (contact→body). This is the risky direction since it requires unfreezing the body decoder.
+
+---
+
+## Which Tokens Flow in Each Direction
+
+### Body → Contact (established in Step 1)
+| Source | Tokens | Information |
+|--------|--------|------------|
+| Body decoder | T_pose (decoded) | Joint positions, body shape, global orientation |
+
+### Contact → Body (NEW in Step 7)
+| Source | Tokens | Information |
+|--------|--------|------------|
+| Interaction decoder | T_contact (K=16) | Where contact is happening on body surface |
+| Interaction decoder | T_object (2-4) | Object identity, location, geometry |
+| Interaction decoder | T_scene (2-4) | Floor/wall geometry and contact |
+
+**All interaction decoder tokens** are concatenated as keys/values for the body decoder's new cross-attention layer. This gives the body decoder access to the full interaction context.
 
 ---
 
 ## Implementation Details
 
-### Cross-Attention Bridge
-
+### Contact→Body Cross-Attention Bridge (NEW)
 ```python
-# In Body Decoder layer t:
-body_tokens = body_self_attention(body_tokens)
-body_tokens = body_cross_attention(body_tokens, image_features)  # existing
-body_tokens = contact_bridge(body_tokens, contact_tokens)        # NEW
-
-# In Interaction Decoder layer t:
-inter_tokens = inter_self_attention(inter_tokens)
-inter_tokens = inter_cross_attention(inter_tokens, image_features)  # existing
-inter_tokens = body_bridge(inter_tokens, body_tokens)              # NEW
-```
-
-**Bridge design** (lightweight):
-```python
-class CrossBridge(nn.Module):
+class ContactToBodyBridge(nn.Module):
     def __init__(self, d_model, d_bridge=64, n_heads=1):
         self.q_proj = nn.Linear(d_model, d_bridge)
         self.k_proj = nn.Linear(d_model, d_bridge)
         self.v_proj = nn.Linear(d_model, d_bridge)
         self.out_proj = nn.Linear(d_bridge, d_model)
-        self.gate = nn.Parameter(torch.zeros(1))  # learnable gate, starts at 0
+        self.gate = nn.Parameter(torch.zeros(1))  # starts at 0
 
-    def forward(self, x, context):
-        q = self.q_proj(x)
-        k = self.k_proj(context)
-        v = self.v_proj(context)
+    def forward(self, body_tokens, interaction_tokens):
+        # body_tokens: [N_pose, B, d_model]  (queries)
+        # interaction_tokens: [K+N_obj+N_scene, B, d_model]  (keys, values)
+        q = self.q_proj(body_tokens)
+        k = self.k_proj(interaction_tokens)
+        v = self.v_proj(interaction_tokens)
         attn = softmax(q @ k.T / sqrt(d_bridge)) @ v
-        return x + self.gate * self.out_proj(attn)  # residual with gate
+        return body_tokens + self.gate * self.out_proj(attn)  # residual with gate
 ```
 
-**The learnable gate starts at 0** -- this means at the beginning of training, the cross-attention has no effect, and the model behaves like Steps 1-6. As training progresses, the gate opens and mutual refinement kicks in.
+**The learnable gate starts at 0** — at the beginning of training, the contact→body cross-attention has zero effect. The model behaves exactly like Steps 1-6. As training progresses, the gate opens and mutual refinement kicks in. This ensures smooth transition.
+
+**Note**: The body→contact cross-attention (Step 1) does NOT use a gate — it's a standard cross-attention that was trained from the start.
 
 ### Deep Supervision
 Every iteration t produces intermediate outputs. All are supervised:
@@ -116,7 +130,7 @@ lambda_t increases with t (later iterations get higher weight):
 
 ### Phase 1: Warm Up (Frozen Gates)
 - Load all weights from Steps 1-6
-- Add cross-attention bridges with gates initialized to 0
+- Add contact→body cross-attention bridges with gates initialized to 0
 - Train for a few epochs with gates frozen at 0 (verify no degradation)
 - Unfreeze gates, train with low lr on bridge parameters
 
@@ -145,15 +159,16 @@ lambda_t increases with t (later iterations get higher weight):
 
 ## Evaluation
 
-### Does Iterative Refinement Help?
+### Does Adding Contact→Body Help? (Core Question)
 
 | Experiment | Comparison |
 |-----------|------------|
+| Body→contact only (Steps 1-6) vs. bidirectional | Does the reverse direction improve anything? |
+| Body pose (MPJPE) with vs. without contact→body feedback | Does contact improve pose? |
+| Contact F1: Steps 1-6 vs. Step 7 (iterative) | Does iteration improve contact? |
 | T=1 vs. T=3 vs. T=6 | Does more iteration = better? |
-| Body pose (MPJPE) with vs. without contact feedback | Does contact improve pose? |
-| Contact F1 with vs. without pose feedback | Does pose improve contact? |
-| Object pose error with vs. without mutual refinement | Does the loop help objects? |
 | Per-iteration metrics | Do predictions improve at each step? |
+| Object pose error with vs. without mutual refinement | Does the loop help objects? |
 
 ### Full Benchmark
 
@@ -174,29 +189,31 @@ lambda_t increases with t (later iterations get higher weight):
 
 | Issue | Symptom | Mitigation |
 |-------|---------|-----------|
-| Oscillation between iterations | Metrics don't improve or oscillate | Reduce gate magnitude; add momentum; fewer iterations |
-| Body pose degradation | MPJPE increases | Freeze body decoder; gradient stopping from interaction to body |
+| Body pose degradation from contact→body | MPJPE increases | Reduce gate magnitude; gradient stopping; lower lr for body decoder |
+| Oscillation between iterations | Metrics don't improve or oscillate | Add momentum; fewer iterations; tighter gate |
 | Training instability | Loss diverges or NaN | Gradient clipping; lower lr; staged unfreezing |
-| No improvement from iteration | T=3 same as T=1 | The cross-attention bridge may be too weak; increase d_bridge |
+| No improvement from iteration | T=3 same as T=1 | Contact→body bridge too weak; increase d_bridge |
 | Slow convergence | Takes too many epochs | Pre-train bridges separately on synthetic paired data |
 
 ---
 
 ## Ablations
 
-1. T=1 vs. T=2 vs. T=3 vs. T=4 vs. T=6
-2. Bidirectional bridge vs. contact->body only vs. body->contact only
-3. Gated bridge vs. ungated
+1. **Unidirectional (body→contact only, Steps 1-6) vs. bidirectional (Step 7)** — core ablation
+2. T=1 vs. T=2 vs. T=3 vs. T=4 vs. T=6
+3. Gated bridge vs. ungated for contact→body direction
 4. Deep supervision vs. final-iteration-only supervision
-5. Gradient stopping schedule
+5. Gradient stopping schedule for contact→body
 6. Bridge dimension d=32 vs. d=64 vs. d=128
+7. Which interaction tokens the body decoder attends to: all vs. contact-only vs. contact+object
 
 ---
 
 ## Success Criteria
 
-- **Both pose and contact improve** with iterative refinement (the core hypothesis)
+- **Bidirectional improves over unidirectional** (the core hypothesis of this step)
 - Per-iteration improvement visible (iteration 3 > iteration 2 > iteration 1)
+- Body pose does not degrade, ideally improves for interaction poses
 - Overall metrics competitive with or exceeding:
   - DECO on body contact
   - InteractVLM on semantic contact
@@ -209,7 +226,7 @@ lambda_t increases with t (later iterations get higher weight):
 ## Expected Contributions (from Full System)
 
 1. **First promptable end-to-end model** for joint pose + contact + object/scene from single image
-2. **Iterative cross-modal refinement** between body, contact, and object decoders
+2. **Bidirectional cross-modal refinement** between body, contact, and object decoders
 3. **Rich contact representation** beyond binary per-vertex labels
 4. **Unified object + scene contact** in one architecture
 5. **Practical speed** vs. optimization-based methods (100x faster than PICO/PhySIC)

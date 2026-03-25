@@ -38,12 +38,15 @@ The final architecture extends SAM 3D Body with three new components: (1) an int
         |   (from SAM3DB)     |  |     (new)                       |
         |                     |  |                                  |
         | - Self-attention    |  | - Self-attention on contact,     |
-        | - Cross-attn to F   |  |   object, scene tokens          |
-        | - Body param heads  |  | - Cross-attn to F               |
+        | - Cross-attn to F  |  |   object, scene tokens           |
+        | - Body param heads |  | - Cross-attn to F                |
+        |                     |  | - Cross-attn to body T_pose     |
+        |   T_pose -----------|->|   (from Step 1, always present)  |
         |                     |  | - Contact/object/scene heads     |
         +----+-------+--------+  +----+-------+-------+------------+
              |       |                |       |       |
-             |       +<-- cross-attn->+       |       |      <-- iterative (Step 7)
+             |       +<-- gated xattn-+       |       |  <-- Step 7: contact->body
+             |       |  (Step 7 only) |       |       |      (reverse direction)
              |                        |       |       |
         +----v----+          +--------v--+ +--v---+ +-v--------+
         | Body    |          | Contact   | | Obj  | | Scene    |
@@ -87,11 +90,13 @@ A transformer decoder that processes contact, object, and scene query tokens.
 
 **Decoder layers** (each iteration):
 ```
-1. Self-attention:   all interaction tokens attend to each other
-2. Cross-attn to F:  interaction tokens attend to image features
-3. Cross-attn to prompts: interaction tokens attend to prompt tokens (obj mask, depth, etc.)
-4. [Step 7] Cross-attn to body: interaction tokens attend to body decoder intermediate tokens
+1. Self-attention:      all interaction tokens attend to each other
+2. Cross-attn to F:     interaction tokens attend to image features
+3. Cross-attn to body:  interaction tokens attend to body decoder T_pose tokens (from Step 1)
+4. Cross-attn to prompts: interaction tokens attend to prompt tokens (obj mask, depth, etc.)
 ```
+
+**Body→contact cross-attention (from Step 1)**: The interaction decoder cross-attends to the body decoder's decoded T_pose tokens at every layer. These tokens encode body joint positions, shape, and global orientation — directly informative for contact reasoning. The body decoder is frozen and T_pose tokens are detached, so this is risk-free.
 
 **Output heads** (MLPs applied to decoded tokens):
 
@@ -121,40 +126,52 @@ All prompt tokens are projected to d_model dimension and concatenated with the i
 
 ---
 
-### E. Cross-Attention Bridge (Step 7)
+### E. Cross-Attention Bridges
 
-The key architectural contribution. Lightweight cross-attention between body decoder and interaction decoder at each iteration.
+Two directional bridges connect the body and interaction decoders:
 
+**Direction 1: Body→Contact (Step 1, always present)**
+```
+Interaction Decoder layer:
+  inter_t = InterSelfAttn(inter_{t-1})
+  inter_t = InterCrossAttn(inter_t, F)
+  inter_t = InterCrossAttn(inter_t, body_T_pose.detach())  <-- pose informs contact
+  inter_t = InterCrossAttn(inter_t, prompts)
+```
+- Standard multi-head cross-attention (n_heads=4)
+- Body T_pose tokens are detached (no gradients to body decoder)
+- Present from the very first training step
+
+**Direction 2: Contact→Body (Step 7, added last)**
 ```
 Body Decoder Iteration t:
   body_t = BodySelfAttn(body_{t-1})
   body_t = BodyCrossAttn(body_t, F)
-  body_t = BodyCrossAttn(body_t, contact_t)    <-- NEW: contact informs pose
-
-Interaction Decoder Iteration t:
-  inter_t = InterSelfAttn(inter_{t-1})
-  inter_t = InterCrossAttn(inter_t, F)
-  inter_t = InterCrossAttn(inter_t, body_t)    <-- NEW: pose informs contact
+  body_t = ContactToBodyBridge(body_t, [contact_t, obj_t, scene_t])  <-- contact informs pose
 ```
+- Lightweight gated cross-attention (d_bridge=64, n_heads=1)
+- Learnable gate initialized to 0 (no effect at start, opens during training)
+- Requires unfreezing body decoder (low lr)
+- This is the risky direction — only added after all other components are stable
 
 **Design constraints**:
-- Single-head cross-attention with small projection (d=64) to avoid slowing body decoder
-- Gradient stopping from interaction->body in early training stages
+- Gate starts at 0 for smooth transition from Steps 1-6
+- Gradient stopping from interaction→body in early training stages
 - Deep supervision: losses at every iteration
 
 ---
 
 ## Training Curriculum (Staged)
 
-| Stage | What Trains | What's Frozen | Data |
-|-------|-------------|---------------|------|
-| Step 1 | Interaction decoder + contact head | Encoder + body decoder | DAMON + HOT |
-| Step 2 | + Object mask prompt encoder | Encoder + body decoder | DAMON + obj masks |
-| Step 3 | + New contact representation heads | Encoder + body decoder | DAMON + BEHAVE + PICO-db |
-| Step 4 | + Scene prompt encoders + scene head | Encoder + body decoder | + PROX + RICH + COFE |
-| Step 5 | + Hand decoder cross-attention | Encoder + body decoder (hands unfrozen) | + BEHAVE + InterCap |
-| Step 6 | + Object pose head + SAM3D prompt encoder | Encoder (lightly unfrozen) | + 3DIR + BEHAVE |
-| Step 7 | + Cross-attention bridge, full iterative loop | Nothing frozen | All data combined |
+| Stage | What Trains | What's Frozen | Cross-Attention | Data |
+|-------|-------------|---------------|-----------------|------|
+| Step 1 | Interaction decoder + contact head + body→contact cross-attn | Encoder + body decoder | Body→contact (T_pose, detached) | DAMON + HOT |
+| Step 2 | + Object mask prompt encoder | Encoder + body decoder | Body→contact | DAMON + obj masks |
+| Step 3 | + New contact representation heads | Encoder + body decoder | Body→contact | DAMON + BEHAVE + PICO-db |
+| Step 4 | + Scene prompt encoders + scene head | Encoder + body decoder | Body→contact | + PROX + RICH + COFE |
+| Step 5 | + Hand decoder cross-attention | Encoder + body decoder (hands unfrozen) | Body→contact + hand↔contact | + BEHAVE + InterCap |
+| Step 6 | + Object pose head + SAM3D prompt encoder | Encoder (lightly unfrozen) | Body→contact + hand↔contact | + 3DIR + BEHAVE |
+| Step 7 | + Contact→body bridge, full iterative loop | Nothing frozen | **Bidirectional** body↔contact + hand↔contact | All data combined |
 
 ---
 

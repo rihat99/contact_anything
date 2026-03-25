@@ -27,6 +27,7 @@ os.environ["MOMENTUM_ENABLED"] = "1"
 
 from sam_3d_body.build_models import load_sam_3d_body
 from sam_3d_body.models.heads.contact_head import ContactHead
+from sam_3d_body.models.decoders.interaction_decoder import InteractionDecoder
 from sam_3d_body.utils.config import get_config
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -34,7 +35,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "dataset"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "mhr_smpl_conversion"))
 from damon_mhr import DamonMHRDataset, DamonPrecomputedDataset
 from dataset_utils import prepare_damon_batch, prepare_damon_batch_precomputed
-from body_converter import BodyConverter
 from losses import ContactLoss
 
 
@@ -134,49 +134,47 @@ class ContactTrainer:
             mhr_path=self.cfg.MODEL.MHR_MODEL_PATH,
         )
 
-        # ---- Reinitialize all contact modules from train config ----
-        # load_sam_3d_body reads the checkpoint's model_config.yaml, which may have
-        # different (or commented-out) CONTACT_HEAD settings. We always reinitialize
-        # contact_embedding and head_contact from train/config.yaml so that the
-        # architecture matches regardless of what the checkpoint config says.
+        # ---- Initialize Step-1 contact modules (InteractionDecoder + ContactHead) ----
+        # These are always freshly initialized from configs/step1_contact.yaml.
+        # They are added as attributes on the model so they're saved/loaded with it.
         import torch.nn as nn
-        train_contact_cfg = self.cfg.MODEL.CONTACT_HEAD
-        train_num_vertices = train_contact_cfg.get('NUM_VERTICES', 18439)
-        num_kp  = train_contact_cfg.get('NUM_CONTACTS', 21)
-        num_gbl = train_contact_cfg.get('NUM_GLOBAL_TOKENS', 0)
-        total   = num_kp + num_gbl
-        dim     = self.model_cfg.MODEL.DECODER.DIM
+        dim = self.model_cfg.MODEL.DECODER.DIM
 
-        old_tokens = getattr(self.model, 'total_contact_tokens', None)
-        old_verts  = getattr(self.model.head_contact, 'num_vertices', None) if hasattr(self.model, 'head_contact') else None
-
-        print(f"Reinitializing contact modules from train config: "
-              f"tokens {old_tokens}→{total}, verts {old_verts}→{train_num_vertices}")
-
-        self.model.num_contact_tokens        = num_kp
-        self.model.num_global_contact_tokens = num_gbl
-        self.model.total_contact_tokens      = total
-        self.model.contact_keypoint_indices  = list(range(num_kp))
-        self.model.contact_grid_size         = train_contact_cfg.get('GRID_SIZE', 1)
-        self.model.contact_grid_radius       = train_contact_cfg.get('GRID_RADIUS', 0.1)
-        self.model.contact_embedding         = nn.Embedding(total, dim).to(device)
-        self.model.head_contact              = ContactHead(
-            input_dim=dim,
-            num_contact_tokens=total,
-            num_vertices=train_num_vertices,
-            mlp_depth=train_contact_cfg.get('MLP_DEPTH', 2),
-            mlp_channel_div_factor=train_contact_cfg.get('MLP_CHANNEL_DIV_FACTOR', 4),
-            pool_mode=train_contact_cfg.get('POOL_MODE', 'attention'),
-            dropout=train_contact_cfg.get('DROPOUT', 0.0),
+        id_cfg = self.cfg.MODEL.INTERACTION_DECODER
+        self.model.interaction_decoder = InteractionDecoder(
+            d_model=id_cfg.get('D_MODEL', dim),
+            image_feat_dim=id_cfg.get('IMAGE_FEAT_DIM', 1280),
+            num_contact_tokens=id_cfg.get('NUM_CONTACT_TOKENS', 16),
+            num_layers=id_cfg.get('NUM_LAYERS', 4),
+            num_heads=id_cfg.get('NUM_HEADS', 8),
+            ffn_dim=id_cfg.get('FFN_DIM', 2048),
+            dropout=id_cfg.get('DROPOUT', 0.0),
         ).to(device)
 
-        # ---- Freeze all params; unfreeze contact-related ones ----
-        print("Freezing all parameters except contact head & tokens...")
+        ch_cfg = self.cfg.MODEL.CONTACT_HEAD
+        num_vertices = ch_cfg.get('NUM_VERTICES', 18439)
+        num_contact_tokens = id_cfg.get('NUM_CONTACT_TOKENS', 16)
+        self.model.head_contact = ContactHead(
+            input_dim=id_cfg.get('D_MODEL', dim),
+            num_contact_tokens=num_contact_tokens,
+            num_vertices=num_vertices,
+            mlp_depth=ch_cfg.get('MLP_DEPTH', 2),
+            mlp_channel_div_factor=ch_cfg.get('MLP_CHANNEL_DIV_FACTOR', 4),
+            pool_mode=ch_cfg.get('POOL_MODE', 'attention'),
+            dropout=ch_cfg.get('DROPOUT', 0.0),
+        ).to(device)
+
+        print(f"Initialized InteractionDecoder: K={num_contact_tokens} tokens, "
+              f"{id_cfg.get('NUM_LAYERS', 4)} layers")
+        print(f"Initialized ContactHead: {num_vertices} vertices")
+
+        # ---- Freeze all params; unfreeze interaction_decoder and head_contact ----
+        print("Freezing all parameters except interaction_decoder and head_contact...")
         for param in self.model.parameters():
             param.requires_grad = False
 
         for name, param in self.model.named_parameters():
-            if "contact" in name.lower():
+            if name.startswith("interaction_decoder") or name.startswith("head_contact"):
                 param.requires_grad = True
                 print(f"  Unfrozen: {name}")
 
@@ -191,14 +189,6 @@ class ContactTrainer:
             for name, param in self.model.named_parameters():
                 if "lora_" in name:
                     param.requires_grad = True
-
-        # CRITICAL: decoder must stay in train mode so gradients flow to
-        # contact query tokens even though decoder weights are frozen.
-        for dec in [getattr(self.model, 'decoder', None),
-                    getattr(self.model, 'decoder_hand', None)]:
-            if dec is not None:
-                for m in dec.modules():
-                    m.train()
 
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -309,6 +299,7 @@ class ContactTrainer:
             print(f"OOB vertex weighting enabled: out-of-bounds weight = {self.oob_weight}")
             if self.lod != 1:
                 print(f"  Loading BodyConverter for LOD{self.lod} mapping...")
+                from body_converter import BodyConverter
                 self.body_converter = BodyConverter(device=device)
         else:
             print("OOB vertex weighting disabled (OOB_VERTEX_WEIGHT=1.0)")
@@ -380,12 +371,12 @@ class ContactTrainer:
         """Prepare batch for model. Accepts either image-based or precomputed-feature args."""
         if self.use_precomputed:
             features, bboxes, cam_ks, ori_img_sizes = args
-            # Use the model's own IMAGE_SIZE (from checkpoint config) to match
-            # the resolution at which features were precomputed.
-            model_img_size = tuple(self.model_cfg.MODEL.IMAGE_SIZE)
+            # Use the training config IMAGE_SIZE (896x896) — features were precomputed
+            # at this resolution (56x56 = 896/16), so the mask/affine must match.
+            target_size = tuple(self.cfg.MODEL.IMAGE_SIZE)
             return prepare_damon_batch_precomputed(
                 features, bboxes, cam_ks, ori_img_sizes,
-                target_size=model_img_size,
+                target_size=target_size,
                 device=self.device,
             )
         else:
@@ -505,11 +496,6 @@ class ContactTrainer:
 
     def train_epoch(self):
         self.model.train()
-        for dec in [getattr(self.model, 'decoder', None),
-                    getattr(self.model, 'decoder_hand', None)]:
-            if dec is not None:
-                for m in dec.modules():
-                    m.train()
 
         total_loss = 0.0
         total_metrics = {k: 0.0 for k in ('accuracy', 'precision', 'recall', 'f1', 'iou')}
@@ -530,12 +516,12 @@ class ContactTrainer:
                 self.model._initialize_batch(batch)
                 output = self.model.forward_step(batch, decoder_type="body")
 
-            if output["contact"] is None:
-                raise RuntimeError(
-                    "No contact output — ensure DO_CONTACT_TOKENS: true in config."
-                )
-
-            logits = output["contact"]["contact_logits"]  # [B, num_vertices]
+            # Step 1 forward: body decoder is frozen; run interaction decoder + head
+            contact_tokens = self.model.interaction_decoder(
+                output["image_embeddings"],
+                output["body_tokens"],
+            )  # [B, K, d_model]
+            logits = self.model.head_contact(contact_tokens)  # [B, num_vertices]
             vw_result = self._compute_vertex_weights(output, batch)
             vertex_weights, oob_frac = vw_result if vw_result is not None else (None, 0.0)
             loss = self._compute_loss(logits, contact_labels, vertex_weights)
@@ -573,7 +559,7 @@ class ContactTrainer:
             if self.current_epoch == 0 and batch_idx == 0:
                 print("\n=== Gradient Flow Check ===")
                 for name, param in self.model.named_parameters():
-                    if param.requires_grad and ("contact" in name.lower() or "lora_" in name):
+                    if param.requires_grad:
                         status = f"grad_norm={param.grad.norm().item():.6f}" if param.grad is not None else "NO GRAD"
                         print(f"  {name}: {status}")
                 print("=" * 40 + "\n")
@@ -638,7 +624,11 @@ class ContactTrainer:
                 self.model._initialize_batch(batch)
                 output = self.model.forward_step(batch, decoder_type="body")
 
-            logits = output["contact"]["contact_logits"]
+            contact_tokens = self.model.interaction_decoder(
+                output["image_embeddings"],
+                output["body_tokens"],
+            )
+            logits = self.model.head_contact(contact_tokens)
 
             vw_result = self._compute_vertex_weights(output, batch)
             vertex_weights = vw_result[0] if vw_result is not None else None
@@ -749,7 +739,7 @@ class ContactTrainer:
 
 def main():
     parser = argparse.ArgumentParser(description="Train per-vertex Contact Head on DAMON")
-    parser.add_argument("--config", type=str, default="train/config.yaml")
+    parser.add_argument("--config", type=str, default="configs/step1_contact.yaml")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 

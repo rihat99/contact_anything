@@ -1,3 +1,11 @@
+# Step 1: Interaction Decoder + Contact Head
+# Implements proposal/step1_contact_tokens_and_head.md (PAL loss excluded).
+#
+# Architecture:
+#   Image features (precomputed DINOv3) → frozen body decoder → pose token (detached)
+#   Image features + pose token → InteractionDecoder → K contact tokens
+#   Contact tokens → ContactHead → 18,439 per-vertex logits
+
 MODEL:
   CHECKPOINT_PATH: /data3/rikhat.akizhanov/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/model.ckpt
   MHR_MODEL_PATH: /data3/rikhat.akizhanov/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
@@ -12,6 +20,7 @@ MODEL:
   - 0.229
   - 0.224
   - 0.225
+  SMPL_MODEL_PATH: /data3/rikhat.akizhanov/human_global_motion/better_human/models/smpl/SMPL_NEUTRAL.npz
   BACKBONE:
     TYPE: dinov3_vith16plus
     FROZEN: true
@@ -28,8 +37,6 @@ MODEL:
     MAX_NUM_CLICKS: 1
     PROMPT_KEYPOINTS: mhr70
     MASK_EMBED_TYPE: null
-  # SMPL model for T-pose template vertices and face connectivity (used in inference_demo.py)
-  SMPL_MODEL_PATH: /data3/rikhat.akizhanov/human_global_motion/better_human/models/smpl/SMPL_NEUTRAL.npz
   MHR_HEAD:
     MHR_MODEL_PATH: /data3/rikhat.akizhanov/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
     MLP_DEPTH: 1
@@ -41,41 +48,51 @@ MODEL:
     MLP_DEPTH: 1
     MLP_CHANNEL_DIV_FACTOR: 1
     DEFAULT_SCALE_FACTOR: 1.0
+
+  # --- Interaction Decoder (NEW) ---
+  # Separate contact decoder; body->contact cross-attention is one-directional (detached).
+  INTERACTION_DECODER:
+    NUM_CONTACT_TOKENS: 8      # K learnable contact query tokens (reduced from 16)
+    NUM_LAYERS: 4              # Transformer decoder depth
+    NUM_HEADS: 8               # Attention heads per layer
+    FFN_DIM: 2048              # FFN hidden dim per layer
+    IMAGE_FEAT_DIM: 1280       # Backbone output channels (DINOv3-H)
+    D_MODEL: 1024              # Must match DECODER.DIM
+    DROPOUT: 0.1               # Dropout after each cross-attn sub-layer
+
+  # --- Contact Head (NEW) ---
+  CONTACT_HEAD:
+    NUM_VERTICES: 18439        # MHR LOD1 vertex count
+    MLP_DEPTH: 2
+    MLP_CHANNEL_DIV_FACTOR: 4  # hidden_dim = D_MODEL // 4 = 256
+    POOL_MODE: attention       # 'attention' or 'mean'
+    DROPOUT: 0.1
+
 TRAIN:
   BATCH_SIZE: 32
   VAL_BATCH_SIZE: 32
   NUM_WORKERS: 16
   EPOCHS: 50
   LR: 1e-4
-  WEIGHT_DECAY: 1e-4
+  WEIGHT_DECAY: 1e-1
   LR_SCHEDULER: cosine
   LR_WARMUP_EPOCHS: 1
   LR_MIN: 1e-5
   USE_FP16: false
   FP16_TYPE: float32
   GRAD_CLIP: 1.0
-  # Positive class weight for heavily imbalanced per-vertex labels.
-  # Set to null to auto-compute from train set statistics.
-  # POS_WEIGHT: null
-  # Multiplier on the negative-class BCE loss; >1.0 penalises false positives harder.
-  # NEG_WEIGHT: 2.0
   SAVE_FREQ: 5
   VAL_FREQ: 1
   RESUME: null
   # Weight applied to out-of-bounds vertices in the loss (0.0 = ignore, 1.0 = treat as visible).
   OOB_VERTEX_WEIGHT: 1.0
-  # --- Precomputed features (skip backbone) ---
+  # --- Precomputed backbone features (skip DINOv3 at training time) ---
   USE_PRECOMPUTED_FEATURES: true
   PRECOMPUTED_FEATURES_DIR: ./dataset/damon_mhr_contact/features
-  PRECOMPUTED_PREDICTIONS_DIR: ./dataset/damon_mhr_contact/predictions
-  # --- Pose supervision (requires precomputed features) ---
-  POSE_SUPERVISION:
-    ENABLED: true
-    KP2D_WEIGHT: 0.1
-    KP3D_WEIGHT: 0.1
-    LOSS_TYPE: smooth_l1
+  PRECOMPUTED_PREDICTIONS_DIR: ./dataset/damon_mhr_contact/predictionsd
+
 DATASET:
-  # MHR LOD level (0–6). Determines vertex count for contact labels.
+  # MHR LOD level (0-6). Determines vertex count for contact labels.
   LOD: 1
   # Contact NPZ files (imgname + contact_label); LOD-specific.
   CONTACT_NPZ:
@@ -89,30 +106,26 @@ DATASET:
   SMPL_TRAINVAL_NPZ: /data3/rikhat.akizhanov/DECO/datasets/Release_Datasets/damon/hot_dca_trainval.npz
   SMPL_TEST_NPZ: /data3/rikhat.akizhanov/DECO/datasets/Release_Datasets/damon/hot_dca_test.npz
   # Root directory containing the 'datasets/' folder referenced in imgname.
-  # Leave null to use DAMON_DATA_ROOT env var or auto-detect from npz_path.
   DATA_ROOT: /data3/rikhat.akizhanov/DECO
   # Fraction of TRAINVAL samples held out for validation.
   VAL_RATIO: 0.15
   # Fixed random seed — ensures identical train/val split across all runs.
   SEED: 42
+
 LOSS:
   # --- Focal BCE ---
-  # FOCAL_ALPHA > 0.5 upweights the rare positive class (contact ~14% of vertices).
-  # With asymmetric alpha: positives get alpha weight, negatives get (1-alpha).
-  # alpha=0.75 → positives 3× more weight than negatives.
+  # alpha=0.75 → positives (contact ~14%) get 3x more weight than negatives.
   FOCAL_ALPHA: 0.75
-  FOCAL_GAMMA: 2.0        # Focusing exponent — down-weights easy (well-classified) examples
-  FOCAL_WEIGHT: 5.0       # Contribution of focal BCE in total loss
+  FOCAL_GAMMA: 2.0
+  FOCAL_WEIGHT: 5.0
   # --- Dice ---
-  DICE_WEIGHT: 0.5        # Contribution of soft-dice loss in total loss
-  DICE_EPS: 1.0e-5        # Epsilon for numerical stability in dice denominator
+  DICE_WEIGHT: 0.5
+  DICE_EPS: 1.0e-5
   # --- L1 Sparsity ---
-  # Very small weight — just a gentle nudge against pathological all-ones predictions.
-  # Don't increase: too high hurts recall on the sparse positive class.
-  SPARSITY_WEIGHT: 0.002  # Regularisation weight — penalises over-predicting contacts
+  SPARSITY_WEIGHT: 0.002
+
 OUTPUT:
-  # Base output directory — each run gets a sub-folder named by date-time
   DIR: ./train/output
-  EXP_NAME: contact_vert  # prefix; actual folder = EXP_NAME_YYYYMMDD_HHMMSS
+  EXP_NAME: step1_contact
   LOG_FREQ: 10
   USE_TENSORBOARD: true

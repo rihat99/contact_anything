@@ -29,16 +29,18 @@ PICO does this via optimization (slow, fragile). LEMON predicts object center po
               |              |                  |
      +--------v--------+    |         +--------v---------+
      |  Body Decoder    |    |         | Interaction      |
-     |                  |    |         | Decoder          |
-     +--------+---------+    |         |                  |
-              |              |         | T_contact (K=16) |
-         Body Mesh           |         | T_object (2-4)   | <-- expanded
-                             |         | T_scene (2-4)    |
+     |  (FROZEN)        |    |         | Decoder          |
+     |                  |    |         |                  |
+     |  T_pose ---------|----+------->| T_contact (K=16) |
+     |                  |    |  body   | T_object (2-4)   | <-- expanded
+     +--------+---------+    |  tokens | T_scene (2-4)    |
+              |              |         |                  |
+         Body Mesh           |         | Cross-Attn to:   |
+                             |         |  - Image F       |
+           +------+          |         |  - body T_pose   | (from Step 1)
+           | SAM  |--mask--->|-------->|  - Obj prompts   |
+           +------+          |         |  - SAM3D tokens  | <-- NEW
                              |         |                  |
-           +------+          |         | Cross-Attn to:   |
-           | SAM  |--mask--->|-------->|  - Image F       |
-           +------+          |         |  - Obj prompts   |
-                             |         |  - SAM3D tokens  | <-- NEW
            +------+          |         |                  |
            |SAM3D |--tokens->|-------->|                  | <-- NEW
            +------+          |         +-----+----+-------+

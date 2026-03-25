@@ -33,23 +33,33 @@ By connecting the interaction decoder to the hand decoder, we get:
            Full Image F              Hand Crop F_hand
                 |                         |
      +----------+---------+     +--------v--------+
-     | Interaction Decoder |     | Hand Decoder    |
-     |                     |     |                  |
-     | T_contact           |     | T_hand          |
-     | T_object            |     |                  |
-     |                     |     | Cross-Attn to    |
-     | Cross-Attn to F     |     | F_hand          |
-     |                     |     |                  |
-     +----+----+-----------+     +---+----+---------+
-          |    |                     |    |
-          |    +-- cross-attn -------+    |          <-- NEW
-          |    +------- cross-attn --+    |          <-- NEW
-          |                               |
-     Contact Field                   Hand Pose
-     + Hand Contact Map              (MANO params)
+     | Body Decoder        |     | Hand Decoder    |
+     | (FROZEN)            |     |                  |
+     |  T_pose ---|        |     | T_hand          |
+     +-----+------\--------+     |                  |
+           |       \              | Cross-Attn to    |
+      Body Mesh     \             | F_hand          |
+                     v            |                  |
+     +-----------+---------+     +---+----+---------+
+     | Interaction Decoder  |         |    |
+     |                      |         |    |
+     | T_contact            |         |    |
+     | T_object             |         |    |
+     | Cross-Attn to F      |         |    |
+     | Cross-Attn to        |         |    |
+     |   body T_pose  (S1)  |         |    |
+     |                      |         |    |
+     +----+----+------------+         |    |
+          |    |                      |    |
+          |    +--- cross-attn -------+    |   <-- NEW (contact -> hand)
+          |    +-------- cross-attn --+    |   <-- NEW (hand -> contact)
+          |                                |
+     Contact Field                    Hand Pose
+     + Hand Contact Map               (MANO params)
 ```
 
-**New cross-attention**: Bidirectional lightweight cross-attention between interaction decoder and hand decoder.
+**Existing**: Body→contact cross-attention (from Step 1, via T_pose tokens).
+**New in this step**: Bidirectional lightweight cross-attention between interaction decoder and hand decoder.
 
 ---
 

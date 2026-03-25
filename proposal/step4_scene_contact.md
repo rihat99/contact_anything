@@ -29,14 +29,15 @@ Scene contact is critical for physical plausibility: a person sitting in mid-air
      |  Body Decoder    |          | Interaction     |
      |  (FROZEN)        |          | Decoder         |
      |                  |          |                  |
-     +--------+---------+          | T_contact (K=16)|
-              |                    | T_object (1-2)  |
-         Body Mesh                 | T_scene (2-4)   | <-- NEW
-                                   |                  |
-                                   | Cross-Attn to F  |
-              +---+                | Cross-Attn to    |
-              |Dep|--depth-------->| scene prompts    | <-- NEW
-              |Pro|                |                  |
+     |  T_pose ---------|--body--->| T_contact (K=16)|
+     |                  |  tokens  | T_object (1-2)  |
+     +--------+---------+          | T_scene (2-4)   | <-- NEW
+              |                    |                  |
+         Body Mesh                 | Cross-Attn to F  |
+                                   | Cross-Attn to    |
+              +---+                |   body T_pose    | (from Step 1)
+              |Dep|--depth-------->| Cross-Attn to    |
+              |Pro|                |   scene prompts  | <-- NEW
               +---+                +--------+---------+
                                             |
                                +-----+-----+------+

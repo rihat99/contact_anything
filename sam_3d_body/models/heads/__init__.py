@@ -2,6 +2,7 @@
 
 from ..modules import to_2tuple
 from .camera_head import PerspectiveHead
+from .contact_head import ContactHead
 from .mhr_head import MHRHead
 
 

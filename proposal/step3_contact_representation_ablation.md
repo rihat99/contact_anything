@@ -16,21 +16,22 @@ See `01_CONTACT_REPRESENTATIONS.md` for full description of each representation.
 
 ## Architecture Changes
 
-The interaction decoder stays the same. Only the **output heads** change per representation.
+The interaction decoder stays the same (including body→contact cross-attention from Step 1). Only the **output heads** change per representation.
 
 ```
-Interaction Decoder (from Step 2)
-         |
-    Contact Tokens (K=16)
-         |
-    +----v----+----v----+----v----+----v----+
-    | Binary  |   CDF   |  Corr.  | Query   |
-    | Head    |   Head  |  Head   | Token   |
-    | (base)  |  (new)  |  (new)  | Head    |
-    +----+----+----+----+----+----+----+----+
-         |         |         |         |
-    p(v) [0,1] d_geo(v)  delta(v)  patch_i
-    6890 verts 6890 verts 6890x3   K structs
+Body Decoder (FROZEN)
+    T_pose ──body tokens──> Interaction Decoder (from Step 2)
+                                     |
+                                Contact Tokens (K=16)
+                                     |
+                +----v----+----v----+----v----+----v----+
+                | Binary  |   CDF   |  Corr.  | Query   |
+                | Head    |   Head  |  Head   | Token   |
+                | (base)  |  (new)  |  (new)  | Head    |
+                +----+----+----+----+----+----+----+----+
+                     |         |         |         |
+                p(v) [0,1] d_geo(v)  delta(v)  patch_i
+                6890 verts 6890 verts 6890x3   K structs
 ```
 
 ---
