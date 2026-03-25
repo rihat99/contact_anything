@@ -148,7 +148,7 @@ lambda_t increases with t (later iterations get higher weight):
 | Dataset | Supervision Signal |
 |---------|-------------------|
 | SAM3DB data (subsampled) | Body pose |
-| DAMON + HOT | Body contact |
+| DAMON + RICH | Body contact (object + scene) |
 | BEHAVE + InterCap | Body-object contact + correspondence + object 6DoF |
 | PICO-db | Body-object correspondence |
 | PROX + RICH | Scene contact |

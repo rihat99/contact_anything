@@ -165,7 +165,7 @@ Body Decoder Iteration t:
 
 | Stage | What Trains | What's Frozen | Cross-Attention | Data |
 |-------|-------------|---------------|-----------------|------|
-| Step 1 | Interaction decoder + contact head + body→contact cross-attn | Encoder + body decoder | Body→contact (T_pose, detached) | DAMON + HOT |
+| Step 1 | Interaction decoder + contact head + body→contact cross-attn | Encoder + body decoder | Body→contact (T_pose, detached) | DAMON + RICH |
 | Step 2 | + Object mask prompt encoder | Encoder + body decoder | Body→contact | DAMON + obj masks |
 | Step 3 | + New contact representation heads | Encoder + body decoder | Body→contact | DAMON + BEHAVE + PICO-db |
 | Step 4 | + Scene prompt encoders + scene head | Encoder + body decoder | Body→contact | + PROX + RICH + COFE |
@@ -183,7 +183,7 @@ Body Decoder Iteration t:
 - `L_corr`: L1 on correspondence vectors (weighted by contact probability)
 - `L_semantic`: Cross-entropy for contact type classification
 - `L_target`: Cross-entropy for target type (object/floor/wall/furniture)
-- `L_pal`: Pixel Anchoring Loss -- project 3D contacts to 2D, match with HOT 2D evidence (from DECO)
+- ~~`L_pal`~~: Pixel Anchoring Loss dropped — HOT 2D annotations are too coarse; projecting DAMON GT to 2D adds no information over direct 3D BCE; DECO ablations show marginal gain
 
 **Object losses**:
 - `L_obj_pose`: L1 on object 6DoF relative to pelvis
@@ -219,7 +219,7 @@ This is comparable to DECO's overhead (~1% for context branches). The interactio
 
 - SAM 3D Body (Yang 2026): Base architecture, ViT-H/DINOv3 encoder, body decoder, hand decoder, MHR
 - SAM 3D (Team 2025): Object tokens, DINOv2 conditioning, mask-based prompting
-- DECO (Tripathi 2023): Dual-branch scene/part context, PAL loss
+- DECO (Tripathi 2023): Dual-branch scene/part context, class-weighted BCE
 - BSTRO (Huang 2022): Per-vertex queries in transformer, MVM training
 - PICO (Cseke 2025): Correspondence vectors, SDF penetration loss
 - IPMAN (Tripathi 2023): CoP-CoM stability loss, differentiable pressure

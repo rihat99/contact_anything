@@ -2,14 +2,13 @@
 """Precompute SAM-3D-Body pose predictions and DINOv3 image features for DAMON dataset.
 
 For each sample:
-- Run SAM-3D-Body body decoder (using pre-generated person masks for better bbox/conditioning)
-- Save pose predictions (keypoints, MHR params, camera) per split as .npz
+- Run SAM-3D-Body body decoder using bbox from the detect NPZ
+- Save pose predictions (keypoints, MHR params, camera) per sample as .npz
 - Save DINOv3 encoder features per sample as .pt (float16)
 
 Output structure:
   {output_dir}/features/{split}/{idx:04d}.pt       # [1280, 56, 56] float16
-  {output_dir}/predictions/{split}/{idx:04d}.npz   # per-sample (for resume)
-  {output_dir}/predictions/{split}_predictions.npz # merged per-split
+  {output_dir}/predictions/{split}/{idx:04d}.npz   # per-sample predictions
 """
 
 import argparse
@@ -27,51 +26,20 @@ from tqdm import tqdm
 # Defaults
 # ---------------------------------------------------------------------------
 DEFAULT_DATA_ROOT = "/data3/rikhat.akizhanov/DECO"
-DEFAULT_MASK_DIR = os.path.join(os.path.dirname(__file__), "damon_mhr_contact", "masks")
 DEFAULT_NPZ_DIR = os.path.join(os.path.dirname(__file__), "damon_mhr_contact")
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "damon_mhr_contact")
 DEFAULT_CHECKPOINT_DIR = (
     "/data3/rikhat.akizhanov/human_global_motion/data/"
     "sam-3d-body-checkpoints/sam-3d-body-dinov3"
 )
-DEFAULT_TRAIN_CONFIG = os.path.join(os.path.dirname(__file__), "..", "train", "config.yaml")
-
-
-# ---------------------------------------------------------------------------
-# Mask / bbox helpers
-# ---------------------------------------------------------------------------
-
-def load_person_mask(mask_dir: str, split: str, idx: int):
-    """Load pre-generated person mask (object order 000, single detection per image).
-
-    Returns (mask_uint8 [H, W, 1], bbox [4]) or (None, None) on failure.
-    """
-    mask_path = Path(mask_dir) / split / f"{idx:04d}" / "masks" / f"{idx:04d}_000.png"
-    if not mask_path.exists():
-        return None, None
-
-    gray = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-    if gray is None:
-        return None, None
-
-    mask_bin = (gray > 127).astype(np.uint8) * 255
-    coords = cv2.findNonZero(mask_bin)
-    if coords is None:
-        return None, None
-
-    x, y, w, h = cv2.boundingRect(coords)
-    if w == 0 or h == 0:
-        return None, None
-
-    bbox = np.array([x, y, x + w, y + h], dtype=np.float32)
-    return mask_bin[:, :, np.newaxis], bbox
+DEFAULT_TRAIN_CONFIG = os.path.join(os.path.dirname(__file__), "..", "configs", "step1_contact.yaml")
 
 
 # ---------------------------------------------------------------------------
 # Per-sample prediction extraction
 # ---------------------------------------------------------------------------
 
-def extract_predictions(mhr_out, bbox_used, mask_available, imgname_str):
+def extract_predictions(mhr_out, bbox_used, imgname_str):
     """Extract scalar/array predictions from model mhr output dict."""
     def _np(x, idx=0):
         if isinstance(x, torch.Tensor):
@@ -95,7 +63,6 @@ def extract_predictions(mhr_out, bbox_used, mask_available, imgname_str):
         "mhr_model_params": _np(mhr_out["mhr_model_params"]),        # [195]
         "pred_joint_coords": _np(mhr_out["pred_joint_coords"]),      # [127, 3]
         "bbox_used": bbox_used.astype(np.float32),                   # [4]
-        "mask_available": np.bool_(mask_available),
     }
 
 
@@ -107,7 +74,6 @@ def process_split(
     split: str,
     data_root: str,
     npz_dir: str,
-    mask_dir: str,
     output_dir: str,
     model,
     transform,
@@ -139,7 +105,7 @@ def process_split(
     feat_dir.mkdir(parents=True, exist_ok=True)
     pred_dir.mkdir(parents=True, exist_ok=True)
 
-    stats = {"processed": 0, "skipped_resume": 0, "skipped_error": 0, "no_mask": 0}
+    stats = {"processed": 0, "skipped_resume": 0, "skipped_error": 0}
 
     pbar = tqdm(total=len(indices), desc=split)
 
@@ -163,28 +129,16 @@ def process_split(
             pbar.update(1)
             continue
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        h, w = img.shape[:2]
 
-        # Load mask → bbox
-        mask_hwc, bbox_from_mask = load_person_mask(mask_dir, split, idx)
-        if mask_hwc is not None:
-            boxes = bbox_from_mask.reshape(1, 4)
-            masks_arr = mask_hwc.reshape(1, h, w, 1).astype(np.uint8)
-            masks_score = np.ones(1, dtype=np.float32)
-            mask_available = True
-        else:
-            stats["no_mask"] += 1
-            boxes = fallback_bboxes[idx].reshape(1, 4).astype(np.float32)
-            masks_arr = None
-            masks_score = None
-            mask_available = False
+        # Use bbox from detect NPZ directly
+        boxes = fallback_bboxes[idx].reshape(1, 4).astype(np.float32)
 
         # Camera intrinsics from detect NPZ
         cam_k = torch.tensor(fallback_camks[idx], dtype=torch.float32).unsqueeze(0)  # [1, 3, 3]
 
         # Build batch
         try:
-            batch = prepare_batch(img, transform, boxes, masks_arr, masks_score)
+            batch = prepare_batch(img, transform, boxes, None, None)
             batch = recursive_to(batch, "cuda")
             model._initialize_batch(batch)
             batch["cam_int"] = cam_k.to(batch["img"])
@@ -220,11 +174,10 @@ def process_split(
         # Save per-sample predictions
         try:
             mhr = pose_output["mhr"]
-            preds = extract_predictions(mhr, boxes[0], mask_available, imgname_str)
+            preds = extract_predictions(mhr, boxes[0], imgname_str)
             np.savez(str(pred_path), **preds)
         except Exception as exc:
             warnings.warn(f"[idx={idx}] Prediction save failed: {exc}")
-            # Feature was saved; still count as partial success but flag error
             stats["skipped_error"] += 1
             pbar.update(1)
             continue
@@ -234,49 +187,7 @@ def process_split(
 
     pbar.close()
     print(f"Split '{split}' done: {stats}")
-
-    # Merge per-sample predictions into a single NPZ
-    _merge_predictions(pred_dir, output_dir, split, start_idx, end)
-
     return stats
-
-
-def _merge_predictions(pred_dir: Path, output_dir: str, split: str, start_idx, end):
-    """Merge all per-sample .npz files into one split-level .npz."""
-    print(f"Merging predictions for split '{split}' ...")
-    all_preds = {}
-    missing = 0
-
-    for idx in range(start_idx, end):
-        pred_path = pred_dir / f"{idx:04d}.npz"
-        if not pred_path.exists():
-            missing += 1
-            continue
-
-        data = np.load(str(pred_path), allow_pickle=True)
-        for key in data.files:
-            val = data[key]
-            if key not in all_preds:
-                all_preds[key] = []
-            all_preds[key].append(val)
-
-    if not all_preds:
-        print(f"  No predictions found to merge for split '{split}'")
-        return
-
-    merged = {}
-    for key, vals in all_preds.items():
-        if key == "imgname":
-            merged[key] = np.array(vals, dtype=object)
-        elif key == "mask_available":
-            merged[key] = np.array(vals, dtype=bool)
-        else:
-            merged[key] = np.stack(vals, axis=0)
-
-    out_path = Path(output_dir) / "predictions" / f"{split}_predictions.npz"
-    np.savez(str(out_path), **merged)
-    n = len(next(iter(merged.values())))
-    print(f"  Saved {n} samples → {out_path}  (missing: {missing})")
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +199,6 @@ def main():
         description="Precompute SAM-3D-Body predictions and DINOv3 features for DAMON"
     )
     parser.add_argument("--data_root", default=DEFAULT_DATA_ROOT)
-    parser.add_argument("--mask_dir", default=DEFAULT_MASK_DIR)
     parser.add_argument("--npz_dir", default=DEFAULT_NPZ_DIR)
     parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--checkpoint_dir", default=DEFAULT_CHECKPOINT_DIR)
@@ -342,7 +252,6 @@ def main():
             split=split,
             data_root=args.data_root,
             npz_dir=args.npz_dir,
-            mask_dir=args.mask_dir,
             output_dir=args.output_dir,
             model=model,
             transform=transform,

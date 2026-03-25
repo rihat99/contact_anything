@@ -2,7 +2,7 @@
 
 **Duration**: ~1 week
 **Depends on**: Current SAM3DB baseline with contact tokens
-**Goal**: Separate the contact prediction into its own decoder with one-directional body→contact cross-attention, train it on DAMON + HOT
+**Goal**: Separate the contact prediction into its own decoder with one-directional body→contact cross-attention, train it on DAMON; address overfitting via regularization and RICH data
 
 ---
 
@@ -108,14 +108,13 @@ class BodyToContactCrossAttn(nn.Module):
 
 ### Loss
 ```
-L = L_bce + lambda_pal * L_pal
+L = L_bce
 
-L_bce:  Binary cross-entropy on per-vertex contact probabilities vs. DAMON GT
+L_bce:  Binary cross-entropy on per-vertex contact probabilities vs. DAMON/RICH GT
         Use class weighting (contact vertices are ~5% of mesh) -- weight ~10:1
-L_pal:  Pixel Anchoring Loss (from DECO) -- render contact-colored mesh to 2D,
-        compare with HOT 2D contact maps via BCE
-        Requires: differentiable rendering (PyTorch3D), GT SMPL mesh from body decoder
 ```
+
+**Note on PAL loss**: DECO's ablations show marginal gain from PAL. The core issue is that HOT 2D contact annotations are coarse and imprecise, and projecting GT 3D contact from DAMON to 2D adds no new information beyond the 3D BCE (it's the same GT projected to a lower-dimensional, ambiguous space). PAL is dropped.
 
 ---
 
@@ -128,16 +127,20 @@ L_pal:  Pixel Anchoring Loss (from DECO) -- render contact-colored mesh to 2D,
 | Dataset | Images | Contact Labels | Usage |
 |---------|--------|---------------|-------|
 | DAMON train | ~4.4K | Dense vertex-level binary (SMPL) | Primary 3D supervision |
-| HOT-Annotated | ~15K | 2D contact heatmaps + body part | PAL loss (2D auxiliary) |
+| RICH | ~577K | Body-scene contact (proximity-based, floor/furniture/wall) | Regularization — massive diversity boost |
+
+**Overfitting mitigation** (DAMON alone is 4.4K images — too small):
+- **RICH data**: Pull RICH into training now even though it's "Step 4 data". Body-scene contact on the same SMPL vertices; label schema is compatible with DAMON's binary labels. Balances DAMON:RICH sampling to avoid scene-contact bias (e.g., 1:4 ratio).
+- **Dropout**: Add dropout 0.1–0.2 after each cross-attention layer in the interaction decoder
+- **Weight decay**: 1e-1 (stronger than default 1e-2)
+- **Reduce K**: Try K=8 before K=16 — fewer parameters to overfit
 
 **Training recipe**:
-- Optimizer: AdamW, lr=1e-4, weight decay 1e-2
-- Batch size: 32 (small data, can fit easily)
-- Epochs: ~50-100 (small dataset, need many passes)
+- Optimizer: AdamW, lr=1e-4, weight decay 1e-1
+- Batch size: 32
+- Epochs: ~50-100 on DAMON; monitor val F1 on both DAMON and RICH separately
 - Augmentation: random flip, color jitter, crop (inherited from SAM3DB)
 - Contact class weighting: 10:1 for contact vs. non-contact vertices
-
-**Body mesh for PAL loss**: Use the frozen body decoder's output mesh. This mesh is good enough for rendering since the body decoder is pretrained on 7M images.
 
 ---
 
@@ -160,7 +163,7 @@ L_pal:  Pixel Anchoring Loss (from DECO) -- render contact-colored mesh to 2D,
 1. **With vs. without body→contact cross-attention** (key ablation: does pose info help contact?)
 2. K=8 vs. K=16 vs. K=32 contact tokens
 3. Interaction decoder depth: 2 vs. 4 vs. 6 layers
-4. With vs. without PAL loss
+4. With vs. without RICH data (does it reduce overfitting without hurting DAMON F1?)
 5. Per-vertex logits vs. Gaussian patch composition from tokens
 6. Cross-attend to T_pose from last body decoder layer vs. intermediate layer vs. all layers (concatenated)
 7. Cross-attention heads: 1 vs. 4 vs. 8
@@ -180,6 +183,6 @@ L_pal:  Pixel Anchoring Loss (from DECO) -- render contact-colored mesh to 2D,
 
 ## References
 
-- DECO (Tripathi 2023): PAL loss formulation, class-weighted BCE, ~55% F1 on DAMON
+- DECO (Tripathi 2023): Class-weighted BCE, ~55% F1 on DAMON; PAL ablation shows marginal gain
 - BSTRO (Huang 2022): Per-vertex transformer queries, Masked Vertex Modeling
-- HOT (Chen 2023): 35K images with 2D contact heatmaps, body-part attention
+- RICH/BSTRO (Huang 2022): 577K images, proximity-based body-scene contact labels

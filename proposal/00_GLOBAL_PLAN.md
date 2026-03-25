@@ -56,7 +56,7 @@ Each step is ~1 week of work, builds on the previous, and is independently publi
 
 | Step | Focus | Key Output | Cross-Attention | Key Data |
 |------|-------|------------|-----------------|----------|
-| **Step 1** | Contact tokens + interaction decoder | Binary contact head + body→contact cross-attn | Body T_pose → contact (one-directional) | DAMON, HOT |
+| **Step 1** | Contact tokens + interaction decoder | Binary contact head + body→contact cross-attn | Body T_pose → contact (one-directional) | DAMON + RICH |
 | **Step 2** | Object mask prompts | Contact conditioned on which object | Body→contact (inherited) | DAMON + object masks from SAM |
 | **Step 3** | Contact representation ablation | Best repr: CDF vs. binary vs. correspondence | Body→contact (inherited) | DAMON, BEHAVE, PICO-db |
 | **Step 4** | Scene contact (floor/wall) | Floor + wall contact prediction | Body→contact (inherited) | PROX, RICH, COFE, MoYo |
@@ -73,7 +73,7 @@ See individual `step*.md` files for detailed plans.
 | Dataset | Size | Contact Type | Object/Scene Info | Role |
 |---------|------|-------------|-------------------|------|
 | DAMON | 5.5K images | Dense binary body vertex | Object class (84 categories) | Primary body contact |
-| HOT | 35K images | 2D contact heatmaps + body part | Object class | 2D auxiliary (PAL loss) |
+| HOT | 35K images | 2D contact heatmaps + body part | Object class | Not used (PAL dropped — coarse 2D annotations, marginal gain per DECO ablations) |
 | RICH | 577K images (90K bodies) | Dense vertex contact | 5 scene scans | Body-scene contact |
 | BEHAVE | 15K RGBD frames | Object vertex contact + SMPL correspondence | 20 object meshes | Body-object correspondence |
 | InterCap | Multi-view | Contact from proximity | 10 object categories | Evaluation + training |
@@ -90,7 +90,7 @@ See individual `step*.md` files for detailed plans.
 
 | Risk | Mitigation |
 |------|------------|
-| Limited contact data (5.5K DAMON vs. 7M SAM3DB) | Freeze encoder; use HOT 2D as weak supervision via PAL; synthetic data |
+| Limited contact data (5.5K DAMON vs. 7M SAM3DB) | Freeze encoder; pull RICH (577K) into training from Step 1 for regularization; dropout + strong weight decay in interaction decoder |
 | Interaction decoder hurts body pose | Body→contact is risk-free (frozen decoder, detached tokens); contact→body (Step 7) uses gated bridge starting at 0 |
 | Object position from single image is ambiguous | Start with relative position; contact constrains arrangement |
 | Too many loss terms cause instability | Staged curriculum; loss weighting search |

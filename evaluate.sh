@@ -1,2 +1,2 @@
-CUDA_VISIBLE_DEVICES=0 python train/evaluate.py --checkpoint train/output/contact_vert_20260318_170639/final_model.pth --split test --threshold 0.5 --mode smpl \
---config  train/output/contact_vert_20260318_170639/config.yaml
+CUDA_VISIBLE_DEVICES=0 python train/evaluate.py --checkpoint train/output/step1_contact_20260325_122451/best_model.pth --split test --threshold 0.5 --mode smpl \
+--config  train/output/step1_contact_20260325_122451/config.yaml

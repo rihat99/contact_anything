@@ -42,6 +42,7 @@ os.environ["MOMENTUM_ENABLED"] = "1"
 
 from sam_3d_body.build_models import load_sam_3d_body
 from sam_3d_body.models.heads.contact_head import ContactHead
+from sam_3d_body.models.decoders.interaction_decoder import InteractionDecoder
 from sam_3d_body.utils.config import get_config
 from damon_mhr import DamonMHRDataset
 from damon_smpl import DamonSMPLDataset
@@ -310,7 +311,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Inference demo — per-vertex contact prediction on DAMON"
     )
-    parser.add_argument("--config",      type=str, default="train/config.yaml")
+    parser.add_argument("--config",      type=str, default="configs/step1_contact.yaml")
     parser.add_argument("--checkpoint",  type=str, required=True,
                         help="Path to trained checkpoint (.pth)")
     parser.add_argument("--num_samples", type=int, default=10,
@@ -339,33 +340,33 @@ def main():
 
     # ---- Model ----
     print("Loading SAM-3D-Body model...")
-    import torch.nn as nn
     model, model_cfg = load_sam_3d_body(
         checkpoint_path=cfg.MODEL.CHECKPOINT_PATH,
         device=args.device,
         mhr_path=cfg.MODEL.MHR_MODEL_PATH,
     )
 
-    # Reinitialize contact modules from train config (same as train_contact.py)
-    contact_cfg = cfg.MODEL.CONTACT_HEAD
-    num_vertices = contact_cfg.get('NUM_VERTICES', 18439)
-    num_kp  = contact_cfg.get('NUM_CONTACTS', 21)
-    num_gbl = contact_cfg.get('NUM_GLOBAL_TOKENS', 0)
-    total   = num_kp + num_gbl
-    dim     = model_cfg.MODEL.DECODER.DIM
-    model.num_contact_tokens        = num_kp
-    model.num_global_contact_tokens = num_gbl
-    model.total_contact_tokens      = total
-    model.contact_keypoint_indices  = list(range(num_kp))
-    model.contact_grid_size         = contact_cfg.get('GRID_SIZE', 1)
-    model.contact_grid_radius       = contact_cfg.get('GRID_RADIUS', 0.1)
-    model.contact_embedding         = nn.Embedding(total, dim).to(args.device)
-    model.head_contact              = ContactHead(
+    # Reinitialize InteractionDecoder + ContactHead from training config
+    dim = model_cfg.MODEL.DECODER.DIM
+    id_cfg = cfg.MODEL.INTERACTION_DECODER
+    ch_cfg = cfg.MODEL.CONTACT_HEAD
+    model.interaction_decoder = InteractionDecoder(
+        d_model=id_cfg.get('D_MODEL', dim),
+        image_feat_dim=id_cfg.get('IMAGE_FEAT_DIM', 1280),
+        num_contact_tokens=id_cfg.get('NUM_CONTACT_TOKENS', 16),
+        num_layers=id_cfg.get('NUM_LAYERS', 4),
+        num_heads=id_cfg.get('NUM_HEADS', 8),
+        ffn_dim=id_cfg.get('FFN_DIM', 2048),
+        dropout=id_cfg.get('DROPOUT', 0.0),
+    ).to(args.device)
+    model.head_contact = ContactHead(
         input_dim=dim,
-        num_contact_tokens=total,
-        num_vertices=num_vertices,
-        mlp_depth=contact_cfg.get('MLP_DEPTH', 2),
-        mlp_channel_div_factor=contact_cfg.get('MLP_CHANNEL_DIV_FACTOR', 4),
+        num_contact_tokens=id_cfg.get('NUM_CONTACT_TOKENS', 16),
+        num_vertices=ch_cfg.get('NUM_VERTICES', 18439),
+        mlp_depth=ch_cfg.get('MLP_DEPTH', 2),
+        mlp_channel_div_factor=ch_cfg.get('MLP_CHANNEL_DIV_FACTOR', 4),
+        pool_mode=ch_cfg.get('POOL_MODE', 'attention'),
+        dropout=ch_cfg.get('DROPOUT', 0.0),
     ).to(args.device)
 
     print(f"Loading checkpoint: {args.checkpoint}")
@@ -472,10 +473,13 @@ def main():
             )
             model._initialize_batch(batch)
             output = model.forward_step(batch, decoder_type="body")
+            contact_tokens = model.interaction_decoder(
+                output["image_embeddings"], output["body_tokens"]
+            )
+            contact_logits = model.head_contact(contact_tokens)  # [1, V_lod]
 
         # ---- Contact predictions (LOD space) ----
-        contact_logits = output["contact"]["contact_logits"]     # [1, V_lod]
-        pred_probs_lod = torch.sigmoid(contact_logits)[0].cpu()  # [V_lod] float
+        pred_probs_lod = torch.sigmoid(contact_logits[0]).cpu()  # [V_lod] float
 
         # ---- Pred: LOD_N → SMPL (Voronoi BFS + barycentric) ----
         pred_smpl_probs = converter.mhr_lod_probs_to_smpl_probs(

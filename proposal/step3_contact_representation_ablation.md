@@ -105,11 +105,11 @@ Inference: use CDF for per-vertex output, query tokens for semantic/structured o
 
 | Representation | Primary Data | Additional Data | Total |
 |---------------|-------------|-----------------|-------|
-| Binary | DAMON (4.4K) | HOT via PAL (15K) | ~19K |
-| CDF | DAMON (4.4K) | HOT via PAL (15K) | ~19K |
-| CDF + Corr | DAMON (4.4K) + BEHAVE (15K) + PICO-db (4.1K) | HOT via PAL | ~38K |
-| Query Tokens | DAMON (4.4K) | HOT via PAL | ~19K |
-| CDF + Tokens | DAMON (4.4K) + BEHAVE (15K) + PICO-db (4.1K) | HOT via PAL | ~38K |
+| Binary | DAMON (4.4K) + RICH (subsampled) | — | ~50K |
+| CDF | DAMON (4.4K) + RICH (subsampled) | — | ~50K |
+| CDF + Corr | DAMON (4.4K) + RICH (subsampled) + BEHAVE (15K) + PICO-db (4.1K) | — | ~70K |
+| Query Tokens | DAMON (4.4K) + RICH (subsampled) | — | ~50K |
+| CDF + Tokens | DAMON (4.4K) + RICH (subsampled) + BEHAVE (15K) + PICO-db (4.1K) | — | ~70K |
 
 **Training**: Same recipe as Step 1. Each representation variant is a separate run. Compare after convergence.
 

@@ -127,7 +127,7 @@ GT: Project 3D contact labels to SMPL UV atlas (DensePose-style)
 - Decouples contact from mesh topology
 - Higher resolution in important regions (hands, feet) via non-uniform UV
 - Compatible with 2D convolutional decoders
-- Can leverage HOT 2D contact maps as auxiliary supervision
+- Could leverage 2D contact maps as auxiliary supervision (but PAL gain is marginal per DECO ablations)
 
 **Recommended as**: Optional exploration. More complex than CDF but resolution-independent.
 
@@ -151,7 +151,7 @@ GT: Project 3D contact labels to SMPL UV atlas (DensePose-style)
 
 | Representation | Requires | Available From |
 |---------------|----------|---------------|
-| Binary | Body contact labels | DAMON (5.5K), RICH (90K), HOT (35K via PAL) |
+| Binary | Body contact labels | DAMON (5.5K), RICH (90K) |
 | CDF | Same as binary (precomputed) | Same + geodesic computation |
 | Correspondence vectors | Body-object pairs with GT meshes | BEHAVE (15K), InterCap, PICO-db (4.1K) |
 | Query tokens | Grouped contact patches | Derived from binary labels |
@@ -161,7 +161,7 @@ GT: Project 3D contact labels to SMPL UV atlas (DensePose-style)
 
 ## References
 
-- DECO (Tripathi 2023): Binary per-vertex + PAL loss
+- DECO (Tripathi 2023): Binary per-vertex, class-weighted BCE; PAL marginal per their own ablations
 - BSTRO (Huang 2022): Per-vertex queries in transformer
 - POSA (Hassan 2021): Per-vertex binary + semantic (40 Matterport categories)
 - PICO (Cseke 2025): Dense vertex-to-point correspondences
