@@ -39,8 +39,7 @@ from sam_3d_body.build_models import load_sam_3d_body
 from sam_3d_body.models.heads.contact_head import ContactHead
 from sam_3d_body.models.decoders.interaction_decoder import InteractionDecoder
 from sam_3d_body.utils.config import get_config
-from damon_mhr import DamonMHRDataset
-from damon_smpl import DamonSMPLDataset
+from damon_dataset import DamonDataset
 from dataset_utils import prepare_damon_batch
 from train_contact import damon_collate
 
@@ -167,17 +166,19 @@ class ContactEvaluator:
             if self.split == 'test':
                 if not smpl_test:
                     raise ValueError("DATASET.SMPL_TEST_NPZ not set in config.")
-                dataset = DamonSMPLDataset(
-                    smpl_npz_path=smpl_test,
+                dataset = DamonDataset(
+                    contact_npz_path=smpl_test,
                     detect_npz_path=detect_npz.get('TEST', None),
+                    topology='smpl',
                     data_root=data_root,
                 )
             else:
                 if not smpl_trainval:
                     raise ValueError("DATASET.SMPL_TRAINVAL_NPZ not set in config.")
-                train_ds, val_ds = DamonSMPLDataset.split_train_val(
-                    smpl_npz_path=smpl_trainval,
+                train_ds, val_ds = DamonDataset.split_train_val(
+                    contact_npz_path=smpl_trainval,
                     detect_npz_path=detect_npz.get('TRAINVAL', None),
+                    topology='smpl',
                     val_ratio=val_ratio,
                     seed=seed,
                     data_root=data_root,
@@ -188,17 +189,19 @@ class ContactEvaluator:
             if self.split == 'test':
                 if not contact_npz.get('TEST', None):
                     raise ValueError("DATASET.CONTACT_NPZ.TEST not set in config.")
-                dataset = DamonMHRDataset(
+                dataset = DamonDataset(
                     contact_npz_path=contact_npz.TEST,
                     detect_npz_path=detect_npz.get('TEST', None),
+                    topology='mhr',
                     lod=lod,
                     data_root=data_root,
                 )
             else:
                 # Reproduce the exact same train/val split used during training.
-                train_ds, val_ds = DamonMHRDataset.split_train_val(
+                train_ds, val_ds = DamonDataset.split_train_val(
                     contact_npz_path=contact_npz.TRAINVAL,
                     detect_npz_path=detect_npz.get('TRAINVAL', None),
+                    topology='mhr',
                     lod=lod,
                     val_ratio=val_ratio,
                     seed=seed,

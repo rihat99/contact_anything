@@ -33,7 +33,7 @@ from sam_3d_body.utils.config import get_config
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "dataset"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "mhr_smpl_conversion"))
-from damon_mhr import DamonMHRDataset, DamonPrecomputedDataset
+from damon_dataset import DamonDataset, DamonPrecomputedDataset
 from dataset_utils import prepare_damon_batch, prepare_damon_batch_precomputed
 from losses import ContactLoss
 
@@ -223,9 +223,10 @@ class ContactTrainer:
             collate_fn = damon_precomputed_collate
             print(f"  Using precomputed features from {features_base}")
         else:
-            self.train_dataset, self.val_dataset = DamonMHRDataset.split_train_val(
+            self.train_dataset, self.val_dataset = DamonDataset.split_train_val(
                 contact_npz_path=contact_npz.TRAINVAL,
                 detect_npz_path=detect_npz.get('TRAINVAL', None),
+                topology='mhr',
                 lod=lod,
                 val_ratio=val_ratio,
                 seed=seed,

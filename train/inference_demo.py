@@ -44,8 +44,7 @@ from sam_3d_body.build_models import load_sam_3d_body
 from sam_3d_body.models.heads.contact_head import ContactHead
 from sam_3d_body.models.decoders.interaction_decoder import InteractionDecoder
 from sam_3d_body.utils.config import get_config
-from damon_mhr import DamonMHRDataset
-from damon_smpl import DamonSMPLDataset
+from damon_dataset import DamonDataset
 from dataset_utils import prepare_damon_batch
 from train_contact import damon_collate
 from body_converter import BodyConverter
@@ -407,25 +406,28 @@ def main():
     use_smpl_gt   = bool(smpl_trainval or smpl_test)
 
     if use_smpl_gt:
-        print("Using original SMPL GT contacts (DamonSMPLDataset).")
+        print("Using original SMPL GT contacts.")
         if args.split == "test":
             if not smpl_test:
                 raise ValueError("DATASET.SMPL_TEST_NPZ not set in config.")
-            dataset = DamonSMPLDataset(
-                smpl_npz_path=smpl_test,
+            dataset = DamonDataset(
+                contact_npz_path=smpl_test,
                 detect_npz_path=detect_npz.get('TEST', None),
+                topology='smpl',
                 data_root=data_root,
             )
         elif args.split == "trainval":
-            dataset = DamonSMPLDataset(
-                smpl_npz_path=smpl_trainval,
+            dataset = DamonDataset(
+                contact_npz_path=smpl_trainval,
                 detect_npz_path=detect_npz.get('TRAINVAL', None),
+                topology='smpl',
                 data_root=data_root,
             )
         else:
-            train_ds, val_ds = DamonSMPLDataset.split_train_val(
-                smpl_npz_path=smpl_trainval,
+            train_ds, val_ds = DamonDataset.split_train_val(
+                contact_npz_path=smpl_trainval,
                 detect_npz_path=detect_npz.get('TRAINVAL', None),
+                topology='smpl',
                 val_ratio=val_ratio, seed=seed_ds, data_root=data_root,
             )
             dataset = train_ds if args.split == "train" else val_ds
@@ -433,22 +435,22 @@ def main():
         print("SMPL NPZ not configured — using MHR LOD GT with conversion.")
         contact_npz = cfg.DATASET.CONTACT_NPZ
         if args.split == "test":
-            dataset = DamonMHRDataset(
+            dataset = DamonDataset(
                 contact_npz_path=contact_npz.TEST,
                 detect_npz_path=detect_npz.get('TEST', None),
-                lod=lod, data_root=data_root,
+                topology='mhr', lod=lod, data_root=data_root,
             )
         elif args.split == "trainval":
-            dataset = DamonMHRDataset(
+            dataset = DamonDataset(
                 contact_npz_path=contact_npz.TRAINVAL,
                 detect_npz_path=detect_npz.get('TRAINVAL', None),
-                lod=lod, data_root=data_root,
+                topology='mhr', lod=lod, data_root=data_root,
             )
         else:
-            train_ds, val_ds = DamonMHRDataset.split_train_val(
+            train_ds, val_ds = DamonDataset.split_train_val(
                 contact_npz_path=contact_npz.TRAINVAL,
                 detect_npz_path=detect_npz.get('TRAINVAL', None),
-                lod=lod, val_ratio=val_ratio, seed=seed_ds, data_root=data_root,
+                topology='mhr', lod=lod, val_ratio=val_ratio, seed=seed_ds, data_root=data_root,
             )
             dataset = train_ds if args.split == "train" else val_ds
 
@@ -488,11 +490,11 @@ def main():
 
         # ---- GT: original SMPL labels or converted from LOD_N ----
         if use_smpl_gt:
-            # contact_label is already [6890] from DamonSMPLDataset
+            # contact_label is already [6890] (SMPL topology)
             gt_mask_smpl  = contact_label.numpy().astype(bool)           # [6890]
             gt_smpl_float = contact_label.float().unsqueeze(0)           # [1, 6890]
         else:
-            # contact_label is [V_lod] from DamonMHRDataset — convert to SMPL
+            # contact_label is [V_lod] (MHR topology) — convert to SMPL
             gt_smpl_float = converter.mhr_lod_probs_to_smpl_probs(
                 contact_label.float().unsqueeze(0), source_lod=lod)      # [1, 6890]
             gt_mask_smpl  = (gt_smpl_float[0] > 0.5).numpy().astype(bool)  # [6890]

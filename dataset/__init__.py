@@ -1,13 +1,10 @@
 """
-Datasets for SAM-3D-Body training.
+Datasets for SAM-3D-Body contact training.
 
-Available datasets:
-- DamonMHRDataset: Damon dataset with MHR contact labels (18,439 vertices),
-                   bounding boxes, and camera parameters
+    DamonDataset              — raw images, MHR or SMPL topology, three modes
+    DamonPrecomputedDataset   — precomputed DINOv3 features, MHR topology
+    build_datasets(cfg)       — config-driven factory returning (train, val, test)
 """
+from .damon_dataset import DamonDataset, DamonPrecomputedDataset, build_datasets
 
-from .damon_mhr import DamonMHRDataset
-
-__all__ = [
-    'DamonMHRDataset',
-]
+__all__ = ['DamonDataset', 'DamonPrecomputedDataset', 'build_datasets']

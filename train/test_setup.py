@@ -31,7 +31,7 @@ from sam_3d_body.build_models import load_sam_3d_body
 from sam_3d_body.models.heads.contact_head import ContactHead
 from sam_3d_body.models.decoders.interaction_decoder import InteractionDecoder
 from sam_3d_body.utils.config import get_config
-from damon_mhr import DamonPrecomputedDataset
+from damon_dataset import DamonPrecomputedDataset
 from dataset_utils import prepare_damon_batch_precomputed
 from torch.utils.data import DataLoader
 
