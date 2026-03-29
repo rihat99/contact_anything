@@ -1,32 +1,38 @@
 """
-InteractionDecoder: separate transformer decoder for contact prediction.
+InteractionDecoder: transformer decoder for contact prediction.
+
+Token layout (fixed):
+  - 24 body-part query tokens: auxiliary supervision, one per SMPL joint/part.
+    These mimic the SAM-3D body decoder's query structure.
+  - 1 vertex query token: drives the dense per-vertex contact map.
+  Total = 25 tokens. Output is split by the caller:
+      tokens[:, :24, :] → PartContactHead  (part logits)
+      tokens[:, 24:, :] → ContactHead      (vertex logits)
 
 Architecture (per layer):
-  1. Self-attention among K contact query tokens
-  2. Cross-attention to image features (spatial)
-  3. Cross-attention to body decoder pose token (detached — one-directional)
+  1. Self-attention among all 25 tokens
+  2. Cross-attention to image features (spatial, hard-masked)
+  3. Cross-attention to SAM-3D body pose token (detached — one-directional)
   4. FFN
   All sub-layers use pre-LayerNorm + residual connections.
 
-The body decoder's output tokens are detached before being used as keys/values,
-so no gradients flow back to the (frozen) body decoder.
+Mask conditioning (Step 2 only):
+  person_mask [B, 1, H, W] and object_mask [B, 1, H, W] — their union is used
+  to zero out image features outside the combined region before any attention.
+  The decoder only attends to features inside the human + object area.
+
+Body token is detached before use as keys/values — no gradients flow to the frozen
+body decoder.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class InteractionDecoderLayer(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int,
-        ffn_dim: int,
-        dropout: float = 0.0,
-    ):
+    def __init__(self, d_model: int, num_heads: int, ffn_dim: int, dropout: float = 0.0):
         super().__init__()
-        # 1. Self-attention among contact tokens
+        # 1. Self-attention among all contact tokens
         self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(d_model)
 
@@ -34,7 +40,7 @@ class InteractionDecoderLayer(nn.Module):
         self.cross_attn_image = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
         self.norm2 = nn.LayerNorm(d_model)
 
-        # 3. Cross-attention to body token (one-directional, body->contact)
+        # 3. Cross-attention to body token (one-directional, body→contact, detached)
         self.cross_attn_body = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
         self.norm3 = nn.LayerNorm(d_model)
 
@@ -50,21 +56,21 @@ class InteractionDecoderLayer(nn.Module):
 
     def forward(
         self,
-        q: torch.Tensor,          # [B, K, d_model]  contact queries
-        img_feats: torch.Tensor,  # [B, HW, d_model] flattened image features
-        body_token: torch.Tensor, # [B, 1, d_model]  body pose token (already detached)
+        q: torch.Tensor,          # [B, 25, d_model]
+        img_feats: torch.Tensor,  # [B, HW, d_model]  (already masked by caller)
+        body_token: torch.Tensor, # [B, 1, d_model]   (already detached)
     ) -> torch.Tensor:
         # 1. Self-attention
         x = self.norm1(q)
         x, _ = self.self_attn(x, x, x)
         q = q + self.dropout(x)
 
-        # 2. Cross-attention to image
+        # 2. Cross-attention to image features
         x = self.norm2(q)
         x, _ = self.cross_attn_image(x, img_feats, img_feats)
         q = q + self.dropout(x)
 
-        # 3. Cross-attention to body token (one-directional; body_token already detached)
+        # 3. Cross-attention to body token
         x = self.norm3(q)
         x, _ = self.cross_attn_body(x, body_token, body_token)
         q = q + self.dropout(x)
@@ -79,23 +85,28 @@ class InteractionDecoderLayer(nn.Module):
 
 class InteractionDecoder(nn.Module):
     """
-    Separate decoder for contact prediction.
+    Transformer decoder for contact prediction.
+
+    Uses 24 body-part tokens (auxiliary) + 1 vertex token (dense contact map).
+    The split is fixed: caller receives [B, 25, d_model] and slices as needed.
 
     Args:
-        d_model:            Hidden dimension (should match body decoder dim, typically 1024).
-        image_feat_dim:     Backbone output channels (1280 for DINOv3-H).
-        num_contact_tokens: Number of learnable contact query tokens (K).
-        num_layers:         Number of decoder layers.
-        num_heads:          Number of attention heads.
-        ffn_dim:            Hidden dim of per-layer FFN.
-        dropout:            Dropout probability.
+        d_model:        Hidden dimension (should match body decoder dim, typically 1024).
+        image_feat_dim: Backbone output channels (1280 for DINOv3-H).
+        num_layers:     Number of decoder layers.
+        num_heads:      Number of attention heads.
+        ffn_dim:        Hidden dim of per-layer FFN.
+        dropout:        Dropout probability.
     """
+
+    NUM_PART_TOKENS = 24
+    NUM_VERTEX_TOKENS = 1
+    NUM_TOKENS = NUM_PART_TOKENS + NUM_VERTEX_TOKENS  # 25
 
     def __init__(
         self,
         d_model: int = 1024,
         image_feat_dim: int = 1280,
-        num_contact_tokens: int = 16,
         num_layers: int = 4,
         num_heads: int = 8,
         ffn_dim: int = 2048,
@@ -103,16 +114,19 @@ class InteractionDecoder(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
-        self.num_contact_tokens = num_contact_tokens
+        self.num_heads = num_heads
 
-        # Learnable contact query embeddings
-        self.contact_queries = nn.Embedding(num_contact_tokens, d_model)
+        # 24 learnable body-part query embeddings (auxiliary)
+        self.part_queries = nn.Embedding(self.NUM_PART_TOKENS, d_model)
+        # 1 learnable global vertex query embedding
+        self.vertex_query = nn.Embedding(self.NUM_VERTEX_TOKENS, d_model)
 
-        # Project backbone features (image_feat_dim) → d_model if they differ
-        if image_feat_dim != d_model:
-            self.image_proj = nn.Linear(image_feat_dim, d_model)
-        else:
-            self.image_proj = nn.Identity()
+        # Project backbone features → d_model if they differ
+        self.image_proj = (
+            nn.Linear(image_feat_dim, d_model)
+            if image_feat_dim != d_model
+            else nn.Identity()
+        )
 
         self.layers = nn.ModuleList([
             InteractionDecoderLayer(d_model, num_heads, ffn_dim, dropout)
@@ -122,28 +136,43 @@ class InteractionDecoder(nn.Module):
 
     def forward(
         self,
-        image_features: torch.Tensor,  # [B, C, H, W]
-        body_tokens: torch.Tensor,     # [B, N, d_model] — caller should pass pose token only
+        image_features: torch.Tensor,       # [B, C, H, W]
+        body_tokens: torch.Tensor,          # [B, N, d_model] — pose token [B, 1, d_model]
+        person_mask: torch.Tensor = None,   # [B, 1, H, W]  — Step 2 only
+        object_mask: torch.Tensor = None,   # [B, 1, H, W]  — Step 2 only
     ) -> torch.Tensor:
         """
-        Returns contact tokens [B, K, d_model].
-        body_tokens is detached inside this forward to enforce one-directional flow.
+        Returns all contact tokens [B, 25, d_model].
+          [:, :24, :] — body-part tokens → PartContactHead
+          [:, 24:, :] — vertex token    → ContactHead
         """
         B = image_features.shape[0]
 
         # Flatten spatial dims and project to d_model
-        # image_features: [B, C, H, W] → [B, H*W, C] → [B, H*W, d_model]
         img_flat = image_features.flatten(2).permute(0, 2, 1)  # [B, HW, C]
-        img_flat = self.image_proj(img_flat)                   # [B, HW, d_model]
+        img_flat = self.image_proj(img_flat)                    # [B, HW, d_model]
+
+        # Hard masking: zero out features outside union(person_mask, object_mask)
+        if person_mask is not None or object_mask is not None:
+            if person_mask is not None and object_mask is not None:
+                combined = (person_mask.float() + object_mask.float()).clamp(max=1.0)
+            elif person_mask is not None:
+                combined = person_mask.float()
+            else:
+                combined = object_mask.float()
+            mask_flat = combined.flatten(2).permute(0, 2, 1)   # [B, HW, 1]
+            img_flat = img_flat * mask_flat.to(dtype=img_flat.dtype)
 
         # Detach body tokens — no gradient flows back to body decoder
-        body_kv = body_tokens.detach()  # [B, 1, d_model]
+        body_kv = body_tokens.detach()
 
-        # Expand learnable queries to batch
-        q = self.contact_queries.weight.unsqueeze(0).expand(B, -1, -1)  # [B, K, d_model]
-        q = q.contiguous()
+        # Concatenate part + vertex queries → [B, 25, d_model]
+        q = torch.cat([
+            self.part_queries.weight.unsqueeze(0).expand(B, -1, -1).contiguous(),
+            self.vertex_query.weight.unsqueeze(0).expand(B, -1, -1).contiguous(),
+        ], dim=1)
 
         for layer in self.layers:
             q = layer(q, img_flat, body_kv)
 
-        return self.norm(q)  # [B, K, d_model]
+        return self.norm(q)  # [B, 25, d_model]

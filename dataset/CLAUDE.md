@@ -140,7 +140,7 @@ All dataset logic lives in two files:
 
 | File | Contents |
 |------|----------|
-| `damon_utils.py` | Shared utilities: mask loading, instance index building, label conversion, split helpers |
+| `damon_utils.py` | Shared utilities: mask loading, instance index building, label conversion, split helpers, `load_smpl_part_segmentation`, `part_contact_from_vertex_label` |
 | `damon_dataset.py` | `DamonDataset`, `DamonPrecomputedDataset`, `build_datasets(cfg)` |
 
 #### `DamonDataset`
@@ -157,7 +157,34 @@ DamonDataset(
     masks_v2_dir=None,          # required for instance modes
     data_root=None,             # image root; defaults to DAMON_DATA_ROOT env var
     transform=None,
+    smpl_part_seg_path=None,    # SMPL vertex segmentation JSON; enables per-body-part labels
+                                # only valid with topology='smpl'
 )
+```
+
+**Per-body-part contact labels** (`smpl_part_seg_path`): when provided with `topology='smpl'`, each item
+also returns a 24-dim binary tensor indicating which SMPL body parts are in contact. Computed on the fly
+from the per-vertex label — no precomputation needed.
+
+- Segmentation NPY path: `/data3/rikhat.akizhanov/human_global_motion/better_human/src/better_human/smpl/config/smpl_3d_segmentation.npy`
+  (key `body_vertices` → dict of int part id 0–23 → vertex index list; one sentinel index ≥ 6890 per part is filtered automatically)
+- 24 parts in **SMPL joint order** (index = part id): `hips(0), leftUpLeg(1), rightUpLeg(2), spine(3), leftLeg(4), rightLeg(5), spine1(6), leftFoot(7), rightFoot(8), spine2(9), leftToeBase(10), rightToeBase(11), neck(12), leftShoulder(13), rightShoulder(14), head(15), leftArm(16), rightArm(17), leftForeArm(18), rightForeArm(19), leftHand(20), rightHand(21), leftHandIndex1(22), rightHandIndex1(23)`
+- Part names also exported as `damon_utils.SMPL_PART_NAMES` (list, index = part id)
+- Part i is active (=1) if **any** of its vertices has contact
+- **Classic mode**: label becomes a dict `{'contact_label': tensor[6890], 'part_contact': tensor[24]}`
+  (without `smpl_part_seg_path`, label remains a flat tensor — backward compatible)
+- **Instance modes**: `'part_contact': tensor[24]` added to `label_dict`
+
+```python
+# Example
+ds = DamonDataset(
+    "hot_dca_trainval.npz",   # source SMPL NPZ
+    topology='smpl',
+    smpl_part_seg_path="/data3/.../smpl_vert_segmentation.json",
+)
+inputs, labels = ds[0]
+labels['contact_label']   # int64 [6890] per-vertex
+labels['part_contact']    # int64 [24]   per-body-part
 ```
 
 #### `DamonPrecomputedDataset`
@@ -181,7 +208,7 @@ DamonPrecomputedDataset(
 | `instance_all` | one per (image, any-object) | `inputs_dict, label_dict` — all non-person objects; zeros label if no contact |
 
 Instance mode `inputs_dict` keys: `image` (or `feature`), `person_mask`, `object_mask`, `person_bbox`, `object_bbox`, `cam_k`
-Instance mode `label_dict` keys: `contact_label [V]`, `object_name` (str), `has_contact` (bool)
+Instance mode `label_dict` keys: `contact_label [V]`, `object_name` (str), `has_contact` (bool), `part_contact [24]` *(SMPL only, when `smpl_part_seg_path` set)*
 
 > `object_name` is a string — use a custom `collate_fn` when batching instance-mode items with DataLoader.
 
@@ -195,6 +222,7 @@ Both classes share `split_train_val(...)` classmethod that always splits at **im
 |--------|---------|
 | `visualize_masks.py` | Overlay v2 masks on original images with colour-coded contact status |
 | `example_damon_mhr.py` | Usage example / sanity check (uses `DamonDataset`) |
+| `test_smpl_part_contact.py` | Tests for per-body-part contact labels (17 tests) |
 
 ---
 
@@ -251,7 +279,7 @@ Instance modes additionally read `masks_v2/{split}/{idx:04d}/` for per-object ma
 
 Conversion uses `mhr_smpl_conversion/body_converter.py` with precomputed barycentric mapping files in `mhr_smpl_conversion/assets/`. No SMPL forward pass needed at inference — only SMPL face connectivity (`SMPL_NEUTRAL.npz` key `f`, shape `[13776, 3]`).
 
-SMPL part segmentation for disambiguation:
-- `/data3/rikhat.akizhanov/climbing/deco/data/smpl_partSegmentation_mapping.pkl`
-- Key `smpl_index` [6890]: each vertex → body part id 0–23
-- Part names: `Global=0, L_Thigh=1, R_Thigh=2, Spine=3, L_Calf=4, R_Calf=5, Spine1=6, L_Foot=7, R_Foot=8, Spine2=9, L_Toes=10, R_Toes=11, Neck=12, L_Shoulder=13, R_Shoulder=14, Head=15, L_UpperArm=16, R_UpperArm=17, L_ForeArm=18, R_ForeArm=19, L_Hand=20, R_Hand=21, Jaw=22, L_Eye=23`
+SMPL part segmentation (used for contact part labels and disambiguation):
+- `/data3/rikhat.akizhanov/human_global_motion/better_human/src/better_human/smpl/config/smpl_3d_segmentation.npy`
+- Key `body_vertices`: dict int→list, 24 parts in SMPL joint order (see `SMPL_PART_NAMES` in `damon_utils.py`)
+- Loaded via `load_smpl_part_segmentation(npy_path)` in `damon_utils.py`

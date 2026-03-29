@@ -67,6 +67,8 @@ try:
         image_level_split,
         infer_split_from_npz_path,
         load_mask_png,
+        load_smpl_part_segmentation,
+        part_contact_from_vertex_label,
         sanitize_object_name,
     )
 except ImportError:
@@ -78,6 +80,8 @@ except ImportError:
         image_level_split,
         infer_split_from_npz_path,
         load_mask_png,
+        load_smpl_part_segmentation,
+        part_contact_from_vertex_label,
         sanitize_object_name,
     )
 
@@ -104,18 +108,27 @@ class DamonDataset(Dataset):
         masks_v2_dir: Optional[str] = None,
         data_root: Optional[str] = None,
         transform=None,
+        smpl_part_seg_path: Optional[str] = None,
     ):
         """
         Args:
-            contact_npz_path: NPZ with keys 'imgname' and 'contact_label' [N, V].
-            detect_npz_path:  NPZ with 'imgname', 'bbox' [N,4], 'cam_k' [N,3,3]. Optional.
-            topology:         'mhr' or 'smpl'.
-            lod:              MHR LOD level 0–6. Ignored for topology='smpl'.
-            mode:             'classic', 'instance_contact', or 'instance_all'.
-            masks_v2_dir:     Path to masks_v2 root dir. Required for instance modes.
-            data_root:        Image root. Falls back to DAMON_DATA_ROOT env var, then
-                              '/data3/rikhat.akizhanov/DECO'.
-            transform:        Optional transform applied to PIL Image (classic mode only).
+            contact_npz_path:  NPZ with keys 'imgname' and 'contact_label' [N, V].
+            detect_npz_path:   NPZ with 'imgname', 'bbox' [N,4], 'cam_k' [N,3,3]. Optional.
+            topology:          'mhr' or 'smpl'.
+            lod:               MHR LOD level 0–6. Ignored for topology='smpl'.
+            mode:              'classic', 'instance_contact', or 'instance_all'.
+            masks_v2_dir:      Path to masks_v2 root dir. Required for instance modes.
+            data_root:         Image root. Falls back to DAMON_DATA_ROOT env var, then
+                               '/data3/rikhat.akizhanov/DECO'.
+            transform:         Optional transform applied to PIL Image (classic mode only).
+            smpl_part_seg_path: Path to SMPL vertex segmentation JSON (maps part name →
+                               vertex index list). When provided and topology='smpl',
+                               each item also returns a 'part_contact' label [24] whose
+                               i-th element is 1 if any vertex in that body part is in
+                               contact. In classic mode the label becomes a dict with keys
+                               'contact_label' and 'part_contact'; in instance modes
+                               'part_contact' is added to label_dict. Ignored when
+                               topology != 'smpl'.
         """
         super().__init__()
         _validate_args(topology, lod, mode, masks_v2_dir)
@@ -130,6 +143,13 @@ class DamonDataset(Dataset):
 
         self.imgnames, self.contact_labels = _load_contact_npz(contact_npz_path, self.num_vertices)
         self.bboxes, self.cam_ks = _load_detect_npz(detect_npz_path)
+
+        self._part_names = None
+        self._part_vert_arrays = None
+        if smpl_part_seg_path is not None:
+            if topology != 'smpl':
+                raise ValueError("smpl_part_seg_path requires topology='smpl'")
+            self._part_names, self._part_vert_arrays = load_smpl_part_segmentation(smpl_part_seg_path)
 
         self._instance_index = None
         if mode != 'classic':
@@ -159,7 +179,14 @@ class DamonDataset(Dataset):
             else torch.tensor([0., 0., float(w), float(h)])
         cam_k = torch.from_numpy(self.cam_ks[idx]).float() if self.cam_ks is not None \
             else _default_cam_k(w, h)
-        return (img, bbox, cam_k), torch.from_numpy(self.contact_labels[idx]).long()
+        contact_label = self.contact_labels[idx]
+        if self._part_vert_arrays is not None:
+            part_contact = part_contact_from_vertex_label(contact_label, self._part_vert_arrays)
+            return (img, bbox, cam_k), {
+                'contact_label': torch.from_numpy(contact_label).long(),
+                'part_contact': torch.from_numpy(part_contact).long(),
+            }
+        return (img, bbox, cam_k), torch.from_numpy(contact_label).long()
 
     def _item_for_pair(self, sample_idx, obj_order):
         meta, masks_dir = _load_meta(self.masks_v2_dir, self._split, sample_idx)
@@ -171,12 +198,20 @@ class DamonDataset(Dataset):
         cam_k = torch.from_numpy(self.cam_ks[sample_idx]).float() if self.cam_ks is not None \
             else _default_cam_k(w, h)
         vert_key = f"contact_vertices_{'mhr' if self.topology == 'mhr' else 'smpl'}_{obj_order}"
-        contact_label = torch.from_numpy(dense_label_from_indices(meta[vert_key], self.num_vertices))
+        contact_np = dense_label_from_indices(meta[vert_key], self.num_vertices)
+        contact_label = torch.from_numpy(contact_np)
+        label_dict = {
+            'contact_label': contact_label,
+            'object_name': object_name,
+            'has_contact': bool(contact_label.any()),
+        }
+        if self._part_vert_arrays is not None:
+            part_contact = part_contact_from_vertex_label(contact_np, self._part_vert_arrays)
+            label_dict['part_contact'] = torch.from_numpy(part_contact).long()
         return (
             {'image': img, 'person_mask': person_mask, 'object_mask': object_mask,
              'person_bbox': person_bbox, 'object_bbox': object_bbox, 'cam_k': cam_k},
-            {'contact_label': contact_label, 'object_name': object_name,
-             'has_contact': bool(contact_label.any())},
+            label_dict,
         )
 
     @classmethod
@@ -191,6 +226,7 @@ class DamonDataset(Dataset):
         val_ratio: float = 0.2,
         seed: int = 42,
         data_root: Optional[str] = None,
+        smpl_part_seg_path: Optional[str] = None,
     ):
         """
         Split at image level into train and val Subset objects.
@@ -200,7 +236,8 @@ class DamonDataset(Dataset):
         subset.
         """
         full = cls(contact_npz_path, detect_npz_path, topology=topology, lod=lod,
-                   mode=mode, masks_v2_dir=masks_v2_dir, data_root=data_root)
+                   mode=mode, masks_v2_dir=masks_v2_dir, data_root=data_root,
+                   smpl_part_seg_path=smpl_part_seg_path)
         return _make_split(full, val_ratio, seed, mode)
 
 
@@ -213,11 +250,12 @@ class DamonPrecomputedDataset(Dataset):
     DAMON dataset that loads precomputed DINOv3 features (.pt) instead of images.
 
     Skips the backbone at training time for faster iteration.
-    Always MHR topology.
+    Supports both MHR (default) and SMPL topology.
 
-    Classic mode returns (tuple, contact_label) — backward-compatible:
-        (feature[C,H,W], bbox[4], cam_k[3,3], ori_img_size[2],
-         pred_kp2d[70,2], pred_kp3d[70,3]), contact_label[V]
+    Classic mode returns (tuple, label):
+        topology='mhr': (feature[C,H,W], bbox[4], cam_k[3,3], ori_img_size[2]), contact_label[V]
+        topology='smpl' with smpl_part_seg_path:
+            same tuple, {'contact_label': tensor[6890], 'part_contact': tensor[24]}
 
     Instance modes return (inputs_dict, label_dict) — see module docstring.
     """
@@ -227,32 +265,35 @@ class DamonPrecomputedDataset(Dataset):
         contact_npz_path: str,
         detect_npz_path: str,
         features_dir: str,
-        predictions_npz_path: Optional[str] = None,
+        topology: str = 'mhr',
         lod: int = 1,
         mode: str = 'classic',
         masks_v2_dir: Optional[str] = None,
         data_root: Optional[str] = None,
+        smpl_part_seg_path: Optional[str] = None,
     ):
         """
         Args:
-            contact_npz_path:     Contact label NPZ.
-            detect_npz_path:      Detect NPZ (bbox + cam_k). Required.
-            features_dir:         Dir containing {idx:04d}.pt feature files.
-            predictions_npz_path: Optional merged predictions NPZ with keys
-                                  'pred_keypoints_2d' [N,70,2] and
-                                  'pred_keypoints_3d' [N,70,3].
-            lod:                  MHR LOD level (default 1 → 18 439 vertices).
-            mode:                 'classic', 'instance_contact', or 'instance_all'.
-            masks_v2_dir:         Required for instance modes.
-            data_root:            Image root for computing original image sizes.
+            contact_npz_path:  Contact label NPZ (MHR LOD NPZ or source DECO SMPL NPZ).
+            detect_npz_path:   Detect NPZ (bbox + cam_k). Required.
+            features_dir:      Dir containing {idx:04d}.pt feature files.
+            topology:          'mhr' (default) or 'smpl'.
+            lod:               MHR LOD level (default 1 → 18 439 vertices). Ignored for SMPL.
+            mode:              'classic', 'instance_contact', or 'instance_all'.
+            masks_v2_dir:      Required for instance modes.
+            data_root:         Image root for computing original image sizes.
+            smpl_part_seg_path: Path to smpl_3d_segmentation.npy. When provided with
+                               topology='smpl', each item includes 'part_contact' [24]
+                               in the label. Raises ValueError for topology='mhr'.
         """
         super().__init__()
-        _validate_args('mhr', lod, mode, masks_v2_dir)
+        _validate_args(topology, lod, mode, masks_v2_dir)
 
+        self.topology = topology
         self.lod = lod
         self.mode = mode
         self.masks_v2_dir = masks_v2_dir
-        self.num_vertices = LOD_VERTEX_COUNTS[lod]
+        self.num_vertices = LOD_VERTEX_COUNTS[lod] if topology == 'mhr' else SMPL_NUM_VERTS
         self.features_dir = Path(features_dir)
         self.data_root = _resolve_data_root(data_root)
 
@@ -260,14 +301,14 @@ class DamonPrecomputedDataset(Dataset):
         self.bboxes, self.cam_ks = _load_detect_npz(detect_npz_path)
         n = len(self.imgnames)
 
-        self.ori_img_sizes = self._load_or_compute_sizes(n)
+        self._part_names = None
+        self._part_vert_arrays = None
+        if smpl_part_seg_path is not None:
+            if topology != 'smpl':
+                raise ValueError("smpl_part_seg_path requires topology='smpl'")
+            self._part_names, self._part_vert_arrays = load_smpl_part_segmentation(smpl_part_seg_path)
 
-        self.pred_kp2d = self.pred_kp3d = None
-        if predictions_npz_path and os.path.exists(predictions_npz_path):
-            pred = np.load(predictions_npz_path, allow_pickle=True)
-            self.pred_kp2d = pred['pred_keypoints_2d'].astype(np.float32)  # [N, 70, 2]
-            self.pred_kp3d = pred['pred_keypoints_3d'].astype(np.float32)  # [N, 70, 3]
-            assert self.pred_kp2d.shape[0] == n
+        self.ori_img_sizes = self._load_or_compute_sizes(n)
 
         assert (self.features_dir / "0000.pt").exists(), \
             f"Feature file not found: {self.features_dir / '0000.pt'}"
@@ -276,9 +317,9 @@ class DamonPrecomputedDataset(Dataset):
         if mode != 'classic':
             self._split = infer_split_from_npz_path(contact_npz_path)
             self._instance_index = build_instance_index(masks_v2_dir, self._split, mode)
-            print(f"Loaded DamonPrecomputed ({mode}): {len(self._instance_index)} instances")
+            print(f"Loaded DamonPrecomputed ({topology.upper()}, {mode}): {len(self._instance_index)} instances")
         else:
-            print(f"Loaded DamonPrecomputed (classic): {n} samples from {features_dir}")
+            print(f"Loaded DamonPrecomputed ({topology.upper()}, classic): {n} samples from {features_dir}")
 
     def _load_or_compute_sizes(self, n):
         cache = self.features_dir / "ori_img_sizes.npy"
@@ -303,14 +344,6 @@ class DamonPrecomputedDataset(Dataset):
             weights_only=True,
         )
 
-    def _get_predictions(self, sample_idx: int):
-        if self.pred_kp2d is not None:
-            return (
-                torch.from_numpy(self.pred_kp2d[sample_idx]).float(),
-                torch.from_numpy(self.pred_kp3d[sample_idx]).float(),
-            )
-        return torch.zeros(70, 2), torch.zeros(70, 3)
-
     def __len__(self):
         return len(self._instance_index) if self.mode != 'classic' else len(self.imgnames)
 
@@ -320,15 +353,20 @@ class DamonPrecomputedDataset(Dataset):
         return self._item_for_pair(*self._instance_index[idx])
 
     def _getitem_classic(self, idx):
-        pred_kp2d, pred_kp3d = self._get_predictions(idx)
-        return (
+        contact_label = self.contact_labels[idx]
+        inputs = (
             self._load_feature(idx),
             torch.from_numpy(self.bboxes[idx]).float(),
             torch.from_numpy(self.cam_ks[idx]).float(),
             torch.from_numpy(self.ori_img_sizes[idx]).float(),
-            pred_kp2d,
-            pred_kp3d,
-        ), torch.from_numpy(self.contact_labels[idx]).long()
+        )
+        if self._part_vert_arrays is not None:
+            part_contact = part_contact_from_vertex_label(contact_label, self._part_vert_arrays)
+            return inputs, {
+                'contact_label': torch.from_numpy(contact_label).long(),
+                'part_contact':  torch.from_numpy(part_contact).long(),
+            }
+        return inputs, torch.from_numpy(contact_label).long()
 
     def _item_for_pair(self, sample_idx, obj_order):
         meta, masks_dir = _load_meta(self.masks_v2_dir, self._split, sample_idx)
@@ -336,10 +374,17 @@ class DamonPrecomputedDataset(Dataset):
         h, w = int(self.ori_img_sizes[sample_idx][0]), int(self.ori_img_sizes[sample_idx][1])
         person_mask, person_bbox = _load_person_mask(sample_idx, masks_dir, meta, h, w)
         object_mask, object_bbox = _load_object_mask(sample_idx, obj_order, object_name, masks_dir, meta)
-        pred_kp2d, pred_kp3d = self._get_predictions(sample_idx)
-        contact_label = torch.from_numpy(
-            dense_label_from_indices(meta[f"contact_vertices_mhr_{obj_order}"], self.num_vertices)
-        )
+        vert_key = f"contact_vertices_{'mhr' if self.topology == 'mhr' else 'smpl'}_{obj_order}"
+        contact_np = dense_label_from_indices(meta[vert_key], self.num_vertices)
+        contact_label = torch.from_numpy(contact_np)
+        label_dict = {
+            'contact_label': contact_label,
+            'object_name': object_name,
+            'has_contact': bool(contact_label.any()),
+        }
+        if self._part_vert_arrays is not None:
+            part_contact = part_contact_from_vertex_label(contact_np, self._part_vert_arrays)
+            label_dict['part_contact'] = torch.from_numpy(part_contact).long()
         return (
             {
                 'feature': self._load_feature(sample_idx),
@@ -349,11 +394,8 @@ class DamonPrecomputedDataset(Dataset):
                 'object_bbox': object_bbox,
                 'cam_k': torch.from_numpy(self.cam_ks[sample_idx]).float(),
                 'ori_img_size': torch.from_numpy(self.ori_img_sizes[sample_idx]).float(),
-                'pred_kp2d': pred_kp2d,
-                'pred_kp3d': pred_kp3d,
             },
-            {'contact_label': contact_label, 'object_name': object_name,
-             'has_contact': bool(contact_label.any())},
+            label_dict,
         )
 
     @classmethod
@@ -362,18 +404,20 @@ class DamonPrecomputedDataset(Dataset):
         contact_npz_path: str,
         detect_npz_path: str,
         features_dir: str,
-        predictions_npz_path: Optional[str] = None,
+        topology: str = 'mhr',
         lod: int = 1,
         mode: str = 'classic',
         masks_v2_dir: Optional[str] = None,
         val_ratio: float = 0.2,
         seed: int = 42,
         data_root: Optional[str] = None,
+        smpl_part_seg_path: Optional[str] = None,
     ):
         """Split at image level into train and val Subset objects."""
         full = cls(contact_npz_path, detect_npz_path, features_dir,
-                   predictions_npz_path=predictions_npz_path, lod=lod,
-                   mode=mode, masks_v2_dir=masks_v2_dir, data_root=data_root)
+                   topology=topology, lod=lod, mode=mode,
+                   masks_v2_dir=masks_v2_dir, data_root=data_root,
+                   smpl_part_seg_path=smpl_part_seg_path)
         return _make_split(full, val_ratio, seed, mode)
 
 
@@ -397,7 +441,6 @@ def build_datasets(cfg):
         VAL_RATIO             — val fraction (default 0.2)
         SEED                  — random seed (default 42)
         FEATURES_DIR          — precomputed features dir; enables DamonPrecomputedDataset
-        PREDICTIONS_NPZ       — merged predictions NPZ (optional, for DamonPrecomputed)
     """
     lod = cfg.DATASET.get('LOD', 1)
     mode = cfg.DATASET.get('MODE', 'classic')
@@ -408,7 +451,6 @@ def build_datasets(cfg):
     contact_npz = cfg.DATASET.CONTACT_NPZ
     detect_npz = cfg.DATASET.get('DETECT_NPZ', {})
     features_dir = cfg.DATASET.get('FEATURES_DIR', None)
-    predictions_npz = cfg.DATASET.get('PREDICTIONS_NPZ', None)
 
     split_kw = dict(lod=lod, mode=mode, masks_v2_dir=masks_v2_dir,
                     val_ratio=val_ratio, seed=seed, data_root=data_root)
@@ -416,12 +458,11 @@ def build_datasets(cfg):
     if features_dir:
         train, val = DamonPrecomputedDataset.split_train_val(
             contact_npz.TRAINVAL, detect_npz.get('TRAINVAL'), features_dir,
-            predictions_npz_path=predictions_npz, **split_kw,
+            **split_kw,
         )
         test = DamonPrecomputedDataset(
             contact_npz.TEST, detect_npz.get('TEST'),
             features_dir.replace('trainval', 'test'),
-            predictions_npz_path=(predictions_npz.replace('trainval', 'test') if predictions_npz else None),
             lod=lod, mode=mode, masks_v2_dir=masks_v2_dir, data_root=data_root,
         ) if contact_npz.get('TEST') else None
     else:

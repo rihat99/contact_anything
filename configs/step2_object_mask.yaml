@@ -1,10 +1,10 @@
-# Step 1: InteractionDecoder + ContactHead + PartContactHead
+# Step 2: InteractionDecoder + ContactHead + PartContactHead + Hard Mask Conditioning
 #
-# Architecture:
-#   Precomputed DINOv3 features → frozen SAM-3D body decoder → pose token (detached)
-#   Image features + pose token → InteractionDecoder (25 tokens: 24 part + 1 vertex)
-#   part tokens  [:, :24, :] → PartContactHead → 24 per-body-part logits  (auxiliary)
-#   vertex token [:, 24:, :] → ContactHead     → 6890 per-vertex logits   (primary)
+# Builds on Step 1 by conditioning contact prediction on person + object masks:
+#   union(person_mask, object_mask) → zero out image features outside combined region
+#   InteractionDecoder only attends to features inside the human + object area.
+#
+# Training uses INSTANCE_ONLY=true: only instance_contact batches (mask always provided).
 
 MODEL:
   CHECKPOINT_PATH: /data3/rikhat.akizhanov/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/model.ckpt
@@ -49,39 +49,33 @@ MODEL:
     MLP_CHANNEL_DIV_FACTOR: 1
     DEFAULT_SCALE_FACTOR: 1.0
 
-  # --- InteractionDecoder ---
-  # Tokens are fixed: 24 body-part queries + 1 vertex query = 25 total.
-  # NUM_CONTACT_TOKENS is no longer a parameter.
   INTERACTION_DECODER:
     NUM_LAYERS: 4
     NUM_HEADS: 4
     FFN_DIM: 1024
-    IMAGE_FEAT_DIM: 1280       # DINOv3-H backbone output channels
-    D_MODEL: 1024              # Must match DECODER.DIM
+    IMAGE_FEAT_DIM: 1280
+    D_MODEL: 1024
     DROPOUT: 0.1
-    MASK_BIAS_LAMBDA: 1.0      # Only active in Step 2 (object_mask provided)
 
-  # --- ContactHead (per-vertex) ---
   CONTACT_HEAD:
-    NUM_VERTICES: 6890         # SMPL vertex count
+    NUM_VERTICES: 6890
     MLP_DEPTH: 2
     HIDDEN_DIM: 512
     DROPOUT: 0.1
 
-  # --- PartContactHead (per-body-part, auxiliary) ---
-  # No params needed beyond d_model (taken from DECODER.DIM).
   PART_CONTACT_HEAD: {}
 
 TRAIN:
   BATCH_SIZE: 64
+  INSTANCE_BATCH_SIZE: 64
   VAL_BATCH_SIZE: 64
   NUM_WORKERS: 16
   EPOCHS: 20
-  LR: 1e-4
+  LR: 5e-5
   WEIGHT_DECAY: 1e-1
   LR_SCHEDULER: cosine
   LR_WARMUP_EPOCHS: 1
-  LR_MIN: 1e-5
+  LR_MIN: 1e-6
   USE_FP16: false
   GRAD_CLIP: 1.0
   SAVE_FREQ: 5
@@ -89,6 +83,10 @@ TRAIN:
   RESUME: null
   USE_PRECOMPUTED_FEATURES: true
   PRECOMPUTED_FEATURES_DIR: ./dataset/damon_mhr_contact/features
+  STEP2_MODE: true
+  INSTANCE_ONLY: true
+  INSTANCE_FRACTION: 0.7
+  STEP1_CHECKPOINT: null
 
 DATASET:
   TOPOLOGY: smpl
@@ -102,16 +100,15 @@ DATASET:
   DATA_ROOT: /data3/rikhat.akizhanov/DECO
   VAL_RATIO: 0.15
   SEED: 42
+  MASKS_V2_DIR: ./dataset/damon_mhr_contact/masks_v2
 
 LOSS:
-  # pos_weight for vertex BCE: compensates for ~14% contact rate (neg/pos ≈ 6).
-  # Tunable: higher → more recall, lower → more precision.
-  VERTEX_POS_WEIGHT: 10.0
+  VERTEX_POS_WEIGHT: 6.0
   VERTEX_WEIGHT: 1.0
-  PART_WEIGHT: 0.5             # Auxiliary part loss scale
+  PART_WEIGHT: 1.0
 
 OUTPUT:
   DIR: ./train/output
-  EXP_NAME: step1_contact
+  EXP_NAME: step2_object_mask
   LOG_FREQ: 10
   USE_TENSORBOARD: true

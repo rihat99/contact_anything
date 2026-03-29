@@ -47,6 +47,88 @@ def sanitize_object_name(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# SMPL part segmentation helpers
+# ---------------------------------------------------------------------------
+
+# Part names in SMPL joint order (index 0–23), matching the integer keys in
+# smpl_3d_segmentation.npy['body_vertices'].
+SMPL_PART_NAMES = [
+    'hips',            # 0  — pelvis / global
+    'leftUpLeg',       # 1
+    'rightUpLeg',      # 2
+    'spine',           # 3
+    'leftLeg',         # 4
+    'rightLeg',        # 5
+    'spine1',          # 6
+    'leftFoot',        # 7
+    'rightFoot',       # 8
+    'spine2',          # 9
+    'leftToeBase',     # 10
+    'rightToeBase',    # 11
+    'neck',            # 12
+    'leftShoulder',    # 13
+    'rightShoulder',   # 14
+    'head',            # 15
+    'leftArm',         # 16
+    'rightArm',        # 17
+    'leftForeArm',     # 18
+    'rightForeArm',    # 19
+    'leftHand',        # 20
+    'rightHand',       # 21
+    'leftHandIndex1',  # 22
+    'rightHandIndex1', # 23
+]
+
+
+def load_smpl_part_segmentation(npy_path: str):
+    """
+    Load SMPL vertex segmentation from a .npy file.
+
+    Expected format: dict with key 'body_vertices' → dict mapping int part id
+    (0–23) to a list of SMPL vertex indices.  Each list contains one sentinel
+    index >= 6890 that is automatically filtered out.
+
+    Parts are returned in SMPL joint order (0, 1, …, 23) with names from
+    SMPL_PART_NAMES.
+
+    Returns:
+        part_names       — list of 24 part name strings in SMPL joint order
+        part_vert_arrays — list of int32 numpy arrays, one per part (valid indices only)
+    """
+    data = np.load(npy_path, allow_pickle=True).item()
+    bv = data['body_vertices']
+    part_vert_arrays = [
+        np.array([v for v in bv[i] if v < SMPL_NUM_VERTS], dtype=np.int32)
+        for i in range(len(SMPL_PART_NAMES))
+    ]
+    return list(SMPL_PART_NAMES), part_vert_arrays
+
+
+def part_contact_from_vertex_label(
+    contact_label: np.ndarray,
+    part_vert_arrays: list,
+) -> np.ndarray:
+    """
+    Compute per-body-part contact from a per-vertex SMPL contact label.
+
+    A part is considered in contact if at least one of its vertices is in contact.
+
+    Args:
+        contact_label:    int64 array [6890], binary per-vertex contact.
+        part_vert_arrays: list of int32 arrays of vertex indices per part
+                          (as returned by load_smpl_part_segmentation).
+
+    Returns:
+        int64 array [N_parts], 1 if any vertex in that part has contact, else 0.
+    """
+    result = np.zeros(len(part_vert_arrays), dtype=np.int64)
+    for i, verts in enumerate(part_vert_arrays):
+        if contact_label[verts].any():
+            result[i] = 1
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Contact label helpers
 # ---------------------------------------------------------------------------
 
