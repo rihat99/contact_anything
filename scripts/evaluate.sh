@@ -1,0 +1,2 @@
+CUDA_VISIBLE_DEVICES=0 python train/evaluate.py --checkpoint train/output/step2_object_mask_20260329_152506/best_model.pth --split test --threshold 0.5 \
+--config  train/output/step2_object_mask_20260329_152506/config.yaml --masks_v2_dir dataset/damon_mhr_contact/masks_v2

@@ -1,0 +1,2 @@
+CUDA_VISIBLE_DEVICES=0 python train/inference_demo.py --checkpoint train/output/step2_object_mask_20260329_152506/best_model.pth --split test --threshold 0.5 --num_samples 10 --seed 42 \
+--config  train/output/step2_object_mask_20260329_152506/config.yaml --masks_v2_dir dataset/damon_mhr_contact/masks_v2

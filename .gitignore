@@ -124,4 +124,7 @@ sandbox*
 images
 output
 inference_samples
+train/figures
 dataset/damon_mhr_contact
+data/sam-3d-body-checkpoints
+data/sam3-checkpoints

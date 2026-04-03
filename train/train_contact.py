@@ -325,7 +325,7 @@ class ContactTrainer:
                 features_dir=os.path.join(features_base, 'trainval'),
                 topology=topology,
                 val_ratio=val_ratio, seed=seed, data_root=data_root,
-                mode='instance_contact', masks_v2_dir=masks_v2_dir,
+                mode='instance_all', masks_v2_dir=masks_v2_dir,
                 smpl_part_seg_path=part_seg,
             )
             print(f"  Instance Train: {len(inst_train)}  Val: {len(inst_val)}")

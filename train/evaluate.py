@@ -152,9 +152,14 @@ class ContactEvaluator:
         state = ckpt.get('model_state_dict', ckpt)
         missing, unexpected = self.model.load_state_dict(state, strict=False)
 
+        # mask_encoder keys are safe to be absent (zero-initialized → no-op)
         contact_missing = [k for k in missing
-                           if 'interaction_decoder' in k or 'head_contact' in k
-                           or 'head_part_contact' in k]
+                           if ('interaction_decoder' in k or 'head_contact' in k
+                               or 'head_part_contact' in k)
+                           and 'mask_encoder' not in k]
+        mask_enc_missing = [k for k in missing if 'mask_encoder' in k]
+        if mask_enc_missing:
+            print(f"  mask_encoder absent in checkpoint (zero-init, no-op) — OK.")
         if contact_missing:
             print(f"ERROR: Contact keys MISSING from checkpoint:")
             for k in contact_missing:
@@ -193,7 +198,7 @@ class ContactEvaluator:
         self._setup_dataset()
         self.instance_loader = None
         if self.masks_v2_dir and self.step2_mode:
-            print(f"Loading instance_contact dataset from {self.masks_v2_dir}...")
+            print(f"Loading instance_all dataset from {self.masks_v2_dir}...")
             self._setup_instance_dataset()
 
     # ------------------------------------------------------------------
@@ -236,7 +241,7 @@ class ContactEvaluator:
         )
 
     def _setup_instance_dataset(self):
-        """Build instance_contact DataLoader for mask-conditioned evaluation."""
+        """Build instance_all DataLoader for mask-conditioned evaluation."""
         data_root  = self.cfg.DATASET.get('DATA_ROOT', None)
         val_ratio  = self.cfg.DATASET.get('VAL_RATIO', 0.2)
         seed       = self.cfg.DATASET.get('SEED', 42)
@@ -247,7 +252,7 @@ class ContactEvaluator:
         common_kwargs = dict(
             topology='smpl',
             smpl_part_seg_path=smpl_part_seg,
-            mode='instance_contact',
+            mode='instance_all',
             masks_v2_dir=self.masks_v2_dir,
             data_root=data_root,
         )
@@ -370,7 +375,7 @@ class ContactEvaluator:
 
         # --- Mask-conditioned evaluation (Step 2) ---
         if self.instance_loader is not None:
-            print("\n=== Evaluation: with object mask (instance_contact) ===")
+            print("\n=== Evaluation: with object mask (instance_all) ===")
             all_probs_m, all_gt_m, part_probs_m, part_gt_m = self._run_eval_loop(
                 self.instance_loader,
                 desc="Evaluating (with mask)",

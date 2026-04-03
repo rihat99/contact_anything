@@ -3,8 +3,8 @@
 # Not used directly by training scripts — included for reproducibility.
 
 MODEL:
-  CHECKPOINT_PATH: /data3/rikhat.akizhanov/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/model.ckpt
-  MHR_MODEL_PATH: /data3/rikhat.akizhanov/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
+  CHECKPOINT_PATH: data/sam-3d-body-checkpoints/sam-3d-body-dinov3/model.ckpt
+  MHR_MODEL_PATH: data/sam-3d-body-checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
   IMAGE_SIZE:
   - 896
   - 896
@@ -46,7 +46,7 @@ MODEL:
     PROMPT_KEYPOINTS: mhr70
     MASK_EMBED_TYPE: null
   MHR_HEAD:
-    MHR_MODEL_PATH: /data3/rikhat.akizhanov/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
+    MHR_MODEL_PATH: data/sam-3d-body-checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
     MLP_DEPTH: 1
     MLP_CHANNEL_DIV_FACTOR: 1
   PERSON_HEAD:
