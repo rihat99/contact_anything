@@ -1,147 +1,56 @@
-MODEL:
-  CHECKPOINT_PATH: /data3/rikhat.akizhanov/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/model.ckpt
-  MHR_MODEL_PATH: /data3/rikhat.akizhanov/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
-  IMAGE_SIZE:
-  - 896
-  - 896
-  IMAGE_MEAN:
-  - 0.485
-  - 0.456
-  - 0.406
-  IMAGE_STD:
-  - 0.229
-  - 0.224
-  - 0.225
-  BACKBONE:
-    TYPE: dinov3_vith16plus
-    FROZEN: true
-    DROP_PATH_RATE: 0.1
-  DECODER:
-    DIM: 1024
-    FROZEN: true
-    DO_CONTACT_TOKENS: true
-    DO_KEYPOINT_TOKENS: true
-    DO_KEYPOINT3D_TOKENS: true
-    CONDITION_TYPE: cliff
-    USE_INTRIN_CENTER: false
-  CONTACT_HEAD:
-    # 21 tokens — one per the first 21 MHR70 keypoints (body + toes/heels)
-    NUM_CONTACTS: 21
-    # Extra global token(s) not updated with image features (0 = off)
-    NUM_GLOBAL_TOKENS: 3
-    # 18439 MHR mesh vertices
-    NUM_VERTICES: 18439
-    # NUM_VERTICES: 595
-    MLP_DEPTH: 4
-    MLP_CHANNEL_DIV_FACTOR: 2
-    # Pooling mode: "attention" (pool to 1 vector) or "concat" (flatten all tokens)
-    POOL_MODE: concat
-    # Dropout in contact head MLP
-    DROPOUT: 0.1
-    # K×K grid sampling around each keypoint (1 = original single-point)
-    GRID_SIZE: 5
-    GRID_RADIUS: 0.1
-  PROMPT_ENCODER:
-    ENABLE: true
-    MAX_NUM_CLICKS: 1
-    PROMPT_KEYPOINTS: mhr70
-    MASK_EMBED_TYPE: null
-  # SMPL model for T-pose template vertices and face connectivity (used in inference_demo.py)
-  SMPL_MODEL_PATH: /data3/rikhat.akizhanov/human_global_motion/better_human/models/smpl/SMPL_NEUTRAL.npz
-  MHR_HEAD:
-    MHR_MODEL_PATH: /data3/rikhat.akizhanov/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
-    MLP_DEPTH: 1
-    MLP_CHANNEL_DIV_FACTOR: 1
-  PERSON_HEAD:
-    POSE_TYPE: mhr
-    CAMERA_TYPE: perspective
-  CAMERA_HEAD:
-    MLP_DEPTH: 1
-    MLP_CHANNEL_DIV_FACTOR: 1
-    DEFAULT_SCALE_FACTOR: 1.0
-  LORA:
-    ENABLED: true
-    RANK: 32
-    ALPHA: 32
-    DROPOUT: 0.0
-    TARGET_MODULES:
-      - self_attn
-      - cross_attn
-    TARGET_PROJECTIONS:
-      - q_proj
-      - v_proj
-TRAIN:
-  BATCH_SIZE: 32
-  VAL_BATCH_SIZE: 32
-  NUM_WORKERS: 16
-  EPOCHS: 50
-  LR: 1e-4
-  WEIGHT_DECAY: 1e-4
-  LR_SCHEDULER: cosine
-  LR_WARMUP_EPOCHS: 1
-  LR_MIN: 1e-5
-  USE_FP16: false
-  FP16_TYPE: float32
-  GRAD_CLIP: 1.0
-  # Positive class weight for heavily imbalanced per-vertex labels.
-  # Set to null to auto-compute from train set statistics.
-  # POS_WEIGHT: null
-  # Multiplier on the negative-class BCE loss; >1.0 penalises false positives harder.
-  # NEG_WEIGHT: 2.0
-  SAVE_FREQ: 5
-  VAL_FREQ: 1
-  RESUME: null
-  # Weight applied to out-of-bounds vertices in the loss (0.0 = ignore, 1.0 = treat as visible).
-  OOB_VERTEX_WEIGHT: 1.0
-  # --- Precomputed features (skip backbone) ---
-  USE_PRECOMPUTED_FEATURES: true
-  PRECOMPUTED_FEATURES_DIR: ./dataset/damon_mhr_contact/features
-  PRECOMPUTED_PREDICTIONS_DIR: ./dataset/damon_mhr_contact/predictions
-  # --- Pose supervision (requires precomputed features) ---
-  POSE_SUPERVISION:
-    ENABLED: true
-    KP2D_WEIGHT: 0.1
-    KP3D_WEIGHT: 0.1
-    LOSS_TYPE: smooth_l1
-DATASET:
-  # MHR LOD level (0–6). Determines vertex count for contact labels.
-  LOD: 1
-  # Contact NPZ files (imgname + contact_label); LOD-specific.
-  CONTACT_NPZ:
-    TRAINVAL: ./dataset/damon_mhr_contact/hot_dca_trainval_contact_lod1.npz
-    TEST: ./dataset/damon_mhr_contact/hot_dca_test_contact_lod1.npz
-  # Detect NPZ files (imgname + bbox + cam_k); LOD-independent.
-  DETECT_NPZ:
-    TRAINVAL: ./dataset/damon_mhr_contact/hot_dca_trainval_detect.npz
-    TEST: ./dataset/damon_mhr_contact/hot_dca_test_detect.npz
-  # Original DECO NPZs with SMPL (6890-vertex) contact labels — used for SMPL-space evaluation.
-  SMPL_TRAINVAL_NPZ: /data3/rikhat.akizhanov/DECO/datasets/Release_Datasets/damon/hot_dca_trainval.npz
-  SMPL_TEST_NPZ: /data3/rikhat.akizhanov/DECO/datasets/Release_Datasets/damon/hot_dca_test.npz
-  # Root directory containing the 'datasets/' folder referenced in imgname.
-  # Leave null to use DAMON_DATA_ROOT env var or auto-detect from npz_path.
-  DATA_ROOT: /data3/rikhat.akizhanov/DECO
-  # Fraction of TRAINVAL samples held out for validation.
-  VAL_RATIO: 0.15
-  # Fixed random seed — ensures identical train/val split across all runs.
-  SEED: 42
-LOSS:
-  # --- Focal BCE ---
-  # FOCAL_ALPHA > 0.5 upweights the rare positive class (contact ~14% of vertices).
-  # With asymmetric alpha: positives get alpha weight, negatives get (1-alpha).
-  # alpha=0.75 → positives 3× more weight than negatives.
-  FOCAL_ALPHA: 0.75
-  FOCAL_GAMMA: 2.0        # Focusing exponent — down-weights easy (well-classified) examples
-  FOCAL_WEIGHT: 5.0       # Contribution of focal BCE in total loss
-  # --- Dice ---
-  DICE_WEIGHT: 0.5        # Contribution of soft-dice loss in total loss
-  DICE_EPS: 1.0e-5        # Epsilon for numerical stability in dice denominator
-  # --- L1 Sparsity ---
-  # Very small weight — just a gentle nudge against pathological all-ones predictions.
-  # Don't increase: too high hurts recall on the sparse positive class.
-  SPARSITY_WEIGHT: 0.002  # Regularisation weight — penalises over-predicting contacts
-OUTPUT:
-  # Base output directory — each run gets a sub-folder named by date-time
-  DIR: ./train/output
-  EXP_NAME: contact_vert  # prefix; actual folder = EXP_NAME_YYYYMMDD_HHMMSS
-  LOG_FREQ: 10
-  USE_TENSORBOARD: true
+# --------------------------------------------------------------------------
+# Contact head training — slim, single source of truth.
+# Everything not listed here uses the SAM-3D-Body checkpoint's model_config.
+# --------------------------------------------------------------------------
+
+model:
+  # SAM-3D-Body base (DINOv3-H + frozen decoder).
+  checkpoint_path: /data3/rikhat.akizhanov/.cache/huggingface/hub/models--facebook--sam-3d-body-dinov3/snapshots/11aaa346c7204874a1cbafe3d39a979080b2c55a/model.ckpt
+  mhr_model_path:  /data3/rikhat.akizhanov/.cache/huggingface/hub/models--facebook--sam-3d-body-dinov3/snapshots/11aaa346c7204874a1cbafe3d39a979080b2c55a/assets/mhr_model.pt
+
+  # New contact head: 21 keypoint-anchored tokens + extra global tokens,
+  # MLP head that predicts per-vertex contact in SMPL-6890 topology.
+  contact_head:
+    num_keypoint_tokens: 21
+    num_global_tokens:   3
+    num_vertices:        6890       # SMPL — matches DAMON GT directly
+    mlp_depth:           4
+    mlp_channel_div_factor: 2
+    pool_mode:           concat     # 'concat' or 'attention'
+    dropout:             0.1
+    grid_size:           5          # K x K image-feature grid per keypoint
+    grid_radius:         0.1
+
+  # Use the pretrained SAM-3D-Body mask conditioning (v2 — weights ship
+  # with the checkpoint, frozen during contact training).
+  mask_embed_type: v2
+
+data:
+  dataset_config: configs/damon.yaml  # uses DamonDataset.from_config
+  val_ratio: 0.15
+  seed:      42
+  batch_size: 32
+  num_workers: 16
+
+loss:
+  focal_alpha:     0.75   # >0.5 upweights the rare positive class
+  focal_gamma:     2.0
+  focal_weight:    5.0
+  dice_weight:     0.5
+  dice_eps:        1.0e-5
+  sparsity_weight: 0.002
+
+optim:
+  lr:            1.0e-4
+  weight_decay:  1.0e-4
+  epochs:        50
+  warmup_epochs: 1
+  lr_min:        1.0e-5
+  grad_clip:     1.0
+
+output:
+  dir:        ./train/output
+  exp_name:   contact
+  log_freq:   10           # train scalars every N steps
+  val_freq:   1            # epochs
+  save_freq:  5            # periodic full-state checkpoints (epochs)

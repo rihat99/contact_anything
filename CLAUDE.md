@@ -39,24 +39,9 @@ python train/evaluate.py --checkpoint train/output/<run_folder>/best_model.pth
 python train/inference_demo.py --checkpoint train/output/<run_folder>/best_model.pth --num_samples 10
 ```
 
-**Verify setup before training:**
-```bash
-python train/test_setup.py
-```
-
 **Monitor training:**
 ```bash
 tensorboard --logdir train/output/contact_head_eth/tensorboard/
-```
-
-**General inference demo:**
-```bash
-python demo.py --image_folder <path> --output_folder <path> --checkpoint_path ./model.ckpt --mhr_path ./mhr_model.pt
-```
-
-**Interactive path setup:**
-```bash
-python train/setup_paths.py
 ```
 
 **Precompute SAM-3D-Body predictions and DINOv3 features for DAMON:**
@@ -87,7 +72,7 @@ CUDA_VISIBLE_DEVICES=0 python dataset/damon_sam3_segment.py --splits trainval --
    - 1 pose token → initial pose/shape estimate
    - 70 keypoint query tokens → 2D/3D keypoint predictions
    - 0–1 prompt tokens → optional user-provided 2D keypoint or mask prompts
-   - **21 contact tokens** ← new addition; one per first 21 MHR70 keypoints (body joints + toes/heels)
+   - **21 contact tokens** ← new addition; one per first 21 MHR70 keypoints (body joints + toes/heels). Only the body decoder (`self.decoder`) carries contact tokens; the hand decoder does not. An asymmetric attention mask keeps the original frozen tokens from attending to the contact tokens, so contact training cannot degrade body pose estimation.
 
 3. **Prediction Heads** (`sam_3d_body/models/heads/`):
    - `mhr_head.py` — Predicts MHR parameters (pose: 260D, shape: 45D, scale: 28D, hand: 108D, face: 72D)
@@ -105,10 +90,32 @@ CUDA_VISIBLE_DEVICES=0 python dataset/damon_sam3_segment.py --splits trainval --
 
 ### Dataset (`dataset/`)
 
-- `damon_mhr.py` — PyTorch `Dataset` wrapping NPZ files
-- NPZ keys: `imgname` (image paths), `contact_label` (binary `[N, 18439]`), `bbox` (optional), `cam_k` (optional)
-- Train set: ~4,384 samples; Test set: ~785 samples; single person per image throughout
-- Data root configured via `DATASET.DATA_ROOT` in `train/config.yaml`
+All loaders return the same dict schema:
+
+```python
+{
+    "image":   uint8 ndarray [H, W, 3],   # None for label-only mode (RICH without .img.tsv)
+    "contact": float32 tensor [6890],     # SMPL topology
+    "key":     str,
+    "dataset": str,
+    "mask":    None,                       # placeholder, future preprocessing
+    "bbox":    ndarray [4] or None,        # placeholder (RICH has crop bbox)
+    "focal":   float or None,              # placeholder (DAMON has fx from cam_k)
+}
+```
+
+- `damon.py` — `DamonDataset(root, split)` — DECO release NPZ, SMPL 6890. ~4,384 trainval / 785 test.
+- `lemon.py` — `LemonDataset(root, split)` — 3DIR release, SMPL-H 6890 (body topology matches SMPL). ~4,000 train / 1,000 val.
+- `rich.py` — `RichDataset(root, split)` — BSTRO TSV format. 27,677 train / 25,144 val / 118,883 test. Requires extracted `rich_for_bstro_tsv_db/` (`unzip` the BSTRO zip into `/data3/rikhat.akizhanov/datasets/RICH/`); the loader runs in label-only mode if `*.img.tsv` is missing.
+- `contact.py` — `ContactDataset(names=...)` — unified loader concatenating any combination of the three.
+
+### Viewer (`tools/view_dataset.py`)
+
+FastAPI app that walks the datasets sample-by-sample: image on the left, SMPL T-pose (front + back) with per-vertex contacts on the right. Chips at the top filter which datasets to walk; Next / Random buttons at the bottom navigate.
+
+```bash
+python tools/view_dataset.py --port 8765
+```
 
 **Precomputed data:**
 

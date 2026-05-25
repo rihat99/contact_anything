@@ -1,0 +1,18 @@
+name: damon
+
+# Raw dataset paths
+data:
+  root: /data3/rikhat.akizhanov/datasets/DECO
+  splits:
+    trainval: datasets/Release_Datasets/damon/hot_dca_trainval.npz
+    test:     datasets/Release_Datasets/damon/hot_dca_test.npz
+
+# Precomputed artefacts (one folder per dataset under ../data)
+masks:
+  dir: /data3/rikhat.akizhanov/better/data/damon/masks
+
+# Camera intrinsics estimated by MoGe2 (absolute-pixel 3x3 K).
+# One .npz per split, keyed by sample index. See
+# scripts/precompute_cam_params_damon.py.
+cam_params:
+  dir: /data3/rikhat.akizhanov/better/data/damon/cam_params

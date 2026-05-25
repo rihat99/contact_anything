@@ -792,40 +792,6 @@ class SAM3DBody(BaseModel):
                     dim=1,
                 )  # B x 3 + 70 + 70 x 1024
 
-            # Add contact tokens if enabled
-            if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
-                contact_emb_start_idx_hand = token_embeddings.shape[1]
-                token_embeddings = torch.cat(
-                    [
-                        token_embeddings,
-                        self.contact_embedding.weight[None, :, :].repeat(
-                            batch_size, 1, 1
-                        ),
-                    ],
-                    dim=1,
-                )
-                # No positional embeddings for contact tokens
-                token_augment = torch.cat(
-                    [
-                        token_augment,
-                        torch.zeros_like(
-                            token_embeddings[:, token_augment.shape[1] :, :]
-                        ),
-                    ],
-                    dim=1,
-                )
-
-                # Asymmetric attention mask: frozen tokens must not attend to contact
-                # tokens (to avoid polluting their representations), but contact tokens
-                # can still attend to all other tokens to learn from them.
-                N_total = token_embeddings.shape[1]
-                token_mask = torch.ones(
-                    batch_size, N_total, N_total,
-                    dtype=torch.bool,
-                    device=token_embeddings.device,
-                )
-                token_mask[:, :contact_emb_start_idx_hand, contact_emb_start_idx_hand:] = False
-
         # We're doing intermediate model predictions
         def token_to_pose_output_fn(tokens, prev_pose_output, layer_idx):
             # Get the pose token
@@ -856,23 +822,12 @@ class SAM3DBody(BaseModel):
         # Now for 3D
         kp3d_token_update_fn = self.keypoint3d_token_update_fn_hand
 
-        # Contact token update (PE + image feature sampling at wrist/ankle locations)
-        ct_token_update_fn = (
-            self.contact_token_update_fn
-            if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False)
-            else None
-        )
-
-        # Combine the 2D, 3D, and contact update functions
+        # Combine the 2D and 3D update functions
         def keypoint_token_update_fn_comb(*args):
             if kp_token_update_fn is not None:
                 args = kp_token_update_fn(kps_emb_start_idx, image_embeddings, *args)
             if kp3d_token_update_fn is not None:
                 args = kp3d_token_update_fn(kps3d_emb_start_idx, *args)
-            if ct_token_update_fn is not None:
-                args = ct_token_update_fn(
-                    contact_emb_start_idx_hand, image_embeddings, self.decoder_hand.layers, *args
-                )
             return args
 
         pose_token, pose_output = self.decoder_hand(
@@ -885,26 +840,13 @@ class SAM3DBody(BaseModel):
             keypoint_token_update_fn=keypoint_token_update_fn_comb,
         )
 
-        # Process contact tokens if enabled
-        contact_output = None
-        if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
-            contact_tokens = pose_token[
-                :, contact_emb_start_idx_hand : contact_emb_start_idx_hand + self.total_contact_tokens
-            ]
-            contact_logits = self.head_contact(contact_tokens)
-            contact_output = {
-                "contact_logits": contact_logits,  # [B, num_vertices]
-                "contact_probs": torch.sigmoid(contact_logits),  # [B, num_vertices]
-            }
-
         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
             return (
                 pose_token[:, hand_det_emb_start_idx : hand_det_emb_start_idx + 2],
                 pose_output,
-                contact_output,
             )
         else:
-            return pose_token, pose_output, contact_output
+            return pose_token, pose_output
 
     @torch.no_grad()
     def _get_keypoint_prompt(self, batch, pred_keypoints_2d, force_dummy=False):
@@ -1314,7 +1256,7 @@ class SAM3DBody(BaseModel):
 
         # Forward promptable decoder to get updated pose tokens and regression output
         pose_output, pose_output_hand = None, None
-        contact_output, contact_output_hand = None, None
+        contact_output = None
         if len(self.body_batch_idx):
             tokens_output, pose_output, contact_output = self.forward_decoder(
                 image_embeddings[self.body_batch_idx],
@@ -1326,7 +1268,7 @@ class SAM3DBody(BaseModel):
             )
             pose_output = pose_output[-1]
         if len(self.hand_batch_idx):
-            tokens_output_hand, pose_output_hand, contact_output_hand = self.forward_decoder_hand(
+            tokens_output_hand, pose_output_hand = self.forward_decoder_hand(
                 image_embeddings[self.hand_batch_idx],
                 init_estimate=None,
                 keypoints=keypoints_prompt[self.hand_batch_idx],
@@ -1340,8 +1282,7 @@ class SAM3DBody(BaseModel):
             # "pose_token": pose_token,
             "mhr": pose_output,  # mhr prediction output
             "mhr_hand": pose_output_hand,  # mhr prediction output
-            "contact": contact_output,  # contact prediction output
-            "contact_hand": contact_output_hand,  # contact prediction for hand decoder
+            "contact": contact_output,  # contact prediction output (body decoder only)
             "condition_info": condition_info,
             "image_embeddings": image_embeddings,
         }
