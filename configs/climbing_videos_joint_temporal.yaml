@@ -1,0 +1,15 @@
+# ClimbingVideos_v1 per-joint (22) contact WITH temporal attention (Phase 3).
+# Same setup as climbing_videos_joint.yaml (joint target, wrist/nose anchors),
+# plus the zero-gated ContactTemporalModule over the T=8 contact-token clips
+# (post_decoder placement). frames_per_clip=8 comes from base.yaml's sequence block.
+base: configs/climbing_videos_joint.yaml
+
+model:
+  temporal:
+    enabled: true
+    placement: post_decoder
+    attend: joint
+    causal: false
+
+output:
+  exp_name: contact_climbing_videos_temporal

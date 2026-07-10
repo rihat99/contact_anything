@@ -156,6 +156,16 @@ class SAM3DBody(BaseModel):
         )
         self.hand_pe_layer = PositionEmbeddingRandom(self.backbone.embed_dims // 2)
 
+        # --- contact efficiency hook (detach_interm_preds) ---
+        # When set, the decoder runs its per-layer interm MHR/camera predictions
+        # under no_grad (they feed keypoint/contact-token *sampling locations* only,
+        # and every grad path through them dead-ends in frozen params). Absent key =
+        # old full-graph behaviour, so the fork stays usable standalone.
+        _detach_interm = bool(self.cfg.MODEL.get("EFFICIENCY", {}).get("DETACH_INTERM_PREDS", False))
+        self.decoder.detach_interm_preds = _detach_interm
+        self.decoder_hand.detach_interm_preds = _detach_interm
+        # --- end contact efficiency hook ---
+
         # Manually convert the torso of the model to fp16.
         if self.cfg.TRAIN.USE_FP16:
             self.convert_to_fp16()
@@ -197,28 +207,36 @@ class SAM3DBody(BaseModel):
         # Contact prediction head and tokens
         if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
             contact_head_cfg = self.cfg.MODEL.get("CONTACT_HEAD", dict())
-            self.num_contact_tokens = contact_head_cfg.get("NUM_CONTACTS", 4)
+            # Each keypoint-anchored contact token grid-samples image features at
+            # one MHR70 keypoint. KEYPOINT_INDICES selects which (default = first
+            # 21: body joints + toes/heels; the recommended climbing set adds the
+            # wrists 41/62 and nose 0). num_contact_tokens follows the list length.
+            kp_indices = contact_head_cfg.get("KEYPOINT_INDICES", None)
+            if kp_indices is None:
+                kp_indices = list(range(21))
+            kp_indices = list(kp_indices)
+            assert all(0 <= int(i) < 70 for i in kp_indices), (
+                f"contact keypoint indices must be MHR70 indices in [0, 70); got {kp_indices}"
+            )
+            self.contact_keypoint_indices = [int(i) for i in kp_indices]
+            self.num_contact_tokens = len(self.contact_keypoint_indices)
             # Extra global token(s) not updated with image features
             self.num_global_contact_tokens = contact_head_cfg.get("NUM_GLOBAL_TOKENS", 0)
             self.total_contact_tokens = self.num_contact_tokens + self.num_global_contact_tokens
             # Learnable query tokens for contact prediction
-            # Index 0: Left foot, 1: Right foot, 2: Left hand, 3: Right hand
             self.contact_embedding = nn.Embedding(
                 self.total_contact_tokens, self.cfg.MODEL.DECODER.DIM
             )
-            # Contact prediction head
-            self.head_contact = build_head(self.cfg, "contact")
-
-            # --- Contact token update layers (PE + feature sampling) ---
-            # Each of the 21 contact tokens corresponds to one of the first 21
-            # MHR70 keypoints (body joints + toes/heels):
-            #   0-nose, 1-left-eye, 2-right-eye, 3-left-ear, 4-right-ear,
-            #   5-left-shoulder, 6-right-shoulder, 7-left-elbow, 8-right-elbow,
-            #   9-left-hip, 10-right-hip, 11-left-knee, 12-right-knee,
-            #   13-left-ankle, 14-right-ankle, 15-left-big-toe-tip,
-            #   16-left-small-toe-tip, 17-left-heel, 18-right-big-toe-tip,
-            #   19-right-small-toe-tip, 20-right-heel
-            self.contact_keypoint_indices = list(range(self.num_contact_tokens))
+            # One independent prediction head per enabled target. TARGETS maps a
+            # target name -> output dim (topology verts for 'vertex', 22 for 'joint').
+            targets = contact_head_cfg.get(
+                "TARGETS", {"VERTEX": contact_head_cfg.get("NUM_VERTICES", 18439)}
+            )
+            self.contact_target_names = [str(name).lower() for name in targets]
+            self.head_contact = nn.ModuleDict({
+                str(name).lower(): build_head(self.cfg, "contact", output_dims=int(dims))
+                for name, dims in targets.items()
+            })
 
             # Positional encoding: project 2D keypoint position -> decoder dim
             self.contact_posemb_linear = FFN(
@@ -235,6 +253,26 @@ class SAM3DBody(BaseModel):
             # K×K grid sampling params
             self.contact_grid_size   = contact_head_cfg.get("GRID_SIZE", 1)
             self.contact_grid_radius = contact_head_cfg.get("GRID_RADIUS", 0.1)
+
+            # --- contact temporal hook (module construction) ---
+            # Zero-gated temporal self-attention over contact tokens (Phase 3).
+            # Params carry "contact" in their names so the contact-only freeze/
+            # eval filters pick them up. Attribute absent when disabled.
+            tcfg = self.cfg.MODEL.get("TEMPORAL", None)
+            if tcfg is not None and tcfg.get("ENABLED", False):
+                from ..modules.temporal import ContactTemporalModule
+                self.contact_temporal = ContactTemporalModule(
+                    dim=self.cfg.MODEL.DECODER.DIM,
+                    num_layers=tcfg.get("NUM_LAYERS", 2),
+                    num_heads=tcfg.get("NUM_HEADS", 8),
+                    mlp_ratio=tcfg.get("MLP_RATIO", 4.0),
+                    attend=tcfg.get("ATTEND", "joint"),
+                    causal=tcfg.get("CAUSAL", False),
+                    dropout=tcfg.get("DROPOUT", 0.0),
+                    placement=tcfg.get("PLACEMENT", "post_decoder"),
+                    image_dim=self.backbone.embed_dims,
+                )
+            # --- end contact temporal hook ---
 
         self.keypoint_posemb_linear = FFN(
             embed_dims=2,
@@ -327,6 +365,27 @@ class SAM3DBody(BaseModel):
             raise NotImplementedError
 
         return condition_info.type(batch["img"].dtype)
+
+    def _contact_temporal_fields(self, batch):
+        """Temporal-clip fields for the body samples (contact temporal hooks).
+
+        Returns ``(seq_len, frame_pos_sec, frame_valid)`` where the per-frame
+        tensors are indexed by ``self.body_batch_idx`` so they line up row-for-row
+        with the contact tokens / image features seen inside ``forward_decoder``.
+        Defaults to ``(1, None, None)`` for single-image batches (no ``seq_len``).
+        """
+        if batch is None:
+            return 1, None, None
+        seq_len = int(batch.get("seq_len", 1))
+        pos = batch.get("frame_pos_sec")
+        valid = batch.get("frame_valid")
+        idx = self.body_batch_idx
+        if idx is not None and len(idx):
+            if pos is not None:
+                pos = pos[idx]
+            if valid is not None:
+                valid = valid[idx]
+        return seq_len, pos, valid
 
     def forward_decoder(
         self,
@@ -572,6 +631,19 @@ class SAM3DBody(BaseModel):
             else None
         )
 
+        # --- contact temporal hook (pre_decoder) ---
+        # Image tensor the contact tokens grid-sample from: a PRIVATE zero-gated
+        # temporal copy for pre_decoder, otherwise the shared decoder tensor. The
+        # decoder cross-attention below always keeps the original image_embeddings.
+        contact_image_embeddings = image_embeddings
+        _tm = getattr(self, "contact_temporal", None)
+        if _tm is not None and _tm.placement == "pre_decoder":
+            _sl, _pos, _valid = self._contact_temporal_fields(batch)
+            contact_image_embeddings = _tm.forward_image(
+                image_embeddings, _sl, _pos, _valid
+            )
+        # --- end contact temporal hook ---
+
         # Combine the 2D, 3D, and contact update functions
         def keypoint_token_update_fn_comb(*args):
             if kp_token_update_fn is not None:
@@ -580,7 +652,8 @@ class SAM3DBody(BaseModel):
                 args = kp3d_token_update_fn(kps3d_emb_start_idx, *args)
             if ct_token_update_fn is not None:
                 args = ct_token_update_fn(
-                    contact_emb_start_idx, image_embeddings, self.decoder.layers, *args
+                    contact_emb_start_idx, contact_image_embeddings,
+                    self.decoder.layers, batch, *args
                 )
             return args
 
@@ -600,11 +673,18 @@ class SAM3DBody(BaseModel):
             contact_tokens = pose_token[
                 :, contact_emb_start_idx : contact_emb_start_idx + self.total_contact_tokens
             ]
-            contact_logits = self.head_contact(contact_tokens)
-            contact_output = {
-                "contact_logits": contact_logits,  # [B, num_vertices]
-                "contact_probs": torch.sigmoid(contact_logits),  # [B, num_vertices]
-            }
+            # --- contact temporal hook (post_decoder) ---
+            _tm = getattr(self, "contact_temporal", None)
+            if _tm is not None and _tm.placement == "post_decoder":
+                _sl, _pos, _valid = self._contact_temporal_fields(batch)
+                contact_tokens = _tm(contact_tokens, _sl, _pos, _valid)
+            # --- end contact temporal hook ---
+            # One head per target -> {"<target>_logits": [B, D], "<target>_probs": ...}
+            contact_output = {}
+            for name, head in self.head_contact.items():
+                logits = head(contact_tokens)
+                contact_output[f"{name}_logits"] = logits
+                contact_output[f"{name}_probs"] = torch.sigmoid(logits)
 
         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
             return (
@@ -1227,9 +1307,22 @@ class SAM3DBody(BaseModel):
                 batch["ray_cond_hand"] = ray_cond[self.hand_batch_idx].clone()
             ray_cond = None
 
-            image_embeddings = self.backbone(
-                x.type(self.backbone_dtype), extra_embed=ray_cond
-            )  # (B, C, H, W)
+            # --- contact efficiency hook (backbone_no_grad) ---
+            # The backbone is fully frozen (asserted at build in contact/model.py),
+            # so wrapping ONLY this call in no_grad drops its activation graph without
+            # touching any trainable param. Absent key = old behaviour. Deliberately
+            # scoped to the backbone call: the pre_decoder temporal branch lives in
+            # forward_decoder and stays in the graph.
+            if self.cfg.MODEL.get("EFFICIENCY", {}).get("BACKBONE_NO_GRAD", False):
+                with torch.no_grad():
+                    image_embeddings = self.backbone(
+                        x.type(self.backbone_dtype), extra_embed=ray_cond
+                    )  # (B, C, H, W)
+            else:
+                image_embeddings = self.backbone(
+                    x.type(self.backbone_dtype), extra_embed=ray_cond
+                )  # (B, C, H, W)
+            # --- end contact efficiency hook ---
 
             if isinstance(image_embeddings, tuple):
                 image_embeddings = image_embeddings[-1]
@@ -2033,6 +2126,7 @@ class SAM3DBody(BaseModel):
         contact_emb_start_idx,
         image_embeddings,
         decoder_layers,
+        batch,
         token_embeddings,
         token_augment,
         pose_output,
@@ -2144,6 +2238,21 @@ class SAM3DBody(BaseModel):
         token_embeddings[
             :, contact_emb_start_idx : contact_emb_start_idx + num_ct, :
         ] += self.contact_feat_linear(sampled_feats)
+
+        # --- contact temporal hook (between_layers) ---
+        # Runs once per intermediate decoder layer (layers 0..N-2, i.e. 5×), with
+        # SHARED weights, over the full contact-token slice (kp-anchored + global).
+        # Rebuilt via cat (no in-place on graph tensors) to stay autograd-safe.
+        _tm = getattr(self, "contact_temporal", None)
+        if _tm is not None and _tm.placement == "between_layers":
+            _sl, _pos, _valid = self._contact_temporal_fields(batch)
+            _lo = contact_emb_start_idx
+            _hi = contact_emb_start_idx + self.total_contact_tokens
+            _updated = _tm(token_embeddings[:, _lo:_hi], _sl, _pos, _valid)
+            token_embeddings = torch.cat(
+                [token_embeddings[:, :_lo], _updated, token_embeddings[:, _hi:]], dim=1
+            )
+        # --- end contact temporal hook ---
 
         return token_embeddings, token_augment, pose_output, layer_idx
 
