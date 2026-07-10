@@ -15,7 +15,7 @@ from typing import Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset, default_collate
+from torch.utils.data import ConcatDataset, DataLoader, Subset, default_collate
 from torchvision.transforms import ToTensor
 
 from sam_3d_body.data.transforms import (
@@ -23,6 +23,7 @@ from sam_3d_body.data.transforms import (
 )
 from sam_3d_body.data.utils.prepare_batch import NoCollate
 
+from dataset.climbing import ClimbingImagesDataset
 from dataset.damon import DamonDataset
 
 
@@ -118,10 +119,37 @@ def batch_to_device(batch: dict, device: str) -> dict:
 
 # -------------------------------------------------------------------- splits
 
+def _build_dataset(spec: dict):
+    """Construct one sub-dataset from a ``data.datasets`` list entry.
+
+    ``spec`` is ``{name, config[, split]}``. Both loaders return the same
+    SMPL-6890 contact schema, so the collate path is identical downstream.
+    """
+    name = spec["name"]
+    if name == "damon":
+        return DamonDataset.from_config(spec["config"], split=spec.get("split", "trainval"))
+    if name == "climbing":
+        return ClimbingImagesDataset.from_config(spec["config"])
+    raise ValueError(f"unknown dataset {name!r}; choose from 'damon', 'climbing'")
+
+
 def make_loaders(cfg: dict, image_size: Tuple[int, int]) -> Tuple[DataLoader, DataLoader]:
-    """Build train + val DataLoaders from the trainval split of DAMON."""
+    """Build train + val DataLoaders, split once over the combined corpus.
+
+    ``data.datasets`` is a list of ``{name, config[, split]}`` entries; the
+    sub-datasets are concatenated and split randomly by ``val_ratio`` /
+    ``seed``. A legacy ``data.dataset_config`` (single DAMON trainval) is
+    still honoured so the original config keeps working.
+    """
     dcfg = cfg["data"]
-    ds   = DamonDataset.from_config(dcfg["dataset_config"], split="trainval")
+    if "datasets" in dcfg:
+        specs = list(dcfg["datasets"])
+    else:  # legacy single-DAMON config
+        specs = [{"name": "damon", "config": dcfg["dataset_config"], "split": "trainval"}]
+
+    subsets = [_build_dataset(s) for s in specs]
+    ds = subsets[0] if len(subsets) == 1 else ConcatDataset(subsets)
+
     n    = len(ds)
     rng  = np.random.default_rng(int(dcfg.get("seed", 42)))
     idx  = rng.permutation(n)
@@ -143,6 +171,7 @@ def make_loaders(cfg: dict, image_size: Tuple[int, int]) -> Tuple[DataLoader, Da
         collate_fn=collate, pin_memory=False,
         persistent_workers=nw > 0,
     )
-    print(f"Damon split: train={len(train_idx)} val={len(val_idx)} "
+    sizes = " + ".join(f"{s['name']}={len(d)}" for s, d in zip(specs, subsets))
+    print(f"Datasets [{sizes}] → total={n}  train={len(train_idx)} val={len(val_idx)} "
           f"(val_ratio={dcfg.get('val_ratio', 0.15)}, seed={dcfg.get('seed', 42)})")
     return train_loader, val_loader

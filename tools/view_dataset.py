@@ -28,10 +28,16 @@ from fastapi.responses import HTMLResponse, Response
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dataset import DamonDataset, LemonDataset, RichDataset  # noqa: E402
+from dataset import (  # noqa: E402
+    ClimbingImagesDataset,
+    DamonDataset,
+    LemonDataset,
+    RichDataset,
+)
 
 
-SMPL_NPZ = "/data3/rikhat.akizhanov/human_global_motion/better_human/models/smpl/SMPL_NEUTRAL.npz"
+SMPL_NPZ  = "/data3/rikhat.akizhanov/human_global_motion/better_human/models/smpl/SMPL_NEUTRAL.npz"
+SMPLX_NPZ = "/data3/rikhat.akizhanov/better/better_human/models/smplx/SMPLX_NEUTRAL.npz"
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
 COLOR_CONTACT     = np.array([0.95, 0.15, 0.15])
@@ -107,11 +113,10 @@ def _render_view(ax, verts: np.ndarray, faces: np.ndarray,
     ax.set_axis_off()
 
 
-def render_tpose_png(contact_mask: np.ndarray) -> bytes:
-    verts = _T_VERTS
-    faces = _T_FACES
+def render_tpose_png(contact_mask: np.ndarray, topology: str = "smpl") -> bytes:
+    verts, faces = _TEMPLATES[topology]
     contact_mask = contact_mask.astype(bool)
-    assert contact_mask.shape == (verts.shape[0],), contact_mask.shape
+    assert contact_mask.shape == (verts.shape[0],), (contact_mask.shape, topology)
 
     fig = plt.figure(figsize=(8, 6), dpi=110)
     gs = fig.add_gridspec(1, 2, wspace=0.0, left=0, right=1, top=1, bottom=0)
@@ -157,6 +162,7 @@ PAGE = """<!doctype html>
   <span class='chip on' data-name='damon'>damon</span>
   <span class='chip on' data-name='lemon'>lemon</span>
   <span class='chip on' data-name='rich'>rich</span>
+  <span class='chip on' data-name='climbing'>climbing</span>
 </header>
 <main>
   <img id='img' alt='input image'>
@@ -280,20 +286,25 @@ def mesh(ds_name: str, local_idx: int) -> Response:
         raise HTTPException(404, f"unknown dataset {ds_name!r}")
     item = DATASETS[ds_name][local_idx]
     contact = (item["contact"].numpy() > 0.5)
-    return Response(render_tpose_png(contact), media_type="image/png",
+    topology = item.get("vertex_topology", "smpl")
+    return Response(render_tpose_png(contact, topology), media_type="image/png",
                     headers={"Cache-Control": "public, max-age=60"})
 
 
 # -------------------------------------------------------------------- CLI
 
-def _load_smpl_tpose() -> tuple[np.ndarray, np.ndarray]:
+def _load_tpose(path: str) -> tuple[np.ndarray, np.ndarray]:
     """Return T-pose vertices remapped for matplotlib (X right, Y depth, Z up).
 
-    Two-step transform from SMPL (Y-up) matches inference_demo.py exactly:
+    Two-step transform from SMPL-family (Y-up) matches inference_demo.py exactly:
       1. ``[:, [1, 2]] *= -1``  → OpenCV-like (Y down, Z back)
       2. axis swap (x, -y, z) → matplotlib (X right, Y depth, Z up)
+
+    Works for both SMPL (6890 verts) and SMPL-X (10475 verts) since the
+    template + face arrays live under the same ``v_template`` / ``f``
+    keys in either NPZ.
     """
-    npz = np.load(SMPL_NPZ, allow_pickle=True)
+    npz = np.load(path, allow_pickle=True)
     v = npz["v_template"].astype(np.float32).copy()
     f = npz["f"].astype(np.int32)
     v[:, [1, 2]] *= -1
@@ -310,8 +321,11 @@ def main() -> int:
     p.add_argument("--no-open", action="store_true")
     args = p.parse_args()
 
-    global _T_VERTS, _T_FACES, DATASETS
-    _T_VERTS, _T_FACES = _load_smpl_tpose()
+    global _TEMPLATES, DATASETS
+    _TEMPLATES = {
+        "smpl":  _load_tpose(SMPL_NPZ),
+        "smplx": _load_tpose(SMPLX_NPZ),
+    }
 
     print("Loading datasets...")
     damon_cfg = CONFIG_DIR / "damon.yaml"
@@ -319,10 +333,16 @@ def main() -> int:
         damon = DamonDataset.from_config(damon_cfg, split=args.damon_split)
     else:
         damon = DamonDataset(split=args.damon_split)
+
+    climbing_cfg = CONFIG_DIR / "climbing.yaml"
+    climbing = (ClimbingImagesDataset.from_config(climbing_cfg)
+                if climbing_cfg.is_file() else ClimbingImagesDataset())
+
     DATASETS = {
-        "damon": damon,
-        "lemon": LemonDataset(split=args.lemon_split),
-        "rich":  RichDataset(split=args.rich_split),
+        "damon":    damon,
+        "lemon":    LemonDataset(split=args.lemon_split),
+        "rich":     RichDataset(split=args.rich_split),
+        "climbing": climbing,
     }
     for n, ds in DATASETS.items():
         print(f"  {n}: {len(ds)} samples")
