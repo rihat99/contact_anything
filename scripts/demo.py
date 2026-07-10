@@ -18,8 +18,8 @@ mesh comes straight from the MHR pose head — nothing here re-poses the GT fit.
 
 Usage::
 
-    CUDA_VISIBLE_DEVICES=0 python train/inference_demo.py \
-        --checkpoint train/output/contact_climbing_20260529_151004/best.pth \
+    CUDA_VISIBLE_DEVICES=0 python scripts/demo.py \
+        --checkpoint output/contact_climbing_20260529_151004/best.pth \
         --num_samples 12 --split val
 """
 from __future__ import annotations
@@ -31,7 +31,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import yaml
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -43,14 +42,17 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from train import checkpoint as ckpt_io
-from train.data import batch_to_device, make_collate
-from train.model import build_model
-from dataset.climbing import ClimbingImagesDataset
+from contact import checkpoint as ckpt_io
+from contact.config import load_config
+from contact.data.collate import batch_to_device, make_collate
+from contact.engine import forward_model
+from contact.data.climbing_images import ClimbingImagesDataset
+from contact.data.splits import train_val_indices
+from contact.metrics import prf1
+from contact.model import build_model
+from contact.targets import TargetSpec
 
-# Architecture is shared across runs; this config builds the matching model.
-BUILD_CONFIG = REPO / "train" / "config_climbing.yaml"
-SMPL_NPZ = "/data3/rikhat.akizhanov/human_global_motion/better_human/models/smpl/SMPL_NEUTRAL.npz"
+SMPL_NPZ = "/data3/rikhat.akizhanov/better/better_human/models/smpl/SMPL_NEUTRAL.npz"
 
 COLOR_CONTACT    = np.array([0.95, 0.15, 0.15])   # red — in contact
 COLOR_NO_CONTACT = np.array([0.55, 0.65, 0.80])   # steel-blue — no contact
@@ -200,21 +202,15 @@ def _mhr_overlay_arrays(mhr: dict):
 def split_indices(cfg, n_total, which):
     """Reproduce ``make_loaders``' seed-42 split for the single climbing set."""
     dcfg = cfg["data"]
-    rng = np.random.default_rng(int(dcfg.get("seed", 42)))
-    idx = rng.permutation(n_total)
-    n_val = int(round(n_total * float(dcfg.get("val_ratio", 0.15))))
-    return (idx[:n_val] if which == "val" else idx[n_val:]).tolist()
+    train, val = train_val_indices(n_total, dcfg.get("val_ratio", 0.15), dcfg.get("seed", 42))
+    return val if which == "val" else train
 
 
 def _metrics(pred, gt):
-    tp = int((pred & gt).sum()); fp = int((pred & ~gt).sum()); fn = int((~pred & gt).sum())
-    eps = 1e-8
-    return {
-        "iou": tp / (tp + fp + fn + eps),
-        "f1": 2 * tp / (2 * tp + fp + fn + eps),
-        "precision": tp / (tp + fp + eps),
-        "recall": tp / (tp + fn + eps),
-    }
+    return prf1({
+        "tp": int((pred & gt).sum()), "fp": int((pred & ~gt).sum()),
+        "fn": int((~pred & gt).sum()), "tn": int((~pred & ~gt).sum()),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +220,8 @@ def _metrics(pred, gt):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--checkpoint", required=True, help="trained contact .pth")
+    ap.add_argument("--config", type=Path, default=REPO / "configs" / "climbing_baseline.yaml",
+                    help="config to build the (shared) model architecture from")
     ap.add_argument("--num_samples", type=int, default=12)
     ap.add_argument("--split", default="val", choices=["val", "train"])
     ap.add_argument("--output_dir", default=None,
@@ -238,12 +236,12 @@ def main() -> int:
         Path(args.checkpoint).resolve().parent / f"inference_{args.split}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cfg = yaml.safe_load(BUILD_CONFIG.read_text())
+    cfg = load_config(args.config)
     print("Building model …")
     model, _ = build_model(cfg, args.device)
     ckpt_io.load(args.checkpoint, model)
     model.eval()
-    collate = make_collate(tuple(model.cfg.MODEL.IMAGE_SIZE))
+    collate = make_collate(tuple(model.cfg.MODEL.IMAGE_SIZE), TargetSpec.from_config(cfg))
     tpose_verts, smpl_faces = load_smpl_template()
 
     ds = ClimbingImagesDataset()
@@ -256,9 +254,8 @@ def main() -> int:
         sample = ds[ds_idx]
         batch = batch_to_device(collate([sample]), args.device)
         with torch.no_grad():
-            model._initialize_batch(batch)
-            out = model.forward_step(batch, decoder_type="body")
-        logits = out["contact"]["contact_logits"][0]              # [6890]
+            out = forward_model(model, batch)
+        logits = out["contact"]["vertex_logits"][0]               # [6890]
         pred_mask = (torch.sigmoid(logits) > args.threshold).cpu().numpy().astype(bool)
         gt_mask = (sample["contact"].numpy() > 0.5).astype(bool)
         pred_v2, pred_vcam, mhr_faces = _mhr_overlay_arrays(out["mhr"])

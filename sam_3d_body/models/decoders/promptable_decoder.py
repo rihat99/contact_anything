@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
+import contextlib
 import pickle
 from typing import Dict, Optional
 
@@ -145,13 +146,27 @@ class PromptableDecoder(nn.Module):
                 image_embedding = image_embedding[:, : image_augment.shape[1]]
 
             if self.do_interm_preds and layer_idx < len(self.layers) - 1:
-                curr_pose_output = token_to_pose_output_fn(
-                    self.norm_final(token_embedding),
-                    prev_pose_output=(
-                        all_pose_outputs[-1] if len(all_pose_outputs) > 0 else None
-                    ),
-                    layer_idx=layer_idx,
+                # --- contact efficiency hook (detach_interm_preds) ---
+                # These interm MHR/camera preds only supply grid-sample *locations*
+                # for the token updates below; every grad path through them dead-ends
+                # in frozen params. Under no_grad their outputs are detached, dropping
+                # the (frozen) MHR activation graph. The trainable token-update
+                # projections still run WITH grad, consuming the detached locations.
+                # Attribute absent -> old full-graph behaviour (standalone fork use).
+                _interm_ctx = (
+                    torch.no_grad()
+                    if getattr(self, "detach_interm_preds", False)
+                    else contextlib.nullcontext()
                 )
+                with _interm_ctx:
+                    curr_pose_output = token_to_pose_output_fn(
+                        self.norm_final(token_embedding),
+                        prev_pose_output=(
+                            all_pose_outputs[-1] if len(all_pose_outputs) > 0 else None
+                        ),
+                        layer_idx=layer_idx,
+                    )
+                # --- end contact efficiency hook ---
                 all_pose_outputs.append(curr_pose_output)
 
                 if self.keypoint_token_update:
