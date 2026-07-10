@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a fork of **SAM 3D Body** (Meta Superintelligence Labs) — a single-image 3D human mesh recovery (HMR) model. The fork adds a **Contact Head** that predicts per-vertex contact states (which of 18,439 MHR mesh vertices are in contact with the environment), trained on the DAMON/DECO dataset.
+Fork of **SAM 3D Body** (Meta) — single-image 3D human mesh recovery — extended with a
+**contact prediction head**. The base model is frozen; only contact-named parameters train.
+Contact can be predicted **per-vertex** (SMPL 6890 / SMPL-X 10475; MHR not implemented) and/or
+**per-joint** (SMPL-X body-22 joint set), on single images or on **video clips** via an optional
+temporal attention module that provably does not change the frozen model's pose (MHR) predictions.
 
 ## Environment Setup
 
@@ -17,156 +21,130 @@ pip install pytorch-lightning pyrender opencv-python yacs scikit-image einops ti
 pip install 'git+https://github.com/facebookresearch/detectron2.git@a1ce2f9' --no-build-isolation --no-deps
 ```
 
-## Key Commands
-
-Use this python to run code in terminal
+Use this python to run code in terminal:
 ```
 PYTHON=/data3/rikhat.akizhanov/miniconda3/envs/sam3d/bin/python
 ```
 
-**Train contact head:**
+## Key Commands
+
+All commands run from the repo root.
+
 ```bash
-python train/train_contact.py
+# Train (config = experiment yaml; resume: --resume auto | --resume path/to/last.pth)
+python scripts/train.py --config configs/damon_baseline.yaml
+python scripts/train.py --config configs/climbing_videos_joint_temporal.yaml
+
+# Evaluate a checkpoint on the config's val split (per-target P/R/F1/IoU)
+python scripts/evaluate.py --checkpoint output/<run>/best.pth --config configs/<experiment>.yaml
+
+# Qualitative demo (GT vs predicted contacts)
+python scripts/demo.py --checkpoint output/<run>/best.pth --config configs/<experiment>.yaml --num_samples 10
+
+# Tests (fast CPU suite ~15s; add --runslow-style GPU tests via -m slow)
+python -m pytest tests/ -q -m "not slow"
+python -m pytest tests/ -q                    # everything incl. GPU invariance/grad-flow tests
+
+# Logging: wandb project "contact-anything" (box is logged in) + optional tensorboard
+tensorboard --logdir output/<run>/tensorboard/
+
+# Data preparation
+python scripts/precompute_masks_damon.py          # SAM3 person masks for DAMON
+python scripts/precompute_cam_params_damon.py     # MoGe2 intrinsics for DAMON
+python scripts/build_climbing_images.py --config configs/datasets/climbing_images.yaml
+python tools/view_dataset.py --port 8765          # dataset browser (image + T-pose contacts)
 ```
 
-**Evaluate a checkpoint:**
-```bash
-python train/evaluate.py --checkpoint train/output/<run_folder>/best_model.pth
-```
+## Repository Layout
 
-**Inference demo (visualize GT vs predicted contacts):**
-```bash
-python train/inference_demo.py --checkpoint train/output/<run_folder>/best_model.pth --num_samples 10
-```
-
-**Monitor training:**
-```bash
-tensorboard --logdir train/output/contact_head_eth/tensorboard/
-```
-
-**Precompute SAM-3D-Body predictions and DINOv3 features for DAMON:**
-```bash
-# Full run (with resume support)
-CUDA_VISIBLE_DEVICES=0 python dataset/damon_sam3d_precompute.py --resume --gpu 0
-
-# Test on first N samples of one split
-CUDA_VISIBLE_DEVICES=0 python dataset/damon_sam3d_precompute.py --splits test --end_idx 5 --gpu 0
-```
-
-**Generate SAM3 segmentation masks and bounding boxes for DAMON (person + contact objects):**
-```bash
-# Full dataset, both splits, with resume support
-CUDA_VISIBLE_DEVICES=0 python dataset/damon_sam3_segment.py --resume --gpu 0
-
-# Test on first N samples of one split
-CUDA_VISIBLE_DEVICES=0 python dataset/damon_sam3_segment.py --splits trainval --end_idx 10 --gpu 0
-```
+| Path | Purpose |
+|---|---|
+| `sam_3d_body/` | Vendored SAM 3D Body fork. Upstream code untouched; our additions are the contact head/tokens, `models/modules/temporal.py`, and hooks delimited by `# --- contact temporal hook ---` / efficiency-flag comments. |
+| `contact/` | Our library: `config.py` (yaml + `base:` include + strict validation), `model.py` (build/freeze/eval-pin), `targets.py`, `losses.py`, `metrics.py`, `engine.py` (shared forward), `checkpoint.py` (schema v2), `tracking.py` (wandb+TB), `data/` (loaders, collate, splits). |
+| `scripts/` | Thin CLIs: train, evaluate, demo, build_climbing_images, precompute_*, render_results_table. |
+| `configs/` | `base.yaml` (all defaults, commented) + experiment overrides; `configs/datasets/*.yaml` = dataset paths/options. |
+| `tests/` | pytest suite (79 tests; `-m slow` = GPU integration: temporal invariance, grad flow). |
+| `tools/` | `view_dataset.py` (FastAPI browser), `climbing_contact_stats.py` (source-tree stats, SMPL-X). |
+| `legacy/` | Superseded code kept for reference — see `legacy/README.md` for why each item is there and what functionality it still uniquely has. |
+| `conversion/smplx_smpl_conversion/` | SMPL-X→SMPL vertex/param/contact conversion (used by the climbing-images builder). |
+| `output/` | New training runs (gitignored). `train/output/` holds pre-refactor historical runs. |
 
 ## Architecture
 
-### Model Pipeline
+1. **Backbone** — DINOv3-H (bf16, frozen) → image embeddings `[B,1280,32,32]`.
+2. **Promptable decoder** (6 layers, dim 1024) with typed tokens. Contact adds keypoint-anchored
+   tokens (configurable MHR70 anchor indices, `model.contact_head.contact_keypoint_indices`;
+   default = first 21; climbing configs add both wrists 41/62) + `num_global_tokens` extra tokens.
+   An **asymmetric attention mask** stops all original tokens from attending to contact tokens —
+   pose/keypoint outputs are unaffected by anything contact-side.
+3. **Per-target contact heads** — `head_contact` is an `nn.ModuleDict`: `vertex` → `[B, 6890|10475]`
+   logits, `joint` → `[B, 22]` logits. Output: `out["contact"]["<target>_logits"]`.
+4. **Temporal module** (`model.temporal`, optional) — zero-init-gated pre-LN attention blocks over
+   the frames of a clip, order-aware via sinusoidal encoding of real elapsed seconds
+   (`frame_pos_sec`), optional frame-level causal mask. Placements: `post_decoder` (default),
+   `between_layers` (runs at decoder layers 0–4, shared weights), `pre_decoder` (experimental,
+   contact-private bottlenecked feature branch). Batches are homogeneous-T flattened clips
+   (`[B_clips*T, ...]` + `seq_len`/`frame_pos_sec`/`frame_valid`); single images are T=1.
 
-1. **Backbone** (`sam_3d_body/models/backbones/`) — DINOv3-H (840M) or ViT-H (631M) encodes the input image into dense embeddings.
+### Invariants (do not break)
 
-2. **Promptable Transformer Decoder** (`sam_3d_body/models/decoders/`) — Multi-layer cross-attention decoder with typed query tokens:
-   - 1 pose token → initial pose/shape estimate
-   - 70 keypoint query tokens → 2D/3D keypoint predictions
-   - 0–1 prompt tokens → optional user-provided 2D keypoint or mask prompts
-   - **21 contact tokens** ← new addition; one per first 21 MHR70 keypoints (body joints + toes/heels). Only the body decoder (`self.decoder`) carries contact tokens; the hand decoder does not. An asymmetric attention mask keeps the original frozen tokens from attending to the contact tokens, so contact training cannot degrade body pose estimation.
+- **Freeze filter is name-based**: only params whose dotted name contains `"contact"` train
+  (tokens, heads, posemb/feat linears, `contact_temporal*`). Any new trainable module must carry
+  "contact" in its attribute path.
+- **Frozen modules are eval-pinned** (`contact/model.py::pin_frozen_eval`): `model.train(True)`
+  re-pins backbone/decoder/MHR+camera heads to eval (the backbone has DROP_PATH_RATE 0.1 — train
+  mode would make it stochastic). Only contact modules toggle.
+- **MHR invariance**: `tests/test_temporal_invariance.py` proves pose/MHR outputs stay within the
+  frozen model's CUDA noise floor while contact logits move orders of magnitude. Run after any
+  change to decoder hooks.
+- `TRAIN.USE_FP16` stays as shipped (backbone bf16); decoder/MHR heads stay fp32 (MHR sparse ops
+  are fp16-incompatible).
 
-3. **Prediction Heads** (`sam_3d_body/models/heads/`):
-   - `mhr_head.py` — Predicts MHR parameters (pose: 260D, shape: 45D, scale: 28D, hand: 108D, face: 72D)
-   - `camera_head.py` — Predicts camera scale/translation
-   - `contact_head.py` — **New.** Mean-pools the 21 contact tokens → 2-layer MLP → 18,439 binary vertex logits
+## Configuration
 
-4. **Main Model** (`sam_3d_body/models/meta_arch/sam3d_body.py`) — `SAM3DBody` orchestrates the full forward pass. The model key `contact_head` stores the new head; `contact_tokens` in the decoder stores the new learnable queries.
+Experiments are small yamls with `base: configs/base.yaml` (deep-merge; unknown keys hard-error).
+Key sections (see `configs/base.yaml` for full commented defaults):
 
-### Contact Head Details (`sam_3d_body/models/heads/contact_head.py`)
-
-- Input: `[B, 21, C]` contact tokens
-- Operation: mean-pool → FFN (depth=2, hidden=C//4) → `[B, 18439]` logits
-- Loss: binary cross-entropy with positive class weighting (heavily imbalanced: ~14–15% contact rate)
-- Training freezes everything except contact head weights and contact tokens
-
-### Dataset (`dataset/`)
-
-All loaders return the same dict schema:
-
-```python
-{
-    "image":   uint8 ndarray [H, W, 3],   # None for label-only mode (RICH without .img.tsv)
-    "contact": float32 tensor [6890],     # SMPL topology
-    "key":     str,
-    "dataset": str,
-    "mask":    None,                       # placeholder, future preprocessing
-    "bbox":    ndarray [4] or None,        # placeholder (RICH has crop bbox)
-    "focal":   float or None,              # placeholder (DAMON has fx from cam_k)
-}
-```
-
-- `damon.py` — `DamonDataset(root, split)` — DECO release NPZ, SMPL 6890. ~4,384 trainval / 785 test.
-- `lemon.py` — `LemonDataset(root, split)` — 3DIR release, SMPL-H 6890 (body topology matches SMPL). ~4,000 train / 1,000 val.
-- `rich.py` — `RichDataset(root, split)` — BSTRO TSV format. 27,677 train / 25,144 val / 118,883 test. Requires extracted `rich_for_bstro_tsv_db/` (`unzip` the BSTRO zip into `/data3/rikhat.akizhanov/datasets/RICH/`); the loader runs in label-only mode if `*.img.tsv` is missing.
-- `contact.py` — `ContactDataset(names=...)` — unified loader concatenating any combination of the three.
-
-### Viewer (`tools/view_dataset.py`)
-
-FastAPI app that walks the datasets sample-by-sample: image on the left, SMPL T-pose (front + back) with per-vertex contacts on the right. Chips at the top filter which datasets to walk; Next / Random buttons at the bottom navigate.
-
-```bash
-python tools/view_dataset.py --port 8765
-```
-
-**Precomputed data:**
-
-```
-dataset/damon_mhr_contact/
-  masks/{split}/{idx:04d}/
-    metadata.npz                          — object_names, num_detections, bboxes_*, scores_*
-    masks/{idx:04d}_000.png               — person mask (largest bbox, always object 0)
-    masks/{idx:04d}_001.png               — first contact object (single detection)
-    masks/{idx:04d}_001_0.png             — first contact object, detection 0 (multiple)
-    masks/{idx:04d}_001_1.png             — first contact object, detection 1 (multiple)
-  features/{split}/{idx:04d}.pt           — DINOv3 encoder features [1280, 56, 56] float16
-  predictions/{split}/{idx:04d}.npz       — per-sample pose predictions (for resume)
-  predictions/{split}_predictions.npz    — merged pose predictions for full split
-```
-
-Generated by:
-- `dataset/damon_sam3_segment.py` — SAM3 open-vocabulary segmentation; text prompts are `"person"` and contact object names from `contact_label_objectwise` (skips `"supporting"`); multiple person detections are deduplicated by keeping the largest bbox
-- `dataset/damon_sam3d_precompute.py` — SAM-3D-Body pose predictions and DINOv3 features; uses person mask from above to derive a tighter bbox, falling back to `hot_dca_{split}_detect.npz` bbox if no mask exists
-
-`hot_dca_{split}_detect.npz` (keys: `imgname`, `bbox`, `cam_k`) is the source of truth for image list and camera intrinsics.
-
-Prediction NPZ keys per sample: `imgname`, `pred_keypoints_3d` [70,3], `pred_keypoints_2d` [70,2], `pred_cam_t` [3], `focal_length`, `pred_pose_raw` [266], `global_rot` [3], `body_pose_params`, `hand_pose_params` [108], `scale_params` [28], `shape_params` [45], `mhr_model_params`, `pred_joint_coords` [127,3], `bbox_used` [4], `mask_available`.
-
-## Configuration (`train/config.yaml`)
-
-All training is controlled by `train/config.yaml`. Key sections:
-
-| Section | Purpose |
+| Section | Controls |
 |---|---|
-| `MODEL.CHECKPOINT_PATH` | Pre-trained SAM 3D Body checkpoint (`.ckpt`) |
-| `MODEL.MHR_MODEL_PATH` | MHR parametric model weights (`.pt`) |
-| `MODEL.CONTACT_HEAD` | Architecture of the contact head (num tokens, vertices, MLP depth) |
-| `TRAIN.USE_FP16` | Keep `false` — MHR sparse ops are incompatible with fp16 |
-| `TRAIN.POS_WEIGHT` | Class weight for imbalanced labels; `null` = auto-compute |
-| `DATASET.TRAINVAL_NPZ` / `TEST_NPZ` | Paths to DAMON/DECO npz files |
-| `OUTPUT.DIR` | Base output dir; each run creates `EXP_NAME_YYYYMMDD_HHMMSS/` |
+| `model.contact_head` | anchor indices, global tokens, pooling (`concat`/`attention`), MLP, grid sampling |
+| `model.temporal` | enabled, placement, layers/heads, `attend: joint|per_token`, `causal` |
+| `contact.topology` | `smpl` / `smplx` (`mhr` → NotImplementedError) |
+| `contact.targets.vertex/joint` | enabled, weight, per-target loss params, joint subset masking, `derive_from_vertex`, confidence weights |
+| `data.datasets` | list of `{name, config, split}`; `frames_per_batch` (memory-flat batch budget), `sequence.{frames_per_clip,frame_stride,jitter}` |
+| `train` | `backbone_no_grad`, `detach_interm_preds` (both true; ~20% faster, grad-asserted no-ops) |
+| `logging` | wandb (project `contact-anything`) + tensorboard |
+| `output` | run dir, `monitor` (e.g. `val/vertex_f1`; `*_f1`/`*_iou`→max, `loss`→min) |
 
-## Training Outputs
+## Datasets
 
-Each run creates `train/output/<EXP_NAME_YYYYMMDD_HHMMSS>/`:
-- `best_model.pth` — checkpoint with best validation loss
-- `final_model.pth` — last epoch checkpoint
-- `checkpoint_epoch_N.pth` — periodic saves (every `SAVE_FREQ` epochs)
-- `tensorboard/` — loss/metric logs
-- `config.yaml` — copy of run config
+| name | granularity | labels | topology |
+|---|---|---|---|
+| `damon` (DECO) | still | per-vertex | SMPL 6890 |
+| `climbing_images` (ClimbingImages_v1) | still | per-vertex (+SMPL params) | SMPL 6890 |
+| `climbing_videos` (ClimbingVideos_v1) | video clips | per-joint 22 | SMPL-X body-22 joints |
+| `lemon`, `rich` | still (viewer-only) | per-vertex | SMPL(-H) 6890 |
 
-## Checkpoints
+ClimbingVideos label semantics (important):
+- **Train labels are automatic and cover all 22 joints** — the `observable_14` mask belongs only
+  to the (pending) manual test annotations. The loader **raises** if test labels are requested
+  while `contacts.npz` has `pending=True`.
+- Video joint labels are **motion-gated "stable contact"** (stillness/hysteresis in the exporter),
+  a different task from instantaneous contact derived from still-image vertices — which is why
+  `derive_from_vertex` defaults to false.
+- Train/val split is grouped by **source video** (chunks of one video never straddle splits).
 
-Pre-trained base models are on HuggingFace (access required):
-- `facebook/sam-3d-body-dinov3` (DINOv3-H backbone, default)
-- `facebook/sam-3d-body-vith` (ViT-H backbone)
+Datasets emit per-target `(gt, sup_mask)`; missing targets are fully masked, so image (vertex) and
+video (joint) datasets mix at batch level (homogeneous-T interleaving).
 
-Local paths on this machine are set in `train/config.yaml` under `MODEL.CHECKPOINT_PATH` and `MODEL.MHR_MODEL_PATH`.
+## Training Outputs & Checkpoints
+
+Each run: `output/<EXP_NAME_YYYYMMDD_HHMMSS>/` with `best.pth` (by `output.monitor`), rolling
+`last.pth`, periodic `epoch_XXXX.pth`, `config.yaml` (resolved), `tensorboard/`.
+Checkpoints are **schema v2**: trainable-only weights + optimizer/scheduler + epoch/step + best
+metric + resolved config + wandb run id + RNG states. Loading **hard-fails with a param diff** on
+architecture mismatch (never silent random init). `--resume auto` reproduces the uninterrupted
+run exactly (RNG + stateless window jitter restored). Pre-refactor checkpoints are incompatible.
+
+Base model checkpoints (HuggingFace, paths set in `configs/base.yaml`):
+`facebook/sam-3d-body-dinov3` (default) / `facebook/sam-3d-body-vith`.
