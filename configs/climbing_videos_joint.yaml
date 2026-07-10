@@ -1,0 +1,25 @@
+# Per-joint (22) contact on ClimbingVideos_v1 — joint target only, vertex off.
+# Per-frame (no temporal module yet; Phase 3). Contact-token anchors add both
+# wrists (MHR70 41 right / 62 left) and the nose (0) to the body16 + toes/heels
+# set, since hand/wrist contact is central to climbing (see sam_3d_body/metadata/mhr70.py).
+base: configs/base.yaml
+
+model:
+  contact_head:
+    contact_keypoint_indices: [0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 41, 62]
+
+contact:
+  primary_target: joint
+  targets:
+    vertex: {enabled: false}
+    joint:
+      enabled: true
+      supervise_subset: null          # ClimbingVideos train labels cover all 22 joints
+
+data:
+  datasets:
+    - {name: climbing_videos, config: configs/datasets/climbing_videos.yaml}
+
+output:
+  exp_name: contact_climbing_videos
+  monitor: val/joint_f1

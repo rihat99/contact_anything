@@ -1,0 +1,77 @@
+# --------------------------------------------------------------------------
+# Base config — full documented defaults. Experiment configs set `base:
+# configs/base.yaml` and override only what differs. Unknown keys hard-error
+# (see contact/config.py). Everything not listed here comes from the
+# SAM-3D-Body checkpoint's own model_config.yaml.
+# --------------------------------------------------------------------------
+
+base: null
+
+model:
+  # SAM-3D-Body base (DINOv3-H backbone + frozen decoder).
+  checkpoint_path: /data3/rikhat.akizhanov/.cache/huggingface/hub/models--facebook--sam-3d-body-dinov3/snapshots/11aaa346c7204874a1cbafe3d39a979080b2c55a/model.ckpt
+  mhr_model_path:  /data3/rikhat.akizhanov/.cache/huggingface/hub/models--facebook--sam-3d-body-dinov3/snapshots/11aaa346c7204874a1cbafe3d39a979080b2c55a/assets/mhr_model.pt
+  mask_embed_type: v2                 # pretrained mask conditioning (frozen)
+  contact_head:
+    contact_keypoint_indices: null    # null = list(range(21)) = body16 + toes/heels.
+                                      # Climbing recommendation: add wrists 41/62 + nose 0.
+    num_global_tokens: 3
+    pool_mode: concat                 # 'concat' | 'attention' (honored after the Phase 2 fix)
+    dropout: 0.1
+    mlp_depth: 4
+    mlp_channel_div_factor: 2
+    grid_size: 5                      # K x K image-feature grid per keypoint anchor
+    grid_radius: 0.1
+  temporal:                           # Phase 3: ContactTemporalModule (zero-gated, no-op off)
+    enabled: false
+    placement: post_decoder           # post_decoder | between_layers | pre_decoder (experimental)
+    num_layers: 2
+    num_heads: 8
+    mlp_ratio: 4.0
+    attend: joint                     # joint (T*K tokens per clip) | per_token (T per token-slot)
+    causal: false                     # frame-level causal mask when true
+    dropout: 0.0
+
+contact:
+  topology: smpl                      # smpl(6890) | smplx(10475) | mhr -> NotImplementedError
+  primary_target: vertex              # headline metric target (monitor/pbar)
+  targets:
+    vertex:
+      enabled: true
+      weight: 1.0
+      loss: {focal_alpha: 0.75, focal_gamma: 2.0, focal_weight: 5.0,
+             dice_weight: 0.5, sparsity_weight: 0.002}
+    joint:
+      enabled: false
+      joint_set: smplx_body_22
+      weight: 1.0
+      supervise_subset: null          # null=all 22 | 'observable_14' | index list
+      derive_from_vertex: false       # OFF: video 'stable contact' != still 'surface contact'
+      use_confidence_weights: false   # weight the joint loss by contact_conf_22
+      loss: {focal_alpha: 0.5, focal_gamma: 2.0, focal_weight: 5.0,
+             dice_weight: 0.5, sparsity_weight: 0.0}
+
+data:
+  datasets: []                        # list of {name, config[, split]}
+  val_ratio: 0.15                     # stills: random item split; videos: source-video group split
+  seed: 42
+  frames_per_batch: 32                # B_clips = frames_per_batch // T (homogeneous-T batches)
+  num_workers: 16
+  sequence: {frames_per_clip: 8, frame_stride: 2, jitter: true}   # jitter stateless from (seed,epoch,idx)
+
+loss: {dice_eps: 1.0e-5, grad_clip: 1.0}
+
+train:                               # Phase 4: narrow the autograd graph (grad-asserted no-ops).
+  detach_interm_preds: true          # interm MHR/camera preds -> torch.no_grad() + detached
+  backbone_no_grad: true             # wrap ONLY the frozen backbone call in torch.no_grad()
+
+optim: {lr: 1.0e-4, weight_decay: 1.0e-4, epochs: 20, warmup_epochs: 1, lr_min: 1.0e-5}
+
+logging:
+  # This box is logged into wandb (rihat99/Rikhat) -> default mode "online".
+  wandb: {enabled: true, project: contact-anything, entity: null, tags: [], mode: online}
+  tensorboard: true
+
+output: {dir: ./output, exp_name: contact, log_freq: 10, val_freq: 1, save_freq: 5,
+         # best-model selection: '..._f1'/'..._iou' -> max, '.../loss' -> min.
+         monitor: val/vertex_f1}

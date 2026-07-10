@@ -1,0 +1,11 @@
+# Experiment 2 — contact head on ClimbingImages_v1 + DAMON (per-vertex SMPL-6890).
+# The two still-image corpora are concatenated then split together (random, seeded).
+base: configs/base.yaml
+
+data:
+  datasets:
+    - {name: damon, config: configs/datasets/damon.yaml, split: trainval}
+    - {name: climbing, config: configs/datasets/climbing_images.yaml}
+
+output:
+  exp_name: contact_climbing_damon

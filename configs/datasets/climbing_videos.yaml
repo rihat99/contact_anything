@@ -1,0 +1,7 @@
+name: climbing_videos
+
+# Windowed per-joint (22) contact clips. The loader uses only the train/ dir,
+# split into train/val by source video (contact.data.splits.group_train_val_split);
+# the test/ dir (manual annotations pending) is held out entirely.
+data:
+  root: /data3/rikhat.akizhanov/datasets/ClimbingVideos_v1

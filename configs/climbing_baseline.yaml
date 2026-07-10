@@ -1,0 +1,10 @@
+# Experiment 1 — contact head on ClimbingImages_v1 only (per-vertex SMPL-6890).
+# Same model / loss / optim as the DAMON baseline; only the data source differs.
+base: configs/base.yaml
+
+data:
+  datasets:
+    - {name: climbing, config: configs/datasets/climbing_images.yaml}
+
+output:
+  exp_name: contact_climbing

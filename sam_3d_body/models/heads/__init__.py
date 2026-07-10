@@ -6,7 +6,8 @@ from .contact_head import ContactHead
 from .mhr_head import MHRHead
 
 
-def build_head(cfg, head_type="mhr", enable_hand_model=False, default_scale_factor=1.0):
+def build_head(cfg, head_type="mhr", enable_hand_model=False, default_scale_factor=1.0,
+               output_dims=None):
     if head_type == "mhr":
         return MHRHead(
             input_dim=cfg.MODEL.DECODER.DIM,
@@ -29,12 +30,15 @@ def build_head(cfg, head_type="mhr", enable_hand_model=False, default_scale_fact
         contact_cfg = cfg.MODEL.get("CONTACT_HEAD", dict())
         num_kp  = contact_cfg.get("NUM_CONTACTS", 21)
         num_gbl = contact_cfg.get("NUM_GLOBAL_TOKENS", 0)
+        dims = output_dims if output_dims is not None else contact_cfg.get("NUM_VERTICES", 18439)
         return ContactHead(
             input_dim=cfg.MODEL.DECODER.DIM,
             num_contact_tokens=num_kp + num_gbl,
-            num_vertices=contact_cfg.get("NUM_VERTICES", 18439),
+            num_vertices=dims,
             mlp_depth=contact_cfg.get("MLP_DEPTH", 2),
             mlp_channel_div_factor=contact_cfg.get("MLP_CHANNEL_DIV_FACTOR", 4),
+            pool_mode=contact_cfg.get("POOL_MODE", "attention"),
+            dropout=contact_cfg.get("DROPOUT", 0.0),
         )
     else:
         raise ValueError("Invalid head type: ", head_type)
