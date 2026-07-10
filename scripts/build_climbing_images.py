@@ -20,8 +20,8 @@ camera-space mesh can be reconstructed and the conversion re-run if improved.
 
 Run::
 
-    python dataset/build_climbing_v1.py                 # full build from config
-    python dataset/build_climbing_v1.py --limit 20      # quick smoke test
+    python scripts/build_climbing_images.py                 # full build from config
+    python scripts/build_climbing_images.py --limit 20      # quick smoke test
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ sys.path.insert(0, str(REPO))
 from conversion.smplx_smpl_conversion import SmplxToSmpl  # noqa: E402
 
 NUM_SMPL, NUM_SMPLX = 6890, 10475
-DEFAULT_CONFIG = REPO / "configs" / "climbing.yaml"
+DEFAULT_CONFIG = REPO / "configs" / "datasets" / "climbing_images.yaml"
 
 
 def _shard(sha: str) -> tuple[str, str]:

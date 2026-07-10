@@ -5,7 +5,7 @@ name: climbing
 data:
   root: /data3/rikhat.akizhanov/datasets/ClimbingImages_v1
 
-# --- builder: dataset/build_climbing_v1.py reads this -----------------------
+# --- builder: scripts/build_climbing_images.py reads this -------------------
 # Walks the BetterImageReconstruction outputs, keeps climbers whose SMPL-X
 # contact_surface count is in [min_contacts, max_contacts], converts
 # SMPL-X -> SMPL (contacts + params), and writes the dataset to `out`.

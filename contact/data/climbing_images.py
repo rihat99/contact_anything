@@ -1,6 +1,6 @@
 """ClimbingImages_v1 dataset — image + per-vertex SMPL (6890) contact labels.
 
-Self-contained and prebuilt by ``dataset/build_climbing_v1.py``: no DB, no
+Self-contained and prebuilt by ``scripts/build_climbing_images.py``: no DB, no
 BetterImageReconstruction sidecars, no SMPL-X conversion at load time — just
 ``metadata.npz`` (all labels stacked by index) plus one jpg + one png per
 climber-item. The builder is where filtering and SMPL-X -> SMPL conversion
@@ -43,13 +43,17 @@ _DEPTH_KEYS = ("sapiens_scale", "sapiens_shift", "sapiens_inliers",
 class ClimbingImagesDataset(Dataset):
     """One climber-item per index, read from the prebuilt v1 dataset."""
 
+    supervised_targets = frozenset({"vertex"})
+    topology = "smpl"
+    name = "climbing"
+
     def __init__(self, root: str = DEFAULT_ROOT):
         super().__init__()
         self.root = Path(root)
         meta = self.root / "metadata.npz"
         if not meta.is_file():
             raise FileNotFoundError(
-                f"{meta} not found — build it with dataset/build_climbing_v1.py")
+                f"{meta} not found — build it with scripts/build_climbing_images.py")
         d = np.load(meta, allow_pickle=True)
         self.m = {k: d[k] for k in d.files}
         self.num_vertices = int(self.m["num_vertices"])

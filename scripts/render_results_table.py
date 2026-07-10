@@ -1,15 +1,20 @@
 """Render the 3x2 cross-evaluation as an academic (booktabs-style) table.
 
-Reads ``train/output/cross_eval.jsonl`` (produced by ``evaluate.py``) and writes
-  train/output/cross_eval_table.png   — presentation-ready, rule-only, serif
-  train/output/cross_eval_table.tex   — LaTeX booktabs source
+Reads ``<input>/cross_eval.jsonl`` (append one line per ``evaluate.py`` run:
+``{"checkpoint", "config", "results": {target: {precision, recall, f1, iou,
+tp, fp, fn, tn}}}``) and writes
+  <input>/cross_eval_table.png   — presentation-ready, rule-only, serif
+  <input>/cross_eval_table.tex   — LaTeX booktabs source
 
-A transfer matrix: rows are models (what each was trained on), column groups
-are the held-out eval sets (DAMON test, ClimbingImages). Cells are global
-precision / recall / F1 in percent; the best per column is bold.
+``--input`` defaults to ``./output`` (new runs) but also accepts the old
+``train/output``. A transfer matrix: rows are models (identified by the
+checkpoint path), column groups are the held-out eval sets (DAMON, ClimbingImages;
+identified by the eval ``config`` path). Cells are global precision / recall / F1
+in percent; the best per column is bold. Missing cells render as ``--``.
 """
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -18,9 +23,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 REPO = Path(__file__).resolve().parents[1]
-JSONL = REPO / "train" / "output" / "cross_eval.jsonl"
-PNG = REPO / "train" / "output" / "cross_eval_table.png"
-TEX = REPO / "train" / "output" / "cross_eval_table.tex"
+JSONL = REPO / "output" / "cross_eval.jsonl"
+PNG = REPO / "output" / "cross_eval_table.png"
+TEX = REPO / "output" / "cross_eval_table.tex"
 
 # row order (model) and the substring that identifies each in a checkpoint path
 ROWS = [
@@ -40,14 +45,36 @@ def model_key(path: str) -> str:
     return "damon"
 
 
+def eval_key(config_path: str) -> str | None:
+    """Which held-out eval set an ``evaluate.py`` line scored, from its config path.
+
+    Returns ``None`` for an ambiguous/combined config (not a single held-out set).
+    """
+    p = str(config_path).lower()
+    has_c, has_d = "climbing" in p, "damon" in p
+    if has_c and not has_d:
+        return "climbing"
+    if has_d and not has_c:
+        return "damon"
+    return None
+
+
 def load():
+    """Parse the evaluator JSONL into ``cells[(model, eval)] = {metric: value}``."""
     cells, nstr = {}, {}
     for line in JSONL.read_text().splitlines():
         if not line.strip():
             continue
         r = json.loads(line)
-        cells[(model_key(r["checkpoint"]), r["eval"])] = r
-        nstr[r["eval"]] = int(r["n_used"])
+        ev = eval_key(r.get("config", ""))
+        results = r.get("results", {})
+        target = next((t for t in ("vertex", "joint") if t in results), None)
+        if ev is None or target is None:
+            continue
+        res = results[target]
+        cells[(model_key(r["checkpoint"]), ev)] = res
+        nstr[ev] = int(res.get("tp", 0) + res.get("fp", 0)
+                       + res.get("fn", 0) + res.get("tn", 0))
     return cells, nstr
 
 
@@ -106,7 +133,11 @@ def render_png(cells, nstr):
         ax.text(label_x, yr, rdisp, ha="left", va="center", fontsize=12)
         for (ev, _), g in zip(EVALS, groups):
             for (mk, _), xi in zip(METRICS, mx[g[0]:g[1] + 1]):
-                v = cells[(rk, ev)][mk] * 100.0
+                cell = cells.get((rk, ev))
+                if cell is None:
+                    ax.text(xi, yr, "--", ha="center", va="center", fontsize=12)
+                    continue
+                v = cell[mk] * 100.0
                 bold = best.get((ev, mk)) == rk
                 ax.text(xi, yr, f"{v:.1f}", ha="center", va="center",
                         fontsize=12, fontweight="bold" if bold else "normal")
@@ -120,7 +151,10 @@ def render_tex(cells, nstr):
     best = best_mask(cells)
 
     def fmt(rk, ev, mk):
-        v = cells[(rk, ev)][mk] * 100.0
+        cell = cells.get((rk, ev))
+        if cell is None:
+            return "--"
+        v = cell[mk] * 100.0
         s = f"{v:.1f}"
         return rf"\textbf{{{s}}}" if best.get((ev, mk)) == rk else s
 
@@ -149,6 +183,16 @@ def render_tex(cells, nstr):
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--input", type=Path, default=REPO / "output",
+                    help="dir holding cross_eval.jsonl (e.g. ./output or train/output)")
+    args = ap.parse_args()
+
+    global JSONL, PNG, TEX
+    JSONL = args.input / "cross_eval.jsonl"
+    PNG = args.input / "cross_eval_table.png"
+    TEX = args.input / "cross_eval_table.tex"
+
     cells, nstr = load()
     render_png(cells, nstr)
     render_tex(cells, nstr)

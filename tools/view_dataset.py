@@ -28,7 +28,7 @@ from fastapi.responses import HTMLResponse, Response
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dataset import (  # noqa: E402
+from contact.data import (  # noqa: E402
     ClimbingImagesDataset,
     DamonDataset,
     LemonDataset,
@@ -36,7 +36,7 @@ from dataset import (  # noqa: E402
 )
 
 
-SMPL_NPZ  = "/data3/rikhat.akizhanov/human_global_motion/better_human/models/smpl/SMPL_NEUTRAL.npz"
+SMPL_NPZ  = "/data3/rikhat.akizhanov/better/better_human/models/smpl/SMPL_NEUTRAL.npz"
 SMPLX_NPZ = "/data3/rikhat.akizhanov/better/better_human/models/smplx/SMPLX_NEUTRAL.npz"
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 
@@ -328,13 +328,13 @@ def main() -> int:
     }
 
     print("Loading datasets...")
-    damon_cfg = CONFIG_DIR / "damon.yaml"
+    damon_cfg = CONFIG_DIR / "datasets" / "damon.yaml"
     if damon_cfg.is_file():
         damon = DamonDataset.from_config(damon_cfg, split=args.damon_split)
     else:
         damon = DamonDataset(split=args.damon_split)
 
-    climbing_cfg = CONFIG_DIR / "climbing.yaml"
+    climbing_cfg = CONFIG_DIR / "datasets" / "climbing_images.yaml"
     climbing = (ClimbingImagesDataset.from_config(climbing_cfg)
                 if climbing_cfg.is_file() else ClimbingImagesDataset())
 

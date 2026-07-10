@@ -48,6 +48,10 @@ SPLIT_NPZ = {
 
 
 class DamonDataset(Dataset):
+    supervised_targets = frozenset({"vertex"})
+    topology = "smpl"
+    name = "damon"
+
     def __init__(
         self,
         root: str = DEFAULT_ROOT,

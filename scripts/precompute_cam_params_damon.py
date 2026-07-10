@@ -40,7 +40,7 @@ from tqdm import tqdm
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
-from dataset.damon import DamonDataset  # noqa: E402
+from contact.data.damon import DamonDataset  # noqa: E402
 
 _DEFAULT_MODEL = "Ruicheng/moge-2-vitl-normal"
 
@@ -189,7 +189,7 @@ def run(config_path: Path, split: str, num_workers: int,
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--config", default=str(REPO / "configs" / "damon.yaml"))
+    p.add_argument("--config", default=str(REPO / "configs" / "datasets" / "damon.yaml"))
     p.add_argument("--split", default="trainval", choices=("trainval", "test"))
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--start", type=int, default=0)
