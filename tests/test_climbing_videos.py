@@ -40,15 +40,18 @@ def _common(n: int, oid: int, valid: np.ndarray) -> dict:
 
 
 def _train_scene(root: Path, scene: str, n: int, valid: np.ndarray,
-                 jc: np.ndarray | None = None, oid: int = 7) -> None:
+                 jc: np.ndarray | None = None, conf: np.ndarray | None = None,
+                 oid: int = 7) -> None:
     scene_dir = root / "train" / scene
     scene_dir.mkdir(parents=True, exist_ok=True)
     _write_frames(scene_dir, n, oid)
     if jc is None:
         jc = np.zeros((1, n, NUM_BODY_22), bool)
+    if conf is None:
+        conf = np.ones((1, n, NUM_BODY_22), np.float32)
     np.savez(scene_dir / "labels.npz",
              joint_contact_22=jc,
-             contact_conf_22=np.ones((1, n, NUM_BODY_22), np.float32),
+             contact_conf_22=conf,
              **_common(n, oid, valid))
 
 
@@ -89,6 +92,27 @@ def test_train_scene_loads_all_22(tmp_path):
     assert bool(frame["joint_contact"][7] > 0.5)
 
 
+def test_raw_confidence_is_separate_from_supervision_and_loss_mask(tmp_path):
+    n = 4
+    conf = np.linspace(0.0, 1.0, NUM_BODY_22, dtype=np.float32)
+    conf = np.tile(conf, (1, n, 1))
+    _train_scene(tmp_path, "vid_0000", n, np.ones(n, bool), conf=conf)
+
+    plain = ClimbingVideosDataset(tmp_path, scenes=["vid_0000"], mode="val",
+                                  frames_per_clip=1, use_confidence_weights=False)
+    weighted = ClimbingVideosDataset(tmp_path, scenes=["vid_0000"], mode="val",
+                                     frames_per_clip=1, use_confidence_weights=True)
+    plain_frame, weighted_frame = plain[0][0], weighted[0][0]
+
+    assert np.allclose(plain_frame["joint_confidence"].numpy(), conf[0, 0])
+    assert float(plain_frame["joint_supervised"].sum()) == NUM_BODY_22
+    assert np.allclose(plain_frame["joint_mask"].numpy(), np.ones(NUM_BODY_22))
+    assert np.allclose(weighted_frame["joint_mask"].numpy(), conf[0, 0])
+    assert np.allclose(weighted_frame["joint_confidence"].numpy(), conf[0, 0])
+    assert weighted_frame["frame_position"] == 0
+    assert weighted_frame["frame_index"] == 0
+
+
 def test_completed_test_scene_uses_annotated_mask(tmp_path):
     n = 8
     jc = np.zeros((1, n, NUM_BODY_22), bool)
@@ -105,6 +129,8 @@ def test_completed_test_scene_uses_annotated_mask(tmp_path):
     assert float(frame["joint_mask"].sum()) == 4.0      # only annotated joints supervised
     assert bool(frame["joint_mask"][20] > 0.5) and bool(frame["joint_contact"][20] > 0.5)
     assert float(frame["joint_mask"][0]) == 0.0         # unannotated joint ignored
+    assert float(frame["joint_supervised"].sum()) == 4.0
+    assert np.allclose(frame["joint_confidence"].numpy(), 1.0)  # no test confidence shipped
 
 
 def test_pending_test_scene_raises(tmp_path):

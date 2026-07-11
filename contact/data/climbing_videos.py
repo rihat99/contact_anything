@@ -17,8 +17,11 @@ frames are skipped.
 ``__getitem__`` returns a **clip**: a list of ``T`` per-frame dicts, each with the
 full RGB image, the person mask (or ``None`` when the file is missing), the xyxy
 bbox, the camera intrinsics, the per-joint contact + supervision mask, and
-``frame_pos_sec`` (elapsed seconds from the window's first frame). The mask is 0
-for invalid frames, so those frames contribute nothing to the loss.
+``frame_pos_sec`` (elapsed seconds from the window's first frame).  Raw
+``joint_confidence`` and the boolean-valued ``joint_supervised`` mask are also
+returned for inspection; ``joint_mask`` remains the loss mask and is confidence-
+weighted only when ``use_confidence_weights=True``. The mask is 0 for invalid
+frames, so those frames contribute nothing to the loss.
 
 Label semantics: train labels cover all 22 joints (no observable subset) and are
 motion-gated *stable* contact — see :mod:`contact.targets` for why they differ
@@ -70,6 +73,8 @@ class ClimbingVideosDataset(Dataset):
         super().__init__()
         if mode not in ("train", "val"):
             raise ValueError(f"mode must be 'train' or 'val'; got {mode!r}")
+        if split_dir not in ("train", "test"):
+            raise ValueError(f"split_dir must be 'train' or 'test'; got {split_dir!r}")
         self.root = Path(root)
         self.split_dir = split_dir
         self.mode = mode
@@ -196,14 +201,26 @@ class ClimbingVideosDataset(Dataset):
             valid = bool(data["valid_mask"][person, pos])
             if data["joint_contact"] is None:              # require_labels=False -> no labels
                 joint_gt = np.zeros(NUM_BODY_22, np.float32)
-                joint_mask = np.zeros(NUM_BODY_22, np.float32)
+                joint_supervised = np.zeros(NUM_BODY_22, np.float32)
+                joint_confidence = np.zeros(NUM_BODY_22, np.float32)
             else:
                 joint_gt = data["joint_contact"][person, pos].astype(np.float32)      # [22]
-                joint_mask = np.full(NUM_BODY_22, float(valid), dtype=np.float32)     # valid broadcast
+                joint_supervised = np.full(NUM_BODY_22, float(valid), dtype=np.float32)
                 if data["annotated"] is not None:          # completed test: ignore unannotated joints
-                    joint_mask = joint_mask * data["annotated"][person, pos].astype(np.float32)
-                if self.use_confidence_weights and data["contact_conf"] is not None:
-                    joint_mask = joint_mask * data["contact_conf"][person, pos].astype(np.float32)
+                    joint_supervised *= data["annotated"][person, pos].astype(np.float32)
+                if data["contact_conf"] is None:
+                    joint_confidence = np.ones(NUM_BODY_22, np.float32)
+                else:
+                    joint_confidence = np.clip(
+                        data["contact_conf"][person, pos].astype(np.float32), 0.0, 1.0)
+
+            # Keep the training contract intact: ``joint_mask`` is the score mask,
+            # optionally confidence-weighted.  The two explicit fields let tools
+            # such as the dataset viewer distinguish an unannotated joint from a
+            # supervised label whose confidence happens to be zero.
+            joint_mask = joint_supervised.copy()
+            if self.use_confidence_weights:
+                joint_mask *= joint_confidence
 
             clip.append({
                 "image": image,
@@ -212,7 +229,11 @@ class ClimbingVideosDataset(Dataset):
                 "cam_int": data["intrinsics"][pos],                                   # [3, 3]
                 "joint_contact": torch.from_numpy(joint_gt),
                 "joint_mask": torch.from_numpy(joint_mask),
+                "joint_supervised": torch.from_numpy(joint_supervised),
+                "joint_confidence": torch.from_numpy(joint_confidence),
                 "frame_pos_sec": (float(frame_indices[pos]) - start_time) / fps,
+                "frame_position": pos,
+                "frame_index": int(frame_indices[pos]),
                 "frame_valid": valid,
                 "key": f"{scene}#{oid}@{pos}",
                 "dataset": "climbing_videos",

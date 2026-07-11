@@ -52,7 +52,7 @@ tensorboard --logdir output/<run>/tensorboard/
 python scripts/precompute_masks_damon.py          # SAM3 person masks for DAMON
 python scripts/precompute_cam_params_damon.py     # MoGe2 intrinsics for DAMON
 python scripts/build_climbing_images.py --config configs/datasets/climbing_images.yaml
-python tools/view_dataset.py --port 8765          # dataset browser (image + T-pose contacts)
+python -m viewer --port 8765                      # Contact Atlas dataset browser
 ```
 
 ## Repository Layout
@@ -64,7 +64,8 @@ python tools/view_dataset.py --port 8765          # dataset browser (image + T-p
 | `scripts/` | Thin CLIs: train, evaluate, demo, build_climbing_images, precompute_*, render_results_table. |
 | `configs/` | `base.yaml` (all defaults, commented) + experiment overrides; `configs/datasets/*.yaml` = dataset paths/options. |
 | `tests/` | pytest suite (79 tests; `-m slow` = GPU integration: temporal invariance, grad flow). |
-| `tools/` | `view_dataset.py` (FastAPI browser), `climbing_contact_stats.py` (source-tree stats, SMPL-X). |
+| `viewer/` | Standalone FastAPI dataset inspector with frame/sequence video skeleton views and still-image contact meshes. |
+| `tools/` | Legacy `view_dataset.py` browser and `climbing_contact_stats.py` (source-tree stats, SMPL-X). |
 | `legacy/` | Superseded code kept for reference — see `legacy/README.md` for why each item is there and what functionality it still uniquely has. |
 | `conversion/smplx_smpl_conversion/` | SMPL-X→SMPL vertex/param/contact conversion (used by the climbing-images builder). |
 | `output/` | New training runs (gitignored). `train/output/` holds pre-refactor historical runs. |

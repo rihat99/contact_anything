@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Contact Atlas — Dataset Inspector</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-mark" aria-hidden="true">
+      <span></span><span></span><span></span>
+    </div>
+    <div class="brand-copy">
+      <strong>Contact Atlas</strong>
+      <small>Dataset inspector</small>
+    </div>
+    <div class="topbar-status" id="topbar-status">
+      <span class="status-dot"></span><span>Ready</span>
+    </div>
+  </header>
+
+  <div class="app-shell">
+    <aside class="sidebar">
+      <section class="control-section">
+        <label class="control-label" for="dataset-select">Dataset</label>
+        <div class="select-wrap">
+          <select id="dataset-select" aria-label="Dataset"></select>
+        </div>
+        <p class="dataset-description" id="dataset-description"></p>
+      </section>
+
+      <section class="control-section">
+        <span class="control-label">Source split</span>
+        <div class="segment" id="split-group" role="group" aria-label="Source split"></div>
+        <p class="field-note" id="split-note"></p>
+      </section>
+
+      <section class="control-section" id="mode-section">
+        <span class="control-label">Instance shape</span>
+        <div class="segment" id="mode-group" role="group" aria-label="Instance shape"></div>
+        <div class="sequence-options" id="sequence-options">
+          <label>Frames
+            <select id="clip-length">
+              <option>3</option><option selected>5</option><option>8</option><option>12</option>
+            </select>
+          </label>
+          <label>Stride
+            <select id="frame-stride">
+              <option selected>1</option><option>2</option><option>3</option><option>4</option>
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section class="control-section">
+        <span class="control-label">Display</span>
+        <label class="switch-row">
+          <span><strong>Person outline</strong><small>Show segmentation boundary</small></span>
+          <input type="checkbox" id="show-mask" checked><i></i>
+        </label>
+        <label class="switch-row">
+          <span><strong>Bounding box</strong><small>Show person extent</small></span>
+          <input type="checkbox" id="show-bbox"><i></i>
+        </label>
+        <label class="switch-row" id="confidence-row">
+          <span><strong>Label confidence</strong><small>Low certainty fades toward gray</small></span>
+          <input type="checkbox" id="show-confidence" checked><i></i>
+        </label>
+      </section>
+
+      <section class="legend" id="joint-legend">
+        <span><i class="legend-dot contact"></i>Contact</span>
+        <span><i class="legend-dot clear"></i>Non-contact</span>
+        <span><i class="legend-dot unknown"></i>Not supervised</span>
+      </section>
+
+      <section class="keyboard-help">
+        <span><kbd>←</kbd><kbd>→</kbd> browse</span>
+        <span><kbd>R</kbd> random</span>
+      </section>
+    </aside>
+
+    <main class="workspace">
+      <div class="sample-heading">
+        <div>
+          <div class="eyebrow" id="sample-context">SELECTING SAMPLE</div>
+          <h1 id="sample-key">Loading…</h1>
+        </div>
+        <div class="heading-badges" id="heading-badges"></div>
+      </div>
+
+      <div class="stats-row" id="stats-row"></div>
+      <div class="error-panel hidden" id="error-panel" role="alert"></div>
+      <div class="viewer-stage" id="viewer-stage" aria-live="polite"></div>
+    </main>
+  </div>
+
+  <nav class="navigation" aria-label="Sample navigation">
+    <button class="button secondary" id="previous-button" title="Previous sample (Left arrow)">
+      <span aria-hidden="true">←</span> Previous
+    </button>
+    <button class="button secondary icon-button" id="random-button" title="Random sample (R)">
+      <span aria-hidden="true">↝</span><span>Random</span>
+    </button>
+    <div class="position-control">
+      <span>Instance</span>
+      <input id="index-input" type="number" min="0" value="0" aria-label="Instance index">
+      <span id="total-label">of —</span>
+    </div>
+    <button class="button primary" id="next-button" title="Next sample (Right arrow)">
+      Next <span aria-hidden="true">→</span>
+    </button>
+  </nav>
+
+  <div class="loading-layer hidden" id="loading-layer">
+    <div class="spinner"></div><span>Reading instance…</span>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
