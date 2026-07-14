@@ -48,6 +48,8 @@ def _synth_frames(n: int):
             "cam_int": (np.eye(3, dtype=np.float32) * 500.0),
             "joint_contact": gt,
             "joint_mask": torch.ones(NUM_BODY_22),
+            "joint_supervised": torch.ones(NUM_BODY_22),
+            "joint_confidence": torch.ones(NUM_BODY_22),
             "frame_pos_sec": t * 0.1,
             "frame_valid": True,
         })

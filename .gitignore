@@ -122,6 +122,6 @@ sandbox*
 # *.sh
 
 images
-output
+*output/
 inference_samples
 dataset/damon_mhr_contact

@@ -24,6 +24,10 @@ class RunLogger:
                  resume_id: Optional[str] = None):
         out_dir = Path(out_dir)
         self.tb = None
+        selected_metrics = cfg["logging"].get("tensorboard_metrics")
+        self.tensorboard_metrics = (
+            None if selected_metrics is None else frozenset(selected_metrics)
+        )
         if cfg["logging"]["tensorboard"]:
             from torch.utils.tensorboard import SummaryWriter
             self.tb = SummaryWriter(str(out_dir / "tensorboard"))
@@ -68,7 +72,8 @@ class RunLogger:
         step = int(step)
         if self.tb is not None:
             for key, val in scalars.items():
-                self.tb.add_scalar(key, val, step)
+                if self.tensorboard_metrics is None or key in self.tensorboard_metrics:
+                    self.tb.add_scalar(key, val, step)
         if self.wandb is not None:
             self.wandb.log(scalars, step=step)
 

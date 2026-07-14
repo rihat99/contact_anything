@@ -207,10 +207,10 @@ class SAM3DBody(BaseModel):
         # Contact prediction head and tokens
         if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
             contact_head_cfg = self.cfg.MODEL.get("CONTACT_HEAD", dict())
-            # Each keypoint-anchored contact token grid-samples image features at
-            # one MHR70 keypoint. KEYPOINT_INDICES selects which (default = first
-            # 21: body joints + toes/heels; the recommended climbing set adds the
-            # wrists 41/62 and nose 0). num_contact_tokens follows the list length.
+            # Each anchored contact token grid-samples image features at one
+            # explicitly selected MHR70 keypoint. The list is fully configurable
+            # (for example [62, 41, 13, 14] for both wrists and ankles), and the
+            # number of anchored tokens follows its length.
             kp_indices = contact_head_cfg.get("KEYPOINT_INDICES", None)
             if kp_indices is None:
                 kp_indices = list(range(21))
@@ -228,7 +228,7 @@ class SAM3DBody(BaseModel):
                 self.total_contact_tokens, self.cfg.MODEL.DECODER.DIM
             )
             # One independent prediction head per enabled target. TARGETS maps a
-            # target name -> output dim (topology verts for 'vertex', 22 for 'joint').
+            # target name to its configured output dimension.
             targets = contact_head_cfg.get(
                 "TARGETS", {"VERTEX": contact_head_cfg.get("NUM_VERTICES", 18439)}
             )
@@ -271,6 +271,8 @@ class SAM3DBody(BaseModel):
                     dropout=tcfg.get("DROPOUT", 0.0),
                     placement=tcfg.get("PLACEMENT", "post_decoder"),
                     image_dim=self.backbone.embed_dims,
+                    bottleneck_dim=tcfg.get("BOTTLENECK_DIM", 256),
+                    position_scale=tcfg.get("POSITION_SCALE", 1.0),
                 )
             # --- end contact temporal hook ---
 
@@ -624,7 +626,7 @@ class SAM3DBody(BaseModel):
         # Now for 3D
         kp3d_token_update_fn = self.keypoint3d_token_update_fn
 
-        # Contact token update (PE + image feature sampling at wrist/ankle locations)
+        # Contact token update (PE + local image-feature sampling at its anchors).
         ct_token_update_fn = (
             self.contact_token_update_fn
             if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False)
@@ -2141,23 +2143,24 @@ class SAM3DBody(BaseModel):
         2. Samples image features at those 2D positions via grid_sample and adds
            them to the contact token embeddings.
 
-        Each of the 21 contact tokens corresponds to MHR70 keypoint index i
-        (first 21: nose through right-heel, covering body+toes/heels).
+        Every anchored contact token corresponds to the MHR70 keypoint at the
+        same position in ``contact_keypoint_indices``. Global contact tokens are
+        deliberately excluded from this local update.
         """
         # Skip after the last layer (same pattern as keypoint_token_update_fn)
         if layer_idx == len(decoder_layers) - 1:
             return token_embeddings, token_augment, pose_output, layer_idx
 
         num_ct = self.num_contact_tokens
-        kp_indices = self.contact_keypoint_indices  # list(range(num_contact_tokens))
+        kp_indices = self.contact_keypoint_indices
 
         # Get predicted 2D keypoint positions in crop space (-0.5 to 0.5)
         pred_kps_2d = pose_output["pred_keypoints_2d_cropped"].clone()  # [B, 70, 2]
         pred_kps_depth = pose_output["pred_keypoints_2d_depth"].clone()  # [B, 70]
 
-        # Select the 4 keypoints corresponding to contact tokens
-        contact_kps_2d = pred_kps_2d[:, kp_indices]  # [B, 4, 2]
-        contact_kps_depth = pred_kps_depth[:, kp_indices]  # [B, 4]
+        # Select the configured keypoint anchor for every anchored contact token.
+        contact_kps_2d = pred_kps_2d[:, kp_indices]       # [B, K_anchor, 2]
+        contact_kps_depth = pred_kps_depth[:, kp_indices]  # [B, K_anchor]
 
         # Validity check: outside image bounds or behind camera
         contact_kps_01 = contact_kps_2d + 0.5  # convert to 0-1 range
@@ -2167,7 +2170,7 @@ class SAM3DBody(BaseModel):
             | (contact_kps_01[:, :, 1] < 0)
             | (contact_kps_01[:, :, 1] > 1)
             | (contact_kps_depth < 1e-5)
-        )  # [B, 4]
+        )  # [B, K_anchor]
 
         # --- 1. Update positional encoding ---
         token_augment = token_augment.clone()

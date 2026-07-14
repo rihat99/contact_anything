@@ -1,10 +1,11 @@
 """Contact targets: topologies, joint sets, and vertex->joint ownership.
 
-Two supervision targets share the 24 contact tokens through independent heads:
+The model may expose independent heads over the configured contact-token bank:
 
 * ``vertex`` — per-vertex contact in the body-model topology (SMPL 6890 or
   SMPL-X 10475).
-* ``joint`` — per-joint contact over the 22-joint SMPL-X body set.
+* ``joint`` — contact over either the 22-joint SMPL-X body set or the reduced
+  four-extremity set selected by ``contact.targets.joint.joint_set``.
 
 Vertex labels come from the still-image datasets; joint labels come from the
 ClimbingVideos dataset.
@@ -44,9 +45,26 @@ SMPLX_BODY_22 = [
 ]
 NUM_BODY_22 = len(SMPLX_BODY_22)
 
+# Four contact endpoints used by the climbing-only classifier. Hands are already
+# wrist+finger aggregates in ClimbingVideos_v1; each foot combines the distinct
+# ankle and big-toe/foot labels with a tri-state OR (see
+# :func:`reduce_body22_to_extremities`).
+EXTREMITY_4_NAMES = ("left_hand", "right_hand", "left_foot", "right_foot")
+EXTREMITY_4_GROUPS = ((20,), (21,), (7, 10), (8, 11))
+NUM_EXTREMITY_4 = len(EXTREMITY_4_NAMES)
+
+JOINT_SET_NAMES = {
+    "smplx_body_22": tuple(SMPLX_BODY_22),
+    "extremities_4": EXTREMITY_4_NAMES,
+}
+
 # Joints an annotator can label in the manual test set (evaluation only). The
 # other 8 (pelvis, spine1/2/3, neck, collars, head) stay non-contact.
 OBSERVABLE_14 = [1, 2, 4, 5, 7, 8, 10, 11, 16, 17, 18, 19, 20, 21]
+
+# The manual test protocol does not expose these joints. On a reviewed frame the
+# dataset schema defines them as non-contact rather than unknown.
+ALWAYS_NON_CONTACT_8 = [0, 3, 6, 9, 12, 13, 14, 15]
 
 # SMPL joints 22/23 are the hands; fold them onto the wrists (20/21) so a
 # 24-joint SMPL ownership map lands in the 22-joint body set.
@@ -131,8 +149,92 @@ def derive_joint_contact(vertex_contact: Tensor, owner: Tensor) -> Tensor:
     return out.reshape(*lead, NUM_BODY_22)
 
 
-def _joint_subset_mask(supervise_subset) -> Tensor:
-    """Return a ``(22,)`` float mask of supervised joints (1=supervised)."""
+def joint_set_names(joint_set: str) -> tuple[str, ...]:
+    """Return ordered output names for a supported joint-contact set."""
+    try:
+        return JOINT_SET_NAMES[joint_set]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown joint_set {joint_set!r}; choose from {sorted(JOINT_SET_NAMES)}") from exc
+
+
+def joint_set_num_outputs(joint_set: str) -> int:
+    """Return the contact-head output dimension for ``joint_set``."""
+    return len(joint_set_names(joint_set))
+
+
+def reduce_body22_to_extremities(
+    contact: Tensor,
+    supervised: Tensor,
+    confidence: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Reduce body-22 labels to four extremities with tri-state OR semantics.
+
+    ``contact``, ``supervised`` and ``confidence`` must have the same shape
+    ``(..., 22)``. A group is a known positive when any *supervised* member is
+    positive, even if another member is unknown. It is a known negative only
+    when every member is supervised and free; a partial negative stays ignored.
+    Positive confidence is the maximum over supervised positive members, while
+    known-free confidence is the mean over all group members. This matches the
+    ClimbingVideos exporter convention used to fold fingers into each hand.
+
+    :returns: ``(contact_4, supervised_4, confidence_4)`` as float tensors.
+    """
+    contact = torch.as_tensor(contact, dtype=torch.float32)
+    supervised = torch.as_tensor(supervised, dtype=torch.float32, device=contact.device)
+    confidence = torch.as_tensor(confidence, dtype=torch.float32, device=contact.device)
+    if contact.shape != supervised.shape or contact.shape != confidence.shape:
+        raise ValueError(
+            "body-22 contact/supervised/confidence shapes must match; got "
+            f"{tuple(contact.shape)}, {tuple(supervised.shape)}, {tuple(confidence.shape)}")
+    if contact.ndim < 1 or contact.shape[-1] != NUM_BODY_22:
+        raise ValueError(f"body-22 reduction expects (..., 22); got {tuple(contact.shape)}")
+
+    is_contact = contact > 0.5
+    is_supervised = supervised > 0
+    confidence = torch.nan_to_num(confidence, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
+    out_contact = []
+    out_supervised = []
+    out_confidence = []
+    for group in EXTREMITY_4_GROUPS:
+        indices = list(group)
+        group_contact = is_contact[..., indices]
+        group_supervised = is_supervised[..., indices]
+        group_confidence = confidence[..., indices]
+        supervised_positive = group_contact & group_supervised
+        positive = supervised_positive.any(dim=-1)
+        all_known = group_supervised.all(dim=-1)
+        known = positive | all_known
+
+        positive_confidence = torch.where(
+            supervised_positive,
+            group_confidence,
+            torch.full_like(group_confidence, -torch.inf),
+        ).amax(dim=-1)
+        free_confidence = group_confidence.mean(dim=-1)
+        reduced_confidence = torch.where(
+            positive,
+            positive_confidence,
+            torch.where(all_known, free_confidence, torch.zeros_like(free_confidence)),
+        )
+        out_contact.append(positive.to(torch.float32))
+        out_supervised.append(known.to(torch.float32))
+        out_confidence.append(reduced_confidence)
+
+    return (
+        torch.stack(out_contact, dim=-1),
+        torch.stack(out_supervised, dim=-1),
+        torch.stack(out_confidence, dim=-1),
+    )
+
+
+def _joint_subset_mask(supervise_subset, joint_set: str) -> Tensor:
+    """Return the output-space float supervision-subset mask."""
+    if joint_set == "extremities_4":
+        if supervise_subset is not None:
+            raise ValueError("joint.supervise_subset must be null for joint_set='extremities_4'")
+        return torch.ones(NUM_EXTREMITY_4, dtype=torch.float32)
+
     mask = torch.zeros(NUM_BODY_22, dtype=torch.float32)
     if supervise_subset is None:
         mask[:] = 1.0
@@ -155,17 +257,22 @@ class TargetSpec:
     :param enabled: Enabled target names in canonical order (``vertex`` before ``joint``).
     :param topology: Vertex topology name (``"smpl"`` / ``"smplx"``).
     :param vertex_dims: Vertex head output size (topology vertex count).
-    :param joint_dims: Joint head output size (always 22).
+    :param joint_set: Semantic joint-contact output set.
+    :param joint_names: Ordered semantic output names.
+    :param joint_dims: Joint head output size (22 or 4).
     :param derive_from_vertex: Lift vertex labels to joint labels for image data.
-    :param joint_subset_mask: ``(22,)`` mask restricting supervised joints.
+    :param joint_subset_mask: Output-space mask restricting supervised joints.
     :param owner: ``(6890,)`` vertex->joint owner, present iff ``derive_from_vertex``.
     """
 
     enabled: list[str]
     topology: str
     vertex_dims: int
+    joint_set: str = "smplx_body_22"
+    joint_names: tuple[str, ...] = tuple(SMPLX_BODY_22)
     joint_dims: int = NUM_BODY_22
     derive_from_vertex: bool = False
+    use_confidence_weights: bool = False
     joint_subset_mask: Tensor = field(default_factory=lambda: torch.ones(NUM_BODY_22))
     owner: Optional[Tensor] = None
     #: Bounded cache of per-``betas`` ownership maps (key = rounded-betas bytes).
@@ -177,14 +284,20 @@ class TargetSpec:
         targets = cfg["contact"]["targets"]
         enabled = [name for name in ("vertex", "joint") if targets[name]["enabled"]]
         jcfg = targets["joint"]
+        joint_set = str(jcfg.get("joint_set", "smplx_body_22"))
+        names = joint_set_names(joint_set)
         derive = bool(jcfg["derive_from_vertex"])
         owner = compute_vertex_joint_owner() if (derive and "joint" in enabled) else None
         return cls(
             enabled=enabled,
             topology=topology,
             vertex_dims=topology_num_vertices(topology),
+            joint_set=joint_set,
+            joint_names=names,
+            joint_dims=len(names),
             derive_from_vertex=derive,
-            joint_subset_mask=_joint_subset_mask(jcfg["supervise_subset"]),
+            use_confidence_weights=bool(jcfg.get("use_confidence_weights", False)),
+            joint_subset_mask=_joint_subset_mask(jcfg["supervise_subset"], joint_set),
             owner=owner,
         )
 
@@ -220,8 +333,8 @@ class TargetSpec:
         """Build ``{target: {'gt': [B, D], 'mask': [B, D]}}`` from per-frame dicts.
 
         A frame carries native labels: image frames a ``contact`` ``[V]`` vertex
-        tensor; video frames ``joint_contact`` / ``joint_mask`` ``[22]``. Targets a
-        frame does not supervise get all-zero masks (ignored by the loss).
+        tensor; video frames carry raw body-22 contact, supervision and confidence.
+        Targets a frame does not supervise get all-zero masks (ignored by the loss).
         """
         batch_size = len(frames)
         out: dict[str, dict[str, Tensor]] = {}
@@ -242,12 +355,37 @@ class TargetSpec:
             subset = self.joint_subset_mask
             for i, frame in enumerate(frames):
                 if "joint_contact" in frame:
-                    gt[i] = torch.as_tensor(frame["joint_contact"], dtype=torch.float32)
-                    mask[i] = torch.as_tensor(frame["joint_mask"], dtype=torch.float32) * subset
+                    if self.joint_set == "smplx_body_22":
+                        gt[i] = torch.as_tensor(frame["joint_contact"], dtype=torch.float32)
+                        mask[i] = torch.as_tensor(frame["joint_mask"], dtype=torch.float32) * subset
+                    else:
+                        missing = {
+                            name for name in ("joint_supervised", "joint_confidence")
+                            if name not in frame
+                        }
+                        if missing:
+                            raise ValueError(
+                                "joint_set='extremities_4' requires raw body-22 "
+                                f"{sorted(missing)} in each video frame")
+                        reduced_gt, reduced_supervised, reduced_confidence = (
+                            reduce_body22_to_extremities(
+                                frame["joint_contact"],
+                                frame["joint_supervised"],
+                                frame["joint_confidence"],
+                            )
+                        )
+                        gt[i] = reduced_gt
+                        mask[i] = reduced_supervised * (
+                            reduced_confidence if self.use_confidence_weights else 1.0)
                 elif self.derive_from_vertex and frame.get("contact") is not None:
                     contact = torch.as_tensor(frame["contact"], dtype=torch.float32)
-                    gt[i] = derive_joint_contact(contact, self._owner_for_frame(frame))
-                    mask[i] = subset
+                    body22 = derive_joint_contact(contact, self._owner_for_frame(frame))
+                    if self.joint_set == "smplx_body_22":
+                        gt[i] = body22
+                        mask[i] = subset
+                    else:
+                        gt[i], mask[i], _ = reduce_body22_to_extremities(
+                            body22, torch.ones_like(body22), torch.ones_like(body22))
             out["joint"] = {"gt": gt, "mask": mask}
 
         return out

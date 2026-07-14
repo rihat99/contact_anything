@@ -1,15 +1,27 @@
-# ClimbingVideos_v1 per-joint (22) contact WITH temporal attention (Phase 3).
-# Same setup as climbing_videos_joint.yaml (joint target, wrist/nose anchors),
-# plus the zero-gated ContactTemporalModule over the T=8 contact-token clips
-# (post_decoder placement). frames_per_clip=8 comes from base.yaml's sequence block.
+# ClimbingVideos_v1 four-extremity contact WITH temporal attention (Phase 3).
+# Same four token/output setup as climbing_videos_joint.yaml, plus the zero-gated
+# Lightweight ContactTemporalModule over T=5 contact-token clips after the decoder.
 base: configs/climbing_videos_joint.yaml
 
 model:
+  init_contact_checkpoint: null       # train the complete contact stack from scratch
   temporal:
     enabled: true
     placement: post_decoder
-    attend: joint
+    bottleneck_dim: 256
+    num_layers: 1
+    num_heads: 4
+    mlp_ratio: 2.0
+    attend: per_token                  # each limb mixes only with itself through time
     causal: false
+    position_scale: 30.0               # 30-fps seconds -> well-separated frame offsets
+
+data:
+  frames_per_batch: 60              # 12 clips/GPU; global batch = 120 frames on two GPUs
+  sequence: {frames_per_clip: 5, frame_stride: 1, jitter: true}
+
+optim:
+  lr: 3.75e-4                       # global-batch scaling from 4e-4 at 128 frames
 
 output:
-  exp_name: contact_climbing_videos_temporal
+  exp_name: climb4_t5

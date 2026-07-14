@@ -34,7 +34,9 @@ def build_head(cfg, head_type="mhr", enable_hand_model=False, default_scale_fact
         return ContactHead(
             input_dim=cfg.MODEL.DECODER.DIM,
             num_contact_tokens=num_kp + num_gbl,
-            num_vertices=dims,
+            # ContactHead preserves this arbitrary output size for pooled modes;
+            # per-token mode validates that it equals the total token count.
+            output_dims=dims,
             mlp_depth=contact_cfg.get("MLP_DEPTH", 2),
             mlp_channel_div_factor=contact_cfg.get("MLP_CHANNEL_DIV_FACTOR", 4),
             pool_mode=contact_cfg.get("POOL_MODE", "attention"),

@@ -15,7 +15,8 @@ attribute is ``contact_temporal``), so the contact-only freeze/eval filters in
 Three placements are wired in :class:`sam_3d_body.models.meta_arch.SAM3DBody`:
 
 * ``post_decoder`` / ``between_layers`` — attention over the ``[B, K, C]`` contact
-  tokens (:meth:`ContactTemporalModule.forward`).
+  tokens through a configurable low-dimensional residual adapter
+  (:meth:`ContactTemporalModule.forward`).
 * ``pre_decoder`` — per-location temporal attention over the decoder image tensor
   through a ``1280 -> 256 -> 1280`` bottleneck (:meth:`forward_image`). The single
   output gate ``img_gamma`` (zero-init) sits downstream of the attention blocks,
@@ -151,7 +152,11 @@ class ContactTemporalModule(nn.Module):
     :param dropout: dropout inside attention/FFN (default 0.0).
     :param placement: ``post_decoder`` | ``between_layers`` | ``pre_decoder``.
     :param image_dim: backbone feature dim; required for ``pre_decoder``.
-    :param bottleneck_dim: bottleneck width for the ``pre_decoder`` image branch.
+    :param bottleneck_dim: attention width. Token placements project
+        ``dim -> bottleneck_dim -> dim`` and add only the temporal delta; the
+        image placement uses the same width for its image-feature bottleneck.
+    :param position_scale: multiplier applied to elapsed-second timestamps before
+        sinusoidal encoding. ``30`` turns 30-fps timestamps into frame offsets.
     """
 
     def __init__(
@@ -165,7 +170,8 @@ class ContactTemporalModule(nn.Module):
         dropout: float = 0.0,
         placement: str = "post_decoder",
         image_dim: Optional[int] = None,
-        bottleneck_dim: int = 256,
+        bottleneck_dim: Optional[int] = None,
+        position_scale: float = 1.0,
     ):
         super().__init__()
         if attend not in ("joint", "per_token"):
@@ -177,12 +183,15 @@ class ContactTemporalModule(nn.Module):
         self.attend = attend
         self.causal = bool(causal)
         self.placement = placement
+        self.position_scale = float(position_scale)
+        if not math.isfinite(self.position_scale) or self.position_scale <= 0:
+            raise ValueError("position_scale must be finite and positive")
 
         if placement == "pre_decoder":
             if image_dim is None:
                 raise ValueError("pre_decoder placement needs image_dim")
             self.image_dim = int(image_dim)
-            self.bottleneck_dim = int(bottleneck_dim)
+            self.bottleneck_dim = int(256 if bottleneck_dim is None else bottleneck_dim)
             block_dim = self.bottleneck_dim
             self.img_in_proj = nn.Linear(self.image_dim, block_dim)
             self.img_out_proj = nn.Linear(block_dim, self.image_dim)
@@ -191,7 +200,13 @@ class ContactTemporalModule(nn.Module):
             # projection weights, mirroring the gamma_attn/gamma_ffn token gates.
             self.img_gamma = nn.Parameter(torch.zeros(self.image_dim))
         else:
-            block_dim = dim
+            self.bottleneck_dim = int(dim if bottleneck_dim is None else bottleneck_dim)
+            block_dim = self.bottleneck_dim
+            if block_dim != dim:
+                self.token_in_proj = nn.Linear(dim, block_dim)
+                # Bias-free so a zero temporal delta maps to an exact zero and the
+                # complete adapter remains bitwise identity at initialization.
+                self.token_out_proj = nn.Linear(block_dim, dim, bias=False)
 
         self.blocks = nn.ModuleList(
             _TemporalBlock(block_dim, num_heads, mlp_ratio, dropout)
@@ -252,11 +267,12 @@ class ContactTemporalModule(nn.Module):
 
         A lone frame (``seq_len == 1``) has no temporal position, so the encoding
         is exactly zero. ``pos_sec`` (elapsed seconds, relative to window start)
-        makes the encoding stride/fps aware.
+        keeps the encoding stride/fps aware; ``position_scale`` controls how
+        strongly nearby frames are separated.
         """
         if seq_len == 1 or pos_sec is None:
             return torch.zeros(n_clips, seq_len, dim, device=device, dtype=dtype)
-        pos = pos_sec.to(device=device).view(n_clips, seq_len)
+        pos = pos_sec.to(device=device).view(n_clips, seq_len) * self.position_scale
         return sinusoidal_time_encoding(pos, dim).to(dtype)
 
     # ------------------------------------------------------------------ forwards
@@ -284,15 +300,21 @@ class ContactTemporalModule(nn.Module):
         attend = self.attend if attend is None else attend
         causal = self.causal if causal is None else causal
 
-        b_flat, K, C = tokens.shape
+        b_flat, K, input_dim = tokens.shape
+        if input_dim != self.dim:
+            raise AssertionError(
+                f"token dim {input_dim} does not match configured dim {self.dim}")
         if b_flat % seq_len != 0:
             raise AssertionError(
                 f"batch {b_flat} not divisible by seq_len {seq_len}")
         n_clips = b_flat // seq_len
-        device, dtype = tokens.device, tokens.dtype
+        residual = tokens
+        working = self.token_in_proj(tokens) if hasattr(self, "token_in_proj") else tokens
+        C = working.shape[-1]
+        device, dtype = working.device, working.dtype
         num_heads = self.blocks[0].attn.num_heads
 
-        clips = tokens.view(n_clips, seq_len, K, C)
+        clips = working.view(n_clips, seq_len, K, C)
         frame_pe = self._pos_emb(frame_pos_sec, seq_len, n_clips, C, device, dtype)
 
         if attend == "joint":
@@ -320,7 +342,12 @@ class ContactTemporalModule(nn.Module):
             out = x.reshape(n_clips, seq_len, K, C)
         else:
             out = x.reshape(n_clips, K, seq_len, C).permute(0, 2, 1, 3)
-        return out.reshape(b_flat, K, C)
+        out = out.reshape(b_flat, K, C)
+        if hasattr(self, "token_out_proj"):
+            # The temporal blocks are exact identities while their gammas are
+            # zero. Project only their delta, not the spatial token itself.
+            return residual + self.token_out_proj(out - working)
+        return out
 
     def forward_image(
         self,

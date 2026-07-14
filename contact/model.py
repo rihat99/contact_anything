@@ -71,12 +71,14 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
     model_cfg.MODEL.TEMPORAL = CfgNode({
         "ENABLED": bool(tcfg.get("enabled", False)),
         "PLACEMENT": str(tcfg.get("placement", "post_decoder")),
-        "NUM_LAYERS": int(tcfg.get("num_layers", 2)),
-        "NUM_HEADS": int(tcfg.get("num_heads", 8)),
-        "MLP_RATIO": float(tcfg.get("mlp_ratio", 4.0)),
+        "BOTTLENECK_DIM": int(tcfg.get("bottleneck_dim", 256)),
+        "NUM_LAYERS": int(tcfg.get("num_layers", 1)),
+        "NUM_HEADS": int(tcfg.get("num_heads", 4)),
+        "MLP_RATIO": float(tcfg.get("mlp_ratio", 2.0)),
         "ATTEND": str(tcfg.get("attend", "joint")),
         "CAUSAL": bool(tcfg.get("causal", False)),
         "DROPOUT": float(tcfg.get("dropout", 0.0)),
+        "POSITION_SCALE": float(tcfg.get("position_scale", 1.0)),
     })
 
     # Efficiency flags (Phase 4). Patched even when off so the model config is

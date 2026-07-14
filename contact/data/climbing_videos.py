@@ -1,11 +1,13 @@
 """ClimbingVideos_v1 — per-joint (22) contact over windows of video frames.
 
 Dataset root ``/data3/rikhat.akizhanov/datasets/ClimbingVideos_v1`` (schema in
-``dataset_info.json``). Only the ``train/`` directory is used here; it is split
-into train/val by *source video* (see :func:`contact.data.splits.group_train_val_split`).
-The ``test/`` directory holds manual annotations; a scene still marked ``pending``
-raises when its labels are requested, while a *completed* scene supervises only
-the joints the annotator labelled (``valid_mask`` & ``annotated_22``).
+``dataset_info.json``). The generated labels live in ``train/``; training may
+either hold out source videos for validation or use all of them and evaluate on
+manual annotations from ``test/``. A test scene still marked ``pending`` raises
+when requested explicitly and is skipped by automatic completed-scene discovery.
+A *completed* scene uses the tri-state
+``annotated_22`` mask for the 14 observable joints and treats the other eight as
+schema-defined non-contact on reviewed frames.
 
 An **item** is one ``(scene, person, window)`` of ``T`` frames at a given stride.
 Windows tile each scene with step ``T * stride``; the train split jitters the
@@ -38,7 +40,7 @@ import yaml
 from PIL import Image
 from torch.utils.data import Dataset
 
-from ..targets import NUM_BODY_22
+from ..targets import ALWAYS_NON_CONTACT_8, NUM_BODY_22, OBSERVABLE_14
 
 DEFAULT_ROOT = "/data3/rikhat.akizhanov/datasets/ClimbingVideos_v1"
 
@@ -48,6 +50,19 @@ def list_scenes(root: str | Path, split_dir: str = "train") -> list[str]:
     base = Path(root) / split_dir
     label_file = "labels.npz" if split_dir == "train" else "inputs.npz"
     return sorted(s.name for s in base.iterdir() if s.is_dir() and (s / label_file).is_file())
+
+
+def list_completed_test_scenes(root: str | Path) -> list[str]:
+    """Return test scenes with real, completed manual contact annotations."""
+    completed = []
+    for scene in list_scenes(root, "test"):
+        contacts_path = Path(root) / "test" / scene / "contacts.npz"
+        if not contacts_path.is_file():
+            continue
+        with np.load(contacts_path, allow_pickle=True) as contacts:
+            if "pending" in contacts.files and not bool(contacts["pending"]):
+                completed.append(scene)
+    return completed
 
 
 class ClimbingVideosDataset(Dataset):
@@ -86,7 +101,11 @@ class ClimbingVideosDataset(Dataset):
         self._epoch = 0
 
         if scenes is None:
-            scenes = list_scenes(root, split_dir)
+            scenes = (
+                list_completed_test_scenes(root)
+                if split_dir == "test" and require_labels
+                else list_scenes(root, split_dir)
+            )
 
         self._scenes: dict[str, dict] = {}
         self._items: list[tuple[str, int, int, int]] = []   # (scene, person, base_start, jitter_range)
@@ -110,8 +129,8 @@ class ClimbingVideosDataset(Dataset):
                     bases.append(max_start)
                 for base in bases:
                     positions = base + np.arange(self.T) * self.stride
-                    if valid_mask[person, positions].mean() < 0.5:
-                        continue                            # >50% invalid -> skip window
+                    if not valid_mask[person, positions].all():
+                        continue  # every temporal row needs a real bbox/camera crop
                     jitter_range = max(1, min(step, max_start - base + 1))
                     self._items.append((scene, person, base, jitter_range))
 
@@ -134,20 +153,42 @@ class ClimbingVideosDataset(Dataset):
                         f"{scene}: contacts.npz is a pending placeholder (all-zero) — "
                         f"joint labels are unavailable for the test split")
                 joint_contact = contacts["joint_contact_22"]
-                # Completed manual annotations are tri-state: only the joints the
-                # annotator labelled carry supervision (valid_mask & annotated_22
-                # downstream); unannotated entries are ignored, not false negatives.
+                # Manual labels are tri-state for the 14 observable joints. On a
+                # reviewed frame the other eight joints are schema-defined fixed
+                # negatives. Current exports already encode this in annotated_22;
+                # normalize older files idempotently while leaving wholly unreviewed
+                # frames unsupervised.
                 annotated = contacts["annotated_22"].astype(bool)
+                reviewed = annotated[..., OBSERVABLE_14].any(axis=-1)
+                fixed_contact = joint_contact[..., ALWAYS_NON_CONTACT_8]
+                if np.any(fixed_contact):
+                    raise ValueError(
+                        f"{scene}: test labels mark a schema-fixed non-contact joint "
+                        f"as contact")
+                annotated[..., ALWAYS_NON_CONTACT_8] |= reviewed[..., None]
                 # The completed test set does not ship confidence weights.
                 if self.use_confidence_weights and "contact_conf_22" in contacts.files:
                     contact_conf = contacts["contact_conf_22"]
+        bbox = npz["bbox"].astype(np.float32)             # [P, N, 4] xyxy
+        valid_mask = npz["valid_mask"].astype(bool)       # [P, N]
+        bbox_finite = np.isfinite(bbox).all(axis=-1)
+        bbox_positive = ((bbox[..., 2] - bbox[..., 0]) > 0) & (
+            (bbox[..., 3] - bbox[..., 1]) > 0)
+        bbox_good = bbox_finite & bbox_positive
+        bad_valid = valid_mask & ~bbox_good
+        if np.any(bad_valid):
+            person, frame = np.argwhere(bad_valid)[0]
+            raise ValueError(
+                f"{scene}: valid person/frame ({person}, {frame}) has invalid bbox "
+                f"{bbox[person, frame].tolist()}")
+
         return {
             "dir": scene_dir,
             "object_ids": npz["object_ids"].astype(np.int64),
             "frame_indices": npz["frame_indices"].astype(np.int64),
-            "bbox": npz["bbox"].astype(np.float32),          # [P, N, 4] xyxy
+            "bbox": bbox,
             "intrinsics": npz["intrinsics"].astype(np.float32),  # [N, 3, 3]
-            "valid_mask": npz["valid_mask"].astype(bool),    # [P, N]
+            "valid_mask": valid_mask,
             "fps": float(npz["fps"]),
             "joint_contact": joint_contact,                  # [P, N, 22] bool or None
             "contact_conf": contact_conf,                    # [P, N, 22] f32 or None
@@ -176,11 +217,10 @@ class ClimbingVideosDataset(Dataset):
         data = self._scenes[scene]
         start = self._window_start(base, jitter_range, index)
         positions = start + np.arange(self.T) * self.stride
-        # Validity was checked at `base`, but jitter picks a different start; if the
-        # jittered window is >50% invalid fall back deterministically to `base`
-        # (guaranteed >=50% valid at build), so training batches are never mostly
-        # masked. Deterministic given (seed, epoch, index).
-        if start != base and data["valid_mask"][person, positions].mean() < 0.5:
+        # The indexed base window is all-valid. If jitter crosses a tracking gap,
+        # fall back deterministically so zero/degenerate invalid-frame bboxes never
+        # reach the crop transform or camera-ray conditioning.
+        if start != base and not data["valid_mask"][person, positions].all():
             start = base
             positions = base + np.arange(self.T) * self.stride
 
@@ -211,8 +251,10 @@ class ClimbingVideosDataset(Dataset):
                 if data["contact_conf"] is None:
                     joint_confidence = np.ones(NUM_BODY_22, np.float32)
                 else:
+                    raw_confidence = data["contact_conf"][person, pos].astype(np.float32)
                     joint_confidence = np.clip(
-                        data["contact_conf"][person, pos].astype(np.float32), 0.0, 1.0)
+                        np.nan_to_num(raw_confidence, nan=0.0, posinf=1.0, neginf=0.0),
+                        0.0, 1.0)
 
             # Keep the training contract intact: ``joint_mask`` is the score mask,
             # optionally confidence-weighted.  The two explicit fields let tools

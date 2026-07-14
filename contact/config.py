@@ -13,12 +13,13 @@ efficiency flags (Phase 4) narrow the autograd graph during contact training
 from __future__ import annotations
 
 import copy
+import math
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from .targets import topology_num_vertices
+from .targets import JOINT_SET_NAMES, topology_num_vertices
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,6 +38,7 @@ DEFAULTS: dict[str, Any] = {
     "model": {
         "checkpoint_path": f"{_CKPT_DIR}/model.ckpt",
         "mhr_model_path": f"{_CKPT_DIR}/assets/mhr_model.pt",
+        "init_contact_checkpoint": None,   # optional contact-only warm start (not optimiser resume)
         "mask_embed_type": "v2",
         "contact_head": {
             "contact_keypoint_indices": None,   # None = list(range(21))
@@ -51,12 +53,14 @@ DEFAULTS: dict[str, Any] = {
         "temporal": {                       # Phase 3: ContactTemporalModule
             "enabled": False,
             "placement": "post_decoder",    # post_decoder | between_layers | pre_decoder
-            "num_layers": 2,
-            "num_heads": 8,
-            "mlp_ratio": 4.0,
+            "bottleneck_dim": 256,           # project 1024-d contact tokens before attention
+            "num_layers": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
             "attend": "joint",              # joint (T*K tokens) | per_token (T per slot)
             "causal": False,
             "dropout": 0.0,
+            "position_scale": 1.0,           # multiplier on elapsed seconds before time PE
         },
     },
     "contact": {
@@ -76,7 +80,7 @@ DEFAULTS: dict[str, Any] = {
             },
             "joint": {
                 "enabled": False,
-                "joint_set": "smplx_body_22",
+                "joint_set": "smplx_body_22",  # smplx_body_22 | extremities_4
                 "weight": 1.0,
                 "supervise_subset": None,       # None=all 22; 'observable_14'; or index list
                 "derive_from_vertex": False,    # OFF by default (semantics differ, see targets.py)
@@ -93,6 +97,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "data": {
         "datasets": [],                 # list of {name, config[, split]}
+        "eval_split": "val",           # val | test (manual ClimbingVideos annotations)
         "val_ratio": 0.15,
         "seed": 42,
         "frames_per_batch": 32,         # B_clips = frames_per_batch // T (homogeneous T)
@@ -124,6 +129,7 @@ DEFAULTS: dict[str, Any] = {
             "mode": "online",
         },
         "tensorboard": True,
+        "tensorboard_metrics": None,    # null = all; otherwise exact scalar-tag allowlist
     },
     "output": {
         "dir": "./output",
@@ -139,6 +145,8 @@ _KNOWN_DATASETS = frozenset({"damon", "climbing", "climbing_videos"})
 _KNOWN_TARGETS = frozenset({"vertex", "joint"})
 _TEMPORAL_PLACEMENTS = frozenset({"post_decoder", "between_layers", "pre_decoder"})
 _TEMPORAL_ATTEND = frozenset({"joint", "per_token"})
+_KNOWN_JOINT_SETS = frozenset(JOINT_SET_NAMES)
+_CONTACT_POOL_MODES = frozenset({"attention", "concat", "per_token"})
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -201,6 +209,45 @@ def _validate_semantics(cfg: dict) -> None:
     if not any(targets[name]["enabled"] for name in _KNOWN_TARGETS):
         raise ValueError("no contact target is enabled — enable at least one of vertex/joint")
 
+    joint_cfg = targets["joint"]
+    joint_set = joint_cfg["joint_set"]
+    if joint_set not in _KNOWN_JOINT_SETS:
+        raise ValueError(
+            f"contact.targets.joint.joint_set must be one of {sorted(_KNOWN_JOINT_SETS)}; "
+            f"got {joint_set!r}")
+    if joint_set == "extremities_4" and joint_cfg["supervise_subset"] is not None:
+        raise ValueError(
+            "contact.targets.joint.supervise_subset must be null for "
+            "joint_set='extremities_4'")
+
+    contact_head = cfg["model"]["contact_head"]
+    pool_mode = str(contact_head["pool_mode"])
+    if pool_mode not in _CONTACT_POOL_MODES:
+        raise ValueError(
+            f"model.contact_head.pool_mode must be one of {sorted(_CONTACT_POOL_MODES)}; "
+            f"got {pool_mode!r}")
+    num_global = int(contact_head["num_global_tokens"])
+    if num_global < 0:
+        raise ValueError("model.contact_head.num_global_tokens must be non-negative")
+    if pool_mode == "per_token":
+        anchors = contact_head["contact_keypoint_indices"]
+        num_anchors = 21 if anchors is None else len(anchors)
+        token_count = num_anchors + num_global
+        output_dims = {
+            "vertex": topology_num_vertices(topology),
+            "joint": len(JOINT_SET_NAMES[joint_set]),
+        }
+        mismatched = {
+            name: output_dims[name]
+            for name in _KNOWN_TARGETS
+            if targets[name]["enabled"] and output_dims[name] != token_count
+        }
+        if mismatched:
+            raise ValueError(
+                "model.contact_head.pool_mode='per_token' requires every enabled "
+                f"target output dimension to equal the total token count {token_count}; "
+                f"got {mismatched}")
+
     temporal = cfg["model"]["temporal"]
     if temporal["placement"] not in _TEMPORAL_PLACEMENTS:
         raise ValueError(
@@ -210,6 +257,21 @@ def _validate_semantics(cfg: dict) -> None:
         raise ValueError(
             f"model.temporal.attend must be one of {sorted(_TEMPORAL_ATTEND)}; "
             f"got {temporal['attend']!r}")
+    bottleneck_dim = int(temporal["bottleneck_dim"])
+    num_heads = int(temporal["num_heads"])
+    if bottleneck_dim <= 0:
+        raise ValueError("model.temporal.bottleneck_dim must be positive")
+    if num_heads <= 0 or bottleneck_dim % num_heads:
+        raise ValueError(
+            "model.temporal.bottleneck_dim must be divisible by "
+            f"model.temporal.num_heads; got {bottleneck_dim} and {num_heads}")
+    if int(temporal["num_layers"]) <= 0:
+        raise ValueError("model.temporal.num_layers must be positive")
+    if float(temporal["mlp_ratio"]) <= 0:
+        raise ValueError("model.temporal.mlp_ratio must be positive")
+    position_scale = float(temporal["position_scale"])
+    if not math.isfinite(position_scale) or position_scale <= 0:
+        raise ValueError("model.temporal.position_scale must be finite and positive")
 
     for entry in cfg["data"]["datasets"]:
         if not isinstance(entry, dict) or "name" not in entry or "config" not in entry:
@@ -220,6 +282,23 @@ def _validate_semantics(cfg: dict) -> None:
         extra = set(entry) - {"name", "config", "split"}
         if extra:
             raise ValueError(f"unknown keys in data.datasets entry: {sorted(extra)}")
+
+    eval_split = str(cfg["data"]["eval_split"])
+    if eval_split not in ("val", "test"):
+        raise ValueError("data.eval_split must be 'val' or 'test'")
+    if eval_split == "test" and (
+        len(cfg["data"]["datasets"]) != 1
+        or cfg["data"]["datasets"][0]["name"] != "climbing_videos"
+    ):
+        raise ValueError(
+            "data.eval_split='test' requires a ClimbingVideos-only data config")
+
+    tb_metrics = cfg["logging"]["tensorboard_metrics"]
+    if tb_metrics is not None and (
+        not isinstance(tb_metrics, list)
+        or not all(isinstance(metric, str) and metric for metric in tb_metrics)
+    ):
+        raise ValueError("logging.tensorboard_metrics must be null or a list of scalar tags")
 
 
 def load_config(path: str | Path) -> dict:

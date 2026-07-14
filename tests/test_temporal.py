@@ -50,6 +50,18 @@ def test_zero_gamma_identity_with_invalid_and_causal():
     assert torch.equal(out, tokens)
 
 
+@pytest.mark.parametrize("attend", ["joint", "per_token"])
+def test_bottleneck_adapter_is_exact_identity_and_gets_live_gate_gradients(attend):
+    m = _module(attend=attend, bottleneck_dim=8, num_heads=2)
+    tokens = torch.randn(10, _K, _DIM, requires_grad=True)
+    out = m(tokens, 5, torch.arange(10, dtype=torch.float32), None)
+    assert torch.equal(out, tokens)
+    out.square().sum().backward()
+    gammas = [p for n, p in m.named_parameters() if "gamma_" in n]
+    assert gammas and all(g.grad is not None for g in gammas)
+    assert hasattr(m, "token_in_proj") and hasattr(m, "token_out_proj")
+
+
 # ---------------------------------------------------------------- visibility matrix
 
 def test_frame_visibility_causal_with_invalid_frame():
@@ -123,6 +135,27 @@ def test_pe_nonzero_for_multiframe():
     assert torch.equal(pe[0], pe[1])
 
 
+def test_position_scale_separates_adjacent_30fps_frames():
+    pos = torch.tensor([0.0, 1.0 / 30.0])
+    weak = _module(position_scale=1.0)._pos_emb(
+        pos, seq_len=2, n_clips=1, dim=_DIM,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )[0]
+    strong = _module(position_scale=30.0)._pos_emb(
+        pos, seq_len=2, n_clips=1, dim=_DIM,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )[0]
+    weak_similarity = torch.nn.functional.cosine_similarity(weak[0], weak[1], dim=0)
+    strong_similarity = torch.nn.functional.cosine_similarity(strong[0], strong[1], dim=0)
+    assert strong_similarity < weak_similarity - 1e-3
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0, float("nan"), float("inf")])
+def test_position_scale_must_be_finite_and_positive(scale):
+    with pytest.raises(ValueError, match="position_scale must be finite and positive"):
+        _module(position_scale=scale)
+
+
 def test_sinusoidal_encoding_shape_and_even_dim():
     enc = sinusoidal_time_encoding(torch.tensor([0.0, 1.0, 2.0]), _DIM)
     assert enc.shape == (3, _DIM)
@@ -161,6 +194,21 @@ def test_nonzero_gamma_changes_output_but_stays_finite():
     out = m(tokens, 3, torch.arange(6, dtype=torch.float32), valid)
     assert torch.isfinite(out).all()
     assert not torch.equal(out, tokens)
+
+
+def test_per_token_attention_cannot_mix_limb_slots():
+    torch.manual_seed(0)
+    m = _module(attend="per_token")
+    with torch.no_grad():
+        for block in m.blocks:
+            block.gamma_attn.fill_(0.1)
+            block.gamma_ffn.fill_(0.1)
+    tokens = torch.randn(5, _K, _DIM)
+    changed = tokens.clone()
+    changed[:, 0] += 10.0
+    original_out = m(tokens, 5, torch.arange(5, dtype=torch.float32), None)
+    changed_out = m(changed, 5, torch.arange(5, dtype=torch.float32), None)
+    assert torch.equal(original_out[:, 1:], changed_out[:, 1:])
 
 
 def test_gate_params_present_and_zero_init():

@@ -21,7 +21,8 @@ from typing import Tuple
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import ConcatDataset, DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Sampler, Subset
+from torch.utils.data.distributed import DistributedSampler
 from torchvision.transforms import ToTensor
 
 from sam_3d_body.data.transforms import (
@@ -31,9 +32,31 @@ from sam_3d_body.data.utils.prepare_batch import NoCollate
 
 from ..targets import TargetSpec, validate_targets
 from .climbing_images import ClimbingImagesDataset
-from .climbing_videos import ClimbingVideosDataset, list_scenes
+from .climbing_videos import (
+    ClimbingVideosDataset,
+    list_completed_test_scenes,
+    list_scenes,
+)
 from .damon import DamonDataset
 from .splits import group_train_val_split, train_val_indices, video_id_from_scene
+
+
+class DistributedEvalSampler(Sampler[int]):
+    """Exact, non-padding validation shard for distributed evaluation."""
+
+    def __init__(self, dataset, *, num_replicas: int, rank: int):
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        if not 0 <= self.rank < self.num_replicas:
+            raise ValueError(f"rank {self.rank} outside [0, {self.num_replicas})")
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self) -> int:
+        remaining = len(self.dataset) - self.rank
+        return max(0, (remaining + self.num_replicas - 1) // self.num_replicas)
 
 
 # -------------------------------------------------------------------- transform
@@ -54,6 +77,11 @@ def _process_sample(frame: dict, transform):
     bbox = frame["bbox"]
     if bbox is None:
         raise RuntimeError(f"frame {frame.get('key', '?')} has no bbox")
+    bbox = np.asarray(bbox, dtype=np.float32)
+    if (bbox.shape != (4,) or not np.isfinite(bbox).all()
+            or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]):
+        raise RuntimeError(
+            f"frame {frame.get('key', '?')} has invalid xyxy bbox {bbox.tolist()}")
     has_mask = mask is not None
     if mask is None:
         H, W = img.shape[:2]
@@ -65,7 +93,7 @@ def _process_sample(frame: dict, transform):
     # a substituted all-zeros mask must score 0.0 so it is treated as "no mask".
     data_info = dict(
         img=img,
-        bbox=np.asarray(bbox, dtype=np.float32),
+        bbox=bbox,
         bbox_format="xyxy",
         mask=mask,
         mask_score=np.array(1.0 if has_mask else 0.0, dtype=np.float32),
@@ -156,6 +184,9 @@ class InterleavedLoader:
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
         for loader in self.loaders:
+            sampler = getattr(loader, "sampler", None)
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
             ds = loader.dataset
             if hasattr(ds, "set_epoch"):
                 ds.set_epoch(epoch)
@@ -221,20 +252,53 @@ def _manifest_video_ids(manifest: dict, key: str, scenes: list) -> Tuple[set, se
     return train_vids, val_vids
 
 
-def make_loaders(cfg: dict, image_size: Tuple[int, int], manifest: dict | None = None):
-    """Build interleaved train + val loaders from ``data.datasets``.
+def _manifest_train_test_scenes(
+    manifest: dict, key: str, train_scenes: list[str], test_scenes: list[str],
+) -> tuple[list[str], list[str]]:
+    """Restore an exact all-train/manual-test scene manifest and detect drift."""
+    if key not in manifest:
+        raise ValueError(f"split manifest has no {key!r} entry but the config lists it")
+    entry = manifest[key]
+    if "train" not in entry or "test" not in entry:
+        raise ValueError(
+            f"split manifest {key!r} is not a train/test manifest: expected train and test")
+    selected_train = [str(scene) for scene in entry["train"]]
+    selected_test = [str(scene) for scene in entry["test"]]
+    missing_train = set(selected_train) - set(train_scenes)
+    missing_test = set(selected_test) - set(test_scenes)
+    if missing_train or missing_test:
+        raise ValueError(
+            f"split manifest {key!r} references scenes no longer present/labelled; "
+            f"missing train={sorted(missing_train)}, test={sorted(missing_test)}")
+    return selected_train, selected_test
+
+
+def make_loaders(
+    cfg: dict,
+    image_size: Tuple[int, int],
+    manifest: dict | None = None,
+    *,
+    distributed_rank: int = 0,
+    distributed_world_size: int = 1,
+):
+    """Build interleaved train + configured-evaluation loaders.
 
     Still-image datasets (damon/climbing) are concatenated and split randomly by
     ``val_ratio``/``seed`` (T=1 clips). ClimbingVideos datasets are split by
-    source video (no video crosses train/val) into windowed clips (T). Batches
-    keep a fixed ``frames_per_batch`` budget: ``B_clips = frames_per_batch // T``.
+    source video (no video crosses train/val) into windowed clips (T), unless
+    ``data.eval_split=test``: then every generated-label train scene is used for
+    training and completed manual test scenes form evaluation. Batches keep a
+    fixed ``frames_per_batch`` budget: ``B_clips = frames_per_batch // T``.
 
     :param manifest: when given, splits are taken **from the manifest** instead of
         re-derived (``{"images": {"train": [idx...], "val": [idx...]},
         "video:<config>": {"train": [vid...], "val": [vid...]}}``); missing
         members raise. Used by evaluate/resume to reproduce the exact split a
         checkpoint was trained on rather than the current directory's derivation.
-    :returns: ``(train_loader, val_loader, split_manifest)`` — the manifest is the
+    :param distributed_rank: Process rank for ``DistributedSampler`` sharding.
+    :param distributed_world_size: Number of data-parallel processes. ``1`` keeps
+        the original single-process loader behavior.
+    :returns: ``(train_loader, eval_loader, split_manifest)`` — the manifest is the
         one used (echoing the input when supplied), so callers can persist it.
     """
     dcfg = cfg["data"]
@@ -245,6 +309,7 @@ def make_loaders(cfg: dict, image_size: Tuple[int, int], manifest: dict | None =
     frames_per_batch = int(dcfg["frames_per_batch"])
     num_workers = int(dcfg["num_workers"])
     val_ratio = float(dcfg["val_ratio"])
+    eval_split = str(dcfg["eval_split"])
     seed = int(dcfg["seed"])
     seq = dcfg["sequence"]
     clip_len = int(seq["frames_per_clip"])
@@ -255,7 +320,7 @@ def make_loaders(cfg: dict, image_size: Tuple[int, int], manifest: dict | None =
 
     datasets_for_validation = []
     train_parts: list[tuple] = []   # (dataset, batch_size, shuffle)
-    val_parts: list[tuple] = []
+    eval_parts: list[tuple] = []
     out_manifest: dict = {}
 
     if image_specs:
@@ -267,43 +332,72 @@ def make_loaders(cfg: dict, image_size: Tuple[int, int], manifest: dict | None =
         else:
             train_idx, val_idx = train_val_indices(len(ds), val_ratio, seed)
         train_parts.append((Subset(ds, train_idx), frames_per_batch, True))
-        val_parts.append((Subset(ds, val_idx), frames_per_batch, False))
+        eval_parts.append((Subset(ds, val_idx), frames_per_batch, False))
         out_manifest["images"] = {"train": [int(i) for i in train_idx],
                                   "val": [int(i) for i in val_idx]}
         sizes = " + ".join(f"{s['name']}={len(d)}" for s, d in zip(image_specs, subsets))
-        print(f"Image datasets [{sizes}] -> total={len(ds)} "
-              f"train={len(train_idx)} val={len(val_idx)} (val_ratio={val_ratio}, seed={seed})")
+        if distributed_rank == 0:
+            print(f"Image datasets [{sizes}] -> total={len(ds)} "
+                  f"train={len(train_idx)} val={len(val_idx)} (val_ratio={val_ratio}, seed={seed})")
 
     if video_specs:
         clips_per_batch = max(1, frames_per_batch // clip_len)
         for s in video_specs:
             root = _video_root(s["config"])
-            scenes = list_scenes(root, "train")
             key = f"video:{s['config']}"
-            if manifest is not None:
-                train_vids, val_vids = _manifest_video_ids(manifest, key, scenes)
+            all_train_scenes = list_scenes(root, "train")
+            if eval_split == "test":
+                all_test_scenes = list_completed_test_scenes(root)
+                if manifest is not None:
+                    train_scenes, eval_scenes = _manifest_train_test_scenes(
+                        manifest, key, all_train_scenes, all_test_scenes)
+                else:
+                    train_scenes, eval_scenes = all_train_scenes, all_test_scenes
+                train_ds = ClimbingVideosDataset(
+                    root, scenes=train_scenes, mode="train", split_dir="train",
+                    frames_per_clip=clip_len, frame_stride=int(seq["frame_stride"]),
+                    jitter=bool(seq["jitter"]), seed=seed,
+                    use_confidence_weights=use_conf)
+                eval_ds = ClimbingVideosDataset(
+                    root, scenes=eval_scenes, mode="val", split_dir="test",
+                    frames_per_clip=clip_len, frame_stride=int(seq["frame_stride"]),
+                    jitter=False, seed=seed, use_confidence_weights=use_conf)
+                out_manifest[key] = {
+                    "train": sorted(train_scenes), "test": sorted(eval_scenes)}
+                if distributed_rank == 0:
+                    print(
+                        f"ClimbingVideos [{s['config']}]: all train scenes={len(train_scenes)} "
+                        f"manual test scenes={len(eval_scenes)} | clips train={len(train_ds)} "
+                        f"test={len(eval_ds)} (T={clip_len})")
             else:
-                train_vids, val_vids = group_train_val_split(
-                    (video_id_from_scene(sc) for sc in scenes), val_ratio, seed)
-            train_scenes = [sc for sc in scenes if video_id_from_scene(sc) in train_vids]
-            val_scenes = [sc for sc in scenes if video_id_from_scene(sc) in val_vids]
-            train_ds = ClimbingVideosDataset(
-                root, scenes=train_scenes, mode="train",
-                frames_per_clip=clip_len, frame_stride=int(seq["frame_stride"]),
-                jitter=bool(seq["jitter"]), seed=seed,
-                use_confidence_weights=use_conf)
-            val_ds = ClimbingVideosDataset(
-                root, scenes=val_scenes, mode="val",
-                frames_per_clip=clip_len, frame_stride=int(seq["frame_stride"]),
-                jitter=False, seed=seed,
-                use_confidence_weights=use_conf)
-            datasets_for_validation.append(train_ds)
+                scenes = all_train_scenes
+                if manifest is not None:
+                    train_vids, val_vids = _manifest_video_ids(manifest, key, scenes)
+                else:
+                    train_vids, val_vids = group_train_val_split(
+                        (video_id_from_scene(sc) for sc in scenes), val_ratio, seed)
+                train_scenes = [sc for sc in scenes if video_id_from_scene(sc) in train_vids]
+                eval_scenes = [sc for sc in scenes if video_id_from_scene(sc) in val_vids]
+                train_ds = ClimbingVideosDataset(
+                    root, scenes=train_scenes, mode="train",
+                    frames_per_clip=clip_len, frame_stride=int(seq["frame_stride"]),
+                    jitter=bool(seq["jitter"]), seed=seed,
+                    use_confidence_weights=use_conf)
+                eval_ds = ClimbingVideosDataset(
+                    root, scenes=eval_scenes, mode="val",
+                    frames_per_clip=clip_len, frame_stride=int(seq["frame_stride"]),
+                    jitter=False, seed=seed,
+                    use_confidence_weights=use_conf)
+                out_manifest[key] = {"train": sorted(train_vids), "val": sorted(val_vids)}
+                if distributed_rank == 0:
+                    print(
+                        f"ClimbingVideos [{s['config']}]: videos train={len(train_vids)} "
+                        f"val={len(val_vids)} | scenes train={len(train_scenes)} "
+                        f"val={len(eval_scenes)} | clips train={len(train_ds)} "
+                        f"val={len(eval_ds)} (T={clip_len})")
+            datasets_for_validation.extend((train_ds, eval_ds))
             train_parts.append((train_ds, clips_per_batch, True))
-            val_parts.append((val_ds, clips_per_batch, False))
-            out_manifest[key] = {"train": sorted(train_vids), "val": sorted(val_vids)}
-            print(f"ClimbingVideos [{s['config']}]: videos train={len(train_vids)} val={len(val_vids)} "
-                  f"| scenes train={len(train_scenes)} val={len(val_scenes)} "
-                  f"| clips train={len(train_ds)} val={len(val_ds)} (T={clip_len})")
+            eval_parts.append((eval_ds, clips_per_batch, False))
 
     validate_targets(cfg, datasets_for_validation)
 
@@ -312,11 +406,29 @@ def make_loaders(cfg: dict, image_size: Tuple[int, int], manifest: dict | None =
         # process *after* set_epoch — the stateless video jitter reads the updated
         # epoch (persistent workers would freeze it at epoch 0). Re-fork is cheap:
         # the dataset (window index / npz metadata) is built once and only copied.
+        sampler = None
+        if distributed_world_size > 1:
+            if shuffle:
+                sampler = DistributedSampler(
+                    dataset,
+                    num_replicas=distributed_world_size,
+                    rank=distributed_rank,
+                    shuffle=True,
+                    seed=seed,
+                    drop_last=True,
+                )
+            else:
+                sampler = DistributedEvalSampler(
+                    dataset,
+                    num_replicas=distributed_world_size,
+                    rank=distributed_rank,
+                )
         return DataLoader(
-            dataset, batch_size=batch_size, shuffle=shuffle,
+            dataset, batch_size=batch_size, shuffle=shuffle and sampler is None,
+            sampler=sampler,
             num_workers=num_workers, drop_last=shuffle, collate_fn=collate,
             pin_memory=False, persistent_workers=False)
 
     train_loader = InterleavedLoader([_loader(*p) for p in train_parts], seed=seed)
-    val_loader = InterleavedLoader([_loader(*p) for p in val_parts], seed=seed)
-    return train_loader, val_loader, out_manifest
+    eval_loader = InterleavedLoader([_loader(*p) for p in eval_parts], seed=seed)
+    return train_loader, eval_loader, out_manifest

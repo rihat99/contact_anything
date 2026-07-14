@@ -12,8 +12,13 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from contact.data.climbing_videos import ClimbingVideosDataset
-from contact.targets import NUM_BODY_22
+from contact.config import load_config
+from contact.data.climbing_videos import (
+    ClimbingVideosDataset,
+    list_completed_test_scenes,
+)
+from contact.data.collate import make_loaders
+from contact.targets import ALWAYS_NON_CONTACT_8, NUM_BODY_22
 
 
 # ---------------------------------------------------------------- scene builders
@@ -113,7 +118,7 @@ def test_raw_confidence_is_separate_from_supervision_and_loss_mask(tmp_path):
     assert weighted_frame["frame_index"] == 0
 
 
-def test_completed_test_scene_uses_annotated_mask(tmp_path):
+def test_completed_test_scene_adds_schema_fixed_negative_joints(tmp_path):
     n = 8
     jc = np.zeros((1, n, NUM_BODY_22), bool)
     jc[0, :, 20] = True                                 # left wrist in contact
@@ -126,11 +131,35 @@ def test_completed_test_scene_uses_annotated_mask(tmp_path):
                                split_dir="test", frames_per_clip=4, frame_stride=1,
                                require_labels=True)      # must NOT raise KeyError
     frame = ds[0][0]
-    assert float(frame["joint_mask"].sum()) == 4.0      # only annotated joints supervised
+    assert float(frame["joint_mask"].sum()) == 12.0     # 4 observed + 8 fixed negatives
     assert bool(frame["joint_mask"][20] > 0.5) and bool(frame["joint_contact"][20] > 0.5)
-    assert float(frame["joint_mask"][0]) == 0.0         # unannotated joint ignored
-    assert float(frame["joint_supervised"].sum()) == 4.0
+    assert float(frame["joint_mask"][0]) == 1.0         # pelvis is a fixed negative
+    assert float(frame["joint_contact"][ALWAYS_NON_CONTACT_8].sum()) == 0.0
+    assert float(frame["joint_supervised"].sum()) == 12.0
     assert np.allclose(frame["joint_confidence"].numpy(), 1.0)  # no test confidence shipped
+
+
+def test_wholly_unreviewed_test_frame_stays_unsupervised(tmp_path):
+    n = 4
+    annotated = np.zeros((1, n, NUM_BODY_22), bool)
+    _test_scene(tmp_path, "vid_0000", n, np.ones(n, bool),
+                pending=False, annotated=annotated)
+    ds = ClimbingVideosDataset(tmp_path, scenes=["vid_0000"], mode="val",
+                               split_dir="test", frames_per_clip=1)
+    assert float(ds[0][0]["joint_mask"].sum()) == 0.0
+
+
+def test_test_scene_rejects_contact_on_schema_fixed_joint(tmp_path):
+    n = 4
+    jc = np.zeros((1, n, NUM_BODY_22), bool)
+    jc[..., 0] = True
+    annotated = np.zeros((1, n, NUM_BODY_22), bool)
+    annotated[..., 20] = True
+    _test_scene(tmp_path, "vid_0000", n, np.ones(n, bool),
+                pending=False, jc=jc, annotated=annotated)
+    with pytest.raises(ValueError, match="schema-fixed"):
+        ClimbingVideosDataset(tmp_path, scenes=["vid_0000"], mode="val",
+                              split_dir="test", frames_per_clip=1)
 
 
 def test_pending_test_scene_raises(tmp_path):
@@ -140,6 +169,45 @@ def test_pending_test_scene_raises(tmp_path):
         ClimbingVideosDataset(tmp_path, scenes=["vid_0000"], mode="val",
                               split_dir="test", frames_per_clip=4, frame_stride=1,
                               require_labels=True)
+
+
+def test_completed_test_scene_discovery_skips_pending(tmp_path):
+    n = 5
+    _test_scene(tmp_path, "done_0000", n, np.ones(n, bool), pending=False)
+    _test_scene(tmp_path, "pending_0000", n, np.ones(n, bool), pending=True)
+    assert list_completed_test_scenes(tmp_path) == ["done_0000"]
+
+
+def test_train_test_loaders_use_all_train_and_manual_test_scenes(tmp_path):
+    n = 10
+    _train_scene(tmp_path, "train_a_0000", n, np.ones(n, bool))
+    _train_scene(tmp_path, "train_b_0000", n, np.ones(n, bool))
+    _test_scene(tmp_path, "test_done_0000", n, np.ones(n, bool), pending=False)
+    _test_scene(tmp_path, "test_pending_0000", n, np.ones(n, bool), pending=True)
+
+    dataset_cfg = tmp_path / "climbing.yaml"
+    dataset_cfg.write_text(f"name: climbing_videos\ndata:\n  root: {tmp_path}\n")
+    repo = Path(__file__).resolve().parents[1]
+    cfg = load_config(repo / "configs" / "climbing_videos_joint_temporal.yaml")
+    cfg["data"]["datasets"] = [{
+        "name": "climbing_videos", "config": str(dataset_cfg)}]
+    cfg["data"]["num_workers"] = 0
+
+    train_loader, test_loader, manifest = make_loaders(cfg, (32, 32))
+    train_ds = train_loader.loaders[0].dataset
+    test_ds = test_loader.loaders[0].dataset
+    assert set(train_ds._scenes) == {"train_a_0000", "train_b_0000"}
+    assert set(test_ds._scenes) == {"test_done_0000"}
+    key = f"video:{dataset_cfg}"
+    assert manifest[key] == {
+        "train": ["train_a_0000", "train_b_0000"],
+        "test": ["test_done_0000"],
+    }
+
+    _, restored_test, restored_manifest = make_loaders(
+        cfg, (32, 32), manifest=manifest)
+    assert set(restored_test.loaders[0].dataset._scenes) == {"test_done_0000"}
+    assert restored_manifest == manifest
 
 
 def test_require_labels_false_zero_supervision(tmp_path):
@@ -155,13 +223,13 @@ def test_require_labels_false_zero_supervision(tmp_path):
 
 # ---------------------------------------------------------------- finding 5: windows
 
-def test_exactly_50pct_valid_window_accepted(tmp_path):
+def test_partially_invalid_window_rejected(tmp_path):
     n = 8
     valid = np.array([1, 1, 1, 1, 0, 0, 0, 0], bool)    # exactly 4/8 valid over the window
     _train_scene(tmp_path, "vid_0000", n, valid)
     ds = ClimbingVideosDataset(tmp_path, scenes=["vid_0000"], mode="val",
                                frames_per_clip=8, frame_stride=1, jitter=False)
-    assert len(ds) == 1, "exactly-50%-valid window must be accepted (reject only >50% invalid)"
+    assert len(ds) == 0, "temporal windows must contain only valid tracked-person rows"
 
 
 def test_below_50pct_valid_window_rejected(tmp_path):
@@ -173,10 +241,41 @@ def test_below_50pct_valid_window_rejected(tmp_path):
     assert len(ds) == 0
 
 
+def test_zero_bbox_on_invalid_frame_cannot_enter_temporal_clip(tmp_path):
+    n = 10
+    valid = np.ones(n, bool)
+    valid[4] = False
+    _train_scene(tmp_path, "vid_0000", n, valid)
+    path = tmp_path / "train" / "vid_0000" / "labels.npz"
+    with np.load(path) as saved:
+        payload = {name: saved[name].copy() for name in saved.files}
+    payload["bbox"][0, 4] = 0.0
+    np.savez(path, **payload)
+
+    ds = ClimbingVideosDataset(tmp_path, scenes=["vid_0000"], mode="val",
+                               frames_per_clip=5, frame_stride=1, jitter=False)
+    assert len(ds) == 1                              # base 0 rejected; base 5 survives
+    clip = ds[0]
+    assert all(frame["frame_valid"] for frame in clip)
+    assert all((frame["bbox"][2:] > frame["bbox"][:2]).all() for frame in clip)
+
+
+def test_degenerate_bbox_on_valid_frame_is_dataset_corruption(tmp_path):
+    n = 5
+    _train_scene(tmp_path, "vid_0000", n, np.ones(n, bool))
+    path = tmp_path / "train" / "vid_0000" / "labels.npz"
+    with np.load(path) as saved:
+        payload = {name: saved[name].copy() for name in saved.files}
+    payload["bbox"][0, 2] = 0.0
+    np.savez(path, **payload)
+    with pytest.raises(ValueError, match="valid person/frame.*invalid bbox"):
+        ClimbingVideosDataset(tmp_path, scenes=["vid_0000"], mode="val",
+                              frames_per_clip=5, frame_stride=1)
+
+
 def test_jittered_window_validity_fallback(tmp_path):
     # Frames 0..7 valid, 8+ invalid. base=0 window is fully valid; jitter can push
-    # the start into the invalid tail. The loader must fall back to base so no
-    # returned window is >50% invalid.
+    # the start into the invalid tail. The loader must fall back to the all-valid base.
     n = 20
     valid = np.zeros(n, bool)
     valid[:8] = True
@@ -188,7 +287,7 @@ def test_jittered_window_validity_fallback(tmp_path):
         ds.set_epoch(epoch)
         for i in range(len(ds)):
             fv = np.array([f["frame_valid"] for f in ds[i]])
-            assert fv.mean() >= 0.5, f"epoch {epoch} item {i}: {fv.mean():.3f} valid"
+            assert fv.all(), f"epoch {epoch} item {i}: invalid frame escaped fallback"
 
 
 def test_terminal_val_window_covers_tail(tmp_path):

@@ -11,12 +11,13 @@ model:
   # SAM-3D-Body base (DINOv3-H backbone + frozen decoder).
   checkpoint_path: /data3/rikhat.akizhanov/.cache/huggingface/hub/models--facebook--sam-3d-body-dinov3/snapshots/11aaa346c7204874a1cbafe3d39a979080b2c55a/model.ckpt
   mhr_model_path:  /data3/rikhat.akizhanov/.cache/huggingface/hub/models--facebook--sam-3d-body-dinov3/snapshots/11aaa346c7204874a1cbafe3d39a979080b2c55a/assets/mhr_model.pt
+  init_contact_checkpoint: null       # warm-start common contact weights; fresh optimiser/run
   mask_embed_type: v2                 # pretrained mask conditioning (frozen)
   contact_head:
     contact_keypoint_indices: null    # null = list(range(21)) = body16 + toes/heels.
                                       # Climbing recommendation: add wrists 41/62 + nose 0.
     num_global_tokens: 3
-    pool_mode: concat                 # 'concat' | 'attention' (honored after the Phase 2 fix)
+    pool_mode: concat                 # concat | attention | per_token (one output per token)
     dropout: 0.1
     mlp_depth: 4
     mlp_channel_div_factor: 2
@@ -25,12 +26,14 @@ model:
   temporal:                           # Phase 3: ContactTemporalModule (zero-gated, no-op off)
     enabled: false
     placement: post_decoder           # post_decoder | between_layers | pre_decoder (experimental)
-    num_layers: 2
-    num_heads: 8
-    mlp_ratio: 4.0
+    bottleneck_dim: 256               # lightweight 1024 -> 256 -> 1024 token adapter
+    num_layers: 1
+    num_heads: 4
+    mlp_ratio: 2.0
     attend: joint                     # joint (T*K tokens per clip) | per_token (T per token-slot)
     causal: false                     # frame-level causal mask when true
     dropout: 0.0
+    position_scale: 1.0               # multiply elapsed seconds before sinusoidal time encoding
 
 contact:
   topology: smpl                      # smpl(6890) | smplx(10475) | mhr -> NotImplementedError
@@ -53,6 +56,7 @@ contact:
 
 data:
   datasets: []                        # list of {name, config[, split]}
+  eval_split: val                     # val | test (manual ClimbingVideos annotations)
   val_ratio: 0.15                     # stills: random item split; videos: source-video group split
   seed: 42
   frames_per_batch: 32                # B_clips = frames_per_batch // T (homogeneous-T batches)
@@ -71,6 +75,7 @@ logging:
   # This box is logged into wandb (rihat99/Rikhat) -> default mode "online".
   wandb: {enabled: true, project: contact-anything, entity: null, tags: [], mode: online}
   tensorboard: true
+  tensorboard_metrics: null           # null logs every scalar; otherwise exact tag allowlist
 
 output: {dir: ./output, exp_name: contact, log_freq: 10, val_freq: 1, save_freq: 5,
          # best-model selection: '..._f1'/'..._iou' -> max, '.../loss' -> min.

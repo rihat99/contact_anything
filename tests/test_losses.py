@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from contact.losses import ContactLoss, MultiTargetContactLoss
+from contact.losses import ContactLoss, MultiTargetContactLoss, ddp_global_mean_term
 
 # Recommended hyper-parameters (alpha=0.75 upweights the rare positive class).
 _LOSS = ContactLoss(focal_alpha=0.75, focal_gamma=2.0, focal_weight=5.0,
@@ -68,17 +68,114 @@ def test_masked_elements_contribute_zero():
     assert masked["n_active"] == 4 * 256
 
 
-def test_fully_masked_sample_excluded_from_dice():
+def test_dice_reduction_weights_samples_by_confidence_mass():
     torch.manual_seed(1)
     logits = torch.randn(3, 128)
     gt = (torch.rand(3, 128) < 0.2).float()
     mask = torch.ones(3, 128)
     mask[1] = 0.0                                               # sample 1 fully masked
     _, both = _LOSS(logits, gt, mask)
-    # dice must equal the mean over the two *supervised* samples only
+    # Equal mask mass gives the mean over the two supervised samples.
     dice0 = _LOSS(logits[[0]], gt[[0]], torch.ones(1, 128))[1]["dice"]
     dice2 = _LOSS(logits[[2]], gt[[2]], torch.ones(1, 128))[1]["dice"]
     assert both["dice"] == pytest.approx((dice0 + dice2) / 2, abs=1e-5)
+
+    # Uniformly lower confidence for row 2 must reduce that frame's influence.
+    mask[2] = 0.1
+    _, weighted = _LOSS(logits, gt, mask)
+    assert weighted["dice"] == pytest.approx((dice0 + 0.1 * dice2) / 1.1, abs=1e-5)
+
+
+def test_confidence_scales_per_label_focal_gradient():
+    loss_fn = ContactLoss(focal_alpha=0.5, focal_gamma=2.0, focal_weight=1.0,
+                          dice_weight=0.0, sparsity_weight=0.0)
+    logits = torch.zeros(1, 2, requires_grad=True)
+    gt = torch.ones_like(logits)
+    total, parts = loss_fn(logits, gt, torch.tensor([[1.0, 0.25]]))
+    total.backward()
+    ratio = float(logits.grad[0, 0].abs() / logits.grad[0, 1].abs())
+    assert ratio == pytest.approx(4.0, rel=1e-5)
+    assert parts["weight_mass"] == pytest.approx(1.25)
+
+
+def test_focal_only_skips_inactive_components_and_matches_focal_gradient():
+    loss_fn = ContactLoss(focal_alpha=0.8, focal_gamma=2.0, focal_weight=5.0,
+                          dice_weight=0.0, sparsity_weight=0.0)
+    logits = torch.tensor([[0.0, 0.0]], requires_grad=True)
+    gt = torch.tensor([[1.0, 0.0]])
+    mask = torch.ones_like(logits)
+
+    total, parts = loss_fn(logits, gt, mask)
+    expected = 5.0 * loss_fn._focal_bce(logits, gt, mask)
+    expected_grad = torch.autograd.grad(expected, logits, retain_graph=True)[0]
+    actual_grad = torch.autograd.grad(total, logits)[0]
+
+    assert set(parts) == {
+        "focal", "loss", "n_active", "weight_mass", "loss_numerator_tensor"}
+    assert total.item() == pytest.approx(expected.item(), rel=1e-6)
+    assert torch.allclose(actual_grad, expected_grad)
+    # At equal difficulty alpha=.8 makes a false negative four times costlier.
+    assert float(actual_grad[0, 0].abs() / actual_grad[0, 1].abs()) == pytest.approx(4.0)
+
+
+def _rank_focal_terms(parameter, feature, gt, mask):
+    logits = parameter * feature
+    loss_fn = ContactLoss(focal_alpha=0.8, focal_gamma=2.0, focal_weight=1.0,
+                          dice_weight=0.0, sparsity_weight=0.0)
+    _, parts = loss_fn(logits, gt, mask)
+    return parts["loss_numerator_tensor"], parts["weight_mass"]
+
+
+@pytest.mark.parametrize("masks", [
+    # Unequal ordinary confidence masses.
+    (torch.tensor([[1.0, 0.5]]), torch.tensor([[0.25, 1.0]])),
+    # Rank 0 has 0 < mass < 1; rank 1 is entirely unsupervised.
+    (torch.tensor([[0.1, 0.2]]), torch.zeros(1, 2)),
+])
+def test_ddp_numerator_reduction_matches_global_weighted_gradient(masks):
+    features = (torch.tensor([[1.0, -0.5]]), torch.tensor([[0.25, 2.0]]))
+    targets = (torch.tensor([[1.0, 0.0]]), torch.tensor([[0.0, 1.0]]))
+    global_mass = torch.tensor(sum(float(mask.sum()) for mask in masks))
+
+    local_grads = []
+    local_terms = []
+    for feature, gt, mask in zip(features, targets, masks):
+        parameter = torch.tensor(0.3, requires_grad=True)
+        numerator, _ = _rank_focal_terms(parameter, feature, gt, mask)
+        term = ddp_global_mean_term(numerator, global_mass, world_size=2)
+        local_terms.append(term.detach())
+        local_grads.append(torch.autograd.grad(term, parameter)[0])
+
+    # DDP averages rank gradients and scalar terms.
+    ddp_grad = torch.stack(local_grads).mean()
+    ddp_value = torch.stack(local_terms).mean()
+
+    parameter = torch.tensor(0.3, requires_grad=True)
+    global_numerator = sum(
+        _rank_focal_terms(parameter, feature, gt, mask)[0]
+        for feature, gt, mask in zip(features, targets, masks)
+    )
+    reference = global_numerator / global_mass.clamp(min=1.0)
+    reference_grad = torch.autograd.grad(reference, parameter)[0]
+
+    assert ddp_value.item() == pytest.approx(reference.item(), rel=1e-6)
+    assert ddp_grad.item() == pytest.approx(reference_grad.item(), rel=1e-6)
+
+
+def test_ddp_all_zero_mass_is_zero_and_backward_safe():
+    parameter = torch.tensor(0.3, requires_grad=True)
+    numerator, mass = _rank_focal_terms(
+        parameter,
+        torch.tensor([[1.0, -0.5]]),
+        torch.tensor([[1.0, 0.0]]),
+        torch.zeros(1, 2),
+    )
+    term = ddp_global_mean_term(numerator, torch.tensor(mass), world_size=2)
+    term.backward()
+
+    assert term.item() == 0.0
+    assert parameter.grad is not None
+    assert parameter.grad.item() == 0.0
 
 
 def test_zero_active_target_is_zero_and_graph_safe():
@@ -92,6 +189,20 @@ def test_zero_active_target_is_zero_and_graph_safe():
     total.backward()
     assert logits.grad is not None
     assert float(logits.grad.abs().sum()) == 0.0               # zero grad, no NaN
+
+
+def test_masked_nan_logits_are_ignored_without_nan_gradient():
+    logits = torch.tensor([[0.0, float("nan")]], requires_grad=True)
+    gt = torch.tensor([[1.0, 0.0]])
+    mask = torch.tensor([[1.0, 0.0]])
+    loss_fn = ContactLoss(focal_alpha=0.8, focal_gamma=2.0, focal_weight=5.0,
+                          dice_weight=0.0, sparsity_weight=0.0)
+    total, parts = loss_fn(logits, gt, mask)
+    assert torch.isfinite(total)
+    assert parts["n_active"] == 1.0
+    total.backward()
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad[0, 1].item() == 0.0
 
 
 # ---------------------------------------------------------------- multi-target

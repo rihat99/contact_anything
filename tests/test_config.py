@@ -53,9 +53,52 @@ def test_ported_baselines_keep_semantics():
     assert joint["contact"]["primary_target"] == "joint"
     assert joint["contact"]["targets"]["vertex"]["enabled"] is False
     assert joint["contact"]["targets"]["joint"]["enabled"] is True
+    assert joint["contact"]["targets"]["joint"]["joint_set"] == "extremities_4"
     assert joint["contact"]["targets"]["joint"]["supervise_subset"] is None
-    assert 41 in joint["model"]["contact_head"]["contact_keypoint_indices"]
-    assert 62 in joint["model"]["contact_head"]["contact_keypoint_indices"]
+    assert joint["contact"]["targets"]["joint"]["use_confidence_weights"] is True
+    assert joint["contact"]["targets"]["joint"]["loss"] == {
+        "focal_alpha": 0.6,
+        "focal_gamma": 2.0,
+        "focal_weight": 5.0,
+        "dice_weight": 0.0,
+        "sparsity_weight": 0.0,
+    }
+    assert joint["model"]["temporal"]["enabled"] is False
+    assert joint["data"]["sequence"]["frames_per_clip"] == 1
+    assert joint["data"]["sequence"]["frame_stride"] == 1
+    assert joint["data"]["frames_per_batch"] == 64
+    assert joint["optim"]["lr"] == pytest.approx(4.0e-4)
+    assert joint["logging"]["wandb"]["enabled"] is False
+    assert joint["data"]["eval_split"] == "test"
+    assert joint["logging"]["tensorboard_metrics"] == [
+        "train/loss", "train/lr", "train/grad_norm", "train/joint/f1",
+        "test/loss", "test/joint/precision", "test/joint/recall", "test/joint/f1",
+    ]
+    assert joint["model"]["contact_head"]["contact_keypoint_indices"] == [62, 41, 13, 14]
+    assert joint["model"]["contact_head"]["num_global_tokens"] == 0
+    assert joint["model"]["contact_head"]["pool_mode"] == "per_token"
+    assert joint["output"]["exp_name"] == "climb4_frame"
+    assert joint["output"]["monitor"] == "test/joint_f1"
+
+    temporal = load_config(REPO / "configs" / "climbing_videos_joint_temporal.yaml")
+    assert temporal["model"]["temporal"] == {
+        "enabled": True,
+        "placement": "post_decoder",
+        "bottleneck_dim": 256,
+        "num_layers": 1,
+        "num_heads": 4,
+        "mlp_ratio": 2.0,
+        "attend": "per_token",
+        "causal": False,
+        "dropout": 0.0,
+        "position_scale": 30.0,
+    }
+    assert temporal["data"]["sequence"]["frames_per_clip"] == 5
+    assert temporal["data"]["sequence"]["frame_stride"] == 1
+    assert temporal["data"]["frames_per_batch"] == 60
+    assert temporal["optim"]["lr"] == pytest.approx(3.75e-4)
+    assert temporal["model"]["init_contact_checkpoint"] is None
+    assert temporal["output"]["exp_name"] == "climb4_t5"
 
 
 def test_unknown_top_level_key_rejected(tmp_path):
@@ -83,6 +126,63 @@ def test_unknown_topology_rejected(tmp_path):
         load_config(_write(tmp_path, "base: configs/base.yaml\ncontact:\n  topology: banana\n"))
 
 
+def test_unknown_joint_set_rejected(tmp_path):
+    with pytest.raises(ValueError, match="joint_set must be one of"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+contact:
+  targets:
+    joint:
+      joint_set: hands_and_feet_and_maybe_tail
+"""))
+
+
+def test_unknown_contact_pool_mode_rejected(tmp_path):
+    with pytest.raises(ValueError, match="pool_mode must be one of"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+model:
+  contact_head:
+    pool_mode: magical_pool
+"""))
+
+
+def test_per_token_pool_requires_one_output_per_total_token(tmp_path):
+    with pytest.raises(ValueError, match="output dimension.*total token count 4"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+model:
+  contact_head:
+    contact_keypoint_indices: [62, 41, 13, 14]
+    num_global_tokens: 0
+    pool_mode: per_token
+"""))
+
+
+def test_extremity_joint_set_requires_full_four_output_space(tmp_path):
+    with pytest.raises(ValueError, match="supervise_subset must be null"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+contact:
+  targets:
+    joint:
+      joint_set: extremities_4
+      supervise_subset: observable_14
+"""))
+
+
+def test_extremity_joint_set_is_accepted(tmp_path):
+    cfg = load_config(_write(tmp_path, """
+base: configs/base.yaml
+contact:
+  targets:
+    joint:
+      joint_set: extremities_4
+      supervise_subset: null
+"""))
+    assert cfg["contact"]["targets"]["joint"]["joint_set"] == "extremities_4"
+
+
 def test_no_enabled_target_rejected(tmp_path):
     with pytest.raises(ValueError, match="no contact target is enabled"):
         load_config(_write(tmp_path, """
@@ -101,6 +201,37 @@ base: configs/base.yaml
 data:
   datasets:
     - {name: nope, config: x.yaml}
+"""))
+
+
+def test_manual_test_eval_requires_climbing_videos_only(tmp_path):
+    with pytest.raises(ValueError, match="ClimbingVideos-only"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+data:
+  eval_split: test
+  datasets:
+    - {name: damon, config: configs/datasets/damon.yaml}
+"""))
+
+
+def test_tensorboard_metric_filter_must_be_a_string_list(tmp_path):
+    with pytest.raises(ValueError, match="tensorboard_metrics"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+logging:
+  tensorboard_metrics: train/loss
+"""))
+
+
+@pytest.mark.parametrize("value", ["0", "-1", ".nan", ".inf"])
+def test_temporal_position_scale_must_be_finite_and_positive(tmp_path, value):
+    with pytest.raises(ValueError, match="position_scale must be finite and positive"):
+        load_config(_write(tmp_path, f"""
+base: configs/base.yaml
+model:
+  temporal:
+    position_scale: {value}
 """))
 
 

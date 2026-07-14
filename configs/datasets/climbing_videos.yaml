@@ -1,7 +1,7 @@
 name: climbing_videos
 
-# Windowed per-joint (22) contact clips. The loader uses only the train/ dir,
-# split into train/val by source video (contact.data.splits.group_train_val_split);
-# the test/ dir (manual annotations pending) is held out entirely.
+# Windowed per-joint (22) contact clips. A run chooses either a grouped holdout
+# from train/ (eval_split: val) or the completed manual annotations in test/
+# (eval_split: test). The climbing contact configs use all train/ scenes + test/.
 data:
   root: /data3/rikhat.akizhanov/datasets/ClimbingVideos_v1

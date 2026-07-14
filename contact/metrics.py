@@ -1,4 +1,4 @@
-"""Single mask-aware contact metric: micro precision / recall / F1 / IoU.
+"""Mask-aware contact metrics: micro precision / recall / F1 / F2 / IoU.
 
 One implementation shared by the trainer, evaluator and demo. Predictions are
 ``sigmoid(logits) > threshold``; only elements with ``mask > 0`` count, so a
@@ -34,15 +34,38 @@ def contact_counts(
 
 
 def prf1(counts: dict[str, int]) -> dict[str, float]:
-    """Precision / recall / F1 / IoU / accuracy from confusion counts."""
+    """Precision / recall / F1 / F2 / IoU / accuracy from confusion counts."""
     tp, fp, fn, tn = (counts[k] for k in _COUNT_KEYS)
     return {
         "precision": tp / (tp + fp + _EPS),
         "recall": tp / (tp + fn + _EPS),
         "f1": 2 * tp / (2 * tp + fp + fn + _EPS),
+        # F-beta with beta=2: recall carries four times precision's weight.
+        "f2": 5 * tp / (5 * tp + fp + 4 * fn + _EPS),
         "iou": tp / (tp + fp + fn + _EPS),
         "accuracy": (tp + tn) / (tp + tn + fp + fn + _EPS),
     }
+
+
+@torch.no_grad()
+def contact_counts_per_dim(
+    logits: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor, threshold: float = 0.5,
+) -> list[dict[str, int]]:
+    """Return one masked confusion matrix per output dimension.
+
+    This is primarily useful for the four-extremity head, where a micro score can
+    otherwise hide a weak hand or foot behind the other three outputs.
+    """
+    if logits.shape != gt.shape or logits.shape != mask.shape:
+        raise ValueError(
+            f"logits, gt, and mask must have the same shape; got "
+            f"{tuple(logits.shape)}, {tuple(gt.shape)}, {tuple(mask.shape)}")
+    if logits.ndim < 2:
+        raise ValueError(f"expected a final output dimension; got shape {tuple(logits.shape)}")
+    return [
+        contact_counts(logits[..., i], gt[..., i], mask[..., i], threshold)
+        for i in range(logits.shape[-1])
+    ]
 
 
 def contact_metrics(

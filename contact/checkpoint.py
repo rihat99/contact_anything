@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .targets import NUM_BODY_22, topology_num_vertices
+from .targets import joint_set_names, joint_set_num_outputs, topology_num_vertices
 
 SCHEMA_VERSION = 2
 
@@ -77,10 +77,20 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
     topology = config.get("contact", {}).get("topology", "smpl")
     tgts = config.get("contact", {}).get("targets", {}) or {}
     targets_layout = {}
+    joint_layout = None
     for name in ("vertex", "joint"):
         if tgts.get(name, {}).get("enabled", False):
-            targets_layout[name] = (
-                topology_num_vertices(topology) if name == "vertex" else NUM_BODY_22)
+            if name == "vertex":
+                targets_layout[name] = topology_num_vertices(topology)
+            else:
+                joint_set = str(tgts[name].get("joint_set", "smplx_body_22"))
+                names = joint_set_names(joint_set)
+                targets_layout[name] = joint_set_num_outputs(joint_set)
+                joint_layout = {
+                    "joint_set": joint_set,
+                    "names": list(names),
+                    "dim": len(names),
+                }
 
     tcfg = model_cfg.get("temporal", {}) or {}
     if tcfg.get("enabled", False):
@@ -89,9 +99,11 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
             "placement": str(tcfg.get("placement", "post_decoder")),
             "attend": str(tcfg.get("attend", "joint")),
             "causal": bool(tcfg.get("causal", False)),
-            "num_layers": int(tcfg.get("num_layers", 2)),
-            "num_heads": int(tcfg.get("num_heads", 8)),
-            "mlp_ratio": float(tcfg.get("mlp_ratio", 4.0)),
+            "bottleneck_dim": int(tcfg.get("bottleneck_dim", 256)),
+            "num_layers": int(tcfg.get("num_layers", 1)),
+            "num_heads": int(tcfg.get("num_heads", 4)),
+            "mlp_ratio": float(tcfg.get("mlp_ratio", 2.0)),
+            "position_scale": float(tcfg.get("position_scale", 1.0)),
         }
     else:
         temporal = {"enabled": False}
@@ -107,6 +119,7 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
         "dropout": float(chead.get("dropout", 0.1)),
         "topology": str(topology),
         "targets": {k: int(v) for k, v in sorted(targets_layout.items())},
+        "joint_layout": joint_layout,
         "temporal": temporal,
         "mask_embed_type": model_cfg.get("mask_embed_type", None),
         "base_checkpoint": Path(str(model_cfg.get("checkpoint_path", ""))).name,
@@ -297,4 +310,76 @@ def load(
         scheduler.load_state_dict(ckpt["scheduler"])
     if restore_rng:
         _restore_rng(ckpt.get("rng"))
+    return ckpt
+
+
+def initialize_common_contact(
+    path: str | Path,
+    model: nn.Module,
+    *,
+    config: dict,
+    map_location: str = "cpu",
+) -> dict:
+    """Warm-start common contact parameters while allowing a new temporal module.
+
+    This is deliberately narrower than :func:`load`: it does not restore the
+    optimiser, scheduler, epoch, or RNG, and the only trainable parameters that
+    may be absent from the source checkpoint are ``contact_temporal.*``. All
+    forward semantics other than the temporal configuration must match exactly.
+    It is intended for starting temporal fine-tuning from a per-frame contact
+    checkpoint without weakening strict resume checks.
+    """
+    path = Path(path)
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    if not isinstance(ckpt, dict) or "trainable_state_dict" not in ckpt:
+        raise RuntimeError(f"{path}: not a contact checkpoint (no trainable_state_dict).")
+    if ckpt.get("schema_version") != SCHEMA_VERSION:
+        raise RuntimeError(
+            f"{path}: schema_version {ckpt.get('schema_version')!r} != {SCHEMA_VERSION}")
+
+    source_sig = dict(ckpt.get("arch_signature") or {})
+    target_sig = dict(_arch_signature(config) or {})
+    source_temporal = source_sig.pop("temporal", {"enabled": False})
+    target_temporal = target_sig.pop("temporal", {"enabled": False})
+    if source_sig != target_sig:
+        diffs = [
+            f"  {key}: checkpoint={source_sig.get(key, 'ABSENT')!r} "
+            f"run={target_sig.get(key, 'ABSENT')!r}"
+            for key in sorted(set(source_sig) | set(target_sig))
+            if source_sig.get(key) != target_sig.get(key)
+        ]
+        raise RuntimeError(
+            f"{path}: warm-start architecture mismatch outside temporal module:\n"
+            + "\n".join(diffs))
+    if source_temporal.get("enabled", False):
+        raise RuntimeError(
+            f"{path}: warm-start source already has temporal enabled; use strict resume "
+            "for the same architecture or start from a per-frame checkpoint")
+    if not target_temporal.get("enabled", False):
+        raise RuntimeError(
+            "initialize_common_contact is only valid when the target enables temporal")
+
+    current = dict(model.named_parameters())
+    source_state = ckpt["trainable_state_dict"]
+    problems = []
+    for name, value in source_state.items():
+        if name not in current:
+            problems.append(f"  {name}: absent from target model")
+        elif tuple(value.shape) != tuple(current[name].shape):
+            problems.append(
+                f"  {name}: checkpoint={tuple(value.shape)} model={tuple(current[name].shape)}")
+    if problems:
+        raise RuntimeError(f"{path}: incompatible warm-start parameters:\n" + "\n".join(problems))
+
+    current_trainable = {name for name, p in current.items() if p.requires_grad}
+    missing = sorted(current_trainable - set(source_state))
+    invalid_missing = [name for name in missing if not name.startswith("contact_temporal.")]
+    if invalid_missing:
+        raise RuntimeError(
+            f"{path}: warm start is missing non-temporal trainable parameters: "
+            f"{invalid_missing}")
+
+    model.load_state_dict(source_state, strict=False)
+    ckpt["warm_start_loaded_names"] = sorted(source_state)
+    ckpt["warm_start_new_names"] = missing
     return ckpt

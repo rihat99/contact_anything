@@ -5,13 +5,17 @@ import pytest
 import torch
 
 from contact.targets import (
+    EXTREMITY_4_GROUPS,
+    EXTREMITY_4_NAMES,
     NUM_BODY_22,
+    NUM_EXTREMITY_4,
     OBSERVABLE_14,
     SMPLX_BODY_22,
     TOPOLOGY_VERTS,
     TargetSpec,
     compute_vertex_joint_owner,
     derive_joint_contact,
+    reduce_body22_to_extremities,
     topology_num_vertices,
     validate_targets,
 )
@@ -36,6 +40,9 @@ def test_joint_set_names_and_observable():
     assert SMPLX_BODY_22[_LEFT_WRIST] == "left_wrist"
     assert SMPLX_BODY_22[_RIGHT_WRIST] == "right_wrist"
     assert OBSERVABLE_14 == [1, 2, 4, 5, 7, 8, 10, 11, 16, 17, 18, 19, 20, 21]
+    assert EXTREMITY_4_NAMES == ("left_hand", "right_hand", "left_foot", "right_foot")
+    assert EXTREMITY_4_GROUPS == ((20,), (21,), (7, 10), (8, 11))
+    assert NUM_EXTREMITY_4 == 4
 
 
 def test_ownership_every_joint_owns_at_least_25_verts():
@@ -86,6 +93,102 @@ def test_target_spec_output_dims():
 
     cfg_joint = _base_cfg(vertex=False, joint=True)
     assert TargetSpec.from_config(cfg_joint).output_dims() == {"joint": 22}
+
+    cfg_extremities = _base_cfg(vertex=False, joint=True)
+    cfg_extremities["contact"]["targets"]["joint"]["joint_set"] = "extremities_4"
+    spec_extremities = TargetSpec.from_config(cfg_extremities)
+    assert spec_extremities.output_dims() == {"joint": 4}
+    assert spec_extremities.joint_names == EXTREMITY_4_NAMES
+
+
+def test_reduce_body22_to_extremities_tri_state_and_confidence():
+    # Eight rows cover the complete two-member foot truth table plus the
+    # singleton hand behavior. Values not explicitly set remain free/unknown.
+    contact = torch.zeros(8, NUM_BODY_22)
+    supervised = torch.zeros_like(contact)
+    confidence = torch.zeros_like(contact)
+
+    # 0: both known free -> known free, confidence mean = .6
+    supervised[0, [7, 10]] = 1
+    confidence[0, [7, 10]] = torch.tensor([0.4, 0.8])
+    # 1: ankle positive, foot free -> contact; only positive confidence counts
+    supervised[1, [7, 10]] = 1
+    contact[1, 7] = 1
+    confidence[1, [7, 10]] = torch.tensor([0.3, 0.95])
+    # 2: foot/toe positive, ankle free -> symmetric OR behavior
+    supervised[2, [7, 10]] = 1
+    contact[2, 10] = 1
+    confidence[2, [7, 10]] = torch.tensor([0.95, 0.45])
+    # 3: both positive -> max positive confidence
+    supervised[3, [7, 10]] = 1
+    contact[3, [7, 10]] = 1
+    confidence[3, [7, 10]] = torch.tensor([0.55, 0.9])
+    # 4: known positive + unknown -> contact remains known
+    supervised[4, 10] = 1
+    contact[4, 10] = 1
+    confidence[4, 10] = 0.7
+    # 5: known negative + unknown -> partial negative is ignored
+    supervised[5, 7] = 1
+    confidence[5, 7] = 0.8
+    # 6: both unknown -> ignored
+    # 7: singleton hand known positive preserves its confidence
+    supervised[7, 20] = 1
+    contact[7, 20] = 1
+    confidence[7, 20] = 0.65
+
+    gt, sup, conf = reduce_body22_to_extremities(contact, supervised, confidence)
+    assert gt.shape == sup.shape == conf.shape == (8, NUM_EXTREMITY_4)
+    assert torch.allclose(gt[:7, 2], torch.tensor([0, 1, 1, 1, 1, 0, 0]).float())
+    assert torch.allclose(sup[:7, 2], torch.tensor([1, 1, 1, 1, 1, 0, 0]).float())
+    assert torch.allclose(conf[:7, 2], torch.tensor([0.6, 0.3, 0.45, 0.9, 0.7, 0, 0]))
+    assert gt[7, 0] == 1 and sup[7, 0] == 1 and conf[7, 0] == pytest.approx(0.65)
+
+
+def test_extremity_assemble_batch_uses_raw_supervision_and_confidence():
+    cfg = _base_cfg(vertex=False, joint=True)
+    jcfg = cfg["contact"]["targets"]["joint"]
+    jcfg["joint_set"] = "extremities_4"
+    jcfg["use_confidence_weights"] = True
+    spec = TargetSpec.from_config(cfg)
+
+    contact = torch.zeros(NUM_BODY_22)
+    supervised = torch.zeros(NUM_BODY_22)
+    confidence = torch.zeros(NUM_BODY_22)
+    # Known left-hand contact.
+    contact[20] = 1
+    supervised[20] = 1
+    confidence[20] = 0.75
+    # Known-free left foot: mean confidence .5.
+    supervised[[7, 10]] = 1
+    confidence[[7, 10]] = torch.tensor([0.2, 0.8])
+    # Right foot is only a partial negative and must remain ignored despite its
+    # nonzero confidence. A preweighted mask alone could not distinguish this.
+    supervised[8] = 1
+    confidence[8] = 0.9
+    frame = {
+        "joint_contact": contact,
+        "joint_supervised": supervised,
+        "joint_confidence": confidence,
+        "joint_mask": supervised * confidence,
+    }
+    target = spec.assemble_batch([frame])["joint"]
+    assert torch.allclose(target["gt"], torch.tensor([[1.0, 0.0, 0.0, 0.0]]))
+    assert torch.allclose(target["mask"], torch.tensor([[0.75, 0.0, 0.5, 0.0]]))
+
+    jcfg["use_confidence_weights"] = False
+    unweighted = TargetSpec.from_config(cfg).assemble_batch([frame])["joint"]
+    assert torch.allclose(unweighted["mask"], torch.tensor([[1.0, 0.0, 1.0, 0.0]]))
+
+
+def test_extremity_assemble_requires_raw_annotation_fields():
+    cfg = _base_cfg(vertex=False, joint=True)
+    cfg["contact"]["targets"]["joint"]["joint_set"] = "extremities_4"
+    frame = {
+        "joint_contact": torch.zeros(NUM_BODY_22),
+        "joint_mask": torch.ones(NUM_BODY_22),
+    }
+    with pytest.raises(ValueError, match="requires raw body-22"):
+        TargetSpec.from_config(cfg).assemble_batch([frame])
 
 
 # ---------------------------------------------------------------- validation
@@ -189,8 +292,10 @@ def _base_cfg(vertex: bool, joint: bool) -> dict:
                 "vertex": {"enabled": vertex},
                 "joint": {
                     "enabled": joint,
+                    "joint_set": "smplx_body_22",
                     "supervise_subset": None,
                     "derive_from_vertex": False,
+                    "use_confidence_weights": False,
                 },
             },
         }

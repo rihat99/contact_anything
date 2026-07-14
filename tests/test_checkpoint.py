@@ -41,6 +41,18 @@ _CFG_B = {"model": {"checkpoint_path": "snap/model.ckpt", "contact_head": {"grid
           "contact": {"topology": "smpl", "targets": {}}}
 
 
+def _joint_cfg(joint_set: str) -> dict:
+    return {
+        "model": {"checkpoint_path": "snap/model.ckpt", "contact_head": {"grid_size": 5}},
+        "contact": {
+            "topology": "smpl",
+            "targets": {
+                "joint": {"enabled": True, "joint_set": joint_set},
+            },
+        },
+    }
+
+
 def _trainable_names(model: nn.Module) -> list[str]:
     return [n for n, p in model.named_parameters() if p.requires_grad]
 
@@ -131,6 +143,36 @@ def test_extra_trainable_param_in_model_raises(tmp_path):
     _save(path, _Tiny(dim=4))
     with pytest.raises(RuntimeError, match="fingerprint mismatch"):
         ckpt_io.load(path, _TinyPlus(dim=4))
+
+
+def test_temporal_warm_start_loads_common_params_only(tmp_path):
+    source = _Tiny()
+    path = tmp_path / "frame.pth"
+    source_cfg = {
+        "model": {"checkpoint_path": "snap/model.ckpt", "contact_head": {},
+                  "temporal": {"enabled": False}},
+        "contact": {"topology": "smpl", "targets": {}},
+    }
+    target_cfg = {
+        "model": {"checkpoint_path": "snap/model.ckpt", "contact_head": {},
+                  "temporal": {"enabled": True, "placement": "post_decoder",
+                               "bottleneck_dim": 2, "num_layers": 1,
+                               "num_heads": 1, "mlp_ratio": 2.0,
+                               "attend": "joint", "causal": False}},
+        "contact": {"topology": "smpl", "targets": {}},
+    }
+    opt, sched = _opt_sched(source)
+    ckpt_io.save(path, source, _trainable_names(source), opt, sched,
+                 epoch=0, global_step=1, best_metric=0.0,
+                 monitor="val/vertex_f1", config=source_cfg)
+
+    target = _TinyPlus()
+    before_temporal = target.contact_temporal.weight.detach().clone()
+    state = ckpt_io.initialize_common_contact(path, target, config=target_cfg)
+    assert torch.equal(target.contact_head.weight, source.contact_head.weight)
+    assert torch.equal(target.contact_temporal.weight, before_temporal)
+    assert state["warm_start_new_names"] == [
+        "contact_temporal.bias", "contact_temporal.weight"]
     # the diff must name the unmatched trainable param
     with pytest.raises(RuntimeError, match="contact_temporal"):
         ckpt_io.load(path, _TinyPlus(dim=4))
@@ -148,6 +190,39 @@ def test_same_shape_semantic_mismatch_raises(tmp_path):
         ckpt_io.load(path, _Tiny(), config=_CFG_B)
 
 
+def test_temporal_position_scale_is_checkpointed_semantics(tmp_path):
+    def cfg(scale):
+        return {
+            "model": {
+                "checkpoint_path": "snap/model.ckpt",
+                "contact_head": {"grid_size": 5},
+                "temporal": {
+                    "enabled": True,
+                    "placement": "post_decoder",
+                    "attend": "per_token",
+                    "causal": False,
+                    "bottleneck_dim": 256,
+                    "num_layers": 1,
+                    "num_heads": 4,
+                    "mlp_ratio": 2.0,
+                    "position_scale": scale,
+                },
+            },
+            "contact": {"topology": "smpl", "targets": {}},
+        }
+
+    model = _Tiny()
+    opt, sched = _opt_sched(model)
+    path = tmp_path / "ck.pth"
+    ckpt_io.save(
+        path, model, _trainable_names(model), opt, sched,
+        epoch=0, global_step=0, best_metric=0.0,
+        monitor="test/joint_f1", config=cfg(30.0),
+    )
+    with pytest.raises(RuntimeError, match="signature mismatch"):
+        ckpt_io.load(path, _Tiny(), config=cfg(1.0))
+
+
 def test_matching_signature_loads(tmp_path):
     path = tmp_path / "ck.pth"
     opt, sched = _opt_sched(_Tiny())
@@ -155,6 +230,29 @@ def test_matching_signature_loads(tmp_path):
                  epoch=0, global_step=0, best_metric=0.0, monitor="val/vertex_f1",
                  config=_CFG_A)
     ckpt_io.load(path, _Tiny(), config=_CFG_A)   # same signature -> no raise
+
+
+def test_checkpoint_signature_records_extremity_semantics():
+    signature = ckpt_io._arch_signature(_joint_cfg("extremities_4"))
+    assert signature["targets"]["joint"] == 4
+    assert signature["joint_layout"] == {
+        "joint_set": "extremities_4",
+        "names": ["left_hand", "right_hand", "left_foot", "right_foot"],
+        "dim": 4,
+    }
+
+
+def test_same_shape_different_joint_set_signature_raises(tmp_path):
+    # The tiny stand-in deliberately has identical parameter shapes; semantic
+    # layout metadata must still prevent cross-loading body-22/extremity heads.
+    path = tmp_path / "ck.pth"
+    model = _Tiny()
+    opt, sched = _opt_sched(model)
+    ckpt_io.save(path, model, _trainable_names(model), opt, sched,
+                 epoch=0, global_step=0, best_metric=0.0, monitor="val/joint_f1",
+                 config=_joint_cfg("smplx_body_22"))
+    with pytest.raises(RuntimeError, match="joint_layout"):
+        ckpt_io.load(path, _Tiny(), config=_joint_cfg("extremities_4"))
 
 
 def test_split_manifest_roundtrips(tmp_path):
