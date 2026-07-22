@@ -22,6 +22,7 @@ def test_base_yaml_loads_with_defaults():
     assert cfg["contact"]["targets"]["vertex"]["enabled"] is True
     assert cfg["contact"]["targets"]["joint"]["enabled"] is False
     assert cfg["data"]["frames_per_batch"] == 32
+    assert cfg["data"]["sequence"]["target_frame"] == "all"
     assert cfg["loss"]["grad_clip"] == 1.0
 
 
@@ -95,10 +96,40 @@ def test_ported_baselines_keep_semantics():
     }
     assert temporal["data"]["sequence"]["frames_per_clip"] == 5
     assert temporal["data"]["sequence"]["frame_stride"] == 1
+    assert temporal["data"]["sequence"]["target_frame"] == "all"
     assert temporal["data"]["frames_per_batch"] == 60
     assert temporal["optim"]["lr"] == pytest.approx(3.75e-4)
     assert temporal["model"]["init_contact_checkpoint"] is None
     assert temporal["output"]["exp_name"] == "climb4_t5"
+
+    center = load_config(REPO / "configs" / "climbing_videos_joint_temporal_center.yaml")
+    assert center["model"]["temporal"]["enabled"] is True
+    assert center["model"]["temporal"]["causal"] is False
+    assert center["data"]["sequence"]["frames_per_clip"] == 5
+    assert center["data"]["sequence"]["target_frame"] == "center"
+    assert center["model"]["init_contact_checkpoint"] is None
+    assert center["output"]["exp_name"] == "climb4_t5mid"
+
+
+def test_center_target_frame_requires_odd_clip_length(tmp_path):
+    with pytest.raises(ValueError, match="requires an odd frames_per_clip"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+data:
+  sequence:
+    frames_per_clip: 4
+    target_frame: center
+"""))
+
+
+def test_unknown_target_frame_rejected(tmp_path):
+    with pytest.raises(ValueError, match="target_frame must be 'all' or 'center'"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+data:
+  sequence:
+    target_frame: almost_middle
+"""))
 
 
 def test_unknown_top_level_key_rejected(tmp_path):

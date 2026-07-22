@@ -1,0 +1,11 @@
+# ClimbingVideos_v1 four-extremity contact with causal temporal attention.
+# Each limb attends only to itself at the current and earlier frames; future
+# frames are masked. All other settings match the T=5 temporal experiment.
+base: configs/climbing_videos_joint_temporal.yaml
+
+model:
+  temporal:
+    causal: true
+
+output:
+  exp_name: climb4_t5c

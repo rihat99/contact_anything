@@ -61,7 +61,9 @@ data:
   seed: 42
   frames_per_batch: 32                # B_clips = frames_per_batch // T (homogeneous-T batches)
   num_workers: 16
-  sequence: {frames_per_clip: 8, frame_stride: 2, jitter: true}   # jitter stateless from (seed,epoch,idx)
+  # target_frame: all supervises every temporal row; center supervises only the
+  # middle row (and therefore requires an odd frames_per_clip).
+  sequence: {frames_per_clip: 8, frame_stride: 2, jitter: true, target_frame: all}
 
 loss: {dice_eps: 1.0e-5, grad_clip: 1.0}
 

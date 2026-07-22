@@ -31,7 +31,7 @@ from contact import checkpoint as ckpt_io
 from contact.config import load_config
 from contact.data.climbing_videos import ClimbingVideosDataset
 from contact.data.collate import batch_to_device, make_collate, make_loaders
-from contact.engine import forward_contact
+from contact.engine import forward_contact, select_temporal_supervision
 from contact.metrics import (
     add_counts,
     contact_counts,
@@ -53,6 +53,7 @@ def evaluate(
     threshold: float = 0.5,
     curve_thresholds: tuple[float, ...] = (),
     output_names: dict[str, tuple[str, ...]] | None = None,
+    target_frame: str = "all",
 ) -> dict:
     thresholds = tuple(sorted(set((float(threshold), *map(float, curve_thresholds)))))
     counts = {th: {t: zero_counts() for t in targets} for th in thresholds}
@@ -62,9 +63,15 @@ def evaluate(
     for batch in loader:
         batch = batch_to_device(batch, device)
         contact = forward_contact(model, batch)
+        logits_by_target, selected_targets = select_temporal_supervision(
+            {t: contact[f"{t}_logits"] for t in targets},
+            batch["targets"],
+            int(batch.get("seq_len", 1)),
+            target_frame,
+        )
         for t in targets:
-            tgt = batch["targets"][t]
-            logits = contact[f"{t}_logits"]
+            tgt = selected_targets[t]
+            logits = logits_by_target[t]
             for th in thresholds:
                 add_counts(counts[th][t], contact_counts(
                     logits, tgt["gt"], tgt["mask"], threshold=th))
@@ -166,6 +173,7 @@ def main() -> int:
         threshold=args.threshold,
         curve_thresholds=curve_thresholds,
         output_names=output_names,
+        target_frame=str(cfg["data"]["sequence"]["target_frame"]),
     )
     for t, res in results.items():
         print(f"[{t}] P={res['precision']:.4f}  R={res['recall']:.4f}  "

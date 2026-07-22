@@ -86,6 +86,27 @@ def test_frame_visibility_causal_all_valid_is_lower_triangular():
     assert torch.equal(allowed, torch.tril(torch.ones(4, 4, dtype=torch.bool)))
 
 
+def test_causal_per_token_outputs_do_not_depend_on_future_frames():
+    """Changing future token features cannot change an earlier prediction."""
+    torch.manual_seed(7)
+    module = _module(attend="per_token", causal=True)
+    with torch.no_grad():
+        for block in module.blocks:
+            block.gamma_attn.fill_(0.2)
+            block.gamma_ffn.fill_(0.2)
+
+    tokens = torch.randn(5, _K, _DIM)
+    changed = tokens.clone()
+    changed[3:] += 10.0
+    positions = torch.arange(5, dtype=torch.float32)
+
+    original_out = module(tokens, 5, positions)
+    changed_out = module(changed, 5, positions)
+
+    assert torch.equal(original_out[:3], changed_out[:3])
+    assert not torch.equal(original_out[3:], changed_out[3:])
+
+
 def test_frame_visibility_diagonal_never_fully_masked():
     # Every row must keep at least the diagonal so softmax never sees an all -inf row.
     for causal in (True, False):
@@ -209,6 +230,22 @@ def test_per_token_attention_cannot_mix_limb_slots():
     original_out = m(tokens, 5, torch.arange(5, dtype=torch.float32), None)
     changed_out = m(changed, 5, torch.arange(5, dtype=torch.float32), None)
     assert torch.equal(original_out[:, 1:], changed_out[:, 1:])
+
+
+def test_noncausal_center_output_backpropagates_to_every_context_frame():
+    """A center-only loss still trains from all five temporal input rows."""
+    torch.manual_seed(11)
+    module = _module(attend="per_token", causal=False, num_layers=1)
+    with torch.no_grad():
+        module.blocks[0].gamma_attn.fill_(0.2)
+        module.blocks[0].gamma_ffn.fill_(0.2)
+
+    tokens = torch.randn(5, _K, _DIM, requires_grad=True)
+    output = module(tokens, 5, torch.arange(5, dtype=torch.float32))
+    output[2].sum().backward()
+
+    gradient_per_frame = tokens.grad.abs().sum(dim=(1, 2))
+    assert bool((gradient_per_frame > 0).all())
 
 
 def test_gate_params_present_and_zero_init():

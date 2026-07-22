@@ -37,3 +37,25 @@ def test_evaluate_reports_named_outputs_f2_and_threshold_curve():
     assert set(result["per_output"]) == {"left_hand", "right_hand"}
     assert all(value["f2"] > 0.999 for value in result["per_output"].values())
     assert [point["threshold"] for point in result["threshold_curve"]] == [0.3, 0.5, 0.7]
+
+
+def test_evaluate_center_policy_ignores_wrong_noncenter_rows():
+    # Two T=5 clips. Only flattened rows 2 and 7 are correct; every other row is
+    # deliberately wrong and must not affect center-only metrics.
+    gt = torch.zeros(10, 2)
+    gt[:, 0] = 1.0
+    logits = torch.full((10, 2), -10.0)
+    logits[:, 1] = 10.0
+    logits[[2, 7], 0] = 10.0
+    logits[[2, 7], 1] = -10.0
+    loader = [{
+        "seq_len": 5,
+        "logits": logits,
+        "targets": {"joint": {"gt": gt, "mask": torch.ones(10, 2)}},
+    }]
+
+    result = evaluate(
+        _ContactModel(), loader, ["joint"], "cpu", target_frame="center",
+    )["joint"]
+    assert result["f1"] > 0.999
+    assert (result["tp"], result["fp"], result["fn"]) == (2, 0, 0)

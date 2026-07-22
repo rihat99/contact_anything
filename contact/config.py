@@ -106,6 +106,7 @@ DEFAULTS: dict[str, Any] = {
             "frames_per_clip": 8,
             "frame_stride": 2,
             "jitter": True,
+            "target_frame": "all",       # all | center (loss/metrics rows per clip)
         },
     },
     "loss": {"dice_eps": 1.0e-5, "grad_clip": 1.0},
@@ -272,6 +273,17 @@ def _validate_semantics(cfg: dict) -> None:
     position_scale = float(temporal["position_scale"])
     if not math.isfinite(position_scale) or position_scale <= 0:
         raise ValueError("model.temporal.position_scale must be finite and positive")
+
+    sequence = cfg["data"]["sequence"]
+    target_frame = str(sequence["target_frame"])
+    if target_frame not in ("all", "center"):
+        raise ValueError("data.sequence.target_frame must be 'all' or 'center'")
+    frames_per_clip = int(sequence["frames_per_clip"])
+    if frames_per_clip <= 0:
+        raise ValueError("data.sequence.frames_per_clip must be positive")
+    if target_frame == "center" and frames_per_clip % 2 == 0:
+        raise ValueError(
+            "data.sequence.target_frame='center' requires an odd frames_per_clip")
 
     for entry in cfg["data"]["datasets"]:
         if not isinstance(entry, dict) or "name" not in entry or "config" not in entry:

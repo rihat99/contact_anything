@@ -1,0 +1,10 @@
+# Non-causal T=5 temporal contact. All five frames provide context, but only
+# the middle frame contributes to the training loss, metrics, and test F1.
+base: configs/climbing_videos_joint_temporal.yaml
+
+data:
+  sequence:
+    target_frame: center
+
+output:
+  exp_name: climb4_t5mid

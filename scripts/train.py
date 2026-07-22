@@ -41,7 +41,7 @@ sys.path.insert(0, str(REPO))
 from contact import checkpoint as ckpt_io
 from contact.config import load_config
 from contact.data.collate import batch_to_device, make_loaders
-from contact.engine import forward_contact
+from contact.engine import forward_contact, select_temporal_supervision
 from contact.losses import MultiTargetContactLoss, ddp_global_mean_term
 from contact.metrics import (
     add_counts,
@@ -245,6 +245,7 @@ class Trainer:
         primary = self.cfg["contact"]["primary_target"]
         self.primary = primary if primary in self.targets else self.targets[0]
         self.eval_split = str(self.cfg["data"]["eval_split"])
+        self.target_frame = str(self.cfg["data"]["sequence"]["target_frame"])
 
         ocfg = self.cfg["optim"]
         self.grad_clip = float(self.cfg["loss"]["grad_clip"])
@@ -349,6 +350,15 @@ class Trainer:
     def _logits(self, contact: dict) -> dict:
         return {t: contact[f"{t}_logits"] for t in self.targets}
 
+    def _supervision(self, contact: dict, batch: dict) -> tuple[dict, dict]:
+        """Return logits/targets for the configured temporal prediction rows."""
+        return select_temporal_supervision(
+            self._logits(contact),
+            batch["targets"],
+            int(batch.get("seq_len", 1)),
+            self.target_frame,
+        )
+
     def _reduce_epoch_stats(
         self,
         running_loss: float,
@@ -436,8 +446,13 @@ class Trainer:
         has_video = any(d["name"] == "climbing_videos" for d in self.cfg["data"]["datasets"])
         layout = (f"video: {max(1, fpb // clip_len)} clips x T={clip_len}"
                   if has_video else f"stills: {fpb} frames x T=1")
+        supervised = (
+            f"center row only ({max(1, fpb // clip_len)} labels/rank)"
+            if self.target_frame == "center"
+            else "all rows"
+        )
         print(f"Trainable params: {n_train:,} | targets={self.targets} primary={self.primary} | "
-              f"monitor={self.monitor} ({self.monitor_mode})")
+              f"monitor={self.monitor} ({self.monitor_mode}) | supervision={supervised}")
         print(f"Batch budget: {fpb} frames/rank x {self.world_size} rank(s) "
               f"= {fpb * self.world_size} global frames -> {layout} per rank | "
               f"train batches/epoch={len(self.train_loader)} "
@@ -461,8 +476,8 @@ class Trainer:
             epoch_frames += frames
             window_frames += frames
 
-            logits = self._logits(self.forward_module(batch))
-            loss, parts = self.loss_fn(logits, batch["targets"])
+            logits, targets = self._supervision(self.forward_module(batch), batch)
+            loss, parts = self.loss_fn(logits, targets)
 
             # A batch with zero active supervision (e.g. an all-invalid video
             # window) has zero gradient — but AdamW weight decay would still nudge
@@ -494,7 +509,7 @@ class Trainer:
             n += 1
             batch_counts = {}
             for t in self.targets:
-                tgt = batch["targets"][t]
+                tgt = targets[t]
                 bc = contact_counts(logits[t].detach(), tgt["gt"], tgt["mask"])
                 batch_counts[t] = bc
                 add_counts(counts[t], bc)
@@ -527,7 +542,7 @@ class Trainer:
                     scalars[f"train/{t}/f2"]        = m["f2"]
                     scalars[f"train/{t}/iou"]       = m["iou"]
                     if t in self.output_names:
-                        tgt = batch["targets"][t]
+                        tgt = targets[t]
                         current_dims = contact_counts_per_dim(
                             logits[t].detach(), tgt["gt"], tgt["mask"])
                         for output_name, current in zip(self.output_names[t], current_dims):
@@ -575,12 +590,12 @@ class Trainer:
             self.eval_loader, desc=self.eval_split, disable=not self.is_main,
         ):
             batch  = batch_to_device(batch, self.device)
-            logits = self._logits(self.forward_module(batch))
-            loss, _ = self.loss_fn(logits, batch["targets"])
+            logits, targets = self._supervision(self.forward_module(batch), batch)
+            loss, _ = self.loss_fn(logits, targets)
             running_loss += loss.item()
             n += 1
             for t in self.targets:
-                tgt = batch["targets"][t]
+                tgt = targets[t]
                 add_counts(counts[t], contact_counts(logits[t], tgt["gt"], tgt["mask"]))
                 if t in output_counts:
                     for accumulated, current in zip(

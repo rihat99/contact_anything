@@ -1,9 +1,10 @@
-"""Render four-extremity contact predictions directly onto ClimbingVideos clips.
+"""Render four-extremity contacts directly onto ClimbingVideos clips.
 
 The renderer selects one random scene chunk per source video and draws four
 circles at the frozen MHR model's predicted left/right wrist and ankle
-positions. Contact is red and non-contact is green. No mesh or skeleton is
-rendered.
+positions. Contact is red and non-contact is green. With ``--overlay-labels``,
+the filled inner circle is the dataset label and the outer ring is the model
+prediction. No mesh or skeleton is rendered.
 
 Temporal checkpoints use centered sliding inference. Interior frames take the
 third (center) output of a five-frame window. The first and last two frames of
@@ -34,12 +35,20 @@ sys.path.insert(0, str(REPO))
 
 from contact import checkpoint as ckpt_io
 from contact.config import load_config
-from contact.data.climbing_videos import ClimbingVideosDataset, list_scenes
+from contact.data.climbing_videos import (
+    ClimbingVideosDataset,
+    list_completed_test_scenes,
+    list_scenes,
+)
 from contact.data.collate import batch_to_device, make_collate
 from contact.data.splits import video_id_from_scene
 from contact.engine import forward_model
 from contact.model import build_model
-from contact.targets import EXTREMITY_4_NAMES, TargetSpec
+from contact.targets import (
+    EXTREMITY_4_NAMES,
+    TargetSpec,
+    reduce_body22_to_extremities,
+)
 
 
 # OpenCV BGR colors.
@@ -126,6 +135,33 @@ def _frame_index_map(ds: ClimbingVideosDataset, scene: str) -> dict[tuple[int, i
     return result
 
 
+def _scene_ground_truth(data: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Return four-extremity labels and known-label mask as ``[P,N,4]`` arrays."""
+    raw_contact = data.get("joint_contact")
+    if raw_contact is None:
+        raise ValueError("dataset labels were not loaded for this scene")
+
+    contact = torch.as_tensor(raw_contact, dtype=torch.float32)
+    valid = torch.as_tensor(data["valid_mask"], dtype=torch.bool)
+    supervised = valid[..., None].expand_as(contact).clone()
+    annotated = data.get("annotated")
+    if annotated is not None:
+        supervised &= torch.as_tensor(annotated, dtype=torch.bool)
+
+    raw_confidence = data.get("contact_conf")
+    confidence = (
+        torch.ones_like(contact)
+        if raw_confidence is None
+        else torch.as_tensor(raw_confidence, dtype=torch.float32)
+    )
+    reduced_contact, reduced_supervised, _ = reduce_body22_to_extremities(
+        contact, supervised, confidence)
+    return (
+        (reduced_contact > 0.5).cpu().numpy(),
+        (reduced_supervised > 0).cpu().numpy(),
+    )
+
+
 def _predict_requests(
     model,
     ds: ClimbingVideosDataset,
@@ -209,19 +245,21 @@ def _predict_scene(
     scene: str,
     batch_size: int,
     device: str,
+    split_dir: str = "test",
+    require_labels: bool = False,
 ) -> tuple[ClimbingVideosDataset, np.ndarray, np.ndarray]:
     """Return dataset plus ``probs[P,N,4]`` and keypoints ``[P,N,4,2]``."""
     ds = ClimbingVideosDataset(
         root=root,
         scenes=[scene],
         mode="val",
-        split_dir="test",
+        split_dir=split_dir,
         frames_per_clip=1,
         frame_stride=1,
         jitter=False,
         seed=int(cfg["data"]["seed"]),
         use_confidence_weights=False,
-        require_labels=False,
+        require_labels=require_labels,
     )
     data = ds._scenes[scene]
     n_people, n_frames = data["valid_mask"].shape
@@ -260,12 +298,27 @@ def _draw_contacts(
     frame_probs: np.ndarray,
     frame_points: np.ndarray,
     threshold: float,
+    frame_labels: np.ndarray | None = None,
+    frame_label_mask: np.ndarray | None = None,
 ) -> None:
+    """Draw prediction disks, or prediction rings around inner label disks."""
     height, width = frame.shape[:2]
     radius = max(6, int(round(min(height, width) * 0.009)))
     outline = max(2, radius // 4)
+    if (frame_labels is None) != (frame_label_mask is None):
+        raise ValueError("frame_labels and frame_label_mask must be provided together")
+    if frame_labels is not None:
+        if frame_labels.shape != frame_probs.shape or frame_label_mask.shape != frame_probs.shape:
+            raise ValueError(
+                "label, label-mask and probability shapes must match; got "
+                f"{frame_labels.shape}, {frame_label_mask.shape}, {frame_probs.shape}")
+        radius = max(9, int(round(min(height, width) * 0.012)))
+        inner_radius = max(4, int(round(radius * 0.48)))
+
     for person in range(frame_probs.shape[0]):
-        for probability, xy in zip(frame_probs[person], frame_points[person]):
+        for joint, (probability, xy) in enumerate(
+            zip(frame_probs[person], frame_points[person])
+        ):
             if not np.isfinite(probability) or not np.isfinite(xy).all():
                 continue
             x, y = (int(round(float(xy[0]))), int(round(float(xy[1]))))
@@ -274,6 +327,19 @@ def _draw_contacts(
             color = CONTACT_COLOR if probability >= threshold else FREE_COLOR
             cv2.circle(frame, (x, y), radius + outline, OUTLINE_COLOR, -1, cv2.LINE_AA)
             cv2.circle(frame, (x, y), radius, color, -1, cv2.LINE_AA)
+            if frame_labels is not None:
+                # A thin white separator makes agreement and disagreement easy
+                # to read: prediction is the outer ring, label is the inner disk.
+                cv2.circle(
+                    frame, (x, y), inner_radius + 2, OUTLINE_COLOR, -1, cv2.LINE_AA)
+                if bool(frame_label_mask[person, joint]):
+                    label_color = (
+                        CONTACT_COLOR
+                        if bool(frame_labels[person, joint])
+                        else FREE_COLOR
+                    )
+                    cv2.circle(
+                        frame, (x, y), inner_radius, label_color, -1, cv2.LINE_AA)
 
 
 def _render_scene(
@@ -283,6 +349,8 @@ def _render_scene(
     points: np.ndarray,
     threshold: float,
     output_path: Path,
+    labels: np.ndarray | None = None,
+    label_mask: np.ndarray | None = None,
 ) -> dict:
     data = ds._scenes[scene]
     frames_dir = data["dir"] / "frames"
@@ -304,14 +372,20 @@ def _render_scene(
             if frame is None:
                 raise FileNotFoundError(frames_dir / f"{frame_position:06d}.jpg")
             _draw_contacts(
-                frame, probs[:, frame_position], points[:, frame_position], threshold)
+                frame,
+                probs[:, frame_position],
+                points[:, frame_position],
+                threshold,
+                None if labels is None else labels[:, frame_position],
+                None if label_mask is None else label_mask[:, frame_position],
+            )
             writer.write(frame)
     finally:
         writer.release()
 
     valid = np.isfinite(probs)
     predicted_contact = valid & (probs >= threshold)
-    return {
+    record = {
         "scene": scene,
         "output": output_path.name,
         "frames": n_frames,
@@ -323,6 +397,17 @@ def _render_scene(
         "predicted_contact_fraction": float(
             predicted_contact.sum() / max(int(valid.sum()), 1)),
     }
+    if labels is not None and label_mask is not None:
+        active = valid & label_mask
+        record.update({
+            "known_extremity_labels": int(active.sum()),
+            "label_contact_fraction": float(
+                (labels & active).sum() / max(int(active.sum()), 1)),
+            "prediction_label_agreement": float(
+                ((predicted_contact == labels) & active).sum()
+                / max(int(active.sum()), 1)),
+        })
+    return record
 
 
 def main() -> int:
@@ -330,7 +415,10 @@ def main() -> int:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
         "--config", type=Path, default=REPO / "configs" / "climbing_videos_joint.yaml")
-    parser.add_argument("--split", choices=("test",), default="test")
+    parser.add_argument("--split", choices=("train", "test"), default="test")
+    parser.add_argument(
+        "--overlay-labels", action="store_true",
+        help="draw dataset label as the inner disk and prediction as the outer ring")
     parser.add_argument("--num-videos", type=int, default=5)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--threshold", type=float, default=0.2)
@@ -357,12 +445,19 @@ def main() -> int:
     threshold_tag = f"{args.threshold:.2f}".replace(".", "")
     output_dir = (
         args.output_dir if args.output_dir is not None else
-        checkpoint.parent / f"video_inference_{args.split}_last_t{threshold_tag}")
+        checkpoint.parent / (
+            f"video_inference_{args.split}_{checkpoint.stem}_t{threshold_tag}"
+            f"{'_gtpred' if args.overlay_labels else ''}"
+        ))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = load_config(args.config)
     root = _dataset_root(cfg)
-    scenes = list_scenes(root, args.split)
+    scenes = (
+        list_completed_test_scenes(root)
+        if args.split == "test" and args.overlay_labels
+        else list_scenes(root, args.split)
+    )
     selected = select_random_scenes(scenes, args.num_videos, args.seed)
     if len(selected) < args.num_videos:
         raise ValueError(
@@ -382,9 +477,19 @@ def main() -> int:
     for index, (video_id, scene) in indexed[rank::world_size]:
         print(f"[rank {rank}] [{index}/{len(selected)}] {video_id} -> {scene}")
         ds, probs, points = _predict_scene(
-            model, cfg, root, scene, args.batch_size, device)
-        output_path = output_dir / f"{index:02d}_{scene}_contacts_t{threshold_tag}.mp4"
-        record = _render_scene(scene, ds, probs, points, args.threshold, output_path)
+            model, cfg, root, scene, args.batch_size, device,
+            split_dir=args.split,
+            require_labels=args.overlay_labels,
+        )
+        labels, label_mask = (
+            _scene_ground_truth(ds._scenes[scene])
+            if args.overlay_labels else (None, None)
+        )
+        suffix = "gtpred" if args.overlay_labels else "contacts"
+        output_path = output_dir / f"{index:02d}_{scene}_{suffix}_t{threshold_tag}.mp4"
+        record = _render_scene(
+            scene, ds, probs, points, args.threshold, output_path,
+            labels=labels, label_mask=label_mask)
         record["source_video"] = video_id
         record["selection_index"] = index
         local_records.append(record)
@@ -415,6 +520,10 @@ def main() -> int:
             "world_size": world_size,
             "joint_names": list(EXTREMITY_4_NAMES),
             "circle_colors": {"contact": "red", "non_contact": "green"},
+            "circle_encoding": (
+                {"inner_disk": "dataset label", "outer_ring": "model prediction"}
+                if args.overlay_labels else {"disk": "model prediction"}
+            ),
             "videos": records,
         }
         (output_dir / "summary.json").write_text(json.dumps(summary, indent=2))
