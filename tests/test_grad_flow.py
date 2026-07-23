@@ -19,13 +19,14 @@ import torch
 
 from contact.config import load_config
 from contact.data.collate import batch_to_device, make_collate
-from contact.engine import forward_contact
+from contact.engine import forward_contact, forward_model
 from contact.losses import MultiTargetContactLoss
 from contact.model import build_model
 from contact.targets import NUM_BODY_22, TargetSpec
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPORAL_CFG = os.path.join(REPO, "configs", "climbing_videos_joint_temporal.yaml")
+JOINT_CFG = os.path.join(REPO, "configs", "climbing_videos_joint.yaml")
 _CKPT = load_config(os.path.join(REPO, "configs", "base.yaml"))["model"]["checkpoint_path"]
 
 pytestmark = [
@@ -174,3 +175,153 @@ def test_flags_do_not_change_gradients(model_batch_loss):
         assert torch.allclose(grads_off[name], grads_on[name], rtol=1e-3, atol=1e-5), (
             f"grad for {name} changed between flags off/on: "
             f"max|diff|={(grads_off[name] - grads_on[name]).abs().max():.2e}")
+
+
+# ---------------------------------------------------------------- force branch (step 04)
+
+def _force_cfg(freeze_contact: bool) -> dict:
+    cfg = load_config(JOINT_CFG)                    # extremities_4, per_token joint target
+    cfg["model"]["force_head"]["enabled"] = True
+    cfg["train"]["detach_interm_preds"] = True
+    cfg["train"]["backbone_no_grad"] = True
+    cfg["train"]["freeze_contact"] = freeze_contact
+    return cfg
+
+
+def _randomize_force_head_final(model, seed=7):
+    """Move the zero-init force output layer off zero so a magnitude force term
+    has a nonzero gradient (at exact zero-init ``d(f^2)/dθ = 2f·f' = 0``)."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    linears = [m for m in model.head_force.proj.modules() if isinstance(m, torch.nn.Linear)]
+    final = linears[-1]
+    with torch.no_grad():
+        final.weight.copy_(torch.randn(final.weight.shape, generator=gen, device="cuda"))
+        final.bias.copy_(torch.randn(final.bias.shape, generator=gen, device="cuda"))
+
+
+def _force_loss_step(model, batch, loss_fn, seed=7):
+    """One fwd/bwd whose loss touches both branches. The real physics force loss
+    is step 06; here a graph-connected ``force`` term only exercises grad flow."""
+    _randomize_force_head_final(model)              # non-zero forces -> live grads
+    model.zero_grad(set_to_none=True)
+    model.train()
+    torch.manual_seed(seed)
+    out = forward_model(model, batch)
+    logits = {t: out["contact"][f"{t}_logits"] for t in loss_fn.target_names}
+    loss, _ = loss_fn(logits, batch["targets"])
+    loss = loss + out["force"]["joint_forces"].pow(2).sum()
+    loss.backward()
+    return loss.detach()
+
+
+def _randomize_force_temporal_gammas(model, seed=13):
+    """Move every force_temporal residual gate off zero so its subtree is live."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    with torch.no_grad():
+        for name, p in model.force_temporal.named_parameters():
+            if "gamma" in name:
+                p.copy_(torch.randn(p.shape, generator=gen, device="cuda"))
+
+
+def test_force_temporal_params_get_nonzero_grad():
+    """Every force_temporal param gets a *nonzero* grad from a force-reading loss
+    across a T>1 clip, with the gammas AND the zero-init force head final layer
+    randomized. A zero final head layer would zero every upstream force grad
+    (including force_temporal.*) regardless of the gammas, so the test would pass
+    spuriously at true init unless the head is moved off zero first."""
+    torch.manual_seed(0)
+    cfg = _force_cfg(freeze_contact=False)
+    cfg["model"]["force_temporal"]["enabled"] = True
+    model, _ = build_model(cfg, "cuda")
+    try:
+        _randomize_force_temporal_gammas(model)     # gates off zero -> live subtree
+        batch = _batch(cfg, model, _synth_frames(8), seq_len=4)   # 2 clips, T=4
+        loss_fn = MultiTargetContactLoss(cfg).to("cuda")
+        loss = _force_loss_step(model, batch, loss_fn)   # randomizes head, reads joint_forces
+        assert torch.isfinite(loss).all()
+
+        ft_params = [(n, p) for n, p in model.named_parameters() if "force_temporal" in n]
+        assert ft_params, "no force_temporal params found"
+        for name, p in ft_params:
+            assert p.requires_grad, f"force_temporal {name} not trainable"
+            assert p.grad is not None, f"force_temporal {name} received no grad"
+            assert float(p.grad.abs().sum()) > 0, f"force_temporal {name} got an all-zero grad"
+    finally:
+        del model
+        torch.cuda.empty_cache()
+
+
+def test_force_enabled_only_contact_or_force_are_trainable():
+    torch.manual_seed(0)
+    cfg = _force_cfg(freeze_contact=False)
+    model, _ = build_model(cfg, "cuda")
+    try:
+        batch = _batch(cfg, model, _synth_frames(4), seq_len=1)
+        loss_fn = MultiTargetContactLoss(cfg).to("cuda")
+        loss = _force_loss_step(model, batch, loss_fn)
+        assert torch.isfinite(loss).all()
+
+        n_train = 0
+        for name, p in model.named_parameters():
+            lname = name.lower()
+            if p.requires_grad:
+                assert "contact" in lname or "force" in lname, f"unexpected trainable {name}"
+                n_train += 1
+            else:
+                assert p.grad is None, f"frozen {name} unexpectedly has a grad"
+        assert n_train > 0
+        # Both branches present and trainable (regime b: joint + physics jointly).
+        assert any("force" in n.lower() and p.requires_grad
+                   for n, p in model.named_parameters())
+        assert any("contact" in n.lower() and p.requires_grad
+                   for n, p in model.named_parameters())
+    finally:
+        del model
+        torch.cuda.empty_cache()
+
+
+def test_freeze_contact_trains_force_only_and_pins_eval():
+    torch.manual_seed(0)
+    cfg = _force_cfg(freeze_contact=True)
+    model, _ = build_model(cfg, "cuda")
+    try:
+        batch = _batch(cfg, model, _synth_frames(4), seq_len=1)
+        loss_fn = MultiTargetContactLoss(cfg).to("cuda")
+        loss = _force_loss_step(model, batch, loss_fn)
+        assert torch.isfinite(loss).all()
+
+        contact_params = [(n, p) for n, p in model.named_parameters() if "contact" in n.lower()]
+        force_params = [(n, p) for n, p in model.named_parameters() if "force" in n.lower()]
+        assert contact_params and force_params
+
+        # Contact frozen: no requires_grad, no grad.
+        for name, p in contact_params:
+            assert not p.requires_grad, f"contact {name} still trainable under freeze_contact"
+            assert p.grad is None, f"frozen contact {name} received a grad"
+        # Every force param trains; at least one gets a nonzero grad (plumbing live).
+        for name, p in force_params:
+            assert p.requires_grad, f"force {name} not trainable"
+            assert p.grad is not None, f"force {name} received no grad"
+        assert any(float(p.grad.abs().sum()) > 0 for _, p in force_params)
+        # Frozen base params never get grads.
+        for name, p in model.named_parameters():
+            if "contact" not in name.lower() and "force" not in name.lower():
+                assert p.grad is None, f"frozen base {name} received a grad"
+
+        # Eval-pin: after train(True) with freeze_contact, contact submodules report
+        # eval, force submodules train.
+        model.train(True)
+        checked_force = checked_contact = 0
+        for mod_name, m in model.named_modules():
+            if not mod_name:
+                continue
+            if "head_force" in mod_name or mod_name.startswith("force_"):
+                assert m.training is True, f"force module {mod_name} not in train mode"
+                checked_force += 1
+            elif "head_contact" in mod_name or mod_name.startswith("contact_"):
+                assert m.training is False, f"frozen contact module {mod_name} in train mode"
+                checked_contact += 1
+        assert checked_force > 0 and checked_contact > 0
+    finally:
+        del model
+        torch.cuda.empty_cache()

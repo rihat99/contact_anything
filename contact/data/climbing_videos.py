@@ -182,12 +182,36 @@ class ClimbingVideosDataset(Dataset):
                 f"{scene}: valid person/frame ({person}, {frame}) has invalid bbox "
                 f"{bbox[person, frame].tolist()}")
 
+        # Per-frame metric camera pose + per-scene gravity (schema v3). Missing keys
+        # mean a stale export predating the camera backfill.
+        if "extrinsics" not in npz.files or "gravity_world" not in npz.files:
+            raise ValueError(
+                f"{scene}: labels/inputs npz has no camera extrinsics (stale export). "
+                f"Re-run BetterVideoReconstruction/scripts/export_contact_dataset.py "
+                f"--backfill to add extrinsics/gravity_world/cam_scale")
+
+        extrinsics = npz["extrinsics"].astype(np.float32)    # [N, 4, 4] cam-from-world
+        # World camera centres C = -R^T t (R,t from cam-from-world) for the physics
+        # camera-jerk filter. The jump is computed in ``__getitem__`` between
+        # consecutive SAMPLED clip frames — NOT consecutive source frames: with
+        # ``frame_stride > 1`` a discontinuity on a skipped source frame would be
+        # invisible to per-source-frame jumps (e.g. the 7.85 m jump at 262->263 of
+        # 45KmZUc0CzA_0007 vanishes for an even-parity stride-2 clip), while the net
+        # sampled-step displacement ||C(idx_i) - C(idx_{i-1})|| bounds any intra-gap
+        # jump from below (a reconstruction discontinuity does not jump back).
+        cam_centers = -np.einsum(
+            "nji,nj->ni", extrinsics[:, :3, :3], extrinsics[:, :3, 3]
+        ).astype(np.float32)
+
         return {
             "dir": scene_dir,
             "object_ids": npz["object_ids"].astype(np.int64),
             "frame_indices": npz["frame_indices"].astype(np.int64),
             "bbox": bbox,
             "intrinsics": npz["intrinsics"].astype(np.float32),  # [N, 3, 3]
+            "extrinsics": extrinsics,                            # [N, 4, 4] cam-from-world
+            "gravity_world": npz["gravity_world"].astype(np.float32),  # [3] unit, downward
+            "cam_centers": cam_centers,                          # [N, 3] world camera centres (m)
             "valid_mask": valid_mask,
             "fps": float(npz["fps"]),
             "joint_contact": joint_contact,                  # [P, N, 22] bool or None
@@ -232,7 +256,7 @@ class ClimbingVideosDataset(Dataset):
         start_time = float(frame_indices[start])
 
         clip = []
-        for pos in positions:
+        for row, pos in enumerate(positions):
             pos = int(pos)
             image = np.array(Image.open(frames_dir / f"{pos:06d}.jpg").convert("RGB"), np.uint8)
             mask_path = mask_dir / f"{pos:06d}.png"
@@ -269,6 +293,15 @@ class ClimbingVideosDataset(Dataset):
                 "mask": mask,
                 "bbox": data["bbox"][person, pos],                                    # [4] xyxy
                 "cam_int": data["intrinsics"][pos],                                   # [3, 3]
+                "cam_from_world": data["extrinsics"][pos],                            # [4, 4]
+                "gravity_world": data["gravity_world"],                              # [3]
+                # Camera-center displacement (m) from the PREVIOUS SAMPLED frame of
+                # this clip (stride-consistent; row 0 = 0.0). The physics jerk
+                # threshold applies to this per-sampled-step quantity.
+                "cam_jump_m": float(np.linalg.norm(
+                    data["cam_centers"][pos]
+                    - data["cam_centers"][int(positions[row - 1])]
+                )) if row > 0 and valid else 0.0,
                 "joint_contact": torch.from_numpy(joint_gt),
                 "joint_mask": torch.from_numpy(joint_mask),
                 "joint_supervised": torch.from_numpy(joint_supervised),

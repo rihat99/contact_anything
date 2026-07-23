@@ -14,8 +14,10 @@ from PIL import Image
 
 from contact.config import load_config
 from contact.data.climbing_videos import (
+    DEFAULT_ROOT,
     ClimbingVideosDataset,
     list_completed_test_scenes,
+    list_scenes,
 )
 from contact.data.collate import make_loaders
 from contact.targets import ALWAYS_NON_CONTACT_8, NUM_BODY_22
@@ -33,7 +35,15 @@ def _write_frames(scene_dir: Path, n: int, oid: int) -> None:
         Image.fromarray(np.full((8, 8), 255, np.uint8)).save(masks / f"{pos:06d}.png")
 
 
-def _common(n: int, oid: int, valid: np.ndarray) -> dict:
+def _common(n: int, oid: int, valid: np.ndarray,
+            extrinsics: np.ndarray | None = None,
+            gravity: np.ndarray | None = None) -> dict:
+    # Schema-v3 camera keys default to identity extrinsics / downward gravity;
+    # camera-specific tests pass their own.
+    if extrinsics is None:
+        extrinsics = np.tile(np.eye(4, dtype=np.float32), (n, 1, 1))
+    if gravity is None:
+        gravity = np.array([0.0, 1.0, 0.0], np.float32)
     return dict(
         object_ids=np.array([oid], np.int64),
         frame_indices=np.arange(n, dtype=np.int64),
@@ -41,12 +51,15 @@ def _common(n: int, oid: int, valid: np.ndarray) -> dict:
         intrinsics=np.tile(np.eye(3, dtype=np.float32) * 5.0, (n, 1, 1)),
         valid_mask=valid[None].astype(bool),                # [1, n]
         fps=np.float32(30.0),
+        extrinsics=extrinsics.astype(np.float32),           # [n, 4, 4]
+        gravity_world=gravity.astype(np.float32),           # [3]
     )
 
 
 def _train_scene(root: Path, scene: str, n: int, valid: np.ndarray,
                  jc: np.ndarray | None = None, conf: np.ndarray | None = None,
-                 oid: int = 7) -> None:
+                 oid: int = 7, extrinsics: np.ndarray | None = None,
+                 gravity: np.ndarray | None = None) -> None:
     scene_dir = root / "train" / scene
     scene_dir.mkdir(parents=True, exist_ok=True)
     _write_frames(scene_dir, n, oid)
@@ -57,7 +70,7 @@ def _train_scene(root: Path, scene: str, n: int, valid: np.ndarray,
     np.savez(scene_dir / "labels.npz",
              joint_contact_22=jc,
              contact_conf_22=conf,
-             **_common(n, oid, valid))
+             **_common(n, oid, valid, extrinsics=extrinsics, gravity=gravity))
 
 
 def _test_scene(root: Path, scene: str, n: int, valid: np.ndarray, *,
@@ -303,3 +316,104 @@ def test_terminal_val_window_covers_tail(tmp_path):
     train_bases = {item[2] for item in train._items}
     assert 11 in val_bases, f"terminal window missing from val (bases={sorted(val_bases)})"
     assert 11 not in train_bases, "train must not add the terminal window"
+
+
+# ---------------------------------------------------------------- step 02: cameras
+
+def test_cam_jump_is_sampled_step_displacement(tmp_path):
+    """``cam_jump_m`` is the camera-center displacement between consecutive SAMPLED
+    clip frames (row 0 = 0.0): a discontinuity on a source frame skipped by
+    ``frame_stride=2`` must still appear in the enclosing sampled step — the old
+    per-source-frame jump put it on the skipped row, making it invisible — and the
+    physics jerk filter must then exclude the clip."""
+    import types
+
+    import torch
+
+    from contact.physics.loss import PhysicsLoss
+
+    n = 8
+    extr = np.tile(np.eye(4, dtype=np.float32), (n, 1, 1))
+    extr[5:, 0, 3] = -7.85            # centre C = -R^T t jumps +7.85 x at 4 -> 5
+    _train_scene(tmp_path, "vid_0000", n, np.ones(n, bool), extrinsics=extr)
+    ds = ClimbingVideosDataset(tmp_path, scenes=["vid_0000"], mode="val",
+                               frames_per_clip=4, frame_stride=2, jitter=False)
+    clip = ds[0]
+    assert [f["frame_position"] for f in clip] == [0, 2, 4, 6]
+    jumps = [f["cam_jump_m"] for f in clip]
+    assert jumps[0] == 0.0                              # first clip row
+    assert jumps[1] == pytest.approx(0.0) and jumps[2] == pytest.approx(0.0)
+    # The 4->6 sampled step encloses the skipped 4->5 discontinuity. The
+    # per-source-frame jump at the sampled rows {0,2,4,6} is 0 everywhere.
+    assert jumps[3] == pytest.approx(7.85, rel=1e-5)
+
+    # And the jerk filter (real _eligible_clips code, duck-typed self) drops it.
+    batch = {
+        "frame_valid": torch.ones(4, dtype=torch.bool),
+        "cam_valid": torch.ones(4, dtype=torch.bool),
+        "cam_jump_m": torch.tensor(jumps, dtype=torch.float32),
+    }
+    stub = types.SimpleNamespace(min_frames=4, max_cam_jump_m=0.5)
+    eligible, n_excluded = PhysicsLoss._eligible_clips(stub, batch, 4, 1)
+    assert not bool(eligible.any())
+    assert n_excluded == 1
+
+
+def test_clip_carries_per_frame_camera_and_constant_gravity(tmp_path):
+    n = 12
+    extr = np.tile(np.eye(4, dtype=np.float32), (n, 1, 1))
+    extr[:, 0, 3] = np.arange(n, dtype=np.float32)      # tag each frame by tx = k
+    gravity = np.array([0.0, 0.0, 1.0], np.float32)     # non-default, still unit
+    _train_scene(tmp_path, "vid_0000", n, np.ones(n, bool),
+                 extrinsics=extr, gravity=gravity)
+    ds = ClimbingVideosDataset(tmp_path, scenes=["vid_0000"], mode="val",
+                               frames_per_clip=4, frame_stride=2, jitter=False)
+    clip = ds[0]
+    positions = [f["frame_position"] for f in clip]
+    assert positions == [0, 2, 4, 6]                    # window offsets respected
+    for frame, pos in zip(clip, positions):
+        cam = np.asarray(frame["cam_from_world"], np.float32)
+        assert cam.shape == (4, 4)
+        assert float(cam[0, 3]) == float(pos)           # per-frame extrinsics row
+        assert np.allclose(np.asarray(frame["gravity_world"]), gravity)
+
+
+def test_missing_extrinsics_raises_stale_export(tmp_path):
+    n = 6
+    _train_scene(tmp_path, "vid_0000", n, np.ones(n, bool))
+    path = tmp_path / "train" / "vid_0000" / "labels.npz"
+    with np.load(path) as saved:
+        payload = {name: saved[name].copy() for name in saved.files
+                   if name not in ("extrinsics", "gravity_world")}
+    np.savez(path, **payload)                           # drop the camera keys
+    with pytest.raises(ValueError, match="stale export"):
+        ClimbingVideosDataset(tmp_path, scenes=["vid_0000"], mode="val",
+                              frames_per_clip=4, frame_stride=1)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not (Path(DEFAULT_ROOT) / "train").is_dir(),
+                    reason="ClimbingVideos_v1 not present")
+def test_real_scene_cam_from_world_matches_transform():
+    import json
+
+    root = Path(DEFAULT_ROOT)
+    info = json.loads((root / "dataset_info.json").read_text())
+    if int(info.get("schema_version", 0)) < 3:
+        pytest.skip("dataset not backfilled to schema v3")
+    feat = Path(info["source_data_root"]) / "features"
+    for scene in list_scenes(root, "train"):
+        ds = ClimbingVideosDataset(root, scenes=[scene], mode="val",
+                                   frames_per_clip=4, frame_stride=2, jitter=False)
+        if len(ds) > 0:
+            break
+    else:
+        pytest.skip("no train scene long enough for a T=4 window")
+    aa, bb = scene[:2], scene[2:4]
+    with np.load(feat / "geometry" / aa / bb / scene / "transform.npz") as transform:
+        extr = np.asarray(transform["extrinsics"], np.float32)
+    for frame in ds[0]:
+        pos = frame["frame_position"]
+        assert np.allclose(
+            np.asarray(frame["cam_from_world"], np.float32), extr[pos], atol=1e-5)
+        assert abs(float(np.linalg.norm(np.asarray(frame["gravity_world"]))) - 1.0) < 1e-4

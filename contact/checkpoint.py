@@ -1,10 +1,21 @@
-"""Schema-versioned checkpoints for the trainable contact parameters (v2).
+"""Schema-versioned checkpoints for the trainable contact/force parameters (v2).
 
 The frozen SAM-3D-Body weights live in the original checkpoint — re-saving them
 every epoch would be ~600 MB of nothing new. Here we serialise only the params
-named in ``trainable_names`` (contact tokens, contact head(s), the contact
-posemb/feat projections, and the contact temporal module when enabled), plus the
-optimiser, scheduler, run state, resolved config, wandb run id and RNG states.
+named in ``saved_names`` (contact tokens, contact head(s), the contact
+posemb/feat projections, the contact temporal module, and — when enabled — the
+force tokens / ``head_force`` / ``force_temporal``), plus the optimiser,
+scheduler, run state, resolved config, wandb run id and RNG states.
+
+**Self-contained regime (a).** In regime (a) (``train.freeze_contact``) the
+warm-started contact branch is frozen, so it is *not* in the ``requires_grad``
+trainable set — yet it is not part of the base checkpoint either. ``save`` takes a
+``saved_names`` superset (every ``contact``/``force`` param, whether or not it is
+currently trainable) so those frozen contact weights ride along; the arch
+fingerprint stays computed over the ``requires_grad`` trainable set only, so the
+hard-fail identity check is unchanged. ``load`` restores every saved param and, for
+*legacy* regime-(a) checkpoints written before this (force tensors only, no contact
+weights), recovers the contact branch from the config's ``init_contact_checkpoint``.
 
 **Hard-fail loading.** Every checkpoint carries ``schema_version`` and an *arch
 fingerprint* — a sha256 over the sorted ``(trainable name, shape)`` pairs. Loading
@@ -27,6 +38,10 @@ import torch.nn as nn
 from .targets import joint_set_names, joint_set_num_outputs, topology_num_vertices
 
 SCHEMA_VERSION = 2
+
+# Repo root — used to resolve a legacy regime-(a) checkpoint's relative
+# ``init_contact_checkpoint`` when recovering its dropped contact branch.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 # -------------------------------------------------------------------- fingerprint
@@ -66,6 +81,11 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
     placement/attend/causal, mask conditioning, and the frozen base checkpoint —
     so a same-shape but different-architecture checkpoint is rejected on load.
     Returns ``None`` when ``config`` is ``None`` (signature comparison skipped).
+
+    Known, deliberate gap: the ``temporal``/``force_temporal`` sub-signatures omit
+    ``dropout``. Every shipped artifact uses ``0.0``, and adding the key now would
+    orphan existing checkpoints whose stored signatures lack it (their comparison
+    would spuriously mismatch). Absorb it at the next signature-version bump.
     """
     if config is None:
         return None
@@ -108,6 +128,38 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
     else:
         temporal = {"enabled": False}
 
+    # Force head (step 04): same shape-invariant-but-semantic capture as the
+    # contact head. `frame` changes what the head learns (LWA vs joint-local
+    # forces), so it belongs here; loss weights / physics: numbers do NOT.
+    fhcfg = model_cfg.get("force_head", {}) or {}
+    if fhcfg.get("enabled", False):
+        force = {
+            "enabled": True,
+            "frame": str(fhcfg.get("frame", "local_world_aligned")),
+            "mlp_depth": int(fhcfg.get("mlp_depth", 2)),
+            "mlp_channel_div_factor": int(fhcfg.get("mlp_channel_div_factor", 4)),
+            "dropout": float(fhcfg.get("dropout", 0.0)),
+        }
+    else:
+        force = {"enabled": False}
+
+    # Force temporal module (step 05): mirrors the contact `temporal` capture but
+    # has no placement key (post_decoder only, D11).
+    ftcfg = model_cfg.get("force_temporal", {}) or {}
+    if ftcfg.get("enabled", False):
+        force_temporal = {
+            "enabled": True,
+            "attend": str(ftcfg.get("attend", "per_token")),
+            "causal": bool(ftcfg.get("causal", False)),
+            "bottleneck_dim": int(ftcfg.get("bottleneck_dim", 256)),
+            "num_layers": int(ftcfg.get("num_layers", 1)),
+            "num_heads": int(ftcfg.get("num_heads", 4)),
+            "mlp_ratio": float(ftcfg.get("mlp_ratio", 2.0)),
+            "position_scale": float(ftcfg.get("position_scale", 1.0)),
+        }
+    else:
+        force_temporal = {"enabled": False}
+
     return {
         "anchor_indices": [int(i) for i in kp],
         "num_global_tokens": int(chead.get("num_global_tokens", 3)),
@@ -121,6 +173,8 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
         "targets": {k: int(v) for k, v in sorted(targets_layout.items())},
         "joint_layout": joint_layout,
         "temporal": temporal,
+        "force": force,
+        "force_temporal": force_temporal,
         "mask_embed_type": model_cfg.get("mask_embed_type", None),
         "base_checkpoint": Path(str(model_cfg.get("checkpoint_path", ""))).name,
     }
@@ -192,17 +246,33 @@ def save(
     wandb_run_id: Optional[str] = None,
     split_manifest: Optional[dict] = None,
     extra: Optional[dict] = None,
+    saved_names: Optional[Iterable[str]] = None,
 ) -> None:
-    """Write a schema-v2 checkpoint of the trainable state and run metadata."""
+    """Write a schema-v2 checkpoint of the trainable state and run metadata.
+
+    :param trainable_names: the ``requires_grad`` param names — the arch identity
+        (fingerprint + spec). Unchanged by ``saved_names`` so the hard-fail load
+        check still compares against the live model's trainable set exactly.
+    :param saved_names: superset of ``trainable_names`` whose tensors are actually
+        serialised. Defaults to ``trainable_names``. In regime (a) the caller passes
+        every ``contact``/``force`` param so the frozen-but-not-in-base contact
+        weights are persisted (otherwise consumers would run with random contact
+        weights). The extra frozen names are also recorded under
+        ``frozen_saved_names`` so ``load`` can tell a self-contained regime-(a)
+        checkpoint from a legacy one.
+    """
     trainable_names = list(trainable_names)
+    saved_names = list(saved_names) if saved_names is not None else list(trainable_names)
     spec = _arch_spec(model, trainable_names)
+    frozen_saved_names = sorted(set(saved_names) - set(trainable_names))
     ckpt = {
         "schema_version":       SCHEMA_VERSION,
         "arch_fingerprint":     _fingerprint(spec),
         "arch_spec":            [(n, list(s)) for n, s in spec],
         "arch_signature":       _arch_signature(config),
-        "trainable_state_dict": _select_state(model, trainable_names),
+        "trainable_state_dict": _select_state(model, saved_names),
         "trainable_names":      trainable_names,
+        "frozen_saved_names":   frozen_saved_names,
         "optimizer":            optimizer.state_dict(),
         "scheduler":            scheduler.state_dict() if scheduler is not None else None,
         "epoch":                int(epoch),
@@ -256,6 +326,15 @@ def _check_schema(
     # placement/attend/causal, mask conditioning, base checkpoint identity).
     want_sig = ckpt.get("arch_signature")
     got_sig = _arch_signature(config)
+    if config is not None and want_sig is not None:
+        # Pre-force contact checkpoints (schema v2, saved before the force branch)
+        # have no `force`/`force_temporal` signature keys. Default their absence to
+        # the disabled state on both sides so such a checkpoint still loads into a
+        # contact-only run; a force-enabled run correctly mismatches (enabled vs
+        # disabled).
+        disabled = {"force": {"enabled": False}, "force_temporal": {"enabled": False}}
+        want_sig = {**disabled, **want_sig}
+        got_sig = {**disabled, **(got_sig or {})}
     if config is not None and want_sig is not None and want_sig != got_sig:
         diffs = [
             f"  {key}: checkpoint={want_sig.get(key, 'ABSENT')!r} "
@@ -267,6 +346,74 @@ def _check_schema(
             f"{path}: arch signature mismatch — the trainable params share the "
             f"checkpoint's shapes but the architecture differs semantically:\n"
             + "\n".join(diffs))
+
+
+def _recover_legacy_frozen_contact(
+    ckpt: dict,
+    model: nn.Module,
+    path: str | Path,
+    config: Optional[dict],
+    map_location: str,
+) -> None:
+    """Recover the frozen contact branch of a *legacy* regime-(a) checkpoint.
+
+    Regime-(a) checkpoints written before contact weights became self-contained
+    hold only the force tensors; the warm-started, then frozen, contact branch was
+    dropped and would be left at random init here. Detect that case — the stored
+    config marks ``train.freeze_contact`` true yet no ``contact``-named tensor was
+    restored — and re-warm-start the contact params from the config's
+    ``init_contact_checkpoint`` (resolved relative to the repo root). Self-contained
+    checkpoints (contact tensors present) and all non-regime-(a) checkpoints return
+    immediately. Raises when the recovery source is unavailable so the caller never
+    silently proceeds with a contact-less model.
+    """
+    ckpt_config = ckpt.get("config") or {}
+    if not bool((ckpt_config.get("train") or {}).get("freeze_contact", False)):
+        return
+    saved_contact = {
+        name for name in ckpt["trainable_state_dict"] if "contact" in name.lower()}
+    if saved_contact:
+        # SOME contact tensors present: this claims to be self-contained, so it must
+        # hold the model's FULL contact-named set — a partial contact branch would
+        # leave the missing tensors at random init (the exact silent failure the
+        # hard-fail guarantee forbids). All-or-nothing: full set -> restored above;
+        # empty -> legacy recovery below; partial -> corrupt, raise.
+        model_contact = {
+            name for name, _ in model.named_parameters() if "contact" in name.lower()}
+        partial_missing = sorted(model_contact - saved_contact)
+        if partial_missing:
+            raise RuntimeError(
+                f"{path}: regime-(a) checkpoint holds a PARTIAL contact branch — "
+                f"{len(partial_missing)} contact param(s) of the model are absent from "
+                f"its state (e.g. {partial_missing[:5]}). The checkpoint is corrupt or "
+                f"was written by an incompatible saver; refusing to load with a "
+                f"partially random contact head.")
+        return   # self-contained: the frozen contact weights are already restored
+
+    init_ckpt = (ckpt_config.get("model") or {}).get("init_contact_checkpoint")
+    if not init_ckpt:
+        raise RuntimeError(
+            f"{path}: legacy regime-(a) checkpoint (train.freeze_contact) holds only "
+            f"force weights and its config has no model.init_contact_checkpoint to "
+            f"recover the frozen contact branch from — the contact head would be "
+            f"randomly initialised. Retrain to write a self-contained checkpoint.")
+    init_path = Path(init_ckpt)
+    if not init_path.is_absolute():
+        init_path = _REPO_ROOT / init_path
+    if not init_path.is_file():
+        raise RuntimeError(
+            f"{path}: legacy regime-(a) checkpoint holds only force weights; its "
+            f"contact branch must be recovered from init_contact_checkpoint "
+            f"{init_ckpt!r} but that file is missing/unreadable (resolved to "
+            f"{init_path}). Restore that checkpoint or retrain to write a "
+            f"self-contained one.")
+    print(
+        f"WARNING: {path} is a legacy regime-(a) checkpoint with no contact weights; "
+        f"recovering the frozen contact branch from {init_path}")
+    initialize_common_contact(
+        init_path, model,
+        config=config if config is not None else ckpt_config,
+        map_location=map_location)
 
 
 def load(
@@ -288,7 +435,9 @@ def load(
         python RNG so the next epoch's data ordering matches an uninterrupted run.
     :raises RuntimeError: if the checkpoint is not schema v2 or its trainable-param
         fingerprint / architecture signature does not match ``model`` (never
-        silently random-inits).
+        silently random-inits). Also raised by the legacy regime-(a) recovery
+        (:func:`_recover_legacy_frozen_contact`) when a contact-less checkpoint's
+        ``init_contact_checkpoint`` source is unavailable.
     :returns: the loaded checkpoint dict (metadata + state).
     """
     ckpt = torch.load(Path(path), map_location=map_location, weights_only=False)
@@ -297,12 +446,31 @@ def load(
 
     _check_schema(ckpt, model, path, config)
 
+    # Self-contained-checkpoint completeness: every frozen name the checkpoint
+    # CLAIMS to carry (regime (a) contact branch) must actually have a tensor in
+    # the state dict and a home in the model — a truncated/partial checkpoint must
+    # hard-fail here, never load a partially random frozen branch.
+    frozen_names = ckpt.get("frozen_saved_names") or []
+    if frozen_names:
+        state_keys = set(ckpt["trainable_state_dict"])
+        model_params = {name for name, _ in model.named_parameters()}
+        missing_tensors = sorted(set(frozen_names) - state_keys)
+        missing_params = sorted(set(frozen_names) - model_params)
+        if missing_tensors or missing_params:
+            raise RuntimeError(
+                f"{path}: frozen_saved_names inconsistency — the checkpoint is "
+                f"corrupt/partial or the model differs.\n"
+                f"  names without a saved tensor: {missing_tensors}\n"
+                f"  names absent from the model:  {missing_params}")
+
     missing, unexpected = model.load_state_dict(ckpt["trainable_state_dict"], strict=False)
     # The frozen base weights are expected to be "missing" here; a *trainable*
     # name missing means the fingerprint check let something slip — treat as fatal.
     trainable_missing = [m for m in missing if m in set(ckpt["trainable_names"])]
     if trainable_missing:
         raise RuntimeError(f"{path}: trainable params missing from checkpoint: {trainable_missing}")
+
+    _recover_legacy_frozen_contact(ckpt, model, path, config, map_location)
 
     if optimizer is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -320,14 +488,24 @@ def initialize_common_contact(
     config: dict,
     map_location: str = "cpu",
 ) -> dict:
-    """Warm-start common contact parameters while allowing a new temporal module.
+    """Warm-start common contact parameters, allowing new temporal and/or force params.
 
     This is deliberately narrower than :func:`load`: it does not restore the
-    optimiser, scheduler, epoch, or RNG, and the only trainable parameters that
-    may be absent from the source checkpoint are ``contact_temporal.*``. All
-    forward semantics other than the temporal configuration must match exactly.
-    It is intended for starting temporal fine-tuning from a per-frame contact
-    checkpoint without weakening strict resume checks.
+    optimiser, scheduler, epoch, or RNG. The only trainable parameters that may be
+    absent from the source checkpoint are ``contact_temporal.*`` (temporal
+    fine-tuning from a per-frame checkpoint) and any param whose name contains
+    ``"force"`` (the force branch — force tokens/linears, ``head_force``,
+    ``force_temporal``). Everything else must match exactly: the force keys are
+    exempted from the arch-signature comparison symmetrically (like ``temporal``),
+    and the precondition is that the target enables the temporal module OR the force
+    branch. It starts a temporal fine-tune, or a regime-(a) force warm-start, from a
+    per-frame contact checkpoint without weakening the strict resume checks.
+
+    The source may itself be *temporal* provided the target's temporal architecture
+    is identical (same signature dict): its ``contact_temporal.*`` params then load
+    like any other contact param — no longer "allowed missing", they simply load.
+    This lets a regime-(a) force run warm-start from a trained temporal contact
+    checkpoint. A temporal source with a differing/disabled target temporal raises.
     """
     path = Path(path)
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
@@ -339,8 +517,16 @@ def initialize_common_contact(
 
     source_sig = dict(ckpt.get("arch_signature") or {})
     target_sig = dict(_arch_signature(config) or {})
+    # Exempt the modules a warm start may introduce from the signature comparison,
+    # symmetrically on both sides: temporal (temporal fine-tune) and the force
+    # branch (regime (a)). A contact-only source has no force keys; a force-enabled
+    # target does — popping both keeps the remaining semantics an exact match.
     source_temporal = source_sig.pop("temporal", {"enabled": False})
     target_temporal = target_sig.pop("temporal", {"enabled": False})
+    source_sig.pop("force", None)
+    source_sig.pop("force_temporal", None)
+    target_force = target_sig.pop("force", {"enabled": False})
+    target_sig.pop("force_temporal", None)
     if source_sig != target_sig:
         diffs = [
             f"  {key}: checkpoint={source_sig.get(key, 'ABSENT')!r} "
@@ -349,15 +535,22 @@ def initialize_common_contact(
             if source_sig.get(key) != target_sig.get(key)
         ]
         raise RuntimeError(
-            f"{path}: warm-start architecture mismatch outside temporal module:\n"
-            + "\n".join(diffs))
-    if source_temporal.get("enabled", False):
+            f"{path}: warm-start architecture mismatch outside the temporal/force "
+            f"modules:\n" + "\n".join(diffs))
+    # A temporal source is allowed IFF the target's temporal architecture is
+    # identical: then its ``contact_temporal.*`` params simply load like any other
+    # contact param. A differing (or disabled) target temporal still raises — the
+    # temporal weights would be shape-compatible yet semantically wrong.
+    if source_temporal.get("enabled", False) and source_temporal != target_temporal:
         raise RuntimeError(
-            f"{path}: warm-start source already has temporal enabled; use strict resume "
-            "for the same architecture or start from a per-frame checkpoint")
-    if not target_temporal.get("enabled", False):
+            f"{path}: warm-start source has temporal enabled but the target's temporal "
+            "architecture differs (or is disabled); a temporal source may only warm-start "
+            "an identical temporal architecture. Source temporal="
+            f"{source_temporal!r} target temporal={target_temporal!r}")
+    if not (target_temporal.get("enabled", False) or target_force.get("enabled", False)):
         raise RuntimeError(
-            "initialize_common_contact is only valid when the target enables temporal")
+            "initialize_common_contact is only valid when the target enables the "
+            "temporal module or the force branch")
 
     current = dict(model.named_parameters())
     source_state = ckpt["trainable_state_dict"]
@@ -373,10 +566,13 @@ def initialize_common_contact(
 
     current_trainable = {name for name, p in current.items() if p.requires_grad}
     missing = sorted(current_trainable - set(source_state))
-    invalid_missing = [name for name in missing if not name.startswith("contact_temporal.")]
+    invalid_missing = [
+        name for name in missing
+        if not name.startswith("contact_temporal.") and "force" not in name.lower()
+    ]
     if invalid_missing:
         raise RuntimeError(
-            f"{path}: warm start is missing non-temporal trainable parameters: "
+            f"{path}: warm start is missing non-temporal/non-force trainable parameters: "
             f"{invalid_missing}")
 
     model.load_state_dict(source_state, strict=False)

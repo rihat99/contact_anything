@@ -1,0 +1,13 @@
+# Regime (b) joint training + a FORCE-token temporal block (step 05). Contact head
+# from labels, force branch (with cross-frame force attention) from the physics
+# residual, trained together.
+base: configs/climbing_videos_force_scratch.yaml
+
+model:
+  force_temporal:
+    enabled: true
+    attend: per_token                 # each limb mixes only with itself through time
+    position_scale: 30.0              # ~30-fps seconds -> well-separated frame offsets
+
+output:
+  exp_name: climb4_force_scratch_t8

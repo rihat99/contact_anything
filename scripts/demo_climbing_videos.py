@@ -1,9 +1,21 @@
-"""Qualitative per-frame inference for a ClimbingVideos joint checkpoint.
+"""Qualitative clip inference for a ClimbingVideos joint/force checkpoint.
 
-Each figure contains the source frame, the frozen model's predicted MHR pose,
-the confidence-coloured ground-truth canonical skeleton, and the predicted
-canonical skeleton. ClimbingVideos does not provide projected joint positions,
-so the contact skeleton is deliberately schematic rather than overlaid.
+Each sampled item is a clip of the config's ``data.sequence.frames_per_clip``
+frames, forwarded whole so temporal / force attention (and the physics-frame
+window) see the same cross-frame context they were trained with; the figure is
+rendered for the clip's center frame.
+
+Each figure contains that frame, the frozen model's predicted MHR pose, the
+confidence-coloured ground-truth canonical skeleton, and the predicted canonical
+skeleton. ClimbingVideos does not provide projected joint positions, so the
+contact skeleton is deliberately schematic rather than overlaid.
+
+When the checkpoint has a force head, per-extremity **force arrows** are drawn on
+the predicted-pose panel (anchor = the extremity's 2D keypoint, direction = the
+3D force projected through the model's intrinsics, length ∝ magnitude in body
+weights). Lacking a trained force checkpoint, ``--warm-start`` builds the untrained
+force branch from the config's ``model.init_contact_checkpoint`` (zero-init head →
+no visible arrows until trained).
 """
 from __future__ import annotations
 
@@ -43,6 +55,61 @@ from viewer.skeleton import JOINT_COORDS, JOINT_EDGES
 COLOR_CONTACT = np.array([0.87, 0.12, 0.16])
 COLOR_FREE = np.array([0.08, 0.62, 0.36])
 COLOR_UNCERTAIN = np.array([0.64, 0.66, 0.69])
+
+# One arrow colour per force output (left_hand, right_hand, left_foot, right_foot).
+FORCE_COLORS = ("#e0530f", "#f0a500", "#1c72d8", "#2fb3ad")
+FORCE_PIXELS_PER_BW = 70.0      # arrow pixel length per unit body weight of |f|
+FORCE_MIN_BW = 1.0e-3           # skip near-zero forces (e.g. a zero-init head)
+
+
+def _draw_force_arrows(ax, mhr: dict, forces: np.ndarray, anchor_indices, frame: str) -> None:
+    """Overlay per-extremity predicted force arrows on a full-image axes.
+
+    Anchor = the extremity's projected 2D keypoint; direction = the predicted 3D
+    force projected through the model's own intrinsics; pixel length ∝ magnitude
+    in body weights; colour by extremity. Only the ``local_world_aligned`` frame
+    is drawn — the joint-local frame needs FK not run here.
+
+    :param mhr: ``out["mhr"]`` (reads ``pred_keypoints_3d``, ``pred_keypoints_2d``,
+        ``pred_cam_t``, ``focal_length``).
+    :param forces: ``[K, 3]`` predicted forces (body weight, head frame).
+    :param anchor_indices: MHR70 keypoint indices the force tokens are anchored to.
+    :param frame: ``model.force_head.frame``.
+    """
+    if frame != "local_world_aligned":
+        return
+    kp3d = mhr["pred_keypoints_3d"][0].cpu().numpy()          # [70, 3] camera frame
+    kp2d = mhr["pred_keypoints_2d"][0].cpu().numpy()          # [70, 2] full-img px
+    cam_t = mhr["pred_cam_t"][0].cpu().numpy()                # [3]
+    focal = float(mhr["focal_length"][0].cpu())
+    flip = np.array([1.0, -1.0, -1.0])                        # LWA (cam y-up) -> y-down
+    for out_idx, anchor_idx in enumerate(anchor_indices):
+        f_pred = np.asarray(forces[out_idx], dtype=np.float64)
+        mag = float(np.linalg.norm(f_pred))
+        if mag < FORCE_MIN_BW:
+            continue
+        point_cam = kp3d[anchor_idx] + cam_t                  # camera-space anchor
+        if point_cam[2] <= 1e-3:                              # behind the camera
+            continue
+        anchor = kp2d[anchor_idx]
+        # Principal point that reproduces the model's own 2D keypoint at this anchor,
+        # so the pinhole projection of a step along the force is exactly consistent.
+        cx = anchor[0] - focal * point_cam[0] / point_cam[2]
+        cy = anchor[1] - focal * point_cam[1] / point_cam[2]
+        step_cam = point_cam + (0.05 / mag) * (flip * f_pred)   # 5 cm along force dir
+        tip_x = focal * step_cam[0] / step_cam[2] + cx
+        tip_y = focal * step_cam[1] / step_cam[2] + cy
+        direction = np.array([tip_x - anchor[0], tip_y - anchor[1]])
+        norm = float(np.linalg.norm(direction))
+        if norm < 1e-6:
+            continue
+        tip = anchor + (FORCE_PIXELS_PER_BW * mag) * (direction / norm)
+        color = FORCE_COLORS[out_idx % len(FORCE_COLORS)]
+        ax.annotate("", xy=(tip[0], tip[1]), xytext=(anchor[0], anchor[1]),
+                    arrowprops=dict(arrowstyle="-|>", color=color, lw=2.6,
+                                    shrinkA=0, shrinkB=0), zorder=5)
+        ax.text(tip[0], tip[1], f"{mag:.2f}", color=color, fontsize=8.5,
+                fontweight="bold", ha="left", va="center", zorder=6)
 
 
 def _mix_color(contact: bool, confidence: float) -> np.ndarray:
@@ -143,6 +210,8 @@ def _make_figure(
     target_mask: np.ndarray,
     spec: TargetSpec,
     threshold: float,
+    force_anchor_indices=None,
+    force_frame: str | None = None,
 ):
     reduced_gt, reduced_supervised, reduced_confidence = _reduced_label_arrays(sample, spec)
     gt = target_gt > 0.5
@@ -168,8 +237,16 @@ def _make_figure(
     axes[0, 0].set_axis_off()
 
     pred_v2, pred_vcam, mhr_faces = _mhr_overlay_arrays(out["mhr"])
+    pose_title = "Predicted pose (frozen MHR)"
+    draw_force = out.get("force") is not None and force_anchor_indices is not None
+    if draw_force:
+        pose_title = "Predicted pose (frozen MHR) + force arrows"
     overlay_mesh_on_image_2d(axes[0, 1], image, pred_v2, pred_vcam, mhr_faces,
-                             None, "Predicted pose (frozen MHR)")
+                             None, pose_title)
+    if draw_force:
+        _draw_force_arrows(
+            axes[0, 1], out["mhr"], out["force"]["joint_forces"][0].cpu().numpy(),
+            force_anchor_indices, str(force_frame))
 
     gt_mean = float(confidence[supervised].mean()) if supervised.any() else 0.0
     _draw_skeleton(
@@ -197,17 +274,27 @@ def _video_dataset(cfg: dict, state: dict, split: str) -> ClimbingVideosDataset:
     if split == "val":
         key = f"video:{video_spec['config']}"
         manifest = state.get("split_manifest") or {}
-        if key not in manifest:
-            raise RuntimeError(f"checkpoint split manifest has no {key!r}")
-        val_videos = set(manifest[key]["val"])
+        entry = manifest.get(key)
+        if entry is None or "val" not in entry:
+            detail = (
+                " — this run was trained with data.eval_split=test, so its manifest "
+                "holds train/test scene lists (there is no val split); use --split test"
+                if entry is not None and "test" in entry else "")
+            raise RuntimeError(
+                f"checkpoint split manifest has no val split for {key!r}{detail}")
+        val_videos = set(entry["val"])
         scenes = [scene for scene in scenes if video_id_from_scene(scene) in val_videos]
+    # Match the training-time clip so temporal / force checkpoints see the same
+    # cross-frame context they were trained with (a T=1 clip would collapse the
+    # temporal attention and the physics-frame window). The center frame is rendered.
+    seq = cfg["data"]["sequence"]
     return ClimbingVideosDataset(
         root,
         scenes=scenes,
         mode="val",
         split_dir=split_dir,
-        frames_per_clip=1,
-        frame_stride=1,
+        frames_per_clip=int(seq["frames_per_clip"]),
+        frame_stride=int(seq["frame_stride"]),
         jitter=False,
         seed=int(cfg["data"]["seed"]),
         use_confidence_weights=bool(
@@ -215,27 +302,42 @@ def _video_dataset(cfg: dict, state: dict, split: str) -> ClimbingVideosDataset:
     )
 
 
+def _clip_bucket(ds: ClimbingVideosDataset, spec: TargetSpec, index: int) -> int:
+    """Contact-count bucket (0 / 1 / 2+) of the clip's RENDERED (center) frame.
+
+    ``main`` renders ``clip[T // 2]``, which for a val-mode (jitter-off) clip is
+    source frame ``base + (T // 2) * stride`` — the same sampling arithmetic
+    ``__getitem__`` uses. Stratifying by the clip's *base* frame instead would
+    label the figure by a frame up to ``(T // 2) * stride`` source frames away
+    from the one actually shown (16 frames at T=16 stride 2).
+    """
+    scene, person, base, _ = ds._items[index]
+    data = ds._scenes[scene]
+    center_pos = base + (ds.T // 2) * ds.stride
+    contacts = torch.as_tensor(
+        data["joint_contact"][person, center_pos], dtype=torch.float32)
+    supervised = torch.full((22,), float(data["valid_mask"][person, center_pos]))
+    if data["annotated"] is not None:
+        supervised *= torch.as_tensor(data["annotated"][person, center_pos])
+    confidence = (
+        torch.ones(22) if data["contact_conf"] is None else
+        torch.as_tensor(np.nan_to_num(
+            data["contact_conf"][person, center_pos], nan=0.0, posinf=1.0, neginf=0.0
+        ).clip(0.0, 1.0))
+    )
+    if spec.joint_set == "extremities_4":
+        contacts, supervised, _ = reduce_body22_to_extremities(
+            contacts, supervised, confidence)
+    n_contact = int(((contacts > 0.5) & (supervised > 0)).sum())
+    return min(n_contact, 2)
+
+
 def _stratified_picks(
     ds: ClimbingVideosDataset, spec: TargetSpec, count: int, seed: int,
 ) -> list[int]:
     buckets = {0: [], 1: [], 2: []}
-    for index, (scene, person, base, _) in enumerate(ds._items):
-        data = ds._scenes[scene]
-        contacts = torch.as_tensor(data["joint_contact"][person, base], dtype=torch.float32)
-        supervised = torch.full((22,), float(data["valid_mask"][person, base]))
-        if data["annotated"] is not None:
-            supervised *= torch.as_tensor(data["annotated"][person, base])
-        confidence = (
-            torch.ones(22) if data["contact_conf"] is None else
-            torch.as_tensor(np.nan_to_num(
-                data["contact_conf"][person, base], nan=0.0, posinf=1.0, neginf=0.0
-            ).clip(0.0, 1.0))
-        )
-        if spec.joint_set == "extremities_4":
-            contacts, supervised, _ = reduce_body22_to_extremities(
-                contacts, supervised, confidence)
-        n_contact = int(((contacts > 0.5) & (supervised > 0)).sum())
-        buckets[min(n_contact, 2)].append(index)
+    for index in range(len(ds._items)):
+        buckets[_clip_bucket(ds, spec, index)].append(index)
     rng = random.Random(seed)
     for bucket in buckets.values():
         rng.shuffle(bucket)
@@ -253,9 +355,33 @@ def _stratified_picks(
     return picks
 
 
+def _select_frame(value, index: int, num_frames: int):
+    """Slice a model-output structure down to a single frame, keeping a leading
+    batch dim of length 1 so the figure helpers' ``[0]`` indexing selects that frame.
+
+    The clip is forwarded flat (``[T, ...]``) so temporal / force attention see the
+    whole window; the figure is then rendered for one frame. Tensors / lists whose
+    leading length is the clip length are sliced; anything else passes through.
+    """
+    if torch.is_tensor(value):
+        if value.dim() >= 1 and value.shape[0] == num_frames:
+            return value[index:index + 1]
+        return value
+    if isinstance(value, dict):
+        return {k: _select_frame(v, index, num_frames) for k, v in value.items()}
+    if isinstance(value, (list, tuple)) and len(value) == num_frames:
+        return type(value)([value[index]])
+    return value
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--checkpoint", default=None)
+    ap.add_argument(
+        "--warm-start", action="store_true",
+        help="build an untrained force branch warm-started from the config's "
+             "model.init_contact_checkpoint (no force checkpoint yet). The zero-init "
+             "force head predicts no force, so arrows appear only once trained.")
     ap.add_argument("--config", type=Path, default=REPO / "configs" / "climbing_videos_joint.yaml")
     ap.add_argument("--num-samples", type=int, default=12)
     ap.add_argument("--split", choices=["val", "test"], default="val")
@@ -265,17 +391,34 @@ def main() -> int:
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
-    checkpoint = Path(args.checkpoint).resolve()
-    threshold_tag = f"{args.threshold:.2f}".replace(".", "")
-    out_dir = (Path(args.output_dir) if args.output_dir else
-               checkpoint.parent / f"inference_{args.split}_last_t{threshold_tag}")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     cfg = load_config(args.config)
     print("Building joint-contact model …")
     model, _ = build_model(cfg, args.device)
-    state = ckpt_io.load(checkpoint, model, config=cfg, map_location=args.device)
+    if args.warm_start:
+        init_ckpt = cfg["model"].get("init_contact_checkpoint")
+        if not init_ckpt:
+            ap.error("--warm-start requires model.init_contact_checkpoint in the config")
+        state = ckpt_io.initialize_common_contact(
+            init_ckpt, model, config=cfg, map_location=args.device)
+        ref_path = Path(init_ckpt).resolve()
+    elif args.checkpoint:
+        state = ckpt_io.load(args.checkpoint, model, config=cfg, map_location=args.device)
+        ref_path = Path(args.checkpoint).resolve()
+    else:
+        ap.error("--checkpoint is required unless --warm-start is given")
     model.eval()
+
+    threshold_tag = f"{args.threshold:.2f}".replace(".", "")
+    out_dir = (Path(args.output_dir) if args.output_dir else
+               ref_path.parent / f"inference_{args.split}_last_t{threshold_tag}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    force_anchor_indices = None
+    force_frame = None
+    if cfg["model"]["force_head"]["enabled"]:
+        force_anchor_indices = cfg["model"]["contact_head"].get("contact_keypoint_indices")
+        force_frame = cfg["model"]["force_head"]["frame"]
+
     ds = _video_dataset(cfg, state, args.split)
     target_spec = TargetSpec.from_config(cfg)
     picks = _stratified_picks(
@@ -286,16 +429,23 @@ def main() -> int:
 
     records = []
     for run_index, ds_index in enumerate(picks):
-        sample = ds[ds_index][0]
-        batch = collate([[sample]])
-        target_gt = batch["targets"]["joint"]["gt"][0].numpy()
-        target_mask = batch["targets"]["joint"]["mask"][0].numpy()
+        clip = ds[ds_index]                       # list of T frame dicts
+        num_frames = len(clip)
+        center = num_frames // 2                   # frame rendered from the clip
+        batch = collate([clip])                    # flat [T, ...] batch, seq_len=T
+        target_gt = batch["targets"]["joint"]["gt"][center].numpy()
+        target_mask = batch["targets"]["joint"]["mask"][center].numpy()
         batch = batch_to_device(batch, args.device)
         with torch.inference_mode():
             out = forward_model(model, batch)
+        # Reduce the clip's outputs to the center frame so the figure helpers (which
+        # index row 0) render that frame's pose / contacts / forces.
+        out = _select_frame(out, center, num_frames)
+        sample = clip[center]
         probs = torch.sigmoid(out["contact"]["joint_logits"][0]).float().cpu().numpy()
         fig, score, gt, pred, confidence = _make_figure(
-            sample, out, probs, target_gt, target_mask, target_spec, args.threshold)
+            sample, out, probs, target_gt, target_mask, target_spec, args.threshold,
+            force_anchor_indices=force_anchor_indices, force_frame=force_frame)
         path = out_dir / f"sample_{run_index:02d}_idx{ds_index}_f1{score['f1']:.3f}.png"
         fig.savefig(path, bbox_inches="tight", facecolor="white")
         plt.close(fig)
@@ -316,7 +466,7 @@ def main() -> int:
               f"F1={score['f1']:.3f} IoU={score['iou']:.3f} -> {path.name}")
 
     summary = {
-        "checkpoint": str(checkpoint),
+        "checkpoint": str(ref_path),
         "checkpoint_epoch": int(state["epoch"]),
         "split": args.split,
         "threshold": args.threshold,

@@ -146,6 +146,24 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec):
             [float(f.get("frame_pos_sec", 0.0)) for f in frames], dtype=torch.float32)
         out["frame_valid"] = torch.tensor(
             [bool(f.get("frame_valid", True)) for f in frames], dtype=torch.bool)
+
+        # Per-frame camera pose + gravity for the physics loss. Datasets without
+        # cameras (all still images) fall back to identity/zeros with cam_valid=False.
+        out["cam_from_world"] = torch.stack([
+            torch.as_tensor(f["cam_from_world"], dtype=torch.float32)
+            if "cam_from_world" in f else torch.eye(4, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 4, 4]
+        out["gravity_world"] = torch.stack([
+            torch.as_tensor(f["gravity_world"], dtype=torch.float32)
+            if "gravity_world" in f else torch.zeros(3, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 3]
+        out["cam_valid"] = torch.tensor(
+            ["cam_from_world" in f for f in frames], dtype=torch.bool)     # [B]
+        # Camera-center jump (metres) between consecutive SAMPLED clip frames for
+        # the physics camera-jerk filter (stride-consistent; see climbing_videos.py);
+        # 0.0 for frames without cameras (still images) or the first row of a clip.
+        out["cam_jump_m"] = torch.tensor(
+            [float(f.get("cam_jump_m", 0.0)) for f in frames], dtype=torch.float32)  # [B]
         return out
 
     return _collate

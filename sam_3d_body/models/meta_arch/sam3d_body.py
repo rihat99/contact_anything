@@ -276,6 +276,56 @@ class SAM3DBody(BaseModel):
                 )
             # --- end contact temporal hook ---
 
+        # --- force hook (module construction) ---
+        # Force tokens/head mirror the contact machinery: the four extremity
+        # contact anchors (D2), an own embedding + posemb/feat linears, and a
+        # per-token regression head. Every param carries "force" in its name so
+        # the generalized freeze/eval filters ("contact" OR "force") pick it up.
+        if self.cfg.MODEL.DECODER.get("DO_FORCE_TOKENS", False):
+            assert self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False), (
+                "DO_FORCE_TOKENS requires DO_CONTACT_TOKENS: force tokens reuse "
+                "the contact keypoint anchors (contact_keypoint_indices)."
+            )
+            # Force anchors ARE the contact anchors; no global force tokens.
+            self.num_force_tokens = len(self.contact_keypoint_indices)
+            self.force_embedding = nn.Embedding(
+                self.num_force_tokens, self.cfg.MODEL.DECODER.DIM
+            )
+            self.head_force = build_head(self.cfg, "force")
+            self.force_posemb_linear = FFN(
+                embed_dims=2,
+                feedforward_channels=self.cfg.MODEL.DECODER.DIM,
+                output_dims=self.cfg.MODEL.DECODER.DIM,
+                num_fcs=2,
+                add_identity=False,
+            )
+            self.force_feat_linear = nn.Linear(
+                self.backbone.embed_dims, self.cfg.MODEL.DECODER.DIM
+            )
+
+            # --- force temporal hook (module construction) ---
+            # A second ContactTemporalModule instance over the force tokens
+            # (post_decoder only, D11). Params carry "force" in their names so the
+            # generalized freeze/eval filters pick them up. Attribute absent when
+            # disabled. No image_dim: pre_decoder is not supported here.
+            ftcfg = self.cfg.MODEL.get("FORCE_TEMPORAL", None)
+            if ftcfg is not None and ftcfg.get("ENABLED", False):
+                from ..modules.temporal import ContactTemporalModule
+                self.force_temporal = ContactTemporalModule(
+                    dim=self.cfg.MODEL.DECODER.DIM,
+                    num_layers=ftcfg.get("NUM_LAYERS", 1),
+                    num_heads=ftcfg.get("NUM_HEADS", 4),
+                    mlp_ratio=ftcfg.get("MLP_RATIO", 2.0),
+                    attend=ftcfg.get("ATTEND", "per_token"),
+                    causal=ftcfg.get("CAUSAL", False),
+                    dropout=ftcfg.get("DROPOUT", 0.0),
+                    placement="post_decoder",
+                    bottleneck_dim=ftcfg.get("BOTTLENECK_DIM", 256),
+                    position_scale=ftcfg.get("POSITION_SCALE", 1.0),
+                )
+            # --- end force temporal hook ---
+        # --- end force hook ---
+
         self.keypoint_posemb_linear = FFN(
             embed_dims=2,
             feedforward_channels=self.cfg.MODEL.DECODER.DIM,
@@ -586,9 +636,37 @@ class SAM3DBody(BaseModel):
                     dim=1,
                 )
 
-                # Asymmetric attention mask: frozen tokens must not attend to contact
-                # tokens (to avoid polluting their representations), but contact tokens
-                # can still attend to all other tokens to learn from them.
+                # --- force hook (append tokens after contact) ---
+                # Force tokens live after the contact block; the mask below is
+                # built once the sequence is complete so N_total is correct.
+                if self.cfg.MODEL.DECODER.get("DO_FORCE_TOKENS", False):
+                    force_emb_start_idx = token_embeddings.shape[1]
+                    token_embeddings = torch.cat(
+                        [
+                            token_embeddings,
+                            self.force_embedding.weight[None, :, :].repeat(
+                                batch_size, 1, 1
+                            ),
+                        ],
+                        dim=1,
+                    )
+                    # No positional embeddings for force tokens
+                    token_augment = torch.cat(
+                        [
+                            token_augment,
+                            torch.zeros_like(
+                                token_embeddings[:, token_augment.shape[1] :, :]
+                            ),
+                        ],
+                        dim=1,
+                    )
+                # --- end force hook ---
+
+                # Asymmetric attention mask: no earlier token block may attend a
+                # later one (True=allowed). Original tokens never attend contact
+                # or force tokens; contact tokens never attend force tokens; each
+                # extra block can still attend everything before it to learn from
+                # it. Built after all extra blocks so N_total is final.
                 N_total = token_embeddings.shape[1]
                 token_mask = torch.ones(
                     batch_size, N_total, N_total,
@@ -596,6 +674,10 @@ class SAM3DBody(BaseModel):
                     device=token_embeddings.device,
                 )
                 token_mask[:, :contact_emb_start_idx, contact_emb_start_idx:] = False
+                # --- force hook (extend mask: nothing before force attends it) ---
+                if self.cfg.MODEL.DECODER.get("DO_FORCE_TOKENS", False):
+                    token_mask[:, :force_emb_start_idx, force_emb_start_idx:] = False
+                # --- end force hook ---
 
         # We're doing intermediate model predictions
         def token_to_pose_output_fn(tokens, prev_pose_output, layer_idx):
@@ -633,6 +715,14 @@ class SAM3DBody(BaseModel):
             else None
         )
 
+        # --- force hook (per-layer anchored update) ---
+        ft_token_update_fn = (
+            self.force_token_update_fn
+            if self.cfg.MODEL.DECODER.get("DO_FORCE_TOKENS", False)
+            else None
+        )
+        # --- end force hook ---
+
         # --- contact temporal hook (pre_decoder) ---
         # Image tensor the contact tokens grid-sample from: a PRIVATE zero-gated
         # temporal copy for pre_decoder, otherwise the shared decoder tensor. The
@@ -656,6 +746,12 @@ class SAM3DBody(BaseModel):
                 args = ct_token_update_fn(
                     contact_emb_start_idx, contact_image_embeddings,
                     self.decoder.layers, batch, *args
+                )
+            # --- force hook: force tokens sample the shared decoder image tensor
+            # (no pre_decoder temporal branch), anchored at the contact anchors ---
+            if ft_token_update_fn is not None:
+                args = ft_token_update_fn(
+                    force_emb_start_idx, image_embeddings, self.decoder.layers, *args
                 )
             return args
 
@@ -688,14 +784,31 @@ class SAM3DBody(BaseModel):
                 contact_output[f"{name}_logits"] = logits
                 contact_output[f"{name}_probs"] = torch.sigmoid(logits)
 
+        # --- force hook (process force tokens) ---
+        force_output = None
+        if self.cfg.MODEL.DECODER.get("DO_FORCE_TOKENS", False):
+            force_tokens = pose_token[
+                :, force_emb_start_idx : force_emb_start_idx + self.num_force_tokens
+            ]
+            # --- force temporal hook (post_decoder) ---
+            _ft = getattr(self, "force_temporal", None)
+            if _ft is not None:
+                _sl, _pos, _valid = self._contact_temporal_fields(batch)
+                force_tokens = _ft(force_tokens, _sl, _pos, _valid)
+            # --- end force temporal hook ---
+            # Dimensionless per-extremity force vectors (units of body weight, D5).
+            force_output = {"joint_forces": self.head_force(force_tokens)}  # [B, K, 3]
+        # --- end force hook ---
+
         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
             return (
                 pose_token[:, hand_det_emb_start_idx : hand_det_emb_start_idx + 2],
                 pose_output,
                 contact_output,
+                force_output,
             )
         else:
-            return pose_token, pose_output, contact_output
+            return pose_token, pose_output, contact_output, force_output
 
     def forward_decoder_hand(
         self,
@@ -1050,8 +1163,9 @@ class SAM3DBody(BaseModel):
 
         pose_output, pose_output_hand = None, None
         contact_output = None
+        force_output = None
         if len(self.body_batch_idx):
-            tokens_output, pose_output, contact_output = self.forward_decoder(
+            tokens_output, pose_output, contact_output, force_output = self.forward_decoder(
                 image_embeddings[self.body_batch_idx],
                 init_estimate=None,  # not recurring previous estimate
                 keypoints=cur_keypoint_prompt[self.body_batch_idx],
@@ -1068,6 +1182,7 @@ class SAM3DBody(BaseModel):
                 "mhr": pose_output,
                 "mhr_hand": pose_output_hand,
                 "contact": contact_output,
+                "force": force_output,
             }
         )
 
@@ -1352,8 +1467,9 @@ class SAM3DBody(BaseModel):
         # Forward promptable decoder to get updated pose tokens and regression output
         pose_output, pose_output_hand = None, None
         contact_output = None
+        force_output = None
         if len(self.body_batch_idx):
-            tokens_output, pose_output, contact_output = self.forward_decoder(
+            tokens_output, pose_output, contact_output, force_output = self.forward_decoder(
                 image_embeddings[self.body_batch_idx],
                 init_estimate=None,
                 keypoints=keypoints_prompt[self.body_batch_idx],
@@ -1378,6 +1494,7 @@ class SAM3DBody(BaseModel):
             "mhr": pose_output,  # mhr prediction output
             "mhr_hand": pose_output_hand,  # mhr prediction output
             "contact": contact_output,  # contact prediction output (body decoder only)
+            "force": force_output,  # per-extremity force output (body decoder only)
             "condition_info": condition_info,
             "image_embeddings": image_embeddings,
         }
@@ -1900,7 +2017,7 @@ class SAM3DBody(BaseModel):
                 dim=-1,
             )
 
-        tokens_output, pose_output, contact_output = self.forward_decoder(
+        tokens_output, pose_output, contact_output, force_output = self.forward_decoder(
             image_embeddings,
             init_estimate=None,  # not recurring previous estimate
             keypoints=keypoint_prompt,
@@ -1910,7 +2027,8 @@ class SAM3DBody(BaseModel):
         )
         pose_output = pose_output[-1]
 
-        output.update({"mhr": pose_output, "contact": contact_output})
+        output.update({"mhr": pose_output, "contact": contact_output,
+                       "force": force_output})
         return output, keypoint_prompt
 
     def _get_hand_box(self, pose_output, batch):
@@ -2123,6 +2241,120 @@ class SAM3DBody(BaseModel):
 
         return token_embeddings, token_augment, pose_output, layer_idx
 
+    def _anchored_token_update(
+        self,
+        start_idx,
+        num_anchor,
+        posemb_linear,
+        feat_linear,
+        image_embeddings,
+        pose_output,
+        token_embeddings,
+        token_augment,
+    ):
+        """Anchored per-layer token update shared by contact and force tokens.
+
+        For the ``num_anchor`` tokens starting at ``start_idx``:
+        1. writes a 2D-keypoint positional encoding into ``token_augment`` and
+        2. adds grid-sampled backbone features into ``token_embeddings``,
+
+        both anchored at ``self.contact_keypoint_indices`` (the anchors are shared
+        by the contact and force banks, D2) with the caller's own ``posemb_linear``
+        / ``feat_linear``. Anchors outside the frame or behind the camera
+        contribute zero. Returns the updated ``(token_embeddings, token_augment)``.
+        """
+        kp_indices = self.contact_keypoint_indices
+
+        # Get predicted 2D keypoint positions in crop space (-0.5 to 0.5)
+        pred_kps_2d = pose_output["pred_keypoints_2d_cropped"].clone()  # [B, 70, 2]
+        pred_kps_depth = pose_output["pred_keypoints_2d_depth"].clone()  # [B, 70]
+
+        # Select the configured keypoint anchor for every anchored token.
+        anchor_kps_2d = pred_kps_2d[:, kp_indices]       # [B, K_anchor, 2]
+        anchor_kps_depth = pred_kps_depth[:, kp_indices]  # [B, K_anchor]
+
+        # Validity check: outside image bounds or behind camera
+        anchor_kps_01 = anchor_kps_2d + 0.5  # convert to 0-1 range
+        invalid_mask = (
+            (anchor_kps_01[:, :, 0] < 0)
+            | (anchor_kps_01[:, :, 0] > 1)
+            | (anchor_kps_01[:, :, 1] < 0)
+            | (anchor_kps_01[:, :, 1] > 1)
+            | (anchor_kps_depth < 1e-5)
+        )  # [B, K_anchor]
+
+        # --- 1. Update positional encoding ---
+        token_augment = token_augment.clone()
+        token_augment[
+            :, start_idx : start_idx + num_anchor, :
+        ] = (
+            posemb_linear(anchor_kps_2d)
+            * (~invalid_mask[:, :, None])
+        )
+
+        # --- 2. Sample image features at predicted body part locations ---
+        # Convert from [-0.5, 0.5] to [-1, 1] for grid_sample
+        sample_points = anchor_kps_2d * 2
+        # Handle backbone-specific coordinate adjustments
+        if self.cfg.MODEL.BACKBONE.TYPE in [
+            "vit_hmr", "vit", "vit_b", "vit_l", "vit_hmr_512_384",
+        ]:
+            sample_points[:, :, 0] = sample_points[:, :, 0] / 12 * 16
+
+        # Bilinear sampling with optional K×K neighbourhood grid
+        gs = self.contact_grid_size
+        if gs > 1:
+            half = gs // 2
+            offsets = torch.tensor(
+                [
+                    [dy * self.contact_grid_radius, dx * self.contact_grid_radius]
+                    for dy in range(-half, half + 1)
+                    for dx in range(-half, half + 1)
+                ],
+                dtype=sample_points.dtype,
+                device=sample_points.device,
+            )  # [K*K, 2]
+            # [B, num_anchor, K*K, 2]
+            pts = sample_points.unsqueeze(2) + offsets[None, None]
+            B_s, nc, KK, _ = pts.shape
+            pts_flat = pts.reshape(B_s, nc * KK, 1, 2)
+            feats_flat = (
+                F.grid_sample(
+                    image_embeddings,
+                    pts_flat,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=False,
+                )
+                .squeeze(3)
+                .permute(0, 2, 1)
+            )  # [B, nc*KK, C_backbone]
+            sampled_feats = feats_flat.reshape(B_s, nc, KK, -1).mean(dim=2)  # [B, nc, C_backbone]
+        else:
+            # Original single-point sampling
+            sampled_feats = (
+                F.grid_sample(
+                    image_embeddings,
+                    sample_points[:, :, None, :],  # [B, num_anchor, 1, 2]
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=False,
+                )
+                .squeeze(3)
+                .permute(0, 2, 1)
+            )  # [B, num_anchor, C_backbone]
+
+        # Zero out features for invalid locations
+        sampled_feats = sampled_feats * (~invalid_mask[:, :, None])
+
+        # Project from backbone dim to decoder dim and add to the tokens
+        token_embeddings = token_embeddings.clone()
+        token_embeddings[
+            :, start_idx : start_idx + num_anchor, :
+        ] += feat_linear(sampled_feats)
+
+        return token_embeddings, token_augment
+
     def contact_token_update_fn(
         self,
         contact_emb_start_idx,
@@ -2151,96 +2383,11 @@ class SAM3DBody(BaseModel):
         if layer_idx == len(decoder_layers) - 1:
             return token_embeddings, token_augment, pose_output, layer_idx
 
-        num_ct = self.num_contact_tokens
-        kp_indices = self.contact_keypoint_indices
-
-        # Get predicted 2D keypoint positions in crop space (-0.5 to 0.5)
-        pred_kps_2d = pose_output["pred_keypoints_2d_cropped"].clone()  # [B, 70, 2]
-        pred_kps_depth = pose_output["pred_keypoints_2d_depth"].clone()  # [B, 70]
-
-        # Select the configured keypoint anchor for every anchored contact token.
-        contact_kps_2d = pred_kps_2d[:, kp_indices]       # [B, K_anchor, 2]
-        contact_kps_depth = pred_kps_depth[:, kp_indices]  # [B, K_anchor]
-
-        # Validity check: outside image bounds or behind camera
-        contact_kps_01 = contact_kps_2d + 0.5  # convert to 0-1 range
-        invalid_mask = (
-            (contact_kps_01[:, :, 0] < 0)
-            | (contact_kps_01[:, :, 0] > 1)
-            | (contact_kps_01[:, :, 1] < 0)
-            | (contact_kps_01[:, :, 1] > 1)
-            | (contact_kps_depth < 1e-5)
-        )  # [B, K_anchor]
-
-        # --- 1. Update positional encoding ---
-        token_augment = token_augment.clone()
-        token_augment[
-            :, contact_emb_start_idx : contact_emb_start_idx + num_ct, :
-        ] = (
-            self.contact_posemb_linear(contact_kps_2d)
-            * (~invalid_mask[:, :, None])
+        token_embeddings, token_augment = self._anchored_token_update(
+            contact_emb_start_idx, self.num_contact_tokens,
+            self.contact_posemb_linear, self.contact_feat_linear,
+            image_embeddings, pose_output, token_embeddings, token_augment,
         )
-
-        # --- 2. Sample image features at predicted body part locations ---
-        # Convert from [-0.5, 0.5] to [-1, 1] for grid_sample
-        sample_points = contact_kps_2d * 2
-        # Handle backbone-specific coordinate adjustments
-        if self.cfg.MODEL.BACKBONE.TYPE in [
-            "vit_hmr", "vit", "vit_b", "vit_l", "vit_hmr_512_384",
-        ]:
-            sample_points[:, :, 0] = sample_points[:, :, 0] / 12 * 16
-
-        # Bilinear sampling with optional K×K neighbourhood grid
-        gs = self.contact_grid_size
-        if gs > 1:
-            half = gs // 2
-            offsets = torch.tensor(
-                [
-                    [dy * self.contact_grid_radius, dx * self.contact_grid_radius]
-                    for dy in range(-half, half + 1)
-                    for dx in range(-half, half + 1)
-                ],
-                dtype=sample_points.dtype,
-                device=sample_points.device,
-            )  # [K*K, 2]
-            # [B, num_ct, K*K, 2]
-            pts = sample_points.unsqueeze(2) + offsets[None, None]
-            B_s, nc, KK, _ = pts.shape
-            pts_flat = pts.reshape(B_s, nc * KK, 1, 2)
-            feats_flat = (
-                F.grid_sample(
-                    image_embeddings,
-                    pts_flat,
-                    mode="bilinear",
-                    padding_mode="zeros",
-                    align_corners=False,
-                )
-                .squeeze(3)
-                .permute(0, 2, 1)
-            )  # [B, nc*KK, C_backbone]
-            sampled_feats = feats_flat.reshape(B_s, nc, KK, -1).mean(dim=2)  # [B, nc, C_backbone]
-        else:
-            # Original single-point sampling
-            sampled_feats = (
-                F.grid_sample(
-                    image_embeddings,
-                    sample_points[:, :, None, :],  # [B, num_ct, 1, 2]
-                    mode="bilinear",
-                    padding_mode="zeros",
-                    align_corners=False,
-                )
-                .squeeze(3)
-                .permute(0, 2, 1)
-            )  # [B, num_ct, C_backbone]
-
-        # Zero out features for invalid locations
-        sampled_feats = sampled_feats * (~invalid_mask[:, :, None])
-
-        # Project from backbone dim to decoder dim and add to contact tokens
-        token_embeddings = token_embeddings.clone()
-        token_embeddings[
-            :, contact_emb_start_idx : contact_emb_start_idx + num_ct, :
-        ] += self.contact_feat_linear(sampled_feats)
 
         # --- contact temporal hook (between_layers) ---
         # Runs once per intermediate decoder layer (layers 0..N-2, i.e. 5×), with
@@ -2257,6 +2404,34 @@ class SAM3DBody(BaseModel):
             )
         # --- end contact temporal hook ---
 
+        return token_embeddings, token_augment, pose_output, layer_idx
+
+    def force_token_update_fn(
+        self,
+        force_emb_start_idx,
+        image_embeddings,
+        decoder_layers,
+        token_embeddings,
+        token_augment,
+        pose_output,
+        layer_idx,
+    ):
+        """Update force tokens after each intermediate decoder layer.
+
+        Same anchored update as :meth:`contact_token_update_fn` (2D-keypoint posemb
+        + grid-sampled features at the shared extremity anchors, D2), applied to the
+        force-token slice with the force linears. No temporal hook — force temporal
+        is post_decoder only (step 05).
+        """
+        # Skip after the last layer (same pattern as contact_token_update_fn)
+        if layer_idx == len(decoder_layers) - 1:
+            return token_embeddings, token_augment, pose_output, layer_idx
+
+        token_embeddings, token_augment = self._anchored_token_update(
+            force_emb_start_idx, self.num_force_tokens,
+            self.force_posemb_linear, self.force_feat_linear,
+            image_embeddings, pose_output, token_embeddings, token_augment,
+        )
         return token_embeddings, token_augment, pose_output, layer_idx
 
     def keypoint_token_update_fn_hand(

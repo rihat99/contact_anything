@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import math
+
+import pytest
 import torch
 
+import scripts.evaluate as ev
 from scripts.evaluate import evaluate
 
 
@@ -59,3 +63,138 @@ def test_evaluate_center_policy_ignores_wrong_noncenter_rows():
     )["joint"]
     assert result["f1"] > 0.999
     assert (result["tp"], result["fp"], result["fn"]) == (2, 0, 0)
+
+
+# ------------------------------------------------------------ affine baselines
+
+def _affine_group(n_clips: int, n_res: int, seed: int) -> dict:
+    gen = torch.Generator().manual_seed(seed)
+    return {
+        "r0": torch.randn(n_clips, n_res, 6, generator=gen),
+        "basis": torch.randn(n_clips, n_res, 6, 12, generator=gen) * 0.3,
+        "f_pred": torch.randn(n_clips, n_res, 12, generator=gen) * 0.2,
+        "probs": torch.rand(n_clips, n_res, 4, generator=gen),
+    }
+
+
+def test_affine_baselines_structure_and_math():
+    """Network mean matches an independent recomputation; the fitted constant can
+    only improve on zero forces; the shuffled baseline carries pooled per-frame
+    quantiles; a size-1 T-group is counted unshufflable."""
+    by_t = {7: _affine_group(3, 2, seed=0), 16: _affine_group(1, 10, seed=1)}
+    res = ev._affine_baselines(by_t)
+
+    manual = []
+    for group in by_t.values():
+        pred = group["r0"] + torch.einsum(
+            "...ij,...j->...i", group["basis"], group["f_pred"])
+        manual.append((pred ** 2).sum(-1).reshape(-1))
+    manual = torch.cat(manual)
+    assert res["network"]["mean"] == pytest.approx(float(manual.mean()), rel=1e-5)
+    assert res["n_residual_frames"] == manual.numel()
+    assert res["constant"]["mean"] <= res["zero"]["mean"] + 1e-6
+
+    for key in ("mean", "std", "p50", "p90", "p99", "max"):
+        assert key in res["shuffled"] and math.isfinite(res["shuffled"][key]), key
+    assert res["n_unshuffled_clips"] == 1                    # the size-1 T=16 group
+    assert set(res["head_force_component_std"]) == {
+        "left_hand", "right_hand", "left_foot", "right_foot"}
+    assert isinstance(res["input_dependent"], bool)
+
+
+def test_affine_shuffle_is_never_identity():
+    """Two clips whose predictions exactly zero their own residual: every cyclic
+    rotation must swap them, giving a strictly positive shuffled residual — an
+    unconstrained permutation could draw the identity and (wrongly) report 0."""
+    basis = torch.cat((torch.eye(6), torch.zeros(6, 6)), dim=1)   # (6, 12)
+    c0 = torch.zeros(12)
+    c0[0] = 1.0
+    c1 = torch.zeros(12)
+    c1[1] = -1.0
+    group = {
+        "r0": torch.stack((-(basis @ c0), -(basis @ c1))).unsqueeze(1),   # (2, 1, 6)
+        "basis": basis.expand(2, 1, 6, 12).contiguous(),
+        "f_pred": torch.stack((c0, c1)).unsqueeze(1),                     # (2, 1, 12)
+        "probs": torch.full((2, 1, 4), 0.5),
+    }
+    res = ev._affine_baselines({7: group}, n_shuffles=5)
+    assert res["network"]["mean"] == pytest.approx(0.0, abs=1e-10)
+    # Size-2 group: the only nonzero cyclic offset is 1 (a swap) — every shuffle is
+    # identical (std 0) and strictly worse than the network.
+    assert res["shuffled"]["mean"] == pytest.approx(2.0, rel=1e-5)
+    assert res["shuffled"]["std"] == pytest.approx(0.0, abs=1e-9)
+    assert res["n_unshuffled_clips"] == 0
+    assert res["beats_shuffled"] is True
+
+
+def test_affine_all_groups_unshufflable_fails_conservatively():
+    """Only size-1 groups: the shuffled baseline is NaN, beats_shuffled is False
+    (input-dependence cannot be proven without a shuffle), every clip counted."""
+    by_t = {7: _affine_group(1, 2, seed=2), 9: _affine_group(1, 3, seed=3)}
+    res = ev._affine_baselines(by_t)
+    assert math.isnan(res["shuffled"]["mean"])
+    assert res["n_unshuffled_clips"] == 2
+    assert res["beats_shuffled"] is False
+    assert res["input_dependent"] is False
+
+
+# --------------------------------------------------------- evaluate_physics stubs
+
+class _StubPhysicsLoss:
+    """Duck-typed PhysicsLoss yielding one pre-built ``parts`` dict per batch."""
+
+    def __init__(self, parts_sequence):
+        self._parts = list(parts_sequence)
+        self._index = 0
+
+    def __call__(self, out, batch):
+        parts = self._parts[self._index]
+        self._index += 1
+        return torch.tensor(0.0), parts
+
+    def diagnostics(self, out, batch):
+        return None
+
+    def affine_residual(self, out, batch):
+        return None
+
+
+def _phys_parts(numerator: float, mass: float, sat: float, jerk: int) -> dict:
+    return {
+        "terms": {},
+        "raw_residual": {
+            "weighted_numerator_tensor": torch.tensor(numerator),
+            "weight_mass": mass, "loss": numerator / max(mass, 1.0)},
+        "residual_sat_frac": sat,
+        "n_jerk_excluded_clips": jerk,
+    }
+
+
+def test_evaluate_physics_zero_mass_is_nan(monkeypatch):
+    """Zero residual mass (everything ineligible/jerk-excluded) must report NaN —
+    never a perfect 0 residual — while the jerk count still surfaces."""
+    monkeypatch.setattr(ev, "forward_model", lambda model, batch: {})
+    monkeypatch.setattr(ev, "batch_to_device", lambda batch, device: batch)
+    stub = _StubPhysicsLoss([_phys_parts(0.0, 0.0, 0.0, jerk=3)])
+    res = ev.evaluate_physics(None, [None], stub, "cpu",
+                              threshold=0.5, contact_min_bw=0.05)
+    assert math.isnan(res["physics_residual"])
+    assert math.isnan(res["residual_sat_frac"])
+    assert res["n_jerk_excluded_clips"] == 3
+    assert res["n_frames"] == 0
+
+
+def test_evaluate_physics_aggregates_sat_and_jerk(monkeypatch):
+    """Headline = exact mass-weighted mean over batches; sat_frac mass-weighted;
+    jerk exclusions summed."""
+    monkeypatch.setattr(ev, "forward_model", lambda model, batch: {})
+    monkeypatch.setattr(ev, "batch_to_device", lambda batch, device: batch)
+    stub = _StubPhysicsLoss([
+        _phys_parts(6.0, 4.0, sat=0.25, jerk=1),
+        _phys_parts(2.0, 2.0, sat=0.10, jerk=0),
+    ])
+    res = ev.evaluate_physics(None, [None, None], stub, "cpu",
+                              threshold=0.5, contact_min_bw=0.05)
+    assert res["physics_residual"] == pytest.approx(8.0 / 6.0)
+    assert res["residual_sat_frac"] == pytest.approx((0.25 * 4 + 0.10 * 2) / 6.0)
+    assert res["n_jerk_excluded_clips"] == 1

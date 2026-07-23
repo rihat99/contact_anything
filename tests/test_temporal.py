@@ -256,3 +256,33 @@ def test_gate_params_present_and_zero_init():
     gammas = [p for n, p in m.named_parameters() if "gamma_" in n]
     assert gammas, "no gate parameters found"
     assert all(bool((g == 0).all()) for g in gammas)
+
+
+# ---------------------------------------------------------------- force temporal path
+
+# `force_temporal` is a second ContactTemporalModule instance (post_decoder,
+# attend='per_token' by default, D11). The two tests below pin the module-level
+# contract the force path relies on, reusing the shared `_module` factory.
+
+def test_force_temporal_zero_gamma_is_exact_identity():
+    m = _module(attend="per_token")
+    tokens = torch.randn(8, _K, _DIM)                       # 2 clips, T=4
+    pos = torch.arange(8, dtype=torch.float32) * 0.1
+    valid = torch.ones(8, dtype=torch.bool)
+    out = m(tokens, 4, pos, valid)
+    assert torch.equal(out, tokens), "zero-gamma force temporal must be an exact identity"
+
+
+def test_force_temporal_per_token_cannot_mix_limb_slots():
+    torch.manual_seed(0)
+    m = _module(attend="per_token")
+    with torch.no_grad():
+        for block in m.blocks:
+            block.gamma_attn.fill_(0.1)
+            block.gamma_ffn.fill_(0.1)
+    tokens = torch.randn(5, _K, _DIM)
+    changed = tokens.clone()
+    changed[:, 0] += 10.0
+    out = m(tokens, 5, torch.arange(5, dtype=torch.float32), None)
+    out_changed = m(changed, 5, torch.arange(5, dtype=torch.float32), None)
+    assert torch.equal(out[:, 1:], out_changed[:, 1:])

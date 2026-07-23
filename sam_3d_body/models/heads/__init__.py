@@ -3,6 +3,7 @@
 from ..modules import to_2tuple
 from .camera_head import PerspectiveHead
 from .contact_head import ContactHead
+from .force_head import ForceHead
 from .mhr_head import MHRHead
 
 
@@ -41,6 +42,18 @@ def build_head(cfg, head_type="mhr", enable_hand_model=False, default_scale_fact
             mlp_channel_div_factor=contact_cfg.get("MLP_CHANNEL_DIV_FACTOR", 4),
             pool_mode=contact_cfg.get("POOL_MODE", "attention"),
             dropout=contact_cfg.get("DROPOUT", 0.0),
+        )
+    elif head_type == "force":
+        force_cfg = cfg.MODEL.get("FORCE_HEAD", dict())
+        # Force tokens reuse the contact keypoint anchors (D2), so the number of
+        # force tokens equals the number of anchored contact tokens.
+        num_kp = cfg.MODEL.get("CONTACT_HEAD", dict()).get("NUM_CONTACTS", 21)
+        return ForceHead(
+            input_dim=cfg.MODEL.DECODER.DIM,
+            num_force_tokens=num_kp,
+            mlp_depth=force_cfg.get("MLP_DEPTH", 2),
+            mlp_channel_div_factor=force_cfg.get("MLP_CHANNEL_DIV_FACTOR", 4),
+            dropout=force_cfg.get("DROPOUT", 0.0),
         )
     else:
         raise ValueError("Invalid head type: ", head_type)

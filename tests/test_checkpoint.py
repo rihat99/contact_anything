@@ -34,6 +34,27 @@ class _TinyPlus(_Tiny):
         self.contact_temporal = nn.Linear(dim, dim)
 
 
+class _TinyForce(_Tiny):
+    """``_Tiny`` with an extra 'force'-named trainable head (the force branch)."""
+
+    def __init__(self, dim: int = 4):
+        super().__init__(dim)
+        self.head_force = nn.Linear(dim, dim)
+
+
+def _force_cfg(force_enabled: bool, grid_size: int = 5) -> dict:
+    cfg = {
+        "model": {"checkpoint_path": "snap/model.ckpt",
+                  "contact_head": {"grid_size": grid_size}},
+        "contact": {"topology": "smpl", "targets": {}},
+    }
+    if force_enabled:
+        cfg["model"]["force_head"] = {
+            "enabled": True, "frame": "local_world_aligned",
+            "mlp_depth": 2, "mlp_channel_div_factor": 4, "dropout": 0.0}
+    return cfg
+
+
 # A pair of same-shape configs differing only semantically (grid_size).
 _CFG_A = {"model": {"checkpoint_path": "snap/model.ckpt", "contact_head": {"grid_size": 5}},
           "contact": {"topology": "smpl", "targets": {}}}
@@ -53,8 +74,51 @@ def _joint_cfg(joint_set: str) -> dict:
     }
 
 
+def _temporal_cfg(enabled: bool, position_scale: float = 30.0,
+                  force_enabled: bool = False) -> dict:
+    cfg = {
+        "model": {"checkpoint_path": "snap/model.ckpt",
+                  "contact_head": {"grid_size": 5}},
+        "contact": {"topology": "smpl", "targets": {}},
+    }
+    cfg["model"]["temporal"] = (
+        {"enabled": True, "placement": "post_decoder", "attend": "per_token",
+         "causal": False, "bottleneck_dim": 2, "num_layers": 1, "num_heads": 1,
+         "mlp_ratio": 2.0, "position_scale": position_scale}
+        if enabled else {"enabled": False})
+    if force_enabled:
+        cfg["model"]["force_head"] = {
+            "enabled": True, "frame": "local_world_aligned",
+            "mlp_depth": 2, "mlp_channel_div_factor": 4, "dropout": 0.0}
+    return cfg
+
+
+def _regime_a_cfg(init_contact: str | None = None) -> dict:
+    """A regime-(a) config: force enabled + ``train.freeze_contact``."""
+    cfg = _force_cfg(force_enabled=True)
+    cfg["train"] = {"freeze_contact": True}
+    if init_contact is not None:
+        cfg["model"]["init_contact_checkpoint"] = init_contact
+    return cfg
+
+
+def _freeze_contact(model: nn.Module) -> nn.Module:
+    """Freeze every 'contact'-named param — mirrors regime (a) (train.freeze_contact)."""
+    for name, p in model.named_parameters():
+        if "contact" in name.lower():
+            p.requires_grad = False
+    return model
+
+
 def _trainable_names(model: nn.Module) -> list[str]:
     return [n for n, p in model.named_parameters() if p.requires_grad]
+
+
+def _saved_names(model: nn.Module) -> list[str]:
+    """Superset train.py serialises: every contact/force param (contact/model.py
+    ``_trainable_name_filter``), whether or not currently trainable."""
+    return [n for n, _ in model.named_parameters()
+            if "contact" in n.lower() or "force" in n.lower()]
 
 
 def _opt_sched(model: nn.Module):
@@ -176,6 +240,243 @@ def test_temporal_warm_start_loads_common_params_only(tmp_path):
     # the diff must name the unmatched trainable param
     with pytest.raises(RuntimeError, match="contact_temporal"):
         ckpt_io.load(path, _TinyPlus(dim=4))
+
+
+def test_force_warm_start_loads_contact_leaves_force_fresh(tmp_path):
+    # Regime (a): a contact-only checkpoint (no force keys in its arch signature)
+    # warm-starts a force-enabled model. Contact params load; the force branch stays
+    # fresh; the force keys are exempted from the signature comparison symmetrically.
+    source = _Tiny()
+    path = tmp_path / "contact.pth"
+    opt, sched = _opt_sched(source)
+    ckpt_io.save(path, source, _trainable_names(source), opt, sched,
+                 epoch=0, global_step=1, best_metric=0.0, monitor="val/joint_f1",
+                 config=_force_cfg(force_enabled=False))
+
+    target = _TinyForce()
+    before_force = target.head_force.weight.detach().clone()
+    state = ckpt_io.initialize_common_contact(
+        path, target, config=_force_cfg(force_enabled=True))
+    assert torch.equal(target.contact_head.weight, source.contact_head.weight)  # loaded
+    assert torch.equal(target.head_force.weight, before_force)                  # fresh
+    assert state["warm_start_new_names"] == ["head_force.bias", "head_force.weight"]
+    assert state["warm_start_loaded_names"] == [
+        "contact_head.bias", "contact_head.weight"]
+
+
+def test_force_warm_start_rejects_other_arch_mismatch(tmp_path):
+    # A non-force/non-temporal semantic difference (grid_size) must still hard-fail
+    # even though the force keys are now exempted.
+    source = _Tiny()
+    path = tmp_path / "contact.pth"
+    opt, sched = _opt_sched(source)
+    ckpt_io.save(path, source, _trainable_names(source), opt, sched,
+                 epoch=0, global_step=1, best_metric=0.0, monitor="val/joint_f1",
+                 config=_force_cfg(force_enabled=False, grid_size=5))
+    with pytest.raises(RuntimeError, match="architecture mismatch"):
+        ckpt_io.initialize_common_contact(
+            path, _TinyForce(), config=_force_cfg(force_enabled=True, grid_size=7))
+
+
+def test_force_warm_start_requires_temporal_or_force_target(tmp_path):
+    # Neither temporal nor force enabled in the target -> the precondition fires.
+    source = _Tiny()
+    path = tmp_path / "contact.pth"
+    opt, sched = _opt_sched(source)
+    ckpt_io.save(path, source, _trainable_names(source), opt, sched,
+                 epoch=0, global_step=1, best_metric=0.0, monitor="val/joint_f1",
+                 config=_force_cfg(force_enabled=False))
+    with pytest.raises(RuntimeError, match="temporal module or the force branch"):
+        ckpt_io.initialize_common_contact(
+            path, _Tiny(), config=_force_cfg(force_enabled=False))
+
+
+def test_force_model_checkpoint_roundtrip(tmp_path):
+    # Strict resume of a force-enabled model: save -> load reproduces the trainable
+    # state exactly (force + contact) and the resolved config signature matches.
+    src = _TinyForce()
+    path = tmp_path / "force.pth"
+    opt, sched = _opt_sched(src)
+    opt.step(); sched.step()
+    ckpt_io.save(path, src, _trainable_names(src), opt, sched,
+                 epoch=2, global_step=5, best_metric=0.1,
+                 monitor="val/physics_residual", config=_force_cfg(force_enabled=True))
+
+    dst = _TinyForce()
+    assert not torch.allclose(src.head_force.weight, dst.head_force.weight)
+    state = ckpt_io.load(path, dst, config=_force_cfg(force_enabled=True))
+    assert torch.equal(src.head_force.weight, dst.head_force.weight)
+    assert torch.equal(src.contact_head.weight, dst.contact_head.weight)
+    assert state["monitor"] == "val/physics_residual"
+    assert state["epoch"] == 2 and state["global_step"] == 5
+
+
+# ------------------------------------------ regime (a): self-contained + recovery
+
+def test_regime_a_checkpoint_is_self_contained(tmp_path):
+    # Regime (a): contact frozen, force-only trainable. save() with the saved_names
+    # superset must persist the frozen contact weights so a fresh model + load()
+    # restores contact AND force bit-exact (never a random contact head).
+    src = _freeze_contact(_TinyForce())
+    trainable = _trainable_names(src)
+    assert all("force" in n for n in trainable)            # force-only trainable
+    assert any("contact" in n for n in _saved_names(src))  # contact still serialised
+
+    path = tmp_path / "regime_a.pth"
+    opt, sched = _opt_sched(src)
+    opt.step(); sched.step()
+    ckpt_io.save(path, src, trainable, opt, sched,
+                 epoch=1, global_step=2, best_metric=0.0,
+                 monitor="test/physics_residual", config=_regime_a_cfg(),
+                 saved_names=_saved_names(src))
+
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    assert any("contact" in k for k in ckpt["trainable_state_dict"])   # contact tensors present
+    assert ckpt["frozen_saved_names"] == ["contact_head.bias", "contact_head.weight"]
+
+    dst = _freeze_contact(_TinyForce())
+    assert not torch.allclose(src.contact_head.weight, dst.contact_head.weight)
+    assert not torch.allclose(src.head_force.weight, dst.head_force.weight)
+    ckpt_io.load(path, dst, config=_regime_a_cfg())   # freeze_contact set, contact present -> no recovery
+    assert torch.equal(src.contact_head.weight, dst.contact_head.weight)   # frozen contact restored
+    assert torch.equal(src.head_force.weight, dst.head_force.weight)       # force restored
+
+
+def test_legacy_regime_a_recovers_contact_from_init(tmp_path):
+    # A LEGACY regime-(a) checkpoint (force tensors only, the old bug) must recover
+    # its dropped contact branch from the config's init_contact_checkpoint on load().
+    init_source = _Tiny()
+    init_path = tmp_path / "contact_init.pth"
+    opt, sched = _opt_sched(init_source)
+    ckpt_io.save(init_path, init_source, _trainable_names(init_source), opt, sched,
+                 epoch=0, global_step=1, best_metric=0.0, monitor="val/joint_f1",
+                 config=_force_cfg(force_enabled=False))
+
+    legacy = _freeze_contact(_TinyForce())
+    legacy_path = tmp_path / "legacy_force.pth"
+    opt, sched = _opt_sched(legacy)
+    # saved_names defaults to trainable_names (force-only) -> reproduces the bug.
+    ckpt_io.save(legacy_path, legacy, _trainable_names(legacy), opt, sched,
+                 epoch=2, global_step=3, best_metric=0.0,
+                 monitor="test/physics_residual",
+                 config=_regime_a_cfg(init_contact=str(init_path)))
+    ckpt = torch.load(legacy_path, map_location="cpu", weights_only=False)
+    assert not any("contact" in k for k in ckpt["trainable_state_dict"])   # contact-less
+
+    dst = _freeze_contact(_TinyForce())
+    ckpt_io.load(legacy_path, dst, config=_regime_a_cfg(init_contact=str(init_path)))
+    assert torch.equal(dst.contact_head.weight, init_source.contact_head.weight)  # recovered
+    assert torch.equal(dst.head_force.weight, legacy.head_force.weight)           # from legacy
+
+
+def test_legacy_regime_a_missing_init_raises(tmp_path):
+    legacy = _freeze_contact(_TinyForce())
+    legacy_path = tmp_path / "legacy_force.pth"
+    opt, sched = _opt_sched(legacy)
+    missing = str(tmp_path / "does_not_exist.pth")
+    ckpt_io.save(legacy_path, legacy, _trainable_names(legacy), opt, sched,
+                 epoch=0, global_step=0, best_metric=0.0,
+                 monitor="test/physics_residual",
+                 config=_regime_a_cfg(init_contact=missing))
+    dst = _freeze_contact(_TinyForce())
+    with pytest.raises(RuntimeError, match="missing/unreadable"):
+        ckpt_io.load(legacy_path, dst, config=_regime_a_cfg(init_contact=missing))
+
+
+def test_legacy_regime_a_no_init_raises(tmp_path):
+    legacy = _freeze_contact(_TinyForce())
+    legacy_path = tmp_path / "legacy_force.pth"
+    opt, sched = _opt_sched(legacy)
+    ckpt_io.save(legacy_path, legacy, _trainable_names(legacy), opt, sched,
+                 epoch=0, global_step=0, best_metric=0.0,
+                 monitor="test/physics_residual", config=_regime_a_cfg())
+    dst = _freeze_contact(_TinyForce())
+    with pytest.raises(RuntimeError, match="init_contact_checkpoint"):
+        ckpt_io.load(legacy_path, dst, config=_regime_a_cfg())
+
+
+def test_truncated_frozen_saved_names_raises(tmp_path):
+    # frozen_saved_names is a CLAIM of self-containment: a checkpoint whose claimed
+    # frozen tensor is missing from the state dict (truncated/corrupt file) must
+    # hard-fail — never load a partially random frozen contact branch.
+    src = _freeze_contact(_TinyForce())
+    path = tmp_path / "truncated.pth"
+    opt, sched = _opt_sched(src)
+    ckpt_io.save(path, src, _trainable_names(src), opt, sched,
+                 epoch=0, global_step=0, best_metric=0.0,
+                 monitor="test/physics_residual", config=_regime_a_cfg(),
+                 saved_names=_saved_names(src))
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    del ckpt["trainable_state_dict"]["contact_head.weight"]      # truncate one tensor
+    torch.save(ckpt, path)
+    with pytest.raises(RuntimeError, match="frozen_saved_names"):
+        ckpt_io.load(path, _freeze_contact(_TinyForce()), config=_regime_a_cfg())
+
+
+def test_partial_contact_state_raises_not_recovers(tmp_path):
+    # SOME but not the model's FULL contact-named set in the state is a corrupt /
+    # incompatible regime-(a) save: it must neither pass as self-contained (leaving
+    # the missing tensors random) nor trigger legacy recovery — it raises.
+    src = _freeze_contact(_TinyForce())
+    trainable = _trainable_names(src)
+    partial = trainable + ["contact_head.weight"]                # weight, NOT bias
+    path = tmp_path / "partial.pth"
+    opt, sched = _opt_sched(src)
+    ckpt_io.save(path, src, trainable, opt, sched,
+                 epoch=0, global_step=0, best_metric=0.0,
+                 monitor="test/physics_residual", config=_regime_a_cfg(),
+                 saved_names=partial)
+    with pytest.raises(RuntimeError, match="PARTIAL contact branch"):
+        ckpt_io.load(path, _freeze_contact(_TinyForce()), config=_regime_a_cfg())
+
+
+# ------------------------------------------ warm start from a temporal source (FIX 2)
+
+def test_temporal_source_warm_start_loads_contact_temporal(tmp_path):
+    # A temporal source is allowed when the target's temporal architecture is
+    # identical: contact_temporal.* then LOADS (not left fresh).
+    source = _TinyPlus()
+    path = tmp_path / "t5.pth"
+    opt, sched = _opt_sched(source)
+    ckpt_io.save(path, source, _trainable_names(source), opt, sched,
+                 epoch=0, global_step=1, best_metric=0.0, monitor="test/joint_f1",
+                 config=_temporal_cfg(enabled=True, position_scale=30.0))
+
+    target = _TinyPlus()
+    assert not torch.allclose(target.contact_temporal.weight, source.contact_temporal.weight)
+    state = ckpt_io.initialize_common_contact(
+        path, target, config=_temporal_cfg(enabled=True, position_scale=30.0))
+    assert torch.equal(target.contact_temporal.weight, source.contact_temporal.weight)  # LOADED
+    assert torch.equal(target.contact_head.weight, source.contact_head.weight)
+    assert state["warm_start_new_names"] == []   # nothing missing — contact_temporal loaded
+
+
+def test_temporal_source_mismatched_temporal_raises(tmp_path):
+    source = _TinyPlus()
+    path = tmp_path / "t5.pth"
+    opt, sched = _opt_sched(source)
+    ckpt_io.save(path, source, _trainable_names(source), opt, sched,
+                 epoch=0, global_step=1, best_metric=0.0, monitor="test/joint_f1",
+                 config=_temporal_cfg(enabled=True, position_scale=30.0))
+    with pytest.raises(RuntimeError, match="temporal architecture differs"):
+        ckpt_io.initialize_common_contact(
+            path, _TinyPlus(),
+            config=_temporal_cfg(enabled=True, position_scale=1.0))
+
+
+def test_temporal_source_disabled_target_raises(tmp_path):
+    # Target temporal disabled but force enabled (so the precondition would pass) —
+    # a temporal source must still raise because the temporal architecture differs.
+    source = _TinyPlus()
+    path = tmp_path / "t5.pth"
+    opt, sched = _opt_sched(source)
+    ckpt_io.save(path, source, _trainable_names(source), opt, sched,
+                 epoch=0, global_step=1, best_metric=0.0, monitor="test/joint_f1",
+                 config=_temporal_cfg(enabled=True, position_scale=30.0))
+    with pytest.raises(RuntimeError, match="temporal architecture differs"):
+        ckpt_io.initialize_common_contact(
+            path, _TinyForce(),
+            config=_temporal_cfg(enabled=False, force_enabled=True))
 
 
 def test_same_shape_semantic_mismatch_raises(tmp_path):

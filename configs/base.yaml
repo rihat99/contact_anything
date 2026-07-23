@@ -34,6 +34,22 @@ model:
     causal: false                     # frame-level causal mask when true
     dropout: 0.0
     position_scale: 1.0               # multiply elapsed seconds before sinusoidal time encoding
+  force_head:                         # Step 04: per-extremity 3D force regression (zero-init head)
+    enabled: false                    # requires the extremities_4 per_token joint target
+    frame: local_world_aligned        # local_world_aligned | local (consumed by the physics loss)
+    mlp_depth: 2
+    mlp_channel_div_factor: 4
+    dropout: 0.0
+  force_temporal:                     # Step 05: temporal attention over force tokens (post_decoder)
+    enabled: false                    # requires force_head.enabled; second ContactTemporalModule
+    bottleneck_dim: 256               # lightweight 1024 -> 256 -> 1024 token adapter
+    num_layers: 1
+    num_heads: 4
+    mlp_ratio: 2.0
+    attend: per_token                 # per_token (T per token-slot) | joint (T*K tokens per clip)
+    causal: false                     # frame-level causal mask when true
+    dropout: 0.0
+    position_scale: 1.0               # multiply elapsed seconds before sinusoidal time encoding
 
 contact:
   topology: smpl                      # smpl(6890) | smplx(10475) | mhr -> NotImplementedError
@@ -64,6 +80,30 @@ data:
   # target_frame: all supervises every temporal row; center supervises only the
   # middle row (and therefore requires an odd frames_per_clip).
   sequence: {frames_per_clip: 8, frame_stride: 2, jitter: true, target_frame: all}
+
+physics:                              # Step 06: RNEA root-wrench physics loss on the forces
+  enabled: false                      # requires force_head.enabled + a climbing_videos dataset
+  use_warp: false                     # opt into BetterRobot's fused CUDA FK/RNEA lanes
+  model_path: null                    # null -> $BETTERHUMAN_MODELS_DIR then sibling BetterHuman
+  lod: 1                              # MHR level of detail (1 matches SAM-3D-Body)
+  gravity: 9.81                       # magnitude m/s^2; DIRECTION is per scene (gravity_world)
+  min_frames: 5                       # clips shorter than this are physics-ineligible
+  smoothing_kernel: [0.25, 0.5, 0.25] # manifold smoothing kernel; odd-length, [1.0] = off
+  max_cam_jump_m: null                # null = off; else drop clips whose camera-center jump (m) between consecutive SAMPLED clip frames exceeds this
+  # All loss weights are dimensionless (residual force / m*g, torques / m*g*1m).
+  loss:
+    residual: 1.0                     # sum rho(r_f)+rho(r_tau) root-wrench residual (objective)
+    residual_robust:                  # per-component residual robustifier; square = original objective
+      kind: square                    # square | pseudo_huber
+      delta_force: 1.0                # pseudo-Huber transition for the 3 force components (bw)
+      delta_torque: 0.5               # pseudo-Huber transition for the 3 torque components (bw*m)
+    force_noncontact: 1.0             # (1-p)||f||^2 penalty at non-contact extremities (D8)
+    force_at_contact: 0.1             # p*relu(contact_min_bw - ||f||)^2 at contacts (weak)
+    contact_min_bw: 0.05              # minimum contact force, in units of body weight
+    force_smooth: 0.1                 # ||f_t - f_{t-1}||^2 on world-frame forces
+    force_l2: 0.01                    # ||f||^2 magnitude regulariser
+    torque_l2: 0.01                   # ||tau_j||^2 joint-torque regulariser (residual frames)
+    torque_smooth: 0.0                # ||tau_j(t) - tau_j(t-1)||^2 (needs >=2 residual frames)
 
 loss: {dice_eps: 1.0e-5, grad_clip: 1.0}
 

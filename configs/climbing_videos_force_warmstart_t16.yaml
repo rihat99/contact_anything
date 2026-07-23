@@ -1,0 +1,87 @@
+# Regime (a) DECISIVE force run (codex-reviewed redesign). Warm-start the FROZEN
+# contact branch — including its temporal module — from the trained TEMPORAL
+# contact run, train ONLY the force branch against the RNEA root-wrench residual.
+# This targets the collapse the T=8 run (climb4_force_warmstart_t8) exhibited —
+# a near-constant ~1 body-weight upward force with little input dependence — by
+# attacking its four diagnosed causes: heavy-tailed supervision, few residual
+# frames, high finite-difference noise, and an over-aggressive gradient clip.
+# Every override below is annotated vs the collapsed run (see docs/forces.md and
+# force_redesign_spec.md §5 + the 2026-07-23 adversarial review fixes).
+base: configs/climbing_videos_force_warmstart.yaml
+
+model:
+  # Temporal contact source (user-preferred, MEASURED at this clip geometry):
+  #   climb4_t5 holds test joint F1 0.8878 at T=16/stride 2 (0.8969 at its native
+  #   T=5/stride 1) — safe to reuse frozen. climb4_t5mid (target_frame=center)
+  #   COLLAPSES to ~0.70 under T=16/stride 2 — do NOT substitute it.
+  # contact_temporal.* params are contact-named: the warm start loads them from
+  # the source and train.freeze_contact freezes them with the rest of the branch.
+  init_contact_checkpoint: output/climb4_t5_20260716_183709/best.pth
+  # Contact temporal block — must byte-match the source run's architecture
+  # (configs/climbing_videos_joint_temporal.yaml) or the warm start hard-fails.
+  temporal:
+    enabled: true
+    placement: post_decoder
+    bottleneck_dim: 256
+    num_layers: 1
+    num_heads: 4
+    mlp_ratio: 2.0
+    attend: per_token                 # each limb mixes only with itself through time
+    causal: false
+    position_scale: 30.0              # 30-fps seconds -> well-separated frame offsets
+  # FORCE tokens get their own cross-frame attention; force_temporal params are
+  # force-named -> fresh & trainable while the whole contact branch stays frozen.
+  force_temporal:
+    enabled: true
+    attend: per_token                 # each limb mixes only with itself through time
+    position_scale: 30.0              # ~30-fps seconds -> well-separated frame offsets
+
+data:
+  frames_per_batch: 32                # per GPU -> 2 clips x T=16 (physics FK+RNEA/step)
+  # T 8 -> 16 and stride 1 -> 2 vs the collapsed run. T=16 (kernel r=1) yields 10
+  # residual frames {3..12} instead of 2 ({3,4}) -> 5x more supervision rows, lower
+  # variance. Stride 2 doubles dt (~2/30 s), cutting the double-finite-difference
+  # noise ~4x (v,a scale as 1/dt, 1/dt^2). jitter keeps window augmentation.
+  sequence: {frames_per_clip: 16, frame_stride: 2, jitter: true}
+
+physics:
+  # Camera-jerk clip filter: drop clips whose camera-center jump between
+  # consecutive SAMPLED clip frames exceeds 0.5 m (stride-consistent — a jump on a
+  # skipped source frame still shows in the net sampled-step displacement).
+  # Upstream reconstruction discontinuities alias into body acceleration; e.g. the
+  # 7.85 m jump in train scene 45KmZUc0CzA_0007. Filters on camera evidence, NOT
+  # model residual.
+  max_cam_jump_m: 0.5
+  loss:
+    residual: 1.0                     # RNEA root-wrench residual objective
+    # Component-wise pseudo-Huber on the 6 residual components: the batch residual is
+    # heavy-tailed (rank0 med 0.77, p90 4.24, p99 18, max 46) from noisy MHR/camera
+    # double-differencing. Linear tail past delta stops a few frames dominating.
+    residual_robust: {kind: pseudo_huber, delta_force: 1.0, delta_torque: 0.5}
+    force_noncontact: 2.0             # 1.0 -> 2.0: stronger airborne-force penalty (the main allocation signal)
+    force_at_contact: 0.0             # 0.1 -> 0.0: zero-init head has zero gradient at f=0; this weak floor cannot lift it and only adds noise
+    force_smooth: 0.02               # 0.1 -> 0.02: lighter so the regulariser mix stops selecting a low-variance constant
+    force_l2: 0.001                  # 0.01 -> 0.001: lighter magnitude prior
+    torque_l2: 0.001                 # 0.01 -> 0.001: lighter joint-torque prior
+    torque_smooth: 0.0               # unchanged
+
+loss:
+  grad_clip: 5.0                      # 1.0 -> 5.0: raw grad norm ~28 was clipped EVERY step, discarding signal; raw-norm telemetry (train/grad_norm_raw) now measures the true scale
+
+optim:
+  lr: 1.0e-4                          # 2e-4 -> 1e-4: gentler, matches the smaller 32-frame budget
+  warmup_epochs: 1                    # 0 -> 1: ease the zero-init force head in
+  lr_min: 1.0e-6                      # 1e-5 -> 1e-6: anneal lower over the longer schedule
+  epochs: 30                          # 10 -> 30: give the (now higher-SNR) objective time to learn structure
+
+logging:
+  tensorboard_metrics: null           # log every scalar incl. physics/* diagnostics (raw_residual, force_std, residual_sat_frac, n_jerk_excluded_clips)
+
+output:
+  exp_name: climb4_force_t16
+  # Minimised; reads the RAW physical residual (regulariser mix excluded from
+  # "best"). NOTE the raw residual is protocol-dependent (dt, smoothing stencil,
+  # scored rows): the historical 1.6015 (collapsed best) / ~2.586 (zero-force)
+  # numbers were measured at T=8/stride 1 — re-evaluate those checkpoints under
+  # THIS T=16/stride 2 protocol before treating them as baselines.
+  monitor: test/physics_residual

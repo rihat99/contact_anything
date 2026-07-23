@@ -62,6 +62,24 @@ DEFAULTS: dict[str, Any] = {
             "dropout": 0.0,
             "position_scale": 1.0,           # multiplier on elapsed seconds before time PE
         },
+        "force_head": {                     # Step 04: per-extremity 3D force regression
+            "enabled": False,
+            "frame": "local_world_aligned", # local_world_aligned | local (consumed by physics loss)
+            "mlp_depth": 2,
+            "mlp_channel_div_factor": 4,
+            "dropout": 0.0,
+        },
+        "force_temporal": {                 # Step 05: temporal attention over force tokens
+            "enabled": False,               # requires model.force_head.enabled
+            "bottleneck_dim": 256,          # project 1024-d force tokens before attention
+            "num_layers": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "attend": "per_token",          # joint (T*K tokens per clip) | per_token (T per slot)
+            "causal": False,
+            "dropout": 0.0,
+            "position_scale": 1.0,          # multiply elapsed seconds before sinusoidal time PE
+        },
     },
     "contact": {
         "topology": "smpl",             # smpl(6890) | smplx(10475) | mhr -> NotImplementedError
@@ -109,10 +127,36 @@ DEFAULTS: dict[str, Any] = {
             "target_frame": "all",       # all | center (loss/metrics rows per clip)
         },
     },
+    "physics": {                        # Step 06: RNEA root-wrench physics loss on forces
+        "enabled": False,               # requires model.force_head.enabled + a video dataset
+        "use_warp": False,              # opt into BetterRobot's fused CUDA FK/RNEA lanes
+        "model_path": None,             # null -> $BETTERHUMAN_MODELS_DIR then sibling checkout
+        "lod": 1,                       # MHR level of detail (1 matches SAM-3D-Body)
+        "gravity": 9.81,                # magnitude m/s^2; DIRECTION is per scene (gravity_world)
+        "min_frames": 5,                # clips shorter than this are physics-ineligible
+        "smoothing_kernel": [0.25, 0.5, 0.25],   # odd-length; [1.0] = smoothing off
+        "max_cam_jump_m": None,         # null = off; else drop clips whose sampled-step camera-center jump exceeds this (m)
+        "loss": {
+            "residual": 1.0,            # sum rho(r_f) + rho(r_tau) root-wrench residual (objective)
+            "residual_robust": {        # per-component residual robustifier (rho); square = original
+                "kind": "square",       # square | pseudo_huber
+                "delta_force": 1.0,     # pseudo-Huber transition for the 3 force components
+                "delta_torque": 0.5,    # pseudo-Huber transition for the 3 torque components
+            },
+            "force_noncontact": 1.0,    # (1-p)||f||^2 at non-contact extremities
+            "force_at_contact": 0.1,    # p*relu(contact_min_bw - ||f||)^2 at contacts
+            "contact_min_bw": 0.05,     # min force at a contact, units of body weight
+            "force_smooth": 0.1,        # ||f_t - f_{t-1}||^2 on world-frame forces
+            "force_l2": 0.01,           # ||f||^2
+            "torque_l2": 0.01,          # ||tau_j||^2 (residual frames)
+            "torque_smooth": 0.0,       # ||tau_j(t) - tau_j(t-1)||^2 (>=2 residual frames)
+        },
+    },
     "loss": {"dice_eps": 1.0e-5, "grad_clip": 1.0},
     "train": {                          # Phase 4 efficiency flags (grad-asserted no-ops)
         "detach_interm_preds": True,    # run interm MHR/camera preds under no_grad
         "backbone_no_grad": True,       # wrap only the frozen backbone call in no_grad
+        "freeze_contact": False,        # regime (a): freeze contact, train force branch only
     },
     "optim": {
         "lr": 1.0e-4,
@@ -148,6 +192,7 @@ _TEMPORAL_PLACEMENTS = frozenset({"post_decoder", "between_layers", "pre_decoder
 _TEMPORAL_ATTEND = frozenset({"joint", "per_token"})
 _KNOWN_JOINT_SETS = frozenset(JOINT_SET_NAMES)
 _CONTACT_POOL_MODES = frozenset({"attention", "concat", "per_token"})
+_FORCE_FRAMES = frozenset({"local_world_aligned", "local"})
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -195,6 +240,129 @@ def _validate_keys(node: dict, schema: dict, path: str = "") -> None:
                     f"config key {dotted!r} must be a mapping (namespace); "
                     f"got {type(value).__name__}")
             _validate_keys(value, sub, dotted)
+
+
+def _validate_temporal_common(node: dict, path: str) -> None:
+    """Validate the attend/shape/scale clauses shared by ``model.temporal`` and
+    ``model.force_temporal``.
+
+    Placement is validated separately (``force_temporal`` has no placement key —
+    it is fixed to ``post_decoder``).
+    """
+    if node["attend"] not in _TEMPORAL_ATTEND:
+        raise ValueError(
+            f"{path}.attend must be one of {sorted(_TEMPORAL_ATTEND)}; "
+            f"got {node['attend']!r}")
+    bottleneck_dim = int(node["bottleneck_dim"])
+    num_heads = int(node["num_heads"])
+    if bottleneck_dim <= 0:
+        raise ValueError(f"{path}.bottleneck_dim must be positive")
+    if num_heads <= 0 or bottleneck_dim % num_heads:
+        raise ValueError(
+            f"{path}.bottleneck_dim must be divisible by "
+            f"{path}.num_heads; got {bottleneck_dim} and {num_heads}")
+    if int(node["num_layers"]) <= 0:
+        raise ValueError(f"{path}.num_layers must be positive")
+    if float(node["mlp_ratio"]) <= 0:
+        raise ValueError(f"{path}.mlp_ratio must be positive")
+    position_scale = float(node["position_scale"])
+    if not math.isfinite(position_scale) or position_scale <= 0:
+        raise ValueError(f"{path}.position_scale must be finite and positive")
+
+
+_PHYSICS_WEIGHT_KEYS = frozenset({
+    "residual", "force_noncontact", "force_at_contact", "contact_min_bw",
+    "force_smooth", "force_l2", "torque_l2", "torque_smooth",
+})
+
+_RESIDUAL_ROBUST_KINDS = frozenset({"square", "pseudo_huber"})
+
+
+def _validate_physics(cfg: dict, force_head: dict) -> None:
+    """Validate the ``physics:`` section (step 06). ``physics:`` numbers stay out of
+    the checkpoint arch signature.
+    """
+    physics = cfg["physics"]
+    gravity = float(physics["gravity"])
+    if not math.isfinite(gravity) or gravity <= 0:
+        raise ValueError("physics.gravity must be finite and positive")
+    if int(physics["lod"]) < 0:
+        raise ValueError("physics.lod must be a non-negative integer")
+
+    kernel = physics["smoothing_kernel"]
+    if (not isinstance(kernel, list) or len(kernel) == 0 or len(kernel) % 2 == 0
+            or not all(isinstance(w, (int, float)) and not isinstance(w, bool) for w in kernel)):
+        raise ValueError("physics.smoothing_kernel must be a non-empty odd-length list of numbers")
+    if any(w < 0 for w in kernel):
+        raise ValueError("physics.smoothing_kernel weights must be non-negative")
+    if sum(kernel) <= 0:
+        raise ValueError("physics.smoothing_kernel weights must have a positive sum")
+
+    for key in _PHYSICS_WEIGHT_KEYS:
+        value = float(physics["loss"][key])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"physics.loss.{key} must be finite and >= 0")
+
+    # Robust residual + camera-jerk filter (read via ``.get`` so the direct
+    # ``_validate_physics`` unit test — which passes a pre-schema physics dict —
+    # still runs; ``load_config`` always supplies both from the defaults).
+    robust = physics["loss"].get("residual_robust")
+    if robust is not None:
+        if robust["kind"] not in _RESIDUAL_ROBUST_KINDS:
+            raise ValueError(
+                "physics.loss.residual_robust.kind must be one of "
+                f"{sorted(_RESIDUAL_ROBUST_KINDS)}; got {robust['kind']!r}")
+        for key in ("delta_force", "delta_torque"):
+            delta = float(robust[key])
+            if not math.isfinite(delta) or delta <= 0:
+                raise ValueError(
+                    f"physics.loss.residual_robust.{key} must be finite and positive")
+
+    max_cam_jump = physics.get("max_cam_jump_m")
+    if max_cam_jump is not None:
+        max_cam_jump = float(max_cam_jump)
+        if not math.isfinite(max_cam_jump) or max_cam_jump <= 0:
+            raise ValueError("physics.max_cam_jump_m must be null or a finite positive number")
+
+    # The physics_residual monitor reads the raw RNEA residual, which is computed
+    # only when the residual objective actually runs — a zero residual weight would
+    # leave the monitor permanently without data (the trainer then raises at eval).
+    monitor = str((cfg.get("output") or {}).get("monitor") or "")
+    if monitor.endswith("physics_residual") and float(physics["loss"]["residual"]) == 0.0:
+        raise ValueError(
+            "output.monitor '.../physics_residual' requires physics.loss.residual > 0 "
+            "(the raw residual headline is computed only when the RNEA residual "
+            "objective runs)")
+
+    min_frames = int(physics["min_frames"])
+    if min_frames < 3:
+        raise ValueError("physics.min_frames must be >= 3")
+
+    if not physics["enabled"]:
+        return
+    if not force_head["enabled"]:
+        raise ValueError(
+            "physics.enabled requires model.force_head.enabled=true "
+            "(the physics loss supervises the predicted forces)")
+    if not any(entry["name"] == "climbing_videos" for entry in cfg["data"]["datasets"]):
+        raise ValueError(
+            "physics.enabled requires a video dataset (climbing_videos) in data.datasets")
+    frames_per_clip = int(cfg["data"]["sequence"]["frames_per_clip"])
+    if frames_per_clip < min_frames:
+        raise ValueError(
+            "physics.enabled requires data.sequence.frames_per_clip "
+            f">= physics.min_frames ({frames_per_clip} < {min_frames})")
+    # Residual frames are {2+r <= t <= T-3-r} with r = kernel radius (formula from
+    # contact/physics/loss.py::_residual_frame_indices, duplicated here so config
+    # validation does not import better_robot). Empty set = the residual objective —
+    # the whole point of the physics loss — is silently dead.
+    radius = len(kernel) // 2
+    if 2 + radius > frames_per_clip - 3 - radius:
+        raise ValueError(
+            f"physics.enabled with frames_per_clip={frames_per_clip} and a "
+            f"smoothing kernel of radius {radius} leaves zero residual frames "
+            "({2+r <= t <= T-3-r}) — raise data.sequence.frames_per_clip to at "
+            f"least {5 + 2 * radius} or shorten physics.smoothing_kernel")
 
 
 def _validate_semantics(cfg: dict) -> None:
@@ -254,25 +422,39 @@ def _validate_semantics(cfg: dict) -> None:
         raise ValueError(
             f"model.temporal.placement must be one of {sorted(_TEMPORAL_PLACEMENTS)}; "
             f"got {temporal['placement']!r}")
-    if temporal["attend"] not in _TEMPORAL_ATTEND:
+    _validate_temporal_common(temporal, "model.temporal")
+
+    force_head = cfg["model"]["force_head"]
+    if force_head["frame"] not in _FORCE_FRAMES:
         raise ValueError(
-            f"model.temporal.attend must be one of {sorted(_TEMPORAL_ATTEND)}; "
-            f"got {temporal['attend']!r}")
-    bottleneck_dim = int(temporal["bottleneck_dim"])
-    num_heads = int(temporal["num_heads"])
-    if bottleneck_dim <= 0:
-        raise ValueError("model.temporal.bottleneck_dim must be positive")
-    if num_heads <= 0 or bottleneck_dim % num_heads:
+            f"model.force_head.frame must be one of {sorted(_FORCE_FRAMES)}; "
+            f"got {force_head['frame']!r}")
+    if force_head["enabled"]:
+        joint_enabled = targets["joint"]["enabled"]
+        if not (joint_enabled and joint_set == "extremities_4" and pool_mode == "per_token"):
+            raise ValueError(
+                "model.force_head.enabled requires the joint target enabled with "
+                "joint_set='extremities_4' and model.contact_head.pool_mode='per_token' "
+                "(force tokens reuse the four extremity contact anchors)")
+
+    force_temporal = cfg["model"]["force_temporal"]
+    if force_temporal["enabled"] and not force_head["enabled"]:
         raise ValueError(
-            "model.temporal.bottleneck_dim must be divisible by "
-            f"model.temporal.num_heads; got {bottleneck_dim} and {num_heads}")
-    if int(temporal["num_layers"]) <= 0:
-        raise ValueError("model.temporal.num_layers must be positive")
-    if float(temporal["mlp_ratio"]) <= 0:
-        raise ValueError("model.temporal.mlp_ratio must be positive")
-    position_scale = float(temporal["position_scale"])
-    if not math.isfinite(position_scale) or position_scale <= 0:
-        raise ValueError("model.temporal.position_scale must be finite and positive")
+            "model.force_temporal.enabled requires model.force_head.enabled=true "
+            "(force temporal attends the force tokens)")
+    _validate_temporal_common(force_temporal, "model.force_temporal")
+
+    _validate_physics(cfg, force_head)
+
+    if cfg["train"]["freeze_contact"]:
+        if not force_head["enabled"]:
+            raise ValueError(
+                "train.freeze_contact=true requires model.force_head.enabled=true "
+                "(there is nothing else to train)")
+        if cfg["model"]["init_contact_checkpoint"] is None:
+            raise ValueError(
+                "train.freeze_contact=true requires model.init_contact_checkpoint "
+                "(warm-start the frozen contact branch)")
 
     sequence = cfg["data"]["sequence"]
     target_frame = str(sequence["target_frame"])

@@ -108,6 +108,9 @@ def test_four_extremity_anchors_use_existing_iterative_patch_update():
             self.contact_grid_size = 1
             self.contact_grid_radius = 0.1
             self.cfg = CfgNode({"MODEL": {"BACKBONE": {"TYPE": "dinov3_vith16plus"}}})
+            # contact_token_update_fn delegates the anchored sampling to this
+            # shared helper (also used by the force tokens).
+            self._anchored_token_update = SAM3DBody._anchored_token_update.__get__(self)
 
     harness = UpdateHarness()
     batch_size, channels, token_start = 2, 4, 3

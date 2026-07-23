@@ -1,4 +1,4 @@
-"""Render four-extremity contacts directly onto ClimbingVideos clips.
+"""Render four-extremity contacts (and optional force arrows) onto ClimbingVideos clips.
 
 The renderer selects one random scene chunk per source video and draws four
 circles at the frozen MHR model's predicted left/right wrist and ankle
@@ -6,12 +6,25 @@ positions. Contact is red and non-contact is green. With ``--overlay-labels``,
 the filled inner circle is the dataset label and the outer ring is the model
 prediction. No mesh or skeleton is rendered.
 
-Temporal checkpoints use centered sliding inference. Interior frames take the
-third (center) output of a five-frame window. The first and last two frames of
-each contiguous person track come from three-frame boundary windows. Tracks
-shorter than three frames fall back to per-frame inference so every valid frame
-is still rendered. Launching with ``torchrun`` shards the selected videos across
-the available ranks; each rank owns one GPU and no DDP model wrapper is needed.
+Inference windows follow the config's ``data.sequence`` (``frames_per_clip`` T,
+``frame_stride`` s). Every source frame belongs to exactly one stride-``s``
+parity subsequence; within each parity a contiguous valid person track is tiled
+by centered sliding windows of T sampled frames. Each window owns (emits) a
+central block of rows and boundary windows clamp to the track edge to emit the
+uncovered edge rows; a track shorter than T collapses to a single window that
+emits every row (down to T=1). Every valid (person, frame) is predicted exactly
+once. A per-frame (T=1, s=1) config reduces to one forward per frame.
+
+When the checkpoint has a force head, per-extremity **force arrows** are drawn on
+top of each contact disk: the predicted 3D force is a metric segment of
+``FORCE_METERS_PER_BW`` metres per body weight at the extremity's camera-frame
+3D position, perspective-projected through the dataset's per-frame intrinsics
+(so on-image direction and foreshortening are the camera's own), then attached
+to the extremity's 2D keypoint (colour by extremity). Only the
+``local_world_aligned`` force frame is drawn.
+
+Launching with ``torchrun`` shards the selected videos across the available
+ranks; each rank owns one GPU and no DDP model wrapper is needed.
 """
 from __future__ import annotations
 
@@ -57,6 +70,25 @@ FREE_COLOR = (55, 185, 75)
 OUTLINE_COLOR = (245, 245, 245)
 
 
+def _hex_to_bgr(color: str) -> tuple[int, int, int]:
+    """Convert an ``#rrggbb`` colour to an OpenCV BGR tuple."""
+    color = color.lstrip("#")
+    red, green, blue = (int(color[i:i + 2], 16) for i in (0, 2, 4))
+    return (blue, green, red)
+
+
+# One arrow colour per force output (left_hand, right_hand, left_foot, right_foot),
+# matching scripts/demo_climbing_videos.py::FORCE_COLORS (there in RGB hex).
+FORCE_COLORS = ("#e0530f", "#f0a500", "#1c72d8", "#2fb3ad")
+FORCE_COLORS_BGR = tuple(_hex_to_bgr(color) for color in FORCE_COLORS)
+FORCE_METERS_PER_BW = 1.0       # 3D arrow length in metres per unit body weight of |f|
+FORCE_MIN_BW = 1.0e-3           # skip near-zero forces (e.g. a zero-init head)
+FORCE_THICKNESS = 8             # arrow line thickness (px); outline adds +3
+FORCE_OUTLINE_BGR = (25, 25, 25)
+# LWA (camera y-up) -> OpenCV camera frame (y-down, z-forward).
+FORCE_FLIP = np.array([1.0, -1.0, -1.0])
+
+
 def select_random_scenes(
     scenes: list[str], count: int, seed: int,
 ) -> list[tuple[str, str]]:
@@ -79,51 +111,100 @@ def _dataset_root(cfg: dict) -> str:
     return str(dataset_cfg["data"]["root"])
 
 
-def temporal_window_requests(
-    valid_mask: np.ndarray,
-) -> dict[int, list[tuple[int, tuple[int, ...], tuple[int, ...]]]]:
-    """Build centered temporal requests for every contiguous valid person track.
+def _emit_margin(seq_len: int) -> int:
+    """Context rows trimmed from each side of a full interior window.
 
-    A request is ``(person, frame_positions, emitted_offsets)``. Long tracks use
-    one T=3 request for each boundary and overlapping T=5 windows in the
-    interior. Only offset 2 (the third frame) is emitted from every T=5 window.
-    The boundary T=3 requests emit the exact edge rows they own. This avoids
-    predicting any output frame twice while retaining all available context.
+    Emitted rows sit in the window centre with ``margin`` context frames on each
+    side; the leading/trailing ``margin`` rows are emitted only by the boundary
+    windows that own them. ``(T - 1) // 4`` gives 0 for ``T = 1`` (per-frame)
+    and, for the decisive ``T = 16`` force config, ``margin = 3`` — so the emitted
+    central block ``{3..12}`` coincides with the physics residual frames.
+    """
+    return (seq_len - 1) // 4
+
+
+def _contiguous_runs(valid: np.ndarray) -> list[tuple[int, int]]:
+    """Return half-open ``(lo, hi)`` index ranges of each contiguous True run."""
+    padded = np.pad(np.asarray(valid, dtype=np.int8), (1, 1))
+    changes = np.flatnonzero(np.diff(padded))
+    return [(int(lo), int(hi)) for lo, hi in zip(changes[0::2], changes[1::2])]
+
+
+def _centered_windows(length: int, seq_len: int):
+    """Tile a contiguous track of ``length`` sampled frames with centered windows.
+
+    Yields ``(window_start, emit_lo, emit_hi)`` in the track's local sampled-index
+    space: the window spans ``[window_start, window_start + min(seq_len, length))``
+    and OWNS output rows ``[emit_lo, emit_hi)``. The owned ranges partition
+    ``[0, length)`` exactly once. A track shorter than ``seq_len`` collapses to a
+    single window that emits every row.
+    """
+    if length <= seq_len:
+        yield 0, 0, length
+        return
+    margin = _emit_margin(seq_len)
+    covered = 0
+    while covered < length:
+        start = min(max(covered - margin, 0), length - seq_len)
+        # The final window (clamped to the right edge) emits to the track end;
+        # every other window leaves ``margin`` trailing rows for the next window.
+        emit_hi = length if start == length - seq_len else start + seq_len - margin
+        yield start, covered, emit_hi
+        covered = emit_hi
+
+
+def plan_track_windows(
+    valid_row: np.ndarray, seq_len: int, stride: int,
+) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
+    """Plan centered sliding windows for one person's frame track.
+
+    ``valid_row`` is the 1D per-frame validity mask over source frame positions.
+    Frames are grouped into ``stride`` parity subsequences (offsets ``0..s-1``)
+    so every source frame is covered; each contiguous valid run within a parity
+    is tiled by :func:`_centered_windows`.
+
+    :returns: a list of ``(positions, emitted_offsets)``. ``positions`` are the
+        source frame positions of one window (length ``min(seq_len, run_len)``,
+        stepping by ``stride``); ``emitted_offsets`` index into ``positions`` for
+        the rows this window owns. Every valid source frame appears in exactly
+        one owned ``(window, offset)``.
+    """
+    valid_row = np.asarray(valid_row, dtype=bool)
+    if valid_row.ndim != 1:
+        raise ValueError(f"valid_row must be 1D [frames]; got {valid_row.shape}")
+    if seq_len < 1 or stride < 1:
+        raise ValueError(f"seq_len and stride must be >= 1; got {seq_len}, {stride}")
+
+    requests: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    n_frames = valid_row.shape[0]
+    for offset in range(stride):
+        sampled_positions = np.arange(offset, n_frames, stride)      # source positions
+        for lo, hi in _contiguous_runs(valid_row[sampled_positions]):
+            run_positions = sampled_positions[lo:hi]                 # contiguous in sampled space
+            length = int(run_positions.shape[0])
+            window_len = min(seq_len, length)
+            for start, emit_lo, emit_hi in _centered_windows(length, seq_len):
+                positions = tuple(int(p) for p in run_positions[start:start + window_len])
+                emitted = tuple(range(emit_lo - start, emit_hi - start))
+                requests.append((positions, emitted))
+    return requests
+
+
+def sliding_window_requests(
+    valid_mask: np.ndarray, seq_len: int, stride: int,
+) -> dict[int, list[tuple[int, tuple[int, ...], tuple[int, ...]]]]:
+    """Centered windows for every person, grouped by window length for batching.
+
+    :returns: ``{window_len: [(person, positions, emitted_offsets), ...]}``.
     """
     valid_mask = np.asarray(valid_mask, dtype=bool)
     if valid_mask.ndim != 2:
         raise ValueError(f"valid_mask must be [people, frames]; got {valid_mask.shape}")
-    requests: dict[int, list[tuple[int, tuple[int, ...], tuple[int, ...]]]] = {
-        1: [], 3: [], 5: [],
-    }
+    requests: dict[int, list[tuple[int, tuple[int, ...], tuple[int, ...]]]] = defaultdict(list)
     for person, row in enumerate(valid_mask):
-        padded = np.pad(row.astype(np.int8), (1, 1))
-        changes = np.flatnonzero(np.diff(padded))
-        for start, end in zip(changes[0::2], changes[1::2]):
-            length = int(end - start)
-            if length < 3:
-                for position in range(int(start), int(end)):
-                    requests[1].append((person, (position,), (0,)))
-                continue
-            if length == 3:
-                positions = tuple(range(int(start), int(end)))
-                requests[3].append((person, positions, (0, 1, 2)))
-                continue
-
-            # Own the first two and last two outputs with T=3 windows. For a
-            # four-frame run these are two overlapping windows with disjoint
-            # emitted rows.
-            first = tuple(range(int(start), int(start + 3)))
-            last = tuple(range(int(end - 3), int(end)))
-            requests[3].append((person, first, (0, 1)))
-            requests[3].append((person, last, (1, 2)))
-
-            # T=5 windows exist from a run length of five onward. Each owns only
-            # its center output, which is local offset 2.
-            for center in range(int(start + 2), int(end - 2)):
-                positions = tuple(range(center - 2, center + 3))
-                requests[5].append((person, positions, (2,)))
-    return requests
+        for positions, emitted in plan_track_windows(row, seq_len, stride):
+            requests[len(positions)].append((person, positions, emitted))
+    return dict(requests)
 
 
 def _frame_index_map(ds: ClimbingVideosDataset, scene: str) -> dict[tuple[int, int], int]:
@@ -174,8 +255,15 @@ def _predict_requests(
     anchor_indices: list[int],
     probs: np.ndarray,
     points: np.ndarray,
+    force_data: dict[str, np.ndarray] | None = None,
 ) -> None:
-    """Run homogeneous-T requests and write only their requested output rows."""
+    """Run homogeneous-T requests and write only their requested output rows.
+
+    When ``force_data`` is given (force head present, ``local_world_aligned``
+    frame), the per-row force vector plus the anchors' camera-frame 3D position
+    are stored alongside the 2D anchor keypoints so the render loop can draw
+    force arrows.
+    """
     if not requests:
         return
     item_index = _frame_index_map(ds, scene)
@@ -225,6 +313,15 @@ def _predict_requests(
             output["mhr"]["pred_keypoints_2d"][:, anchor_indices]
             .float().cpu().numpy()
         )
+        collect_force = force_data is not None and output.get("force") is not None
+        if collect_force:
+            batch_forces = output["force"]["joint_forces"].float().cpu().numpy()
+            # Camera-frame 3D position of each anchor (keypoints_3d + cam translation),
+            # matching demo_climbing_videos._draw_force_arrows' ``point_cam``.
+            batch_anchor_cam = (
+                output["mhr"]["pred_keypoints_3d"][:, anchor_indices]
+                + output["mhr"]["pred_cam_t"][:, None, :]
+            ).float().cpu().numpy()
 
         for clip_index, (person, positions, emitted_offsets) in enumerate(selected):
             for offset in emitted_offsets:
@@ -236,6 +333,9 @@ def _predict_requests(
                         f"frame={frame_position}")
                 probs[person, frame_position] = batch_probs[row]
                 points[person, frame_position] = batch_points[row]
+                if collect_force:
+                    force_data["forces"][person, frame_position] = batch_forces[row]
+                    force_data["anchor_cam"][person, frame_position] = batch_anchor_cam[row]
 
 
 def _predict_scene(
@@ -247,8 +347,15 @@ def _predict_scene(
     device: str,
     split_dir: str = "test",
     require_labels: bool = False,
-) -> tuple[ClimbingVideosDataset, np.ndarray, np.ndarray]:
-    """Return dataset plus ``probs[P,N,4]`` and keypoints ``[P,N,4,2]``."""
+    collect_force: bool = False,
+) -> tuple[ClimbingVideosDataset, np.ndarray, np.ndarray, dict[str, np.ndarray] | None]:
+    """Return dataset, ``probs[P,N,4]``, keypoints ``[P,N,4,2]`` and force data.
+
+    The item store is a per-frame (T=1) dataset; inference windows follow the
+    config's ``data.sequence``. ``force_data`` is ``None`` unless ``collect_force``,
+    in which case it carries ``forces[P,N,4,3]`` and camera-frame anchor positions
+    ``anchor_cam[P,N,4,3]`` for the force-arrow projection.
+    """
     ds = ClimbingVideosDataset(
         root=root,
         scenes=[scene],
@@ -265,6 +372,12 @@ def _predict_scene(
     n_people, n_frames = data["valid_mask"].shape
     probs = np.full((n_people, n_frames, 4), np.nan, dtype=np.float32)
     points = np.full((n_people, n_frames, 4, 2), np.nan, dtype=np.float32)
+    force_data = None
+    if collect_force:
+        force_data = {
+            "forces": np.full((n_people, n_frames, 4, 3), np.nan, dtype=np.float32),
+            "anchor_cam": np.full((n_people, n_frames, 4, 3), np.nan, dtype=np.float32),
+        }
     spec = TargetSpec.from_config(cfg)
     if spec.joint_names != EXTREMITY_4_NAMES:
         raise ValueError(
@@ -274,23 +387,15 @@ def _predict_scene(
     if len(anchor_indices) != 4:
         raise ValueError(f"expected four MHR anchors; got {anchor_indices}")
 
-    temporal_enabled = bool(cfg["model"].get("temporal", {}).get("enabled", False))
-    if temporal_enabled:
-        requests_by_t = temporal_window_requests(data["valid_mask"])
-    else:
-        requests_by_t = {
-            1: [
-                (person, (frame_position,), (0,))
-                for item_scene, person, frame_position, _ in ds._items
-                if item_scene == scene
-            ],
-        }
+    seq = cfg["data"]["sequence"]
+    requests_by_t = sliding_window_requests(
+        data["valid_mask"], int(seq["frames_per_clip"]), int(seq["frame_stride"]))
     for seq_len in sorted(requests_by_t):
         _predict_requests(
             model, ds, scene, requests_by_t[seq_len], seq_len, batch_size,
-            device, collate, anchor_indices, probs, points,
+            device, collate, anchor_indices, probs, points, force_data,
         )
-    return ds, probs, points
+    return ds, probs, points, force_data
 
 
 def _draw_contacts(
@@ -342,6 +447,70 @@ def _draw_contacts(
                         frame, (x, y), inner_radius, label_color, -1, cv2.LINE_AA)
 
 
+def _draw_force_arrows(
+    frame: np.ndarray,
+    frame_points: np.ndarray,
+    frame_forces: np.ndarray,
+    frame_anchor_cam: np.ndarray,
+    cam_int: np.ndarray,
+) -> None:
+    """Draw one predicted-force arrow per extremity per person on top of the disks.
+
+    The force (``local_world_aligned``, camera y-up) is flipped into the OpenCV
+    camera frame and treated as a metric 3D segment of ``FORCE_METERS_PER_BW``
+    metres per body weight starting at the extremity's camera-frame position.
+    Both endpoints are perspective-projected through the dataset's intrinsics —
+    on-image direction and foreshortening are the real camera's — and the
+    projected segment is attached to the extremity's 2D keypoint (the model's
+    3D and the dataset camera do not share an exact projection).
+
+    :param frame_points: ``[P, 4, 2]`` anchor keypoints (full-image px).
+    :param frame_forces: ``[P, 4, 3]`` predicted forces (body weight, head frame).
+    :param frame_anchor_cam: ``[P, 4, 3]`` camera-frame anchor positions.
+    :param cam_int: ``[3, 3]`` dataset camera intrinsics for this frame.
+    """
+    height, width = frame.shape[:2]
+    fx, fy = float(cam_int[0, 0]), float(cam_int[1, 1])
+    cx, cy = float(cam_int[0, 2]), float(cam_int[1, 2])
+    if not (np.isfinite(fx) and np.isfinite(fy)) or fx <= 0 or fy <= 0:
+        return
+    for person in range(frame_forces.shape[0]):
+        for out_idx in range(frame_forces.shape[1]):
+            force = np.asarray(frame_forces[person, out_idx], dtype=np.float64)
+            if not np.isfinite(force).all():
+                continue
+            mag = float(np.linalg.norm(force))
+            if mag < FORCE_MIN_BW:
+                continue
+            point_cam = np.asarray(frame_anchor_cam[person, out_idx], dtype=np.float64)
+            if not np.isfinite(point_cam).all() or point_cam[2] <= 1e-3:  # behind camera
+                continue
+            anchor = np.asarray(frame_points[person, out_idx], dtype=np.float64)
+            if not np.isfinite(anchor).all():
+                continue
+            if anchor[0] < 0 or anchor[0] >= width or anchor[1] < 0 or anchor[1] >= height:
+                continue
+            tip_cam = point_cam + FORCE_METERS_PER_BW * (FORCE_FLIP * force)
+            if tip_cam[2] <= 1e-3:
+                continue
+            base_px = np.array([fx * point_cam[0] / point_cam[2] + cx,
+                                fy * point_cam[1] / point_cam[2] + cy])
+            tip_px = np.array([fx * tip_cam[0] / tip_cam[2] + cx,
+                               fy * tip_cam[1] / tip_cam[2] + cy])
+            delta = tip_px - base_px
+            length = float(np.linalg.norm(delta))
+            if length < 2.0:  # force points almost along the optical axis
+                continue
+            color = FORCE_COLORS_BGR[out_idx % len(FORCE_COLORS_BGR)]
+            start = (int(round(anchor[0])), int(round(anchor[1])))
+            end = (int(round(anchor[0] + delta[0])), int(round(anchor[1] + delta[1])))
+            tip_length = float(np.clip(32.0 / max(length, 1.0), 0.1, 0.5))
+            cv2.arrowedLine(frame, start, end, FORCE_OUTLINE_BGR,
+                            FORCE_THICKNESS + 3, cv2.LINE_AA, tipLength=tip_length)
+            cv2.arrowedLine(frame, start, end, color,
+                            FORCE_THICKNESS, cv2.LINE_AA, tipLength=tip_length)
+
+
 def _render_scene(
     scene: str,
     ds: ClimbingVideosDataset,
@@ -351,6 +520,7 @@ def _render_scene(
     output_path: Path,
     labels: np.ndarray | None = None,
     label_mask: np.ndarray | None = None,
+    force_data: dict[str, np.ndarray] | None = None,
 ) -> dict:
     data = ds._scenes[scene]
     frames_dir = data["dir"] / "frames"
@@ -379,6 +549,14 @@ def _render_scene(
                 None if labels is None else labels[:, frame_position],
                 None if label_mask is None else label_mask[:, frame_position],
             )
+            if force_data is not None:
+                _draw_force_arrows(
+                    frame,
+                    points[:, frame_position],
+                    force_data["forces"][:, frame_position],
+                    force_data["anchor_cam"][:, frame_position],
+                    data["intrinsics"][frame_position],
+                )
             writer.write(frame)
     finally:
         writer.release()
@@ -424,7 +602,8 @@ def main() -> int:
     parser.add_argument("--threshold", type=float, default=0.2)
     parser.add_argument(
         "--batch-size", type=int, default=12,
-        help="clips per GPU forward (12 T=5 clips = the 60-frame training budget)")
+        help="windows per GPU forward; frames per forward = batch-size * T "
+             "(T = data.sequence.frames_per_clip)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
@@ -468,6 +647,15 @@ def main() -> int:
     model, _ = build_model(cfg, device)
     state = ckpt_io.load(checkpoint, model, config=cfg, map_location=device)
     model.eval()
+
+    # Draw force arrows only for a local_world_aligned force head; other frames
+    # need FK not run here (guarded like scripts/demo_climbing_videos.py).
+    force_enabled = bool(cfg["model"]["force_head"]["enabled"])
+    force_frame = cfg["model"]["force_head"]["frame"] if force_enabled else None
+    collect_force = force_enabled and force_frame == "local_world_aligned"
+    if rank == 0 and force_enabled and not collect_force:
+        print(f"[force] force_head.frame={force_frame!r} != 'local_world_aligned'; "
+              "force arrows need FK not run here — skipping arrows.")
     if rank == 0:
         print(f"Checkpoint epoch {state['epoch']}; threshold {args.threshold:.2f}")
         print("Selected:", ", ".join(f"{video_id}:{scene}" for video_id, scene in selected))
@@ -476,10 +664,11 @@ def main() -> int:
     indexed = list(enumerate(selected, start=1))
     for index, (video_id, scene) in indexed[rank::world_size]:
         print(f"[rank {rank}] [{index}/{len(selected)}] {video_id} -> {scene}")
-        ds, probs, points = _predict_scene(
+        ds, probs, points, force_data = _predict_scene(
             model, cfg, root, scene, args.batch_size, device,
             split_dir=args.split,
             require_labels=args.overlay_labels,
+            collect_force=collect_force,
         )
         labels, label_mask = (
             _scene_ground_truth(ds._scenes[scene])
@@ -489,7 +678,7 @@ def main() -> int:
         output_path = output_dir / f"{index:02d}_{scene}_{suffix}_t{threshold_tag}.mp4"
         record = _render_scene(
             scene, ds, probs, points, args.threshold, output_path,
-            labels=labels, label_mask=label_mask)
+            labels=labels, label_mask=label_mask, force_data=force_data)
         record["source_video"] = video_id
         record["selection_index"] = index
         local_records.append(record)
@@ -504,7 +693,9 @@ def main() -> int:
     records.sort(key=lambda record: record["selection_index"])
 
     if rank == 0:
-        temporal_enabled = bool(cfg["model"].get("temporal", {}).get("enabled", False))
+        seq = cfg["data"]["sequence"]
+        seq_len = int(seq["frames_per_clip"])
+        stride = int(seq["frame_stride"])
         summary = {
             "checkpoint": str(checkpoint),
             "checkpoint_epoch": int(state["epoch"]),
@@ -513,10 +704,12 @@ def main() -> int:
             "seed": args.seed,
             "selection": "one seeded-random scene chunk per distinct source video",
             "inference": (
-                "centered sliding T=5; T=3 at track boundaries; T=1 only for "
-                "tracks shorter than three frames"
-                if temporal_enabled else "per-frame T=1"
+                f"per-frame T=1" if seq_len == 1 and stride == 1 else
+                f"centered sliding windows of T={seq_len} sampled frames "
+                f"(stride {stride}); every source frame predicted exactly once"
             ),
+            "frames_per_clip": seq_len,
+            "frame_stride": stride,
             "world_size": world_size,
             "joint_names": list(EXTREMITY_4_NAMES),
             "circle_colors": {"contact": "red", "non_contact": "green"},
@@ -526,6 +719,18 @@ def main() -> int:
             ),
             "videos": records,
         }
+        if collect_force:
+            summary["force_arrows"] = {
+                "encoding": "one arrow per extremity: the predicted 3D force as a "
+                            "metric segment at the extremity's camera-frame position, "
+                            "perspective-projected through the dataset per-frame "
+                            "intrinsics, attached to the anchor 2D keypoint",
+                "colors": dict(zip(EXTREMITY_4_NAMES, FORCE_COLORS)),
+                "units": "body weight (dimensionless)",
+                "meters_per_body_weight": FORCE_METERS_PER_BW,
+                "min_magnitude_bw": FORCE_MIN_BW,
+                "frame": force_frame,
+            }
         (output_dir / "summary.json").write_text(json.dumps(summary, indent=2))
         print(f"Done: {output_dir}")
     if world_size > 1:

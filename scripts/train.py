@@ -39,9 +39,10 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from contact import checkpoint as ckpt_io
-from contact.config import load_config
+from contact.config import DEFAULTS as CONFIG_DEFAULTS
+from contact.config import _deep_merge, load_config
 from contact.data.collate import batch_to_device, make_loaders
-from contact.engine import forward_contact, select_temporal_supervision
+from contact.engine import forward_model, select_temporal_supervision
 from contact.losses import MultiTargetContactLoss, ddp_global_mean_term
 from contact.metrics import (
     add_counts,
@@ -50,7 +51,7 @@ from contact.metrics import (
     prf1,
     zero_counts,
 )
-from contact.model import build_model
+from contact.model import _trainable_name_filter, build_model
 from contact.targets import TargetSpec
 from contact.tracking import RunLogger
 
@@ -61,14 +62,23 @@ _MONITOR_METRICS = ("precision", "recall", "f1", "f2", "iou", "accuracy")
 
 
 class _ContactForward(nn.Module):
-    """Give DDP a conventional ``forward`` around SAM-3D-Body's step API."""
+    """Give DDP a conventional ``forward`` around SAM-3D-Body's step API.
+
+    Returns the full forward output (``"contact"``, ``"mhr"``, ``"force"``): the
+    contact loss reads ``out["contact"]`` and the physics loss reads
+    ``out["mhr"]`` / ``out["force"]`` — both must share one DDP-wrapped forward so
+    every trainable param sits on a single backward graph.
+    """
 
     def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
 
     def forward(self, batch: dict) -> dict:
-        return forward_contact(self.model, batch)
+        out = forward_model(self.model, batch)
+        if out.get("contact") is None:
+            raise RuntimeError("model produced no contact output — check DO_CONTACT_TOKENS.")
+        return out
 
 
 class _NullLogger:
@@ -104,16 +114,29 @@ def _build_scheduler(optimizer, optim_cfg):
 
 
 def _resume_config_diffs(saved: dict, current: dict) -> list[str]:
-    """Identity-defining config diffs for an auto-resume candidate.
+    """Identity-defining config diffs for a resume candidate.
 
-    Compared: ``model``, ``contact``, ``data.datasets``, ``data.sequence``,
-    ``optim`` (minus ``epochs``) and ``output.monitor``. Allowed to differ across
-    a resume (not compared): ``optim.epochs`` (extend training) and all
-    ``logging.*``.
+    Compared: ``model``, ``contact``, ``physics`` (whole section), top-level
+    ``loss`` (carries ``grad_clip``), ``data.datasets``, ``data.sequence``,
+    ``data.eval_split``, ``optim`` (minus ``epochs``) and ``output.monitor``.
+    Allowed to differ across a resume (not compared): ``optim.epochs`` (extend
+    training) and all ``logging.*``.
+
+    ``physics`` and ``loss`` are normalised over the schema defaults on BOTH sides
+    before comparison, so a historical config that predates a backward-identical
+    key (e.g. ``physics.loss.residual_robust``/``physics.max_cam_jump_m``, or the
+    whole disabled ``physics`` section) compares equal to a current resolution
+    holding those defaults — absent keys and explicit defaults are the same run.
     """
+    def _normalized(cfg: dict, section: str) -> dict:
+        return _deep_merge(CONFIG_DEFAULTS[section], cfg.get(section) or {})
+
     diffs: list[str] = []
     for section in ("model", "contact"):
         if saved.get(section) != current.get(section):
+            diffs.append(f"  {section}: differs")
+    for section in ("physics", "loss"):
+        if _normalized(saved, section) != _normalized(current, section):
             diffs.append(f"  {section}: differs")
     for key in ("datasets", "sequence", "eval_split"):
         if (saved.get("data", {}) or {}).get(key) != (current.get("data", {}) or {}).get(key):
@@ -125,6 +148,52 @@ def _resume_config_diffs(saved: dict, current: dict) -> list[str]:
     if (saved.get("output", {}) or {}).get("monitor") != (current.get("output", {}) or {}).get("monitor"):
         diffs.append("  output.monitor: differs")
     return diffs
+
+
+def _ensure_resume_identity(saved: dict, current: dict, context: str) -> None:
+    """Raise unless ``saved`` and ``current`` agree on every identity-defining section.
+
+    Shared by BOTH resume paths: ``--resume auto`` (checked against the run dir's
+    ``config.yaml`` before selection) and an explicit ``--resume PATH`` (checked
+    against the checkpoint's stored config after load) — an explicit path must not
+    bypass the physics/loss/optim identity checks the auto path enforces.
+
+    :param context: message prefix naming the offending source (e.g.
+        ``"--resume auto selected <path> but its"``).
+    """
+    diffs = _resume_config_diffs(saved, current)
+    if diffs:
+        raise RuntimeError(
+            f"{context} config differs from the current one on identity-defining "
+            "sections:\n" + "\n".join(diffs)
+            + "\nOnly optim.epochs and logging.* may change across a resume; "
+            "start a fresh run instead.")
+
+
+def _physics_residual_headline(numerator: float, mass: float, *, required: bool) -> float:
+    """Finalize the mass-weighted physics-residual eval headline.
+
+    Zero residual mass — every clip physics-ineligible or jerk-excluded — must
+    never masquerade as a perfect residual: it reports ``NaN`` (which
+    ``_is_better`` rejects in both monitor directions), and when the residual IS
+    the monitor it raises instead — a jerk threshold or data change that silently
+    excludes everything would otherwise starve best-model selection forever.
+
+    :param numerator: all-reduced residual numerator (Σ over frames).
+    :param mass: all-reduced residual mass (Σ ``n_elig * n_res``).
+    :param required: whether ``output.monitor`` is ``{split}/physics_residual``.
+    :raises RuntimeError: when ``required`` and ``mass == 0``.
+    """
+    if mass > 0:
+        return numerator / mass
+    if required:
+        raise RuntimeError(
+            "output.monitor is the physics residual but the evaluation produced no "
+            "residual data: every clip in the split was physics-ineligible or "
+            "excluded by physics.max_cam_jump_m. Loosen the jerk threshold, check "
+            "the split's clip length vs physics.min_frames/smoothing_kernel, or "
+            "monitor a contact metric instead.")
+    return float("nan")
 
 
 def _resolve_resume(cfg: dict, resume: str | None) -> Path | None:
@@ -153,13 +222,8 @@ def _resolve_resume(cfg: dict, resume: str | None) -> Path | None:
         saved_cfg_path = chosen.parent / "config.yaml"
         if saved_cfg_path.exists():
             saved_cfg = yaml.safe_load(saved_cfg_path.read_text()) or {}
-            diffs = _resume_config_diffs(saved_cfg, cfg)
-            if diffs:
-                raise RuntimeError(
-                    f"--resume auto selected {chosen} but its config differs from the "
-                    f"current one on identity-defining sections:\n" + "\n".join(diffs)
-                    + "\nOnly optim.epochs and logging.* may change across a resume; "
-                    "start a fresh run or point --resume at an explicit checkpoint.")
+            _ensure_resume_identity(
+                saved_cfg, cfg, f"--resume auto selected {chosen} but its")
         return chosen
     path = Path(resume)
     if not path.exists():
@@ -211,6 +275,14 @@ class Trainer:
                 dist.barrier()
 
         self.model, self.trainable_names = build_model(self.cfg, device)
+        # Params to serialise: every contact/force param, whether or not currently
+        # trainable. In regime (a) (``freeze_contact``) the warm-started contact
+        # branch is frozen and thus absent from ``trainable_names`` (force-only), yet
+        # it is not in the base checkpoint either — persisting it keeps the checkpoint
+        # self-contained so evaluate/demo/resume never run with a random contact head.
+        # The arch fingerprint still keys on ``trainable_names`` (see checkpoint.save).
+        self.saved_names = [
+            n for n, _ in self.model.named_parameters() if _trainable_name_filter(n)]
         warm_state = None
         warm_path = self.cfg["model"].get("init_contact_checkpoint")
         if resume_ckpt is None and warm_path:
@@ -220,7 +292,7 @@ class Trainer:
                 print(
                     f"Warm-started {len(warm_state['warm_start_loaded_names'])} contact "
                     f"parameters from {warm_path}; initialized "
-                    f"{len(warm_state['warm_start_new_names'])} temporal parameters")
+                    f"{len(warm_state['warm_start_new_names'])} new (temporal/force) parameters")
         image_size = tuple(self.model.cfg.MODEL.IMAGE_SIZE)
         self.train_loader, self.eval_loader, self.split_manifest = make_loaders(
             self.cfg,
@@ -235,6 +307,49 @@ class Trainer:
 
         self.loss_fn = MultiTargetContactLoss(self.cfg).to(device)
         self.targets = self.loss_fn.target_names
+
+        # Physics-force objective (step 06/07). Built once on the training device;
+        # loads the MHR body inside. Regime (a) (``train.freeze_contact``) drops the
+        # contact loss from the total but still logs its metrics.
+        self.physics_enabled = bool(self.cfg["physics"]["enabled"])
+        self.freeze_contact = bool(self.cfg["train"]["freeze_contact"])
+        self.physics_loss = None
+        if self.physics_enabled:
+            from contact.physics.loss import PhysicsLoss
+            self.physics_loss = PhysicsLoss(self.cfg, device=device)
+        elif self.cfg["model"]["force_head"]["enabled"]:
+            # Trainer-only guard (evaluate/demo legitimately build force models
+            # without a physics objective): the force branch is supervised solely
+            # by the physics loss, so training it without one leaves the force
+            # params gradient-less — a silent no-op single-process and a
+            # find_unused_parameters=False crash under DDP.
+            raise ValueError(
+                "model.force_head.enabled requires physics.enabled=true for "
+                "training: without the physics loss the force params never "
+                "receive gradients")
+
+        # Regime-(b) physics-gradient leak guard: the documented physics/contact
+        # gradient isolation holds only in regime (a) (contact frozen). When physics
+        # trains alongside a TRAINABLE contact branch, physics gradients reach the
+        # contact head through force->contact attention (the vendored mask permits it,
+        # sam3d_body.py). Warn loudly (do NOT raise — a joint regime may be intended).
+        if self.physics_enabled and not self.freeze_contact and self.is_main:
+            leaking = [n for n, p in self.model.named_parameters()
+                       if p.requires_grad and "contact" in n]
+            if leaking:
+                bar = "!" * 78
+                print(
+                    f"\n{bar}\n"
+                    "WARNING: regime (b) physics-gradient leak into the contact head\n"
+                    "  physics.enabled=true with train.freeze_contact=false and "
+                    f"{len(leaking)} trainable\n"
+                    "  'contact'-named params. Physics gradients reach the contact head via\n"
+                    "  force->contact attention, so the contact head is trained by BOTH its\n"
+                    "  labels AND the physics residual. The documented gradient isolation\n"
+                    "  holds only in regime (a) (contact frozen). Set train.freeze_contact=true\n"
+                    "  for the isolated force-only objective if this is not intended.\n"
+                    f"{bar}\n")
+
         target_spec = TargetSpec.from_config(self.cfg)
         # Named per-output reporting is useful for compact semantic heads. Avoid
         # creating thousands of metric streams for a vertex target.
@@ -262,7 +377,10 @@ class Trainer:
         self.save_freq = int(ofcfg["save_freq"])
         self.monitor   = str(ofcfg["monitor"])
         self._validate_monitor()
-        self.monitor_mode = "min" if self.monitor.endswith("/loss") else "max"
+        # `.../loss` and the physics-residual pseudo-target are minimised; the
+        # classification metrics (f1/iou/...) are maximised.
+        self.monitor_mode = (
+            "min" if self.monitor.endswith(("/loss", "/physics_residual")) else "max")
 
         self.epoch        = 0
         self.global_step  = 0
@@ -274,6 +392,13 @@ class Trainer:
             state = ckpt_io.load(
                 resume_ckpt, self.model, self.optimizer, self.scheduler,
                 config=self.cfg, restore_rng=True, map_location=device)
+            # Explicit ``--resume PATH`` must enforce the same identity checks the
+            # auto path does (physics/loss/optim/monitor live outside the arch
+            # signature ckpt_io.load verifies) — checked against the checkpoint's
+            # own stored config so a moved/copied run dir cannot dodge it.
+            _ensure_resume_identity(
+                state.get("config") or {}, self.cfg,
+                f"--resume {resume_ckpt}: the checkpoint's stored")
             saved_manifest = state.get("split_manifest")
             if saved_manifest is not None and saved_manifest != self.split_manifest:
                 raise RuntimeError(
@@ -326,12 +451,17 @@ class Trainer:
         """Accept only the configured eval prefix and an available metric.
 
         Any other name (e.g. ``val/joint_loss``) is rejected up-front rather than
-        crashing later in :meth:`_monitor_value` when the metric is looked up.
+        crashing later in :meth:`_monitor_value` when the metric is looked up. When
+        physics is enabled, ``{split}/physics_residual`` is a valid monitor
+        pseudo-target (its residual term only, stored under
+        ``metrics["physics"]["residual"]``; it is NOT a contact target).
         """
         valid = {f"{self.eval_split}/loss"} | {
             f"{self.eval_split}/{t}_{k}"
             for t in self.targets for k in _MONITOR_METRICS
         }
+        if getattr(self, "physics_enabled", False):
+            valid.add(f"{self.eval_split}/physics_residual")
         if self.monitor not in valid:
             raise ValueError(
                 f"output.monitor {self.monitor!r} is not a valid metric; choose one of "
@@ -439,6 +569,62 @@ class Trainer:
             scaled = term if scaled is None else scaled + term
         return scaled, bool(global_mass.sum().item() > 0)
 
+    def _ddp_physics_loss(
+        self, total: torch.Tensor, parts: dict,
+    ) -> tuple[torch.Tensor, bool]:
+        """Fold PhysicsLoss's per-term ``(numerator, mass)`` into the exact DDP mean.
+
+        Reuses the contact machinery (:func:`ddp_global_mean_term`): each physics
+        term is normalised by its all-reduced global mass so DDP's gradient average
+        equals the single-process global weighted mean. The term set is fixed by the
+        nonzero-weight physics config (step 06), so every rank iterates the same
+        terms; every term's numerator carries the graph-connected ``joint_forces``
+        zero, keeping all force params on the backward graph under
+        ``find_unused_parameters=False`` even on physics-ineligible batches.
+        """
+        terms = parts["terms"]
+        names = list(terms)
+        if not self.distributed:
+            active = any(terms[n]["weight_mass"] > 0 for n in names)
+            return total, active
+        local_mass = torch.tensor(
+            [terms[n]["weight_mass"] for n in names],
+            dtype=torch.float64, device=self.device,
+        )
+        global_mass = local_mass.clone()
+        dist.all_reduce(global_mass, op=dist.ReduceOp.SUM)
+        scaled = None
+        for i, name in enumerate(names):
+            term = ddp_global_mean_term(
+                terms[name]["weighted_numerator_tensor"], global_mass[i], self.world_size)
+            scaled = term if scaled is None else scaled + term
+        return scaled, bool(global_mass.sum().item() > 0)
+
+    @staticmethod
+    def _physics_scalars(prefix: str, phys_parts: dict) -> dict:
+        """Flatten PhysicsLoss parts into loggable ``{prefix}/physics/*`` scalars.
+
+        Per-term local losses + masses (residual and every active regulariser) plus
+        the residual-force/torque diagnostics and the eligibility counts.
+        """
+        scalars = {f"{prefix}/physics/loss": phys_parts["loss"]}
+        for name, term in phys_parts["terms"].items():
+            scalars[f"{prefix}/physics/{name}"] = term["loss"]
+            scalars[f"{prefix}/physics/{name}_mass"] = term["weight_mass"]
+        scalars[f"{prefix}/physics/residual_force"] = phys_parts["residual_force"]
+        scalars[f"{prefix}/physics/residual_torque"] = phys_parts["residual_torque"]
+        # Raw (un-robustified) physical residual headline + collapse/robustness/jerk
+        # diagnostics (§1-§3): raw_residual is the comparable physics_residual value,
+        # force_std the cheapest online collapse detector, residual_sat_frac the Huber
+        # tail fraction (0 under square), n_jerk_excluded_clips the camera-jerk drops.
+        scalars[f"{prefix}/physics/raw_residual"] = phys_parts["raw_residual"]["loss"]
+        scalars[f"{prefix}/physics/residual_sat_frac"] = phys_parts["residual_sat_frac"]
+        scalars[f"{prefix}/physics/force_std"] = phys_parts["force_std"]
+        scalars[f"{prefix}/physics/n_eligible_clips"] = phys_parts["n_eligible_clips"]
+        scalars[f"{prefix}/physics/n_residual_frames"] = phys_parts["n_residual_frames"]
+        scalars[f"{prefix}/physics/n_jerk_excluded_clips"] = phys_parts["n_jerk_excluded_clips"]
+        return scalars
+
     def _print_run_summary(self) -> None:
         n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         fpb = int(self.cfg["data"]["frames_per_batch"])
@@ -476,13 +662,33 @@ class Trainer:
             epoch_frames += frames
             window_frames += frames
 
-            logits, targets = self._supervision(self.forward_module(batch), batch)
-            loss, parts = self.loss_fn(logits, targets)
+            out = self.forward_module(batch)
+            logits, targets = self._supervision(out["contact"], batch)
+            contact_loss, parts = self.loss_fn(logits, targets)
+            contact_loss, contact_active = self._ddp_weighted_loss(contact_loss, parts)
 
-            # A batch with zero active supervision (e.g. an all-invalid video
-            # window) has zero gradient — but AdamW weight decay would still nudge
-            # the weights. Skip the optimiser step entirely for those.
-            loss, active = self._ddp_weighted_loss(loss, parts)
+            # Regime (a) (``freeze_contact``): contact params are frozen, so the
+            # contact loss is dropped from the objective (its metrics stay logged)
+            # and physics is the sole objective. Otherwise the total is contact +
+            # physics (either may be absent).
+            phys_parts = None
+            physics_active = False
+            total = None if self.freeze_contact else contact_loss
+            if self.physics_loss is not None:
+                phys_total, phys_parts = self.physics_loss(out, batch)
+                phys_loss, physics_active = self._ddp_physics_loss(phys_total, phys_parts)
+                total = phys_loss if total is None else total + phys_loss
+            if total is None:
+                raise RuntimeError(
+                    "train.freeze_contact is set but no physics objective is enabled — "
+                    "nothing to train")
+
+            # A batch with zero active supervision (an all-invalid video window, or a
+            # fully physics-ineligible clip) has zero gradient — but AdamW weight
+            # decay would still nudge the weights. Skip the optimiser step for those.
+            active = (physics_active if self.freeze_contact
+                      else (contact_active or physics_active))
+            loss = total
             finite = torch.tensor(
                 int(bool(torch.isfinite(loss).item())), device=self.device,
                 dtype=torch.int32)
@@ -495,15 +701,14 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             if active:
                 loss.backward()
-                grad_norm = self._clip_grads()
-                if not math.isfinite(grad_norm):
-                    raise FloatingPointError(
-                        f"non-finite gradient norm at epoch={self.epoch} "
-                        f"global_step={self.global_step}; optimizer step was not executed")
+                # _clip_grads raises FloatingPointError on a non-finite RAW norm:
+                # checking the post-clip value would let an inf raw slip through as
+                # min(inf, grad_clip) while clipping had already NaN'd the grads.
+                grad_norm_raw, grad_norm = self._clip_grads()
                 self.optimizer.step()
             else:
                 skipped += 1
-                grad_norm = 0.0
+                grad_norm_raw = grad_norm = 0.0
 
             running_loss += loss.item()
             n += 1
@@ -529,6 +734,7 @@ class Trainer:
                     "train/loss": loss.item(),
                     "train/lr": self.optimizer.param_groups[0]["lr"],
                     "train/grad_norm": grad_norm,
+                    "train/grad_norm_raw": grad_norm_raw,
                     "train/frames_per_sec": fps,
                 }
                 for t in self.targets:
@@ -549,6 +755,8 @@ class Trainer:
                             output_metrics = prf1(current)
                             for key in ("precision", "recall", "f1", "f2"):
                                 scalars[f"train/{t}/{output_name}/{key}"] = output_metrics[key]
+                if phys_parts is not None:
+                    scalars.update(self._physics_scalars("train", phys_parts))
                 self.logger.log(scalars, self.global_step)
 
             if self.is_main:
@@ -570,12 +778,27 @@ class Trainer:
         return {"loss": running_loss / max(n, 1), "metrics": metrics,
                 "per_output": per_output, "frames": epoch_frames, "skipped": skipped}
 
-    def _clip_grads(self) -> float:
-        """Clip trainable grads; return the post-clip global grad norm."""
+    def _clip_grads(self) -> tuple[float, float]:
+        """Clip trainable grads; return ``(raw, post)`` global grad norms.
+
+        ``raw`` is the pre-clip total norm (exactly what ``clip_grad_norm_`` measures
+        and returns); ``post`` applies the ``loss.grad_clip`` cap. Logging both makes
+        the true gradient scale visible — the post-clip value alone pegs at the cap.
+
+        :raises FloatingPointError: when the RAW norm is non-finite. The finiteness
+            check must run on ``raw``: an inf/NaN raw makes ``clip_grad_norm_``
+            scale the grads by 0/NaN (corrupting them), yet the capped post value
+            ``min(inf, grad_clip)`` would look perfectly finite.
+        """
         params = [p for p in self.model.parameters() if p.requires_grad]
         max_norm = self.grad_clip if self.grad_clip > 0 else float("inf")
-        total = torch.nn.utils.clip_grad_norm_(params, max_norm).item()
-        return min(total, self.grad_clip) if self.grad_clip > 0 else total
+        raw = torch.nn.utils.clip_grad_norm_(params, max_norm).item()
+        if not math.isfinite(raw):
+            raise FloatingPointError(
+                f"non-finite raw gradient norm ({raw}) at epoch={self.epoch} "
+                f"global_step={self.global_step}; optimizer step was not executed")
+        post = min(raw, self.grad_clip) if self.grad_clip > 0 else raw
+        return raw, post
 
     @torch.no_grad()
     def _evaluate(self) -> dict:
@@ -586,14 +809,27 @@ class Trainer:
             target: [zero_counts() for _ in names]
             for target, names in self.output_names.items()
         }
+        # Physics residual: exact global (batch- and rank-wise) mass-weighted mean of
+        # the RAW physical residual (raw_residual — un-robustified, comparable across
+        # runs; falls back to the residual term for old parts). Regularizer terms are
+        # deliberately excluded — their mix should not decide "best". Reuses
+        # PhysicsLoss's additive numerator/mass.
+        phys_residual_num, phys_residual_mass = 0.0, 0.0
         for batch in tqdm(
             self.eval_loader, desc=self.eval_split, disable=not self.is_main,
         ):
             batch  = batch_to_device(batch, self.device)
-            logits, targets = self._supervision(self.forward_module(batch), batch)
+            out = self.forward_module(batch)
+            logits, targets = self._supervision(out["contact"], batch)
             loss, _ = self.loss_fn(logits, targets)
             running_loss += loss.item()
             n += 1
+            if self.physics_loss is not None:
+                _, phys_parts = self.physics_loss(out, batch)
+                rterm = phys_parts.get("raw_residual") or phys_parts["terms"].get("residual")
+                if rterm is not None:
+                    phys_residual_num += float(rterm["weighted_numerator_tensor"].detach())
+                    phys_residual_mass += rterm["weight_mass"]
             for t in self.targets:
                 tgt = targets[t]
                 add_counts(counts[t], contact_counts(logits[t], tgt["gt"], tgt["mask"]))
@@ -606,8 +842,19 @@ class Trainer:
         running_loss, n, _, _, counts = self._reduce_epoch_stats(
             running_loss, n, 0, 0, counts)
         output_counts = self._reduce_output_counts(output_counts)
+        metrics = {t: prf1(counts[t]) for t in self.targets}
+        if self.physics_loss is not None:
+            if self.distributed:
+                packed = torch.tensor(
+                    [phys_residual_num, phys_residual_mass],
+                    dtype=torch.float64, device=self.device)
+                dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+                phys_residual_num, phys_residual_mass = packed.cpu().tolist()
+            metrics["physics"] = {"residual": _physics_residual_headline(
+                phys_residual_num, phys_residual_mass,
+                required=self.monitor.endswith("/physics_residual"))}
         return {"loss": running_loss / max(n, 1),
-                "metrics": {t: prf1(counts[t]) for t in self.targets},
+                "metrics": metrics,
                 "per_output": {
                     target: {
                         name: prf1(value)
@@ -643,8 +890,11 @@ class Trainer:
                     f"{name}[f1={v['metrics'][name]['f1']:.3f} f2={v['metrics'][name]['f2']:.3f} "
                     f"p={v['metrics'][name]['precision']:.3f} "
                     f"r={v['metrics'][name]['recall']:.3f}]" for name in self.targets)
+                phys_note = ""
+                if "physics" in v["metrics"]:
+                    phys_note = f"  physics_residual {v['metrics']['physics']['residual']:.4f}"
                 if self.is_main:
-                    print(f"           {self.eval_split:<4s} loss {v['loss']:.4f}  {vsummary}")
+                    print(f"           {self.eval_split:<4s} loss {v['loss']:.4f}  {vsummary}{phys_note}")
                 val_scalars = {f"{self.eval_split}/loss": v["loss"]}
                 for name in self.targets:
                     for key, val in v["metrics"][name].items():
@@ -654,6 +904,11 @@ class Trainer:
                             val_scalars[
                                 f"{self.eval_split}/{name}/{output_name}/{key}"
                             ] = val
+                # Physics residual pseudo-target (guarded out of the per-target loop
+                # above so the f1-hardcoded summary never KeyErrors on "physics").
+                if "physics" in v["metrics"]:
+                    val_scalars[f"{self.eval_split}/physics/residual"] = (
+                        v["metrics"]["physics"]["residual"])
                 self.logger.log(val_scalars, self.global_step)
                 val_metric = self._monitor_value(v)
 
@@ -692,6 +947,7 @@ class Trainer:
             best_metric=self.best_metric, monitor=self.monitor,
             config=self.cfg, wandb_run_id=self.wandb_run_id,
             split_manifest=self.split_manifest,
+            saved_names=self.saved_names,
         )
         size_mb = path.stat().st_size / 2**20
         print(f"  saved {name}  ({size_mb:.1f} MB)")

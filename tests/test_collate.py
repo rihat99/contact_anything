@@ -139,6 +139,27 @@ def test_homogeneous_t_assertion():
         collate([clip4, single])
 
 
+def test_collate_camera_fallback_for_mixed_batch():
+    # A frame with camera keys (video) and one without (still image) in one T=1
+    # batch: cam_valid tracks presence, missing cameras get identity/zeros.
+    collate = make_collate(_IMG, _joint_spec())
+    gt = torch.zeros(NUM_BODY_22)
+    with_cam = _frame(joint={"gt": gt, "mask": torch.ones(NUM_BODY_22)})
+    with_cam["cam_from_world"] = np.arange(16, dtype=np.float32).reshape(4, 4)
+    with_cam["gravity_world"] = np.array([0.0, 0.0, 1.0], np.float32)
+    without_cam = _frame(joint={"gt": gt, "mask": torch.ones(NUM_BODY_22)})
+    batch = collate([with_cam, without_cam])            # two T=1 items -> B=2
+
+    assert batch["cam_from_world"].shape == (2, 4, 4)
+    assert batch["gravity_world"].shape == (2, 3)
+    assert batch["cam_valid"].tolist() == [True, False]
+    assert torch.allclose(batch["cam_from_world"][0],
+                          torch.arange(16, dtype=torch.float32).reshape(4, 4))
+    assert torch.allclose(batch["cam_from_world"][1], torch.eye(4))        # identity fallback
+    assert torch.allclose(batch["gravity_world"][0], torch.tensor([0.0, 0.0, 1.0]))
+    assert torch.all(batch["gravity_world"][1] == 0.0)                     # zeros fallback
+
+
 def test_distributed_eval_sampler_is_exact_without_padding():
     dataset = list(range(7))
     shards = [

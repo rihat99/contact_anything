@@ -5,10 +5,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 Fork of **SAM 3D Body** (Meta) — single-image 3D human mesh recovery — extended with a
-**contact prediction head**. The base model is frozen; only contact-named parameters train.
+**contact prediction head** and an optional **3D contact-force head**. The base model is frozen;
+only contact- and force-named parameters train.
 Contact can be predicted **per-vertex** (SMPL 6890 / SMPL-X 10475; MHR not implemented) and/or
 **per-joint** (SMPL-X body-22 or four climbing extremities), on single images or on **video clips** via an optional
 temporal attention module that provably does not change the frozen model's pose (MHR) predictions.
+The force head regresses one 3D vector per climbing extremity, supervised by **physics** (an RNEA
+root-wrench residual over reconstructed motion) instead of labels — see `docs/forces.md`.
 
 ## Environment Setup
 
@@ -38,16 +41,29 @@ python scripts/train.py --config configs/climbing_videos_joint_temporal.yaml
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
   scripts/train.py --config configs/climbing_videos_joint.yaml
 
+# Force (physics) training — regime (a) warm-start (contact frozen, force-only) or (b) scratch.
+# Needs the editable better-robot / better-human from the sibling ../BetterRobot / ../BetterHuman
+# checkouts (step-01 env wiring); the MHR archive resolves via that checkout, or set
+# $BETTERHUMAN_MODELS_DIR. See docs/forces.md.
+python scripts/train.py --config configs/climbing_videos_force_warmstart.yaml
+python scripts/train.py --config configs/climbing_videos_force_scratch.yaml
+
 # Evaluate on grouped val or the physical manually annotated ClimbingVideos test split.
 # Reports P/R/F1/F2/IoU, per-extremity metrics and a threshold curve.
 python scripts/evaluate.py --checkpoint output/<run>/best.pth --config configs/<experiment>.yaml
 python scripts/evaluate.py --checkpoint output/<run>/last.pth \
   --config configs/climbing_videos_joint.yaml --split test --threshold 0.3
+# Force runs add physics-consistency metrics (physics_residual, per-extremity force magnitudes
+# split by predicted contact, gate-violation rates, vertical-force-sum). Lacking a trained force
+# checkpoint, --warm-start builds the untrained force branch from the config's init_contact_checkpoint.
+python scripts/evaluate.py --config configs/climbing_videos_force_warmstart.yaml --warm-start --split test
 
-# Qualitative demo (GT vs predicted contacts)
+# Qualitative demo (GT vs predicted contacts; force arrows when the checkpoint has a force head)
 python scripts/demo.py --checkpoint output/<run>/best.pth --config configs/<experiment>.yaml --num_samples 10
 python scripts/demo_climbing_videos.py --checkpoint output/<run>/last.pth \
   --config configs/climbing_videos_joint.yaml --split test --threshold 0.3
+python scripts/demo_climbing_videos.py --config configs/climbing_videos_force_warmstart.yaml \
+  --warm-start --split test --threshold 0.3
 
 # Tests (fast CPU suite ~15s; add --runslow-style GPU tests via -m slow)
 python -m pytest tests/ -q -m "not slow"
@@ -68,7 +84,7 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
 | Path | Purpose |
 |---|---|
 | `sam_3d_body/` | Vendored SAM 3D Body fork. Upstream code untouched; our additions are the contact head/tokens, `models/modules/temporal.py`, and hooks delimited by `# --- contact temporal hook ---` / efficiency-flag comments. |
-| `contact/` | Our library: `config.py` (yaml + `base:` include + strict validation), `model.py` (build/freeze/eval-pin), `targets.py`, `losses.py`, `metrics.py`, `engine.py` (shared forward), `checkpoint.py` (schema v2), `tracking.py` (wandb+TB), `data/` (loaders, collate, splits). |
+| `contact/` | Our library: `config.py` (yaml + `base:` include + strict validation), `model.py` (build/freeze/eval-pin), `targets.py`, `losses.py`, `metrics.py`, `engine.py` (shared forward), `checkpoint.py` (schema v2), `tracking.py` (wandb+TB), `data/` (loaders, collate, splits), `physics/` (`adapter.py` MHR bridge + `loss.py` RNEA residual). |
 | `scripts/` | Thin CLIs: train, evaluate, demo, build_climbing_images, precompute_*, render_results_table. |
 | `configs/` | `base.yaml` (all defaults, commented) + experiment overrides; `configs/datasets/*.yaml` = dataset paths/options. |
 | `tests/` | pytest suite (`-m slow` = GPU integration: temporal invariance, grad flow). |
@@ -86,7 +102,9 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
    default = first 21; the four-extremity config uses `[62,41,13,14]` for left/right
    wrist then left/right ankle) + `num_global_tokens` extra tokens.
    An **asymmetric attention mask** stops all original tokens from attending to contact tokens —
-   pose/keypoint outputs are unaffected by anything contact-side.
+   pose/keypoint outputs are unaffected by anything contact-side. The optional **force tokens**
+   (four, same extremity anchors, `model.force_head`) are appended *after* the contact tokens and
+   the mask is extended so no earlier token block attends a later one.
 3. **Per-target contact heads** — `head_contact` is an `nn.ModuleDict`: pooled modes support
    `vertex` → `[B, 6890|10475]` or body-22 joint logits. `pool_mode: per_token` applies one
    shared classifier independently to each token; ClimbingVideos uses four tokens → `[B,4]`.
@@ -97,18 +115,42 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
    `between_layers` (runs at decoder layers 0–4, shared weights), `pre_decoder` (experimental,
    contact-private bottlenecked feature branch). Batches are homogeneous-T flattened clips
    (`[B_clips*T, ...]` + `seq_len`/`frame_pos_sec`/`frame_valid`); single images are T=1.
+5. **Force head + physics** (`model.force_head`, optional) — four force tokens (same extremity
+   anchors) → `head_force` (zero-init) regressing `out["force"]["joint_forces"] [B,4,3]`,
+   dimensionless (units of body weight), order `left_hand,right_hand,left_foot,right_foot`; an
+   optional `model.force_temporal` block mirrors the contact temporal module (post_decoder only).
+   No force labels: `contact/physics/` supervises them — `adapter.py` (`MHRAdapter`) maps frozen
+   per-frame MHR params + dataset camera extrinsics onto a BetterHuman **MHR** body and a
+   world-frame `q` trajectory; `loss.py` (`PhysicsLoss`) smooths `q`, finite-differences to v/a,
+   runs **RNEA** with the predicted forces as external wrenches, and minimises the 6D
+   root-wrench residual (plus contact-gated / smoothness / L2 regularisers). Full formulation,
+   frames, and conventions: `docs/forces.md`.
 
 ### Invariants (do not break)
 
-- **Freeze filter is name-based**: only params whose dotted name contains `"contact"` train
-  (tokens, heads, posemb/feat linears, `contact_temporal*`). Any new trainable module must carry
-  "contact" in its attribute path.
+- **Freeze filter is name-based**: only params whose dotted name contains `"contact"` **or**
+  `"force"` train (tokens, heads, posemb/feat linears, `contact_temporal*`, `force_*`). Any new
+  trainable module must carry "contact" or "force" in its attribute path.
+- **Mask invariant**: no earlier token block attends a later one — original ⊥ {contact, force},
+  contact ⊥ force. Force tokens attend everything, so contact/MHR outputs have an exactly-zero
+  Jacobian w.r.t. every force param (D1); forward values agree only to the CUDA noise floor.
 - **Frozen modules are eval-pinned** (`contact/model.py::pin_frozen_eval`): `model.train(True)`
   re-pins backbone/decoder/MHR+camera heads to eval (the backbone has DROP_PATH_RATE 0.1 — train
-  mode would make it stochastic). Only contact modules toggle.
-- **MHR invariance**: `tests/test_temporal_invariance.py` proves pose/MHR outputs stay within the
-  frozen model's CUDA noise floor while contact logits move orders of magnitude. Run after any
-  change to decoder hooks.
+  mode would make it stochastic). The toggled set is **requires_grad-derived** at call time (not a
+  name list): a fully-trainable subtree follows the mode in full (incl. its param-less dropout),
+  a fully-frozen subtree (e.g. a contact head frozen by `train.freeze_contact`) stays eval, a
+  mixed container is descended into.
+- **MHR invariance**: `tests/test_temporal_invariance.py` (temporal) and
+  `tests/test_force_invariance.py` (force) prove pose/MHR + contact outputs stay within the frozen
+  model's CUDA noise floor while the new branch's outputs move. Run after any change to decoder
+  hooks.
+- **Physics-loss gradient isolation (regime (a))**: the physics loss consumes the frozen model's
+  outputs (`out["mhr"]`, camera extrinsics) and the contact probs (`out["contact"]["joint_probs"]`)
+  all **detached** — gradients reach **force** params only, and physics never trains the frozen
+  base. This isolation from the **contact** head is exact only in regime (a) (`train.freeze_contact`,
+  contact frozen). In regime (b) (contact trainable) force→contact attention leaks physics gradients
+  into the trainable contact params (the vendored mask permits that direction); the trainer warns,
+  and the detach-fix is deferred. See `docs/forces.md`.
 - `TRAIN.USE_FP16` stays as shipped (backbone bf16); decoder/MHR heads stay fp32 (MHR sparse ops
   are fp16-incompatible).
 
@@ -121,6 +163,9 @@ Key sections (see `configs/base.yaml` for full commented defaults):
 |---|---|
 | `model.contact_head` | anchor indices, global tokens, pooling (`concat`/`attention`/`per_token`), MLP, grid sampling |
 | `model.temporal` | enabled, placement, layers/heads, `attend: joint|per_token`, `causal` |
+| `model.force_head` / `model.force_temporal` | force branch: enabled, `frame: local_world_aligned|local`, MLP; force temporal (post_decoder only) |
+| `physics` | RNEA loss: enabled, MHR `model_path`/`lod`, `gravity`, `min_frames`, `smoothing_kernel`, per-term `loss.*` weights (all dimensionless) |
+| `train.freeze_contact` | regime (a): freeze contact, train force only (requires `model.init_contact_checkpoint`) |
 | `contact.topology` | `smpl` / `smplx` (`mhr` → NotImplementedError) |
 | `contact.targets.vertex/joint` | enabled, weight, loss params, `joint_set`, subset masking, `derive_from_vertex`, confidence weights |
 | `data.datasets` | list of `{name, config, split}`; `frames_per_batch` (memory-flat batch budget), `sequence.{frames_per_clip,frame_stride,jitter}` |
@@ -144,7 +189,11 @@ ClimbingVideos label semantics (important):
   while `contacts.npz` has `pending=True`.
 - Video joint labels are **motion-gated "stable contact"** (stillness/hysteresis in the exporter),
   a different task from instantaneous contact derived from still-image vertices — which is why
-  `derive_from_vertex` defaults to false.
+  `derive_from_vertex` defaults to false. The same gap applies to **forces** (R8): stable-contact
+  labels ≠ instantaneous load, so the physics loss gates on predicted probs, not labels (D8).
+- Video scenes also carry **per-frame camera extrinsics** (`cam_from_world`, OpenCV, metric),
+  `gravity_world`, and `cam_scale`, exported from the reconstruction pipeline for the physics loss
+  (still images carry `cam_valid=False`). See `docs/forces.md`.
 - Train/val split is grouped by **source video** (chunks of one video never straddle splits).
 - The four-output target order is `left_hand, right_hand, left_foot, right_foot`; each foot is
   `ankle OR foot`. A known positive wins under partial annotation, while a known negative needs

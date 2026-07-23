@@ -1,17 +1,20 @@
-"""Build a SAM-3D-Body model wired for contact-head training.
+"""Build a SAM-3D-Body model wired for contact- and force-head training.
 
 We patch the checkpoint's ``model_config.yaml`` *before* constructing
-the model so the contact tokens, contact head, and the mask
-conditioning the checkpoint shipped with are all created natively by
-``SAM3DBody``. Checkpoint weights load with ``strict=False`` —
-everything in the upstream model (including the v2 mask conditioning)
-gets restored, and the new contact modules stay at random init.
+the model so the contact tokens, contact head(s), the optional force
+tokens / force head, and the mask conditioning the checkpoint shipped
+with are all created natively by ``SAM3DBody``. Checkpoint weights load
+with ``strict=False`` — everything in the upstream model (including the
+v2 mask conditioning) gets restored, and the new contact/force modules
+stay at random init.
 
-After the load we freeze the whole network and unfreeze only the
-contact pipeline (anything with ``contact`` in the parameter name —
-that's ``contact_embedding``, ``head_contact.*``, ``contact_posemb_linear.*``,
-``contact_feat_linear.*``, and ``contact_temporal.*`` when enabled). Backbone,
-decoder, prompt encoder, MHR/camera heads stay frozen.
+After the load we freeze the whole network and unfreeze only the contact
+**and force** pipelines: any param whose name contains ``contact`` or
+``force`` (contact tokens/head/posemb/feat/temporal, and the force
+tokens, ``head_force``, ``force_temporal``). Backbone, decoder, prompt
+encoder, MHR/camera heads stay frozen. Regime (a) (``train.freeze_contact``)
+re-freezes the contact params after the unfreeze so only the force branch
+trains. Frozen modules are eval-pinned (:func:`pin_frozen_eval`).
 
 ``build_model`` returns ``(model, trainable_names)``.
 """
@@ -81,6 +84,35 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
         "POSITION_SCALE": float(tcfg.get("position_scale", 1.0)),
     })
 
+    # Force head + tokens (steps 04+). Patched even when disabled so the model
+    # config is self-describing; SAM3DBody only builds the force stack when
+    # DO_FORCE_TOKENS. The `frame` key is consumed by the physics loss (step 06),
+    # not the model, so it is not mirrored here.
+    fhcfg = cfg["model"].get("force_head", {}) or {}
+    model_cfg.MODEL.DECODER.DO_FORCE_TOKENS = bool(fhcfg.get("enabled", False))
+    model_cfg.MODEL.FORCE_HEAD = CfgNode({
+        "MLP_DEPTH":              int(fhcfg.get("mlp_depth", 2)),
+        "MLP_CHANNEL_DIV_FACTOR": int(fhcfg.get("mlp_channel_div_factor", 4)),
+        "DROPOUT":                float(fhcfg.get("dropout", 0.0)),
+    })
+
+    # Force temporal module (step 05). A second ContactTemporalModule over the
+    # force tokens, post_decoder only (no PLACEMENT key — it is fixed). Patched
+    # even when disabled so the model config is self-describing; SAM3DBody only
+    # builds force_temporal when ENABLED.
+    ftcfg = cfg["model"].get("force_temporal", {}) or {}
+    model_cfg.MODEL.FORCE_TEMPORAL = CfgNode({
+        "ENABLED": bool(ftcfg.get("enabled", False)),
+        "BOTTLENECK_DIM": int(ftcfg.get("bottleneck_dim", 256)),
+        "NUM_LAYERS": int(ftcfg.get("num_layers", 1)),
+        "NUM_HEADS": int(ftcfg.get("num_heads", 4)),
+        "MLP_RATIO": float(ftcfg.get("mlp_ratio", 2.0)),
+        "ATTEND": str(ftcfg.get("attend", "per_token")),
+        "CAUSAL": bool(ftcfg.get("causal", False)),
+        "DROPOUT": float(ftcfg.get("dropout", 0.0)),
+        "POSITION_SCALE": float(ftcfg.get("position_scale", 1.0)),
+    })
+
     # Efficiency flags (Phase 4). Patched even when off so the model config is
     # self-describing; sam3d_body / promptable_decoder read them at their delimited
     # hooks and fall back to old (full-graph) behaviour when the key is absent.
@@ -106,36 +138,57 @@ def _load_checkpoint_weights(model: nn.Module, checkpoint_path: str) -> None:
 
 
 def _trainable_name_filter(name: str) -> bool:
-    """Train the contact pipeline only: tokens, head, and the small
-    posemb / feat projection layers that update the tokens between
-    decoder layers (all of which contain ``contact`` in the name)."""
-    return "contact" in name.lower()
+    """Train the contact and force pipelines only: their tokens, heads, and the
+    small posemb / feat projection layers that update the tokens between decoder
+    layers (all of which contain ``contact`` or ``force`` in the dotted name)."""
+    lname = name.lower()
+    return "contact" in lname or "force" in lname
+
+
+def _subtree_requires_grad(module: nn.Module) -> Tuple[bool, bool]:
+    """``(any_trainable, all_trainable)`` over the module's recursive parameters.
+
+    A param-less subtree returns ``(False, False)`` (nothing trainable to toggle).
+    """
+    reqs = [p.requires_grad for p in module.parameters(recurse=True)]
+    if not reqs:
+        return False, False
+    return any(reqs), all(reqs)
 
 
 def pin_frozen_eval(model: nn.Module) -> nn.Module:
-    """Permanently pin every frozen submodule to eval(); only contact modules
-    follow the requested train/eval mode.
+    """Pin every frozen submodule to eval(); only trainable subtrees follow the
+    requested train/eval mode.
 
     The frozen SAM-3D-Body backbone ships with ``DROP_PATH_RATE 0.1`` (stochastic
     depth) plus dropout, so a global ``model.train()`` would make the frozen
-    features the contact head reads nondeterministic. We force all non-contact
-    modules to eval and keep them there by overriding ``model.train`` so any
-    later ``model.train(True)`` re-pins them. ``model.eval()`` still works since
-    it delegates to ``model.train(False)``.
+    features the trainable heads read nondeterministic. We force everything to
+    eval and keep it there by overriding ``model.train`` so any later
+    ``model.train(True)`` re-pins the frozen parts. ``model.eval()`` still works
+    since it delegates to ``model.train(False)``.
 
-    Contact modules are every submodule whose dotted path contains ``"contact"``
-    — ``head_contact``, ``contact_posemb_linear``, ``contact_feat_linear``,
-    ``contact_embedding``, ``contact_temporal`` and all their descendants
-    (including param-less dropout children, which need train mode to be active).
-    This matches the ``"contact"`` param-name freeze filter, so exactly the
-    trainable subtree stays trainable.
+    The toggled set is derived from ``requires_grad`` at call time (not a name
+    list), so it tracks whichever branch is training — contact only, force only
+    (regime a: ``freeze_contact``), or both. A subtree whose parameters are *all*
+    trainable follows ``mode`` in full, including its param-less ``nn.Dropout``
+    children (a rule keyed on direct trainable params would silently disable them);
+    a fully-frozen subtree (e.g. a contact head frozen in regime a) stays eval;
+    a mixed container is descended into. For a contact-only build this reproduces
+    the previous ``"contact"``-name behaviour exactly.
     """
-    contact_modules = [m for name, m in model.named_modules() if "contact" in name.lower()]
+    def _propagate(module: nn.Module, mode: bool) -> None:
+        any_trainable, all_trainable = _subtree_requires_grad(module)
+        if not any_trainable:
+            return                                      # fully frozen → stays eval
+        if all_trainable:
+            nn.Module.train(module, mode)               # trainable subtree → mode
+            return
+        for child in module.children():                 # mixed → descend
+            _propagate(child, mode)
 
     def _apply(mode: bool = True) -> nn.Module:
         nn.Module.train(model, False)                   # every module → eval
-        for submodule in contact_modules:
-            submodule.training = bool(mode)             # contact subtree → mode
+        _propagate(model, bool(mode))
         return model
 
     model.train = _apply
@@ -168,12 +221,21 @@ def build_model(cfg: dict, device: str = "cuda") -> Tuple[nn.Module, List[str]]:
     model = SAM3DBody(model_cfg)
     _load_checkpoint_weights(model, ckpt_path)
 
-    # 3) Freeze everything; unfreeze just the contact pipeline.
+    # 3) Freeze everything; unfreeze the contact + force pipelines.
     for p in model.parameters():
         p.requires_grad = False
     for name, p in model.named_parameters():
         if _trainable_name_filter(name):
             p.requires_grad = True
+
+    # Regime (a): warm-start from a contact checkpoint and train the force branch
+    # only. Re-freeze every contact param after the normal unfreeze (force params,
+    # named force_*, do not match "contact"). Config validation requires an init
+    # contact checkpoint and force_head.enabled when this is set.
+    if cfg.get("train", {}).get("freeze_contact", False):
+        for name, p in model.named_parameters():
+            if "contact" in name.lower():
+                p.requires_grad = False
 
     model.to(device)
 
