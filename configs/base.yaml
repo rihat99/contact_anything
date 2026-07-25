@@ -23,6 +23,12 @@ model:
     mlp_channel_div_factor: 2
     grid_size: 5                      # K x K image-feature grid per keypoint anchor
     grid_radius: 0.1
+    blind_to_image: false             # ablation: cut EVERY image path into the contact
+                                      # tokens — decoder cross-attention is gated off for
+                                      # their rows and the keypoint-anchored update (image
+                                      # features + 2D posemb) never runs, so they see only
+                                      # the sam3d body tokens via self-attention. Drops
+                                      # contact_posemb_linear / contact_feat_linear.
   temporal:                           # Phase 3: ContactTemporalModule (zero-gated, no-op off)
     enabled: false
     placement: post_decoder           # post_decoder | between_layers | pre_decoder (experimental)
@@ -97,9 +103,16 @@ physics:                              # Step 06: RNEA root-wrench physics loss o
       kind: square                    # square | pseudo_huber
       delta_force: 1.0                # pseudo-Huber transition for the 3 force components (bw)
       delta_torque: 0.5               # pseudo-Huber transition for the 3 torque components (bw*m)
-    force_noncontact: 1.0             # (1-p)||f||^2 penalty at non-contact extremities (D8)
+    residual_force_weight: 1.0        # weight on the force part of the residual objective
+    residual_torque_weight: 1.0       # weight on the torque part (allocation signal ~20x weaker)
+    force_noncontact: 1.0             # non-contact force penalty at extremities (D8; form below)
+    noncontact_gate:                  # force_noncontact form
+      kind: soft_l2                   # soft_l2 = (1-p)*||f||^2 (shrinks, never zeros) | hinge_l1 = hinge(p)*||f|| (exact zeros)
+      p_lo: 0.2                       # hinge_l1: full penalty at p <= p_lo
+      p_hi: 0.5                       # hinge_l1: zero penalty at p >= p_hi (linear ramp between)
     force_at_contact: 0.1             # p*relu(contact_min_bw - ||f||)^2 at contacts (weak)
     contact_min_bw: 0.05              # minimum contact force, in units of body weight
+    gate_frames: all                  # all | residual: frames the prob-gated force terms use
     force_smooth: 0.1                 # ||f_t - f_{t-1}||^2 on world-frame forces
     force_l2: 0.01                    # ||f||^2 magnitude regulariser
     torque_l2: 0.01                   # ||tau_j||^2 joint-torque regulariser (residual frames)

@@ -554,6 +554,203 @@ def test_affine_basis_matches_autograd(adapter):
     assert torch.allclose(forces_leaf.grad, expected, atol=1e-4, rtol=1e-3)
 
 
+# ------------------------------ force/torque residual weights + gate_frames
+
+def test_residual_weight_defaults_reproduce_objective_bit_for_bit(adapter):
+    """Passing the new keys at their defaults (residual force/torque weights 1.0,
+    gate_frames 'all') is bit-for-bit identical to a config that omits them: total,
+    every term numerator/mass, and the raw headline are the same tensors."""
+    n_clips, seq_len = 2, 7
+    batch = _batch(n_clips, seq_len)
+    mhr = _mhr_out(adapter, n_clips, seq_len, moving=True, seed=5)
+    forces = torch.randn(n_clips * seq_len, 4, 3,
+                         generator=torch.Generator().manual_seed(7)) * 0.3
+    probs = torch.rand(n_clips * seq_len, 4,
+                       generator=torch.Generator().manual_seed(8))
+    out = _out(mhr, forces, probs)
+
+    total0, parts0 = PhysicsLoss(_cfg(), device="cpu", adapter=adapter)(out, batch)
+    total1, parts1 = PhysicsLoss(
+        _cfg(residual_force_weight=1.0, residual_torque_weight=1.0, gate_frames="all"),
+        device="cpu", adapter=adapter)(out, batch)
+
+    assert torch.equal(total0, total1)
+    assert set(parts0["terms"]) == set(parts1["terms"])
+    for name, term0 in parts0["terms"].items():
+        term1 = parts1["terms"][name]
+        assert term0["weight_mass"] == term1["weight_mass"], name
+        assert torch.equal(
+            term0["weighted_numerator_tensor"],
+            term1["weighted_numerator_tensor"]), name
+    assert torch.equal(
+        parts0["raw_residual"]["weighted_numerator_tensor"],
+        parts1["raw_residual"]["weighted_numerator_tensor"])
+
+
+def test_residual_torque_weight_scales_only_torque_part(adapter):
+    """``residual_torque_weight`` scales only the torque part of the ``residual``
+    objective numerator (force part untouched); ``raw_residual`` — the unweighted
+    headline — is unchanged across every weighting."""
+    n_clips, seq_len = 2, 7
+    batch = _batch(n_clips, seq_len)
+    mhr = _mhr_out(adapter, n_clips, seq_len, moving=True, seed=5)
+    forces = torch.randn(n_clips * seq_len, 4, 3,
+                         generator=torch.Generator().manual_seed(7)) * 0.3
+    probs = torch.zeros(n_clips * seq_len, 4)
+    out = _out(mhr, forces, probs)
+
+    def residual_and_raw(**overrides):
+        _, parts = PhysicsLoss(_cfg(**overrides), device="cpu", adapter=adapter)(out, batch)
+        return (float(parts["terms"]["residual"]["weighted_numerator_tensor"]),
+                float(parts["raw_residual"]["weighted_numerator_tensor"]))
+
+    # Decompose the residual numerator into its force / torque parts by zeroing each.
+    force_part, raw_f = residual_and_raw(residual_torque_weight=0.0)
+    torque_part, raw_t = residual_and_raw(residual_force_weight=0.0)
+    default_num, raw0 = residual_and_raw()
+    weighted_num, raw20 = residual_and_raw(residual_torque_weight=20.0)
+
+    assert torque_part > 0.0                                    # a real signal to scale
+    assert default_num == pytest.approx(force_part + torque_part, rel=1e-5)
+    assert weighted_num == pytest.approx(force_part + 20.0 * torque_part, rel=1e-5)
+    # raw headline is invariant to the residual weights.
+    for raw in (raw_f, raw_t, raw20):
+        assert raw == pytest.approx(raw0, rel=1e-6)
+
+
+def test_gate_frames_residual_restricts_gated_terms(adapter):
+    """gate_frames='residual' computes force_noncontact/force_at_contact only on the
+    residual frames (mass n_elig*n_res*4, values equal to the by-hand gate on those
+    frames); force_l2 keeps its all-frames mass n_elig*T*4."""
+    n_clips, seq_len = 2, 7
+    batch = _batch(n_clips, seq_len)
+    mhr = _mhr_out(adapter, n_clips, seq_len, moving=True, seed=5)
+    forces = torch.randn(n_clips * seq_len, 4, 3,
+                         generator=torch.Generator().manual_seed(7)) * 0.02
+    probs = torch.rand(n_clips * seq_len, 4,
+                       generator=torch.Generator().manual_seed(8))
+    out = _out(mhr, forces, probs)
+
+    residual_frames = _residual_frame_indices(seq_len, 0)          # kernel [1] -> r=0
+    n_res = len(residual_frames)
+    assert n_res == 3
+
+    _, parts = PhysicsLoss(
+        _cfg(gate_frames="residual"), device="cpu", adapter=adapter)(out, batch)
+
+    n_elig = n_clips                                              # every clip eligible
+    assert parts["terms"]["force_noncontact"]["weight_mass"] == float(n_elig * n_res * 4)
+    assert parts["terms"]["force_at_contact"]["weight_mass"] == float(n_elig * n_res * 4)
+    assert parts["terms"]["force_l2"]["weight_mass"] == float(n_elig * seq_len * 4)
+
+    # By-hand gate on just the residual frames (term weights: 1.0 / 0.1 from _cfg).
+    f = forces.view(n_elig, seq_len, 4, 3)[:, residual_frames]
+    p = probs.view(n_elig, seq_len, 4)[:, residual_frames]
+    mag_sq = (f ** 2).sum(-1)
+    mag = (mag_sq + 1e-12).sqrt()
+    expected_noncontact = 1.0 * ((1.0 - p) * mag_sq).sum()
+    expected_at_contact = 0.1 * (p * torch.relu(0.05 - mag) ** 2).sum()
+    assert float(expected_at_contact) > 0.0                       # small forces -> under f_min
+    assert float(parts["terms"]["force_noncontact"]["weighted_numerator_tensor"]) == \
+        pytest.approx(float(expected_noncontact), rel=1e-5)
+    assert float(parts["terms"]["force_at_contact"]["weighted_numerator_tensor"]) == \
+        pytest.approx(float(expected_at_contact), rel=1e-5)
+
+
+def test_gate_frames_residual_empty_stencil_gives_zero_mass(adapter):
+    """gate_frames='residual' with T below the smoothing/difference stencil (no
+    residual frames) leaves the two gated terms present with mass 0; force_l2 still
+    spans all frames."""
+    n_clips, seq_len = 1, 5
+    batch = _batch(n_clips, seq_len)
+    mhr = _mhr_out(adapter, n_clips, seq_len, moving=True, seed=3)
+    forces = torch.randn(n_clips * seq_len, 4, 3,
+                         generator=torch.Generator().manual_seed(4)) * 0.1
+    probs = torch.rand(n_clips * seq_len, 4,
+                       generator=torch.Generator().manual_seed(5))
+    out = _out(mhr, forces, probs)
+
+    _, parts = PhysicsLoss(
+        _cfg(kernel=[0.25, 0.5, 0.25], gate_frames="residual"),
+        device="cpu", adapter=adapter)(out, batch)
+
+    assert parts["n_residual_frames"] == 0
+    assert parts["terms"]["force_noncontact"]["weight_mass"] == 0.0
+    assert parts["terms"]["force_at_contact"]["weight_mass"] == 0.0
+    assert parts["terms"]["force_l2"]["weight_mass"] == float(n_clips * seq_len * 4)
+
+
+# ------------------------------------------------------------ noncontact gate form
+
+def test_noncontact_hinge_l1_matches_hand_computation(adapter):
+    """hinge_l1: numerator = w * clamp((p_hi - p)/(p_hi - p_lo), 0, 1) * ||f|| — probs
+    at p<=p_lo weigh 1, p>=p_hi weigh 0, the ramp midpoint weighs 0.5; the term is
+    linear (not quadratic) in ||f||."""
+    n_clips, seq_len = 1, 7
+    batch = _batch(n_clips, seq_len)
+    mhr = _mhr_out(adapter, n_clips, seq_len, moving=True, seed=11)
+    forces = torch.randn(n_clips * seq_len, 4, 3,
+                         generator=torch.Generator().manual_seed(12)) * 0.3
+    # One prob per hinge region: full / boundary-full / ramp midpoint / zero.
+    probs = torch.tensor([0.05, 0.2, 0.35, 0.9]).expand(n_clips * seq_len, 4).contiguous()
+    out = _out(mhr, forces, probs)
+
+    _, parts = PhysicsLoss(
+        _cfg(force_noncontact=25.0,
+             noncontact_gate={"kind": "hinge_l1", "p_lo": 0.2, "p_hi": 0.5}),
+        device="cpu", adapter=adapter)(out, batch)
+
+    mag = ((forces ** 2).sum(-1) + 1e-12).sqrt()
+    hinge = ((0.5 - probs) / 0.3).clamp(0.0, 1.0)
+    assert torch.allclose(hinge[0], torch.tensor([1.0, 1.0, 0.5, 0.0]))
+    expected = 25.0 * (hinge * mag).sum()
+    assert float(parts["terms"]["force_noncontact"]["weighted_numerator_tensor"]) == \
+        pytest.approx(float(expected), rel=1e-5)
+
+    # Doubling the forces doubles the L1 numerator (the soft_l2 form quadruples).
+    _, parts2 = PhysicsLoss(
+        _cfg(force_noncontact=25.0,
+             noncontact_gate={"kind": "hinge_l1", "p_lo": 0.2, "p_hi": 0.5}),
+        device="cpu", adapter=adapter)(_out(mhr, forces * 2.0, probs), batch)
+    assert float(parts2["terms"]["force_noncontact"]["weighted_numerator_tensor"]) == \
+        pytest.approx(2.0 * float(expected), rel=1e-4)
+
+
+def test_noncontact_hinge_l1_zero_force_gradient_finite(adapter):
+    """The eps-smoothed L1 has a finite (zero) gradient at exactly f = 0 — the
+    classic ||f|| NaN-at-zero trap must not reach the force head."""
+    n_clips, seq_len = 1, 7
+    batch = _batch(n_clips, seq_len)
+    mhr = _mhr_out(adapter, n_clips, seq_len, moving=False)
+    forces = torch.zeros(n_clips * seq_len, 4, 3, requires_grad=True)
+    probs = torch.zeros(n_clips * seq_len, 4)                     # full hinge weight
+    total, _ = PhysicsLoss(
+        _cfg(noncontact_gate={"kind": "hinge_l1", "p_lo": 0.2, "p_hi": 0.5}),
+        device="cpu", adapter=adapter)(_out(mhr, forces, probs), batch)
+    total.backward()
+    assert torch.isfinite(forces.grad).all()
+
+
+def test_noncontact_gate_absent_is_soft_l2(adapter):
+    """A config without noncontact_gate and one with the explicit soft_l2 defaults
+    produce bit-identical force_noncontact numerators."""
+    n_clips, seq_len = 2, 7
+    batch = _batch(n_clips, seq_len)
+    mhr = _mhr_out(adapter, n_clips, seq_len, moving=True, seed=21)
+    forces = torch.randn(n_clips * seq_len, 4, 3,
+                         generator=torch.Generator().manual_seed(22)) * 0.1
+    probs = torch.rand(n_clips * seq_len, 4,
+                       generator=torch.Generator().manual_seed(23))
+    out = _out(mhr, forces, probs)
+
+    _, absent = PhysicsLoss(_cfg(), device="cpu", adapter=adapter)(out, batch)
+    _, explicit = PhysicsLoss(
+        _cfg(noncontact_gate={"kind": "soft_l2", "p_lo": 0.2, "p_hi": 0.5}),
+        device="cpu", adapter=adapter)(out, batch)
+    assert float(absent["terms"]["force_noncontact"]["weighted_numerator_tensor"]) == \
+        float(explicit["terms"]["force_noncontact"]["weighted_numerator_tensor"])
+
+
 # --------------------------------------------------------------- config validation
 
 def test_physics_config_validation():
@@ -602,3 +799,13 @@ def test_physics_config_validation():
     bad_weight["physics"]["loss"]["residual"] = -1.0
     with pytest.raises(ValueError, match="residual"):
         _validate_physics(bad_weight, force_off)
+
+    bad_res_weight = copy.deepcopy(base)
+    bad_res_weight["physics"]["loss"]["residual_torque_weight"] = -1.0
+    with pytest.raises(ValueError, match="residual_torque_weight"):
+        _validate_physics(bad_res_weight, force_off)
+
+    bad_gate = copy.deepcopy(base)
+    bad_gate["physics"]["loss"]["gate_frames"] = "center"
+    with pytest.raises(ValueError, match="gate_frames must be one of"):
+        _validate_physics(bad_gate, force_off)

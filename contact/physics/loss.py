@@ -195,6 +195,27 @@ class PhysicsLoss:
         self.residual_kind = str(robust.get("kind", "square"))
         self.delta_force = float(robust.get("delta_force", 1.0))
         self.delta_torque = float(robust.get("delta_torque", 0.5))
+        # Separate weights on the force / torque parts of the residual objective:
+        # the per-limb allocation signal lives in the torque part (~20x weaker than
+        # the force sum), so weighting torque up rebalances. Default ``(1.0, 1.0)``
+        # is bit-identical to the original combined objective; ``raw_residual`` stays
+        # unweighted. ``gate_frames`` restricts the prob-gated force terms to the
+        # ``residual`` (center) frames when the contact probs come from a windowed
+        # temporal model. ``.get`` keeps pre-schema fixtures/configs backwards-identical.
+        self.residual_force_weight = float(loss_cfg.get("residual_force_weight", 1.0))
+        self.residual_torque_weight = float(loss_cfg.get("residual_torque_weight", 1.0))
+        self.gate_frames = str(loss_cfg.get("gate_frames", "all"))
+        # Non-contact penalty form (§4): ``soft_l2`` is the original (1 − p)·‖f‖²
+        # shrinkage tax — quadratic in ‖f‖, its stationary point against the residual
+        # pull is ‖f‖ ∝ 1/(1 − p), nonzero on every limb. ``hinge_l1`` penalises the
+        # magnitude ‖f‖ with a hinge gate on p — full below ``p_lo``, zero above
+        # ``p_hi``, linear ramp between — whose constant slope at ‖f‖ → 0 admits an
+        # exact zero-force solution on confidently-free limbs while leaving p ≥ p_hi
+        # limbs untaxed. ``.get`` keeps pre-schema fixtures/configs on soft_l2.
+        gate_cfg = loss_cfg.get("noncontact_gate") or {}
+        self.noncontact_kind = str(gate_cfg.get("kind", "soft_l2"))
+        self.noncontact_p_lo = float(gate_cfg.get("p_lo", 0.2))
+        self.noncontact_p_hi = float(gate_cfg.get("p_hi", 0.5))
         # Camera-jerk clip filter (§2): drop clips whose per-frame camera-center jump
         # exceeds this metric threshold (reconstruction discontinuities alias into
         # body acceleration). ``None`` = off (default, backwards-identical).
@@ -256,7 +277,7 @@ class PhysicsLoss:
         }
 
         if eligible.any():
-            self._force_gate_terms(out, eligible, seq_len, terms, diagnostics)
+            self._force_gate_terms(out, eligible, seq_len, residual_frames, terms, diagnostics)
         if run_physics:
             self._physics_terms(
                 out, batch, eligible, seq_len, n_clips, residual_frames, run_rnea,
@@ -305,10 +326,19 @@ class PhysicsLoss:
     # ------------------------------------------------------------ force gate
 
     def _force_gate_terms(
-        self, out: dict, eligible: Tensor, seq_len: int,
+        self, out: dict, eligible: Tensor, seq_len: int, residual_frames: list[int],
         terms: dict[str, tuple[Tensor, float]], diagnostics: dict[str, Any],
     ) -> None:
-        """Contact-gated force terms on all frames of eligible clips (D8).
+        """Contact-gated force terms on eligible clips (D8).
+
+        ``force_l2`` and the ``force_std`` diagnostic always span all frames. The
+        prob-gated terms ``force_noncontact`` / ``force_at_contact`` span all frames
+        when ``physics.loss.gate_frames == "all"`` (default) and only the residual
+        frames when ``"residual"`` — with a windowed temporal contact model only the
+        residual (center) frame's probs are in-distribution, so this avoids gating
+        forces against off-window contact predictions. An empty residual-frame set (T
+        below the smoothing/difference stencil) contributes no gated data this batch
+        (mass 0); ``_assemble`` keeps the term contract fixed by config.
 
         Also records ``force_std`` (§3): the across-clip std of each clip's mean
         head-frame ‖f‖ (mean over its frames and four extremities). A collapsed
@@ -324,14 +354,27 @@ class PhysicsLoss:
 
         magnitude_sq = (forces ** 2).sum(-1)                       # ||f||^2  (., T, 4)
         magnitude = (magnitude_sq + _NORM_EPS).sqrt()
-        gate_mass = float(n_elig * seq_len * 4)
-        terms["force_noncontact"] = (((1.0 - probs) * magnitude_sq).sum(), gate_mass)
-        terms["force_at_contact"] = (
-            (probs * torch.relu(self.f_min - magnitude) ** 2).sum(), gate_mass)
-        terms["force_l2"] = (magnitude_sq.sum(), gate_mass)
+        terms["force_l2"] = (magnitude_sq.sum(), float(n_elig * seq_len * 4))
         if n_elig > 1:
             per_clip = magnitude.mean(dim=(1, 2))                  # (n_elig,)
             diagnostics["force_std"] = float(per_clip.std(unbiased=False).detach())
+
+        if self.gate_frames == "residual":
+            if not residual_frames:
+                return                                             # no in-window frame
+            sel = torch.tensor(residual_frames, device=self.device)
+            magnitude_sq = magnitude_sq.index_select(1, sel)
+            magnitude = magnitude.index_select(1, sel)
+            probs = probs.index_select(1, sel)
+        gate_mass = float(n_elig * magnitude_sq.shape[1] * 4)
+        if self.noncontact_kind == "hinge_l1":
+            hinge = ((self.noncontact_p_hi - probs)
+                     / (self.noncontact_p_hi - self.noncontact_p_lo)).clamp(0.0, 1.0)
+            terms["force_noncontact"] = ((hinge * magnitude).sum(), gate_mass)
+        else:
+            terms["force_noncontact"] = (((1.0 - probs) * magnitude_sq).sum(), gate_mass)
+        terms["force_at_contact"] = (
+            (probs * torch.relu(self.f_min - magnitude) ** 2).sum(), gate_mass)
 
     # --------------------------------------------------------------- physics
 
@@ -411,20 +454,25 @@ class PhysicsLoss:
         torque_sq = (residual_torque ** 2).sum(-1)
         res_mass = float(n_elig * n_res)
 
-        # The ``residual`` objective term applies ρ component-wise (§1). ``square``
-        # reproduces the original ``force_sq + torque_sq`` sum bit-for-bit; the raw
-        # physical residual below is emitted unconditionally as the comparable
-        # headline (zero-force baseline ≈ 2.586).
+        # The ``residual`` objective term applies ρ component-wise (§1) and scales the
+        # force / torque parts by ``residual_force_weight`` / ``residual_torque_weight``.
+        # Default weights ``(1.0, 1.0)`` with ``square`` reproduce the original combined
+        # ``force_sq + torque_sq`` sum bit-for-bit. ``raw_residual`` below is ALWAYS the
+        # unweighted physical residual — the comparable headline (zero-force baseline
+        # ≈ 2.586) — and is untouched by these weights.
         physical_num = (force_sq + torque_sq).sum()
+        w_f, w_tau = self.residual_force_weight, self.residual_torque_weight
         if self.residual_kind == "pseudo_huber":
-            residual_num = (_pseudo_huber(residual_force, self.delta_force).sum()
-                            + _pseudo_huber(residual_torque, self.delta_torque).sum())
+            residual_num = (w_f * _pseudo_huber(residual_force, self.delta_force).sum()
+                            + w_tau * _pseudo_huber(residual_torque, self.delta_torque).sum())
             saturated = int((residual_force.abs() > self.delta_force).sum()
                             + (residual_torque.abs() > self.delta_torque).sum())
             n_components = residual_force.numel() + residual_torque.numel()
             diagnostics["residual_sat_frac"] = saturated / max(n_components, 1)
+        elif w_f == 1.0 and w_tau == 1.0:
+            residual_num = physical_num                      # bit-identical to the original
         else:
-            residual_num = physical_num
+            residual_num = w_f * force_sq.sum() + w_tau * torque_sq.sum()
         terms["residual"] = (residual_num, res_mass)
         diagnostics["raw_residual"] = {
             "weighted_numerator_tensor": physical_num.detach(),

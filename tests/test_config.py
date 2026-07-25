@@ -93,6 +93,7 @@ def test_ported_baselines_keep_semantics():
         "causal": False,
         "dropout": 0.0,
         "position_scale": 30.0,
+        "window_frames": None,
     }
     assert temporal["data"]["sequence"]["frames_per_clip"] == 5
     assert temporal["data"]["sequence"]["frame_stride"] == 1
@@ -182,6 +183,32 @@ base: configs/base.yaml
 physics:
   loss:
     residual_robust: {delta_force: 0.0}
+"""))
+
+
+def test_noncontact_gate_defaults_are_soft_l2():
+    cfg = load_config(REPO / "configs" / "base.yaml")
+    assert cfg["physics"]["loss"]["noncontact_gate"] == {
+        "kind": "soft_l2", "p_lo": 0.2, "p_hi": 0.5}
+
+
+def test_noncontact_gate_bad_kind_rejected(tmp_path):
+    with pytest.raises(ValueError, match="noncontact_gate.kind must be one of"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+physics:
+  loss:
+    noncontact_gate: {kind: hard_step}
+"""))
+
+
+def test_noncontact_gate_bad_thresholds_rejected(tmp_path):
+    with pytest.raises(ValueError, match="must satisfy 0 <= p_lo < p_hi <= 1"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+physics:
+  loss:
+    noncontact_gate: {kind: hinge_l1, p_lo: 0.5, p_hi: 0.5}
 """))
 
 
@@ -490,6 +517,32 @@ base: configs/base.yaml
 model:
   temporal:
     position_scale: {value}
+"""))
+
+
+def test_temporal_window_frames_defaults_null():
+    cfg = load_config(REPO / "configs" / "base.yaml")
+    assert cfg["model"]["temporal"]["window_frames"] is None
+
+
+def test_temporal_window_frames_accepts_odd(tmp_path):
+    cfg = load_config(_write(tmp_path, """
+base: configs/base.yaml
+model:
+  temporal:
+    window_frames: 5
+"""))
+    assert cfg["model"]["temporal"]["window_frames"] == 5
+
+
+@pytest.mark.parametrize("bad", [4, 2, 1])
+def test_temporal_window_frames_rejects_non_odd_ge_3(tmp_path, bad):
+    with pytest.raises(ValueError, match="window_frames must be null or an odd int >= 3"):
+        load_config(_write(tmp_path, f"""
+base: configs/base.yaml
+model:
+  temporal:
+    window_frames: {bad}
 """))
 
 

@@ -49,6 +49,7 @@ DEFAULTS: dict[str, Any] = {
             "mlp_channel_div_factor": 2,
             "grid_size": 5,
             "grid_radius": 0.1,
+            "blind_to_image": False,        # ablation: no image path into contact tokens
         },
         "temporal": {                       # Phase 3: ContactTemporalModule
             "enabled": False,
@@ -61,6 +62,7 @@ DEFAULTS: dict[str, Any] = {
             "causal": False,
             "dropout": 0.0,
             "position_scale": 1.0,           # multiplier on elapsed seconds before time PE
+            "window_frames": None,           # None|odd>=3: attend only the central window
         },
         "force_head": {                     # Step 04: per-extremity 3D force regression
             "enabled": False,
@@ -143,9 +145,17 @@ DEFAULTS: dict[str, Any] = {
                 "delta_force": 1.0,     # pseudo-Huber transition for the 3 force components
                 "delta_torque": 0.5,    # pseudo-Huber transition for the 3 torque components
             },
-            "force_noncontact": 1.0,    # (1-p)||f||^2 at non-contact extremities
+            "residual_force_weight": 1.0,   # weight on the force part of the residual objective
+            "residual_torque_weight": 1.0,  # weight on the torque part (allocation signal ~20x weaker)
+            "force_noncontact": 1.0,    # non-contact force penalty (form: noncontact_gate)
+            "noncontact_gate": {        # force_noncontact form
+                "kind": "soft_l2",      # soft_l2 = (1-p)*||f||^2 | hinge_l1 = hinge(p)*||f|| (exact zeros)
+                "p_lo": 0.2,            # hinge_l1: full penalty at p <= p_lo
+                "p_hi": 0.5,            # hinge_l1: zero penalty at p >= p_hi (linear ramp between)
+            },
             "force_at_contact": 0.1,    # p*relu(contact_min_bw - ||f||)^2 at contacts
             "contact_min_bw": 0.05,     # min force at a contact, units of body weight
+            "gate_frames": "all",       # all | residual: frames the prob-gated force terms use
             "force_smooth": 0.1,        # ||f_t - f_{t-1}||^2 on world-frame forces
             "force_l2": 0.01,           # ||f||^2
             "torque_l2": 0.01,          # ||tau_j||^2 (residual frames)
@@ -277,6 +287,10 @@ _PHYSICS_WEIGHT_KEYS = frozenset({
 
 _RESIDUAL_ROBUST_KINDS = frozenset({"square", "pseudo_huber"})
 
+_GATE_FRAMES = frozenset({"all", "residual"})
+
+_NONCONTACT_GATE_KINDS = frozenset({"soft_l2", "hinge_l1"})
+
 
 def _validate_physics(cfg: dict, force_head: dict) -> None:
     """Validate the ``physics:`` section (step 06). ``physics:`` numbers stay out of
@@ -317,6 +331,33 @@ def _validate_physics(cfg: dict, force_head: dict) -> None:
             if not math.isfinite(delta) or delta <= 0:
                 raise ValueError(
                     f"physics.loss.residual_robust.{key} must be finite and positive")
+
+    # Force/torque residual weights + gated-frame restriction (read via ``.get`` for
+    # the same pre-schema-fixture reason as ``residual_robust`` above).
+    for key in ("residual_force_weight", "residual_torque_weight"):
+        weight = float(physics["loss"].get(key, 1.0))
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError(f"physics.loss.{key} must be finite and >= 0")
+    gate_frames = str(physics["loss"].get("gate_frames", "all"))
+    if gate_frames not in _GATE_FRAMES:
+        raise ValueError(
+            f"physics.loss.gate_frames must be one of {sorted(_GATE_FRAMES)}; "
+            f"got {gate_frames!r}")
+
+    # Non-contact penalty form (read via ``.get`` for the same pre-schema-fixture
+    # reason as ``residual_robust`` above).
+    gate = physics["loss"].get("noncontact_gate")
+    if gate is not None:
+        if gate["kind"] not in _NONCONTACT_GATE_KINDS:
+            raise ValueError(
+                "physics.loss.noncontact_gate.kind must be one of "
+                f"{sorted(_NONCONTACT_GATE_KINDS)}; got {gate['kind']!r}")
+        p_lo, p_hi = float(gate["p_lo"]), float(gate["p_hi"])
+        if not (math.isfinite(p_lo) and math.isfinite(p_hi)
+                and 0.0 <= p_lo < p_hi <= 1.0):
+            raise ValueError(
+                "physics.loss.noncontact_gate must satisfy 0 <= p_lo < p_hi <= 1; "
+                f"got p_lo={p_lo}, p_hi={p_hi}")
 
     max_cam_jump = physics.get("max_cam_jump_m")
     if max_cam_jump is not None:
@@ -422,7 +463,19 @@ def _validate_semantics(cfg: dict) -> None:
         raise ValueError(
             f"model.temporal.placement must be one of {sorted(_TEMPORAL_PLACEMENTS)}; "
             f"got {temporal['placement']!r}")
+    if (contact_head["blind_to_image"] and temporal["enabled"]
+            and temporal["placement"] == "pre_decoder"):
+        raise ValueError(
+            "model.contact_head.blind_to_image with model.temporal.placement="
+            "'pre_decoder' is a no-op: the pre_decoder branch exists only to build "
+            "the image tensor the anchored update samples, and blind_to_image "
+            "removes that update")
     _validate_temporal_common(temporal, "model.temporal")
+    window_frames = temporal["window_frames"]
+    if window_frames is not None and (int(window_frames) < 3 or int(window_frames) % 2 == 0):
+        raise ValueError(
+            f"model.temporal.window_frames must be null or an odd int >= 3; "
+            f"got {window_frames!r}")
 
     force_head = cfg["model"]["force_head"]
     if force_head["frame"] not in _FORCE_FRAMES:

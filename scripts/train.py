@@ -122,20 +122,18 @@ def _resume_config_diffs(saved: dict, current: dict) -> list[str]:
     Allowed to differ across a resume (not compared): ``optim.epochs`` (extend
     training) and all ``logging.*``.
 
-    ``physics`` and ``loss`` are normalised over the schema defaults on BOTH sides
+    Every compared section is normalised over the schema defaults on BOTH sides
     before comparison, so a historical config that predates a backward-identical
-    key (e.g. ``physics.loss.residual_robust``/``physics.max_cam_jump_m``, or the
-    whole disabled ``physics`` section) compares equal to a current resolution
-    holding those defaults — absent keys and explicit defaults are the same run.
+    key (e.g. ``physics.loss.residual_robust``/``physics.max_cam_jump_m``,
+    ``model.temporal.window_frames``, or the whole disabled ``physics`` section)
+    compares equal to a current resolution holding those defaults — absent keys
+    and explicit defaults are the same run.
     """
     def _normalized(cfg: dict, section: str) -> dict:
         return _deep_merge(CONFIG_DEFAULTS[section], cfg.get(section) or {})
 
     diffs: list[str] = []
-    for section in ("model", "contact"):
-        if saved.get(section) != current.get(section):
-            diffs.append(f"  {section}: differs")
-    for section in ("physics", "loss"):
+    for section in ("model", "contact", "physics", "loss"):
         if _normalized(saved, section) != _normalized(current, section):
             diffs.append(f"  {section}: differs")
     for key in ("datasets", "sequence", "eval_split"):

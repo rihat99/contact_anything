@@ -238,18 +238,31 @@ class SAM3DBody(BaseModel):
                 for name, dims in targets.items()
             })
 
-            # Positional encoding: project 2D keypoint position -> decoder dim
-            self.contact_posemb_linear = FFN(
-                embed_dims=2,
-                feedforward_channels=self.cfg.MODEL.DECODER.DIM,
-                output_dims=self.cfg.MODEL.DECODER.DIM,
-                num_fcs=2,
-                add_identity=False,
+            # --- contact blind hook (ablation: no image features at all) ---
+            # When set, the contact tokens lose every path to the image: the
+            # decoder cross-attention is gated off for their rows (see
+            # forward_decoder) and the anchored update below never runs, so their
+            # only input is self-attention over the preceding (body) tokens. The
+            # two anchored-update projections are then not built at all — keeping
+            # them would leave params that never receive a gradient, which DDP
+            # rejects without find_unused_parameters.
+            self.contact_blind_to_image = bool(
+                contact_head_cfg.get("BLIND_TO_IMAGE", False)
             )
-            # Feature projection: project sampled image features -> decoder dim
-            self.contact_feat_linear = nn.Linear(
-                self.backbone.embed_dims, self.cfg.MODEL.DECODER.DIM
-            )
+            if not self.contact_blind_to_image:
+                # Positional encoding: project 2D keypoint position -> decoder dim
+                self.contact_posemb_linear = FFN(
+                    embed_dims=2,
+                    feedforward_channels=self.cfg.MODEL.DECODER.DIM,
+                    output_dims=self.cfg.MODEL.DECODER.DIM,
+                    num_fcs=2,
+                    add_identity=False,
+                )
+                # Feature projection: project sampled image features -> decoder dim
+                self.contact_feat_linear = nn.Linear(
+                    self.backbone.embed_dims, self.cfg.MODEL.DECODER.DIM
+                )
+            # --- end contact blind hook ---
             # K×K grid sampling params
             self.contact_grid_size   = contact_head_cfg.get("GRID_SIZE", 1)
             self.contact_grid_radius = contact_head_cfg.get("GRID_RADIUS", 0.1)
@@ -273,6 +286,7 @@ class SAM3DBody(BaseModel):
                     image_dim=self.backbone.embed_dims,
                     bottleneck_dim=tcfg.get("BOTTLENECK_DIM", 256),
                     position_scale=tcfg.get("POSITION_SCALE", 1.0),
+                    window_frames=tcfg.get("WINDOW_FRAMES", None),
                 )
             # --- end contact temporal hook ---
 
@@ -492,6 +506,7 @@ class SAM3DBody(BaseModel):
         assert num_pose_token == 1
 
         image_augment, token_augment, token_mask = None, None, None
+        token_context_gate = None          # contact blind hook, set with token_mask
         if hasattr(self, "prompt_encoder") and keypoints is not None:
             if prev_estimate is None:
                 # Use initial embedding if no previous embedding
@@ -679,6 +694,26 @@ class SAM3DBody(BaseModel):
                     token_mask[:, :force_emb_start_idx, force_emb_start_idx:] = False
                 # --- end force hook ---
 
+                # --- contact blind hook (gate the image cross-attention) ---
+                # Every token cross-attends the image embeddings, and that
+                # attention is unmasked. A fully-masked query row would make
+                # softmax produce NaN, so the ablation instead zeroes the contact
+                # rows of the cross-attention *output* before its residual add.
+                # Cross-attention is independent per query row (keys/values are
+                # image-only), so this removes the contact tokens' image access
+                # without perturbing any other row by a single ulp.
+                if self.contact_blind_to_image:
+                    token_context_gate = torch.ones(
+                        1, N_total, 1,
+                        dtype=token_embeddings.dtype,
+                        device=token_embeddings.device,
+                    )
+                    token_context_gate[
+                        :, contact_emb_start_idx :
+                             contact_emb_start_idx + self.total_contact_tokens
+                    ] = 0.0
+                # --- end contact blind hook ---
+
         # We're doing intermediate model predictions
         def token_to_pose_output_fn(tokens, prev_pose_output, layer_idx):
             # Get the pose token
@@ -763,6 +798,7 @@ class SAM3DBody(BaseModel):
             token_mask,
             token_to_pose_output_fn=token_to_pose_output_fn,
             keypoint_token_update_fn=keypoint_token_update_fn_comb,
+            token_context_gate=token_context_gate,
         )
 
         # Process contact tokens if enabled
@@ -2383,11 +2419,18 @@ class SAM3DBody(BaseModel):
         if layer_idx == len(decoder_layers) - 1:
             return token_embeddings, token_augment, pose_output, layer_idx
 
-        token_embeddings, token_augment = self._anchored_token_update(
-            contact_emb_start_idx, self.num_contact_tokens,
-            self.contact_posemb_linear, self.contact_feat_linear,
-            image_embeddings, pose_output, token_embeddings, token_augment,
-        )
+        # --- contact blind hook ---
+        # The anchored update is the tokens' only *direct* image path (grid-sampled
+        # features) and their only keypoint-position path (posemb). The ablation
+        # drops both; the temporal hook below still runs, so between_layers
+        # placement keeps working. Attribute absent -> unablated (standalone use).
+        if not getattr(self, "contact_blind_to_image", False):
+            token_embeddings, token_augment = self._anchored_token_update(
+                contact_emb_start_idx, self.num_contact_tokens,
+                self.contact_posemb_linear, self.contact_feat_linear,
+                image_embeddings, pose_output, token_embeddings, token_augment,
+            )
+        # --- end contact blind hook ---
 
         # --- contact temporal hook (between_layers) ---
         # Runs once per intermediate decoder layer (layers 0..N-2, i.e. 5×), with

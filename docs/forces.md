@@ -1,267 +1,422 @@
-# Contact forces
+# Contact forces — what we built, how it trains, and what we learned
 
-Predict a 3D **contact force** at each of the four climbing extremities on top of
-the frozen SAM-3D-Body + contact stack. No force labels exist; supervision is
-**physics** — the RNEA root-wrench residual of the reconstructed motion. This
-page is the narrative record of the formulation, units, frames, world/gravity
-conventions, and the assumptions/risks that outlive `plan/`. Cross-check against
-`contact/physics/` and `configs/base.yaml` (`physics:`, `model.force_head`).
+This page explains the force-prediction extension from start to finish: what the
+model outputs, where the training signal comes from (physics, not labels), every
+loss term and why it exists, how the training runs are set up, and — importantly —
+why our first attempt collapsed to a constant "everything pushes up" answer and
+what we changed to fix it. It is written to be readable top to bottom; the code
+lives in `contact/physics/` and `sam_3d_body/models/heads/force_head.py`, and the
+knobs in `configs/base.yaml` (`physics:`, `model.force_head`).
 
-## What the model outputs
+## The idea in one paragraph
 
-- Four **force tokens** (keypoint-anchored, reusing the contact anchor indices
-  `model.contact_head.contact_keypoint_indices` = `[62, 41, 13, 14]`), an optional
-  **force temporal** block (`model.force_temporal`, a second `ContactTemporalModule`,
-  post-decoder only), and a **force head** (`sam_3d_body/models/heads/force_head.py`,
-  zero-init final linear) regressing one 3D vector per extremity:
-  `out["force"]["joint_forces"] [B, 4, 3]`.
-- Output order: `left_hand, right_hand, left_foot, right_foot` (same as the
-  four-extremity contact joint target; see `contact.physics.EXTREMITY_OUTPUT_NAMES`).
-- The force tokens are appended **after** the contact tokens and the asymmetric
-  attention mask is extended (`token_mask[:, :force_start, force_start:] = False`)
-  so no earlier token block attends a later one — MHR/pose **and** contact logits
-  keep an exactly-zero Jacobian w.r.t. every force param (`tests/test_force_invariance.py`).
+We want the model to look at a climbing video and say, for each hand and foot,
+what 3D force that limb is exerting against the wall. Nobody has labels for this —
+you cannot annotate newtons by watching a video. But physics gives us a teacher
+for free: if we reconstruct the climber's motion over a clip, Newton's laws tell
+us exactly what the *total* external force and torque on the body must have been.
+So we let the network guess per-limb forces, plug those guesses into the equations
+of motion of the reconstructed body, and penalise whatever imbalance remains. If
+the guessed forces explain the motion, the imbalance is zero. That imbalance —
+the "residual wrench" at the root of the body — is the loss.
 
-## Force units — body weight
+## What we added to the model
 
-The head predicts **dimensionless** force in units of the shaped model's body
-weight `m·g` (decision D5); the physics loss converts to newtons as
-`f_newtons = pred · m · g` where `m` is the per-clip shaped mass (kg) and
-`g = physics.gravity` (9.81). Zero-init means the model starts at "no forces": the
-RNEA residual then equals the pure-kinematics baseline, a meaningful curriculum
-start. Body-weight units keep the regression target O(1) and transfer across body
-shapes (D5, D12).
+The base model is a frozen SAM-3D-Body: a DINOv3 backbone plus a promptable
+transformer decoder that already predicts pose (MHR parameters) and, from our
+earlier work, per-extremity contact probabilities. On top of that we add:
 
-## Physics objective — RNEA root-wrench residual
+- **Four force tokens**, one per extremity, anchored to the same keypoints the
+  contact tokens use (`[62, 41, 13, 14]` = left wrist, right wrist, left ankle,
+  right ankle). They ride through the same decoder as everything else.
+- **A force head** (`force_head.py`) that reads those four tokens and regresses
+  one 3D vector each: `out["force"]["joint_forces"]` of shape `[B, 4, 3]`, in
+  the fixed order `left_hand, right_hand, left_foot, right_foot`. The final
+  linear layer is **zero-initialised**, so an untrained model predicts exactly
+  zero force everywhere — more on why that is nice below.
+- **An optional force temporal module** (`model.force_temporal`) — the same
+  gated cross-frame attention block the contact branch uses, so each limb's
+  force can look at neighbouring frames of the clip. It attends `per_token`
+  (each limb mixes only with itself through time).
 
-Over a T-frame clip the frozen model yields per-frame MHR body + camera params.
-The step-03 adapter (`contact/physics/adapter.py::MHRAdapter`) maps them onto a
-BetterHuman **MHR** body (floating-base, `nq=132`) and a world-frame configuration
-trajectory `q`. The step-06 loss (`contact/physics/loss.py::PhysicsLoss`):
+One structural rule keeps all of this safe: the decoder's attention mask is
+asymmetric. The force tokens are appended *after* the contact tokens, and no
+earlier token block is allowed to attend a later one. Original tokens never see
+contact or force tokens; contact tokens never see force tokens. The practical
+consequence, which `tests/test_force_invariance.py` proves numerically, is that
+adding the whole force branch changes the pose and contact outputs by exactly
+nothing — their Jacobian with respect to every force parameter is identically
+zero. We can bolt this on without any risk to what already works.
 
-1. smooths `q` **on the manifold** (windowed mean for the translation + 125
-   revolute channels, hemisphere-aligned slerp mean for the root quaternion);
-2. finite-differences to velocity and acceleration via `Model.difference`
-   (SE3 log for the free-flyer block), honouring the per-interval `dt` from
-   `frame_pos_sec`;
-3. places the predicted forces as external wrenches `fext` at the four extremity
-   joint origins and runs **RNEA** (inverse dynamics):
-   `tau = M(q)·a + b(q,v) + g(q) − Jᵀ·fext`;
-4. minimises the **6D residual wrench at the free-flyer root** `tau[..., :6]` — an
-   unactuated joint whose generalised force must be zero for physically consistent
-   motion. `tau[..., :3]` is the residual force, `tau[..., 3:6]` the residual
-   torque; `tau[..., 6:]` are the joint torques (regularised, not driven to zero).
+Only parameters whose dotted name contains `"contact"` or `"force"` are
+trainable at all (the freeze filter is name-based); everything else in the
+network stays frozen and eval-pinned.
 
-Every term is dimensionless (D12): residual force is normalised by `m·g`,
-residual/joint torques by `m·g·1 m`. RNEA needs no mass-matrix inverse, so MHR's
-singular CRBA (mimic overcompleteness + zero-mass cosmetic bodies) is a non-issue;
-forward dynamics is off the table but not needed.
+## What the numbers mean: units and frame
 
-### Supervision terms (`physics.loss.*`)
+**Units.** The head predicts force in units of the person's **body weight**
+(`m·g`), not newtons. A prediction of `(0, 1, 0)` means "one body weight,
+straight up". This keeps the regression target around 1.0 regardless of whether
+the climber weighs 55 kg or 95 kg, and the physics loss converts to newtons
+internally using the per-clip shaped body mass. It also makes the zero-init
+head meaningful: "no force" is a real, physical starting point, and the loss at
+initialisation equals the pure-kinematics baseline — the model starts from an
+honest "I don't know yet" rather than random noise.
 
-- `residual` — the root-wrench residual above (the training objective). By default
-  (`physics.loss.residual_robust.kind: square`) it is `‖r_f‖² + ‖r_τ‖²`, bit-for-bit
-  the original. Set `kind: pseudo_huber` to apply a **component-wise** pseudo-Huber
-  `ρ_δ(x) = δ²(√(1+(x/δ)²) − 1)` to the three residual-force and three residual-torque
-  components (`delta_force`, `delta_torque`, both dimensionless): quadratic near zero,
-  linear past `δ`, taming the heavy-tailed supervision from noisy double
-  finite-differencing (batch residual p99 ≫ median). The **evaluation headline and the
-  `{split}/physics_residual` monitor read the RAW, un-robustified residual**
-  (`raw_residual`, emitted on every RNEA batch regardless of `kind`) so runs stay
-  comparable across robustifiers. **Comparable only under the same clip protocol**,
-  though: `dt`, the smoothing stencil, and which rows are scored all change with
-  `frames_per_clip`/`frame_stride` — the historical numbers (zero-force baseline
-  ≈ 2.586; collapsed run best ≈ 1.60) were measured at T=8/stride 1 and must be
-  re-measured under a new protocol (e.g. T=16/stride 2) before being used as
-  baselines. `residual_sat_frac` (fraction of residual components past `δ`; 0 under
-  `square`) is logged to watch the robust tail. When the split yields **zero
-  residual mass** the headline is `NaN`, and the trainer raises if
-  `physics_residual` is the monitor.
-- `force_noncontact` — `(1−p)·‖f‖²`, a strong penalty on force at **non-contact**
-  extremities. Without it the residual is trivially zeroable by fictitious forces
-  on airborne limbs. The gate `p` is the **detached** predicted contact prob (D8):
-  physics must never train the contact head, and detaching stops the force loss
-  from inflating contact probs to license fictitious forces. GT labels are *not*
-  used as the gate — the video labels are motion-gated *stable* contact, a
-  different quantity from instantaneous load (R8).
-- `force_at_contact` — `p·relu(contact_min_bw − ‖f‖)²`, a weak opposite penalty
-  discouraging near-zero force at contact extremities. **Caveat:** the force head is
-  zero-init and this term has **zero gradient at `f = 0`** (the magnitude uses the
-  `√(‖f‖²+ε)` softening, so `∂‖f‖/∂f → 0` as `f → 0`), so it cannot by itself lift
-  the head off zero — it only shapes an already-nonzero prediction. The decisive
-  `climbing_videos_force_warmstart_t16` config therefore sets it to `0.0`.
-- `force_smooth`, `force_l2`, `torque_l2`, `torque_smooth` — smoothness / L2
-  regularisers on world-frame forces and RNEA joint torques.
+**Frame.** The head predicts in the `local_world_aligned` frame: the axes of the
+current camera, but with y pointing up (the un-flipped OpenCV frame — what a
+level camera would call right/up/forward). This is deliberate. The
+reconstruction world's yaw is arbitrary per scene, so the network could never
+learn it from a single crop; the camera-aligned frame is something the network
+can actually infer from the image. The physics loss rotates these predictions
+into the world (through the known camera extrinsics) before using them. There is
+also a `local` option (the extremity joint's own frame); `local_world_aligned`
+is the default and the only one our renderers draw.
 
-### Gradient isolation is regime-dependent
+Forces are applied at the wrist/ankle **joint origins** with no torque
+component. Real contact happens on the palm and sole, slightly offset, and grips
+can transmit moments — that `r×f` error is a known, accepted v1 simplification.
 
-The physics loss consumes the frozen MHR pose, camera extrinsics and contact probs
-**detached**, so its gradients reach only the **force** params — *in regime (a)*
-(`train.freeze_contact`, contact frozen). In **regime (b)** (contact trainable
-alongside physics) the isolation is **incomplete**: force tokens attend the contact
-tokens, and the vendored attention mask permits that direction, so physics gradients
-reach the trainable contact head through force→contact attention. The trainer prints
-a loud warning in this case. A detach-fix lives in the vendored attention and is
-deferred; the shipped force runs all use regime (a), where the isolation is exact.
+## Where the supervision comes from
 
-## Force frame (`model.force_head.frame`)
+### Rebuilding the motion in one static world
 
-The head predicts in a **human-centric** frame that must be learnable from a
-single crop — never the reconstruction world (its yaw is arbitrary per scene). Two
-options (D6), converted to RNEA's per-joint LOCAL `fext` in `PhysicsLoss._pred_to_world`:
+The frozen model gives us the body's pose per frame, but in *camera*
+coordinates — and our cameras move. If we ignored that, camera motion would
+masquerade as body acceleration and poison the physics. So every ClimbingVideos
+scene carries **per-frame camera extrinsics** (`cam_from_world`, OpenCV
+convention, metric scale) exported from the video reconstruction pipeline,
+plus a per-scene **gravity direction** (`gravity_world`, the first camera's
+down-axis mapped into world coordinates) and the scale factor used. The adapter
+(`contact/physics/adapter.py::MHRAdapter`) composes the per-frame camera pose
+with the model's camera-frame body pose so that every frame of the clip lands
+in one static, metric world. The result is a configuration trajectory `q(t)`
+for a BetterHuman MHR body — a floating-base skeleton with 132 configuration
+variables whose mass and inertia come from the predicted body shape.
 
-- `local_world_aligned` (**default**) — the per-frame **camera y-up axes** (the
-  un-flipped camera frame: what a level camera calls up/right/forward). Convert:
-  `f_world = R_w←c · D · f_pred` with `D = diag(1, −1, −1)` (camera y-down ↔ native
-  y-up), then rotate into the joint LOCAL frame.
-- `local` — the extremity joint frame; passes straight through to `fext`.
+Cameras are a **dataset** input, not a model input: the network itself never
+sees extrinsics and stays deployable on plain images. The "someone provides
+cameras" contract lives only in the dataset schema and the loss.
 
-Forces act at the wrist/ankle **joint origins** with zero torque component; offset
-contact points (palm/sole, grip moments → `r×f`) are out of scope v1 (R6).
+### Newton's laws as the loss
 
-## World and gravity conventions (moving cameras)
+Given `q(t)`, the loss (`contact/physics/loss.py::PhysicsLoss`) does four
+things:
 
-ClimbingVideos cameras move, so the static-camera assumption is invalid: camera
-motion would alias into body acceleration and corrupt the residual. The dataset
-therefore carries **per-frame camera extrinsics** (step 02), exported from the
-BetterVideoReconstruction pipeline's fuse+scale stages:
+1. **Smooths** the trajectory with a small windowed kernel (`[0.25, 0.5, 0.25]`),
+   done properly on the manifold — positions and joint angles get a weighted
+   mean, the root orientation gets a hemisphere-aligned quaternion average.
+2. **Differentiates** twice: finite differences give velocity and acceleration,
+   using the real elapsed time between frames and the SE(3) logarithm for the
+   free-floating root.
+3. **Runs inverse dynamics (RNEA)** with the predicted forces attached as
+   external forces at the four extremities:
+   `tau = M(q)·a + b(q,v) + g(q) − Jᵀ·f_ext`.
+   RNEA answers the question "what generalised forces would have been needed to
+   produce this motion, given these external forces?"
+4. **Reads the answer at the root.** The first six components of `tau` are the
+   force and torque that would have to act on the free-floating root joint. But
+   nothing actuates a human's root — no motor holds you in space. For a
+   physically consistent explanation, those six numbers must be **zero**. Their
+   magnitude is the residual we minimise.
 
-- `cam_from_world [B, 4, 4]` — camera-from-world, **OpenCV** convention, metric
-  after the scale stage. Provenance: `features/geometry/.../transform.npz`
-  (`extrinsics`, cumulative `scale` applied to translations). Frame 0 ≈ identity, so
-  the physics **world is the metric camera-0 reconstruction frame**. The adapter
-  composes SAM's camera-frame root pose with `T_w←c = cam_from_world⁻¹` (plus the
-  `D` un-flip) so every frame's body lands in one static world per scene (D7).
-- `gravity_world [B, 3]` — the **first camera's +y axis mapped to world** (OpenCV
-  +y points down, so this is the downward unit vector; empirically ≈ `[0, 1, 0]`).
-  RNEA gravity is set per clip as `physics.gravity · gravity_world` via
-  `values.gravity` (differentiable, no global mutation). "Up" in the plausibility
-  metrics is `−gravity_world`.
-- `cam_valid [B]` — still images and stale exports carry `cam_valid=False` and are
-  physics-ineligible; an otherwise-eligible video clip lacking cameras **raises**
-  (a stale export must never become a silent no-op, D13).
+The intuition: gravity pulls the body down, the body accelerates however the
+video says it accelerates, and the only things that can reconcile the two are
+the contact forces. If the network predicts them right, the books balance at
+the root. If it predicts nothing, the residual is exactly the unexplained
+gravity + acceleration — the "pure kinematics" baseline the zero-init head
+starts from.
 
-Cameras are a **dataset input, not a model input** (D13): the model stays
-deployable on plain images/video; the "someone provides extrinsics" contract lives
-only in the dataset schema, and flows batch → physics loss.
+Everything is normalised to dimensionless units: residual force by body weight
+`m·g`, torques by `m·g·1 m`. A note for the curious: RNEA never inverts the
+mass matrix, which matters because MHR's mass matrix is singular (mimic joints,
+zero-mass cosmetic bodies) — inverse dynamics works fine, forward dynamics
+would not.
 
-### Camera-jerk clip filtering
+### Which frames actually get supervised
 
-Camera-motion compensation is only as good as the reconstruction. Where the
-extrinsics jump discontinuously the correction is wrong and the error feeds body
-acceleration through double finite differencing. The dataset therefore emits a
-per-clip-row `cam_jump_m` — the metric distance between the camera centres
-`C = −Rᵀt` of **consecutive sampled clip frames** (row 0 of each clip = 0) — and
-`PhysicsLoss` drops any clip whose `cam_jump_m.max()` exceeds
-`physics.max_cam_jump_m` (`null` = off). The **sampled-step** definition is
-deliberate: with `frame_stride > 1` a discontinuity on a *skipped* source frame is
-invisible to per-source-frame jumps (a real-data audit found 12 of 18 stride-2
-displacements over 0.5 m missed that way — including the 7.85 m jump below for
-even-parity clips), while the net sampled-step displacement bounds any intra-gap
-jump from below; the threshold therefore applies to the per-sampled-step
-displacement. This filters on **upstream camera evidence, not the model
-residual**, so it cannot be gamed by the force branch. Excluded clips are counted
-(`n_jerk_excluded_clips`); unlike the missing-camera guard (which raises), a jerk
-exclusion is silent — but if it excludes *everything*, the eval headline becomes
-`NaN` and the trainer **raises** when `physics_residual` is the monitor (zero data
-must never read as a perfect residual). *War story:* train scene
-`45KmZUc0CzA_0007` has a 7.85 m jump at source frames 262→263, and other scenes
-have `> 0.5 m` discontinuities; `0.5` is the shipped threshold in the decisive
-config.
+A frame only contributes to the residual if its full stencil fits inside the
+clip: one frame of smoothing radius on each side, plus two more on each side
+for the double central difference. With the default kernel the residual frames
+are `{t : 3 ≤ t ≤ T − 4}`, which means **a clip needs T ≥ 7 to produce any
+physics signal at all**. This bit us: contact training used T=5, where the
+physics objective is silently dead. The first force runs used T=8 (2 residual
+frames per clip); the current config uses **T=16 with frame stride 2**, giving
+10 residual frames per clip and, because stride 2 doubles the time step,
+roughly 4× less amplification of reconstruction noise through the double
+derivative (velocity scales as 1/dt, acceleration as 1/dt²).
 
-## Residual-frame stencil — a frame-count pitfall
+One honest limitation: the acceleration is formed by central-differencing the
+velocity with a doubled interval, which is exact only for uniformly spaced
+frames. Our frames are uniformly spaced, so this is currently harmless, but the
+formula would be wrong for non-uniform sampling; a rewrite is deferred.
 
-A frame contributes to the residual only when its full stencil fits inside the
-clip: smoothing radius `r = len(smoothing_kernel)//2` per side, plus two frames for
-the doubled central difference (velocity `±1`, acceleration of velocity `±1`). The
-residual frame indices are `{t : 2 + r ≤ t ≤ T − 3 − r}` (`_residual_frame_indices`).
+### Throwing away clips the reconstruction ruined
 
-The default kernel `[0.25, 0.5, 0.25]` (`r = 1`) needs **`T ≥ 7` for any residual
-frame at all** — with a smaller `T` the residual objective is silently dead. The
-`T = 8` force configs give exactly **2 residual frames** (`{3, 4}`); the decisive
-`T = 16, stride 2` config gives **10** (`{3..12}`) — more supervision rows and, via
-the doubled `dt`, ~4× less finite-difference noise. Set `frames_per_clip` with this
-in mind.
+The camera compensation is only as good as the reconstruction, and a few scenes
+have genuine glitches — train scene `45KmZUc0CzA_0007` contains a 7.85 m
+camera-centre jump between two adjacent frames. Fed through a double
+derivative, a jump like that turns into an absurd fake acceleration that the
+forces can never explain. So the dataset emits, per clip row, the metric
+distance between the camera centres of **consecutive sampled clip frames**
+(`cam_jump_m`), and the loss drops any clip whose largest jump exceeds
+`physics.max_cam_jump_m` (0.5 m in the current config). Two details matter:
+the distance is measured between *sampled* frames, because with stride 2 a
+glitch on a skipped frame would be invisible to per-source-frame checks (an
+audit found 12 of 18 large stride-2 jumps were exactly that); and the filter
+keys on upstream camera evidence, never on the model's own residual, so the
+force branch cannot learn to game it. Excluded clips are counted and logged.
+If filtering ever excludes *everything*, the evaluation headline becomes NaN
+and the trainer raises — an empty split must never read as a perfect score.
 
-**Non-uniform-`dt` limitation:** `_trajectory_derivatives` forms the acceleration by
-central-differencing the velocity with the *doubled-interval* `dt`, which is exact
-only for uniform frame spacing. ClimbingVideos frames are uniformly spaced (constant
-`stride`), so this is currently harmless; a rewrite is deferred (documented, not
-fixed).
+## The loss terms, one by one
 
-## Evaluation & demo
+The total physics loss is a weighted sum (`physics.loss.*`, all dimensionless):
 
-- `scripts/evaluate.py` adds physics-consistency metrics when the run enables the
-  force branch + the RNEA loss (contact metrics unchanged): the headline
-  `physics_residual` (the RAW residual, same as the training monitor), the
-  vertical-force-sum distribution (≈1 body weight for quasi-static climbing), the two
-  gate-violation rates (mean ‖f‖ on predicted non-contact frames; fraction of
-  predicted contact frames with ‖f‖ < `contact_min_bw`), and per-extremity force
-  magnitudes (body weight + newton) split by predicted contact state. Lacking a
-  trained force checkpoint, run `--warm-start` to exercise the pipeline on the
-  zero-init head.
-- **Affine input-dependence baselines** (the decisive collapse test). The root
-  wrench is *affine* in the head-frame forces — per residual frame
-  `r(f) = r0 + B·vec(f)`, `B ∈ ℝ^{6×12}`, obtained from one zero-force and twelve
-  unit-force no-grad RNEA calls per batch (`PhysicsLoss.affine_residual`). Streaming
-  `r0`, `B` and the predicted forces over the split, the evaluator reports the raw
-  residual (mean + median/p90/p99/max) of **(a)** zero forces, **(b)** the best fitted
-  constant 12-DoF force (closed-form least squares on the accumulated normal
-  equations), **(c)** the network, and **(d)** shuffled per-clip force trajectories
-  (5 permutations, mean±std), plus head-frame per-limb/component across-frame std and
-  Pearson `corr(‖f‖, prob)`. **An input-dependent model must beat BOTH (b) and (d)**;
-  the printout states `PASS`/`FAIL`. A collapsed constant solution fails by
-  construction (it ties (b) and is unaffected by (d)). `train/physics/force_std`
-  (across-clip std of mean ‖f‖) is the cheap online counterpart.
-- `scripts/demo_climbing_videos.py` draws per-extremity force arrows on the
-  predicted-pose panel (anchor = the extremity's 2D keypoint, direction = the 3D
-  force projected through the model's intrinsics, length ∝ magnitude in body
-  weights, colour by extremity) — behind an `out["force"]` presence check, for the
-  `local_world_aligned` frame.
+**`residual`** — the root-wrench residual described above; the actual training
+objective. By default it is the plain squared norm `‖r_f‖² + ‖r_τ‖²`. The
+current config instead applies a component-wise **pseudo-Huber**
+`ρ_δ(x) = δ²(√(1+(x/δ)²) − 1)` with `delta_force = 1.0`, `delta_torque = 0.5`:
+quadratic near zero, linear past δ. The reason is that the supervision is
+heavy-tailed — the residual comes from double-differencing a noisy
+reconstruction, and while the median per-clip residual is around 1, the p99 is
+~18–28 and the worst clips reach the hundreds, concentrated in a few scenes. In
+squared-error land those few clips dominate every gradient step; the linear
+tail caps their influence. Importantly, the **reported and monitored number is
+always the raw, un-robustified residual**, so runs remain comparable no matter
+which robustifier trained them. (Comparable under the same clip protocol, that
+is — changing T or stride changes dt, the stencil, and which rows are scored,
+so numbers from a T=8 run cannot be compared to a T=16 run without
+re-evaluating under the same protocol. We learned to be careful with this.)
 
-## Assumptions & risks (from `plan/README.md` §5)
+**`force_noncontact`** — the term that forbids cheating. Without it there is a
+trivial solution: put whatever forces you like on the airborne limbs and zero
+the residual with pure fiction. Penalising force wherever the model itself says
+"no contact" removes that escape. The penalty has two config-selectable forms
+(`physics.loss.noncontact_gate.kind`):
 
-- **R2 — Gravity direction = first camera's +y.** Assumes the camera is level at
-  scene start; per-scene constant thereafter (camera *motion* is compensated via
-  extrinsics, initial *tilt* is not). Wrong tilt biases the residual. `gravity_world`
-  makes the assumption data-visible and swappable (future: pipeline-side gravity
-  estimation; `values.gravity` is differentiable). Not v1.
-- **R3 — Extrinsics quality.** Camera motion is compensated exactly where the
-  reconstruction is right; the residual risk shifts to VGGT drift and the body-ruler
-  scale estimate — errors there feed accelerations through double finite
-  differencing. **Monitor per-scene residuals; drop pathological scenes if needed.**
-  *War story:* train scene `45KmZUc0CzA_0007` has a **7.85 m/frame camera-center
-  jump** (at frame 262 of 329) — a reconstruction quirk; candidates like it may
-  deserve exclusion if their per-scene residuals are pathological.
-- **R4 — Metric scale consistency.** SAM's `pred_cam_t` (from intrinsics) and the
-  pipeline's world scale (body-ruler, exported as `cam_scale`) must agree; both are
-  body-anchored so gross mismatch is unlikely. Disagreement shows up as spurious
-  root acceleration; the step-03 FK acceptance test bounds the per-frame part. Mass
-  tracks predicted shape (`with_shape` recomputes body inertias from the shaped mesh).
-- **R5 — Uniform density 1000 kg/m³**, LOD1 mass ≈ 81.5 kg neutral. Fine for v1.
-- **R6 — Forces applied at wrist/ankle joint origins.** Real contact points are
-  offset (sole, palm, grip moments) → unmodeled `r×f` torque error. Accepted v1.
-- **R7 — Perf.** MHR FK is kernel-launch-bound (~203 BR joints); physics adds
-  FK+RNEA fwd+bwd per step. *War story / accepted cost:* the adapter runs
-  `from_classic` **twice per call** (once for the clip's centre-frame shaped body,
-  once for the full-batch `q`) — a known, deliberately un-optimised cost. Escape
-  hatches (`use_warp`, fewer physics frames per batch) exist; do not pre-optimise.
-- **R8 — Label semantics.** Motion-gated "stable contact" labels ≠ instantaneous
-  load; gating the force loss by predicted probs (D8) inherits this bias. Accepted,
-  documented.
-- **Temporal signature omits `dropout` (deliberate).** The checkpoint arch
-  signature's `temporal`/`force_temporal` blocks do not record `dropout`
-  (`contact/checkpoint.py::_arch_signature`): every shipped artifact uses `0.0`,
-  and adding the key now would spuriously mismatch existing checkpoints whose
-  stored signatures lack it. To be absorbed at the next signature-version bump.
+- `soft_l2` (default, the original) — `(1−p)·‖f‖²`. Being quadratic, its
+  stationary point against the residual's pull is `‖f‖ ∝ 1/(1−p)` on **every**
+  limb: it shrinks forces, it never zeros them. The t7mid run measured exactly
+  this equilibrium — `‖f‖` a smooth increasing function of `p` (corr 0.72),
+  free limbs holding ~0.1 bw, and raising the weight cannot fix it because the
+  soft `(1−p)` weight also taxes true-contact limbs whose `p` is merely 0.6–0.9.
+- `hinge_l1` — `hinge(p)·‖f‖` with `hinge(p) = clamp((p_hi − p)/(p_hi − p_lo),
+  0, 1)`: full penalty at `p ≤ p_lo`, none at `p ≥ p_hi`, linear ramp between.
+  The L1 magnitude has a constant slope at `‖f‖ → 0` (eps-smoothed, so the
+  gradient is finite at exactly zero), which creates a **dead zone**: on a limb
+  with `p ≤ p_lo` the exact-zero force is a stationary point whenever the
+  per-limb penalty slope `(w/4)·hinge(p)` exceeds the residual's pull. The
+  hinge decouples killing free-limb force from taxing contact limbs.
+
+Two subtleties shared by both forms: the gate uses the
+**predicted** probability, not the ground-truth label, because our video labels
+mark motion-gated *stable* contact — a hand can be load-bearing for an instant
+without counting as a stable contact, so the labels are the wrong gate for
+instantaneous force. And the probability is **detached**, so the force loss
+can neither train the contact head nor learn to inflate contact probabilities
+to license fictitious forces.
+
+**`force_at_contact`** — `p·relu(min_force − ‖f‖)²`, a weak nudge that contact
+should carry at least a little force. We ship it **disabled** (weight 0.0), and
+the reason is a genuine trap worth recording: the force head is zero-init, and
+this term's gradient at `f = 0` is exactly zero (the softened magnitude
+`√(‖f‖²+ε)` has vanishing derivative there). It cannot lift the head off zero;
+it can only shape predictions that are already nonzero. It sat in early configs
+looking useful and doing nothing.
+
+**`force_smooth`, `force_l2`, `torque_l2`, `torque_smooth`** — small
+regularisers: forces should change smoothly over time, shouldn't be huge, and
+the implied joint torques shouldn't be huge either. In the current config these
+are deliberately light (0.02 / 0.001 / 0.001 / 0), an order of magnitude below
+the first run — we measured that they were *not* the cause of the collapse
+(they were 30–1000× smaller than the residual term), but there is no reason to
+let a magnitude prior argue with the physics.
+
+## How training runs
+
+Two regimes exist:
+
+- **Regime (a), warm-start — the one we use.** Load the contact branch
+  (including its temporal module) from a trained contact checkpoint, freeze it
+  (`train.freeze_contact: true`), and train only the force branch. Contact
+  quality is exactly the source checkpoint's, guaranteed untouched, and the
+  gradient isolation is exact: the physics loss consumes pose, cameras, and
+  contact probabilities all detached, so gradients flow into force parameters
+  only.
+- **Regime (b), scratch** — train contact and force together. This works, but
+  with a documented wrinkle: force tokens are allowed to attend contact tokens,
+  so physics gradients can leak into the trainable contact head through that
+  attention path. The trainer prints a loud warning; a detach-fix inside the
+  vendored attention is deferred. All shipped force runs use regime (a).
+
+The warm-start source deserves a note, because we measured our way out of a
+wrong assumption here. The natural choice was the best temporal contact
+checkpoint, but temporal checkpoints were trained at T=5, and the physics needs
+T=16. Does a T=5-trained temporal module survive T=16 inference? It depends
+which one: `climb4_t5` (trained to predict all frames) is nearly a passthrough
+and holds F1 0.888 at T=16/stride 2 (vs 0.897 native); `climb4_t5mid` (trained
+to predict the centre frame) genuinely uses its temporal context and
+**collapses to F1 0.70** outside its training window. So the current config
+warm-starts from `climb4_t5` and pins the temporal architecture to byte-match
+the source; the checkpoint loader hard-fails on any architecture mismatch
+rather than silently reinitialising.
+
+Other training mechanics worth knowing: the gradient clip is 5.0 (raised from
+1.0 — see the collapse story below) and the raw pre-clip norm is logged every
+step; a non-finite raw norm raises immediately instead of being masked by the
+clip. Checkpoints of regime-(a) runs are **self-contained**: they store the
+frozen warm-started contact tensors alongside the trainable force tensors, so
+evaluation, demo, and resume reconstruct the exact deployed model from the one
+file. (The first implementation saved only trainable parameters, which meant
+every downstream consumer silently ran with a randomly initialised contact
+branch — test F1 0.15 instead of 0.889. Legacy force-only checkpoints
+auto-recover their contact weights from the config's `init_contact_checkpoint`.)
+The monitored metric is `test/physics_residual` — the raw residual, minimised.
+
+## Why the forces kept converging to "always up"
+
+This is the most instructive part of the project so far, so it gets its own
+section. The first force run (T=8) converged to a near-constant answer: about
+one body weight, pointing up, spread across the limbs — roughly the same on
+every frame, with almost no dependence on the image. Understanding why turned
+out to be a lesson in what the physics objective can and cannot see.
+
+**The residual mostly constrains the *sum* of the forces.** Split the root
+wrench into its force part and its torque part. The force part is just
+Newton: the sum of all external forces must equal mass × acceleration minus
+gravity. Climbing is quasi-static — accelerations are small — so on almost
+every frame this says "the four forces must add up to ≈ 1 body weight, up".
+Notice what it does *not* say: nothing about which limb carries the load. A
+constant prediction of ¼ body weight up on every limb satisfies the force part
+of the residual on nearly every frame *without ever looking at the image*.
+That is exactly the solution the run found; it is not a bug in optimisation,
+it is a real, deep minimum of that part of the objective. And it answers the
+"why up?" question directly: gravity is the dominant term in the books the
+forces must balance, so the cheapest input-independent answer is the one that
+cancels gravity — up.
+
+**Allocation lives in the torque part, and the torque part is weak.** What
+distinguishes "load on the left hand" from "load on the right foot" is the
+lever arm: the same force at different application points produces different
+torques about the root. So the per-limb information is there — but only in the
+torque residual, and on our data the torque part is ~23× smaller than the
+force part (median 0.033 vs 0.74 in the units of the loss). The one signal
+that could break the symmetry is a whisper next to the force-sum's shout.
+
+**Even in principle, one frame does not pin down four forces.** The root
+wrench is 6 numbers; four unknown 3D forces are 12. With two limbs in contact
+the reachable wrench space has rank ≤ 5. The problem is underdetermined
+frame-by-frame, and the soft contact gate does not change that (a probability
+reweights a penalty; it does not remove unknowns). Disambiguation has to come
+from accumulating many frames, the noncontact gate, and temporal smoothness —
+which makes it doubly important that the weak allocation signal survives
+optimisation.
+
+**Noise and clipping finished the job.** The supervision is heavy-tailed: a
+handful of clips with bad reconstruction produce residuals in the tens to
+hundreds against a median near 1. Under squared error those clips dominated
+whole batches. Meanwhile the raw gradient norm ran at 15–28 against a clip
+threshold of 1.0 — meaning *every* step was clipped ~20×, and the update
+direction was effectively "whatever the heavy tail says", drowning the subtle
+torque signal entirely. The regularisers, which we initially suspected of
+selecting the low-variance constant solution, were measured to be irrelevant
+(30–1000× smaller than the residual); the story was force-sum dominance plus
+tail noise plus over-clipping.
+
+**What we changed.** Each diagnosis got a counter: pseudo-Huber tames the
+tails; T=16/stride-2 gives 5× more residual frames per clip and ~4× less
+differencing noise (raising the SNR of the torque whisper); the camera-jerk
+filter removes the worst supervision outright; the clip moved to 5.0 with the
+raw norm logged so silent 20× clipping can never happen unnoticed; the
+noncontact gate was doubled (it is the strongest allocation signal we control);
+and the regularisers were lightened so nothing argues with physics. Just as
+important, we built the test that makes collapse *visible*: the root wrench is
+affine in the predicted forces, so the evaluator computes, in closed form, the
+best possible **constant** force solution and the residual of the network's
+own predictions **shuffled across clips**. An input-dependent model must beat
+both. The collapsed T=8 model, re-scored under the new protocol, loses to the
+fitted constant (0.285 vs 0.271) — it was worse than not looking at the input.
+The redesigned run passes at epoch 2: network 0.266 < constant 0.271 <
+shuffled 0.299, with per-limb correlation between force magnitude and contact
+probability of 0.27–0.52 (previously ≈ 0 for the feet) and contact F1 intact.
+
+**What still points up, and why that is partly correct.** Even in the
+redesigned run, limbs the model believes are airborne still carry ~0.2 body
+weight of mostly-upward force at epoch 2. Some of this is simply an
+unconverged model — the run was stopped early, the residual was still
+descending, and the noncontact gate grinds those forces down over epochs. But
+part of the upward bias is honest physics: the *sum* genuinely must be one
+body weight up, and until the torque signal has fully allocated the load, the
+optimiser hedges by spreading the mandatory total across limbs it is unsure
+about. Watching the free-limb magnitude fall while the residual and the
+affine margins improve is exactly the signature of the allocation being
+learned; watching it plateau would mean the torque signal is still too weak,
+and the next levers would be a stronger gate, longer clips, or better
+reconstructions.
+
+## How we evaluate
+
+`scripts/evaluate.py`, on runs with the force branch enabled, reports alongside
+the usual contact metrics:
+
+- the **raw physics residual** (the headline and monitor, robustifier-independent);
+- the **affine input-dependence baselines** described above — zero forces,
+  best-fitted constant, the network, and clip-shuffled network predictions,
+  each with mean and tail quantiles, plus an explicit PASS/FAIL line ("network
+  beats constant AND shuffled");
+- the **vertical force sum** (should sit near 1 body weight for quasi-static
+  climbing; 0.886 at epoch 2);
+- **gate-violation rates** (mean force on predicted-noncontact limbs, and the
+  fraction of predicted contacts carrying less than the minimum force);
+- per-extremity force magnitudes split by predicted contact state, in body
+  weights and newtons;
+- the residual saturation fraction (how often components exceed the
+  pseudo-Huber δ) and the number of jerk-excluded clips.
+
+For qualitative checks, `scripts/render_climbing_video_contacts.py` renders
+test videos with contact disks (inner = label, outer ring = prediction) and
+**force arrows**: the predicted 3D force is treated as a metric segment (1 m
+per body weight) at the extremity's camera-frame position and
+perspective-projected through the dataset's per-frame intrinsics, so on-image
+direction and foreshortening are the real camera's. `scripts/demo_climbing_videos.py`
+draws force arrows on still panels too (via the model's own intrinsics, with
+screen-space length — a simpler scheme than the video renderer's).
+
+## Assumptions and known limitations
+
+- **Gravity = the first camera's down-axis.** We assume the camera is level at
+  scene start; an initial tilt biases the residual (camera *motion* is
+  compensated, initial *orientation* is trusted). The direction is stored in
+  the data (`gravity_world`), so a better upstream estimate can replace it
+  without code changes.
+- **Reconstruction quality is the real supervision quality.** Extrinsics
+  drift and scale error feed straight into fake accelerations. The jerk filter
+  removes the catastrophic cases; per-scene residual monitoring is the tool
+  for the rest.
+- **Uniform body density** (1000 kg/m³; LOD-1 neutral mass ≈ 81.5 kg), with
+  inertias recomputed from the predicted shape.
+- **Forces at joint origins, no contact moments.** Palm/sole offsets and grip
+  torques are unmodelled (`r×f` error), accepted for v1.
+- **Stable-contact labels ≠ instantaneous load.** This is why the gate uses
+  predicted probabilities; the mismatch is inherited and documented.
+- **Regime (b) gradient leak** through force→contact attention (warned at
+  runtime, fix deferred). Regime (a) is exact.
+- **Performance**: the adapter builds the shaped body twice per call and FK is
+  kernel-launch-bound; known, measured, deliberately un-optimised until it
+  actually hurts.
+- **Checkpoint signature omits temporal dropout** (every shipped artifact uses
+  0.0; adding the key now would orphan existing checkpoints — to be absorbed
+  at the next signature-version bump).
 
 ## Pointers
 
-- Code: `contact/physics/adapter.py` (SAM↔BetterHuman bridge),
-  `contact/physics/loss.py` (objective + `diagnostics` for eval),
+- Code: `contact/physics/adapter.py` (SAM ↔ BetterHuman bridge),
+  `contact/physics/loss.py` (objective + diagnostics + affine baselines),
   `sam_3d_body/models/heads/force_head.py`.
-- Configs: `configs/climbing_videos_force_warmstart.yaml` (regime a: warm-start,
-  contact frozen, force-only), `configs/climbing_videos_force_scratch.yaml`
-  (regime b: contact + force jointly), `_temporal` variants; defaults in
-  `configs/base.yaml` (`physics:`, `model.force_head`, `model.force_temporal`).
-- Design record: `plan/README.md` (decisions D1–D13, risks R1–R9), `plan/for_agents/`.
+- Configs: `configs/climbing_videos_force_warmstart_t16.yaml` (the current,
+  redesigned run — heavily annotated), `configs/climbing_videos_force_warmstart.yaml`
+  (regime a base), `configs/climbing_videos_force_scratch.yaml` (regime b);
+  defaults in `configs/base.yaml`.
+- Design record with the original decision/risk register: `plan/README.md`
+  and `plan/for_agents/`.

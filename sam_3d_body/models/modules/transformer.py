@@ -592,12 +592,16 @@ class TransformerDecoderLayer(nn.Module):
         x_pe: Optional[torch.Tensor] = None,
         context_pe: Optional[torch.Tensor] = None,
         x_mask: Optional[torch.Tensor] = None,
+        x_context_gate: Optional[torch.Tensor] = None,
     ):
         """
         Args:
             x: shape [B, N, C]
             context: shape [B, N, C]
             x_mask: shape [B, N]
+            x_context_gate: shape [1|B, N, 1], optional per-token multiplier on
+                the cross-attention output. Used to make selected tokens blind to
+                the image without a fully-masked (NaN-producing) attention row.
         """
         if self.repeat_pe and context_pe is not None:
             # LaPE: https://openaccess.thecvf.com/content/ICCV2023/papers/Yu_LaPE_Layer-adaptive_Position_Embedding_for_Vision_Transformers_with_Independent_Layer_ICCV_2023_paper.pdf
@@ -634,7 +638,10 @@ class TransformerDecoderLayer(nn.Module):
         else:
             q = self.ln2_1(x)
             k = v = self.ln2_2(context)
-        x = x + self.cross_attn(q=q, k=k, v=v)
+        cross = self.cross_attn(q=q, k=k, v=v)
+        if x_context_gate is not None:
+            cross = cross * x_context_gate
+        x = x + cross
 
         # MLP block
         x = self.ffn(self.ln3(x), identity=x)

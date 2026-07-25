@@ -1,0 +1,15 @@
+# Ablation of climb4_t5mid_v2: identical recipe, but the contact tokens are
+# BLIND to the image. Both image paths are cut — the decoder's image
+# cross-attention is gated off for the contact-token rows, and the
+# keypoint-anchored update (5x5 grid-sampled features + the 2D keypoint posemb)
+# never runs. The four tokens are then pure learned queries whose only input is
+# self-attention over the frozen SAM-3D-Body tokens, so whatever F1 this reaches
+# is what the pose/keypoint representation alone carries about contact.
+base: configs/climbing_videos_joint_temporal_center_v2.yaml
+
+model:
+  contact_head:
+    blind_to_image: true
+
+output:
+  exp_name: climb4_t5mid_blind

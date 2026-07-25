@@ -1,0 +1,12 @@
+# Retrain of climb4_t5mid on the re-exported ClimbingVideos_v1 (dataset schema
+# v3: improved auto contacts + confidence, cameras restored). Model, data and
+# optimiser recipe are byte-identical to the original run — only the length
+# changes: 17 epochs x 893 steps = 15,181 steps, so the cosine schedule
+# completes at the ~15k-step budget instead of running to 20 epochs (17,860).
+base: configs/climbing_videos_joint_temporal_center.yaml
+
+optim:
+  epochs: 17
+
+output:
+  exp_name: climb4_t5mid_v2

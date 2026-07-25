@@ -66,6 +66,7 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
     ch.DROPOUT                 = float(chead["dropout"])
     ch.GRID_SIZE               = int(chead["grid_size"])
     ch.GRID_RADIUS             = float(chead["grid_radius"])
+    ch.BLIND_TO_IMAGE          = bool(chead["blind_to_image"])
     ch.TARGETS = CfgNode({name.upper(): int(dim) for name, dim in out_dims.items()})
 
     # Temporal module (Phase 3). Patched even when disabled so the model config
@@ -82,6 +83,8 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
         "CAUSAL": bool(tcfg.get("causal", False)),
         "DROPOUT": float(tcfg.get("dropout", 0.0)),
         "POSITION_SCALE": float(tcfg.get("position_scale", 1.0)),
+        # None or odd int >= 3; kept as-is (an inference attention-window choice).
+        "WINDOW_FRAMES": tcfg.get("window_frames", None),
     })
 
     # Force head + tokens (steps 04+). Patched even when disabled so the model

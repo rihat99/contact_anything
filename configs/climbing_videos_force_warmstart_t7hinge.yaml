@@ -1,0 +1,27 @@
+# Regime (a) force run #4 — t7hinge. Successor to climbing_videos_force_warmstart_t7mid
+# (stopped at epoch 11: monitored test residual stuck at 1.479 since epoch 1, and the
+# rendered forces showed the measured ridge equilibrium — ‖f‖ smoothly increasing with
+# p (corr 0.72), free limbs holding ~0.1 bw, 100% of label-free limb-frames > 0.05 bw.
+# The soft (1−p)·‖f‖² tax shrinks force everywhere but its quadratic well always
+# balances the residual pull at a nonzero magnitude; it cannot produce zeros).
+# One deliberate change vs t7mid: the non-contact penalty becomes a hinge-gated L1.
+#   kind: hinge_l1 — penalise ‖f‖ (not ‖f‖²): the constant slope at ‖f‖ → 0 creates a
+#     dead zone, so a free limb's exact-zero force is a stationary point whenever the
+#     penalty slope exceeds the residual pull.
+#   p_lo 0.2 / p_hi 0.5 — full penalty at p <= 0.2, none at p >= 0.5: decouples
+#     "kill force on confidently-free limbs" from "don't tax contact limbs" (t5mid's
+#     probs average 0.31 on label-free limb-frames and 0.67 on label-contact; the
+#     soft (1−p) weight taxed both).
+#   weight 10 -> 25 — dead-zone condition per limb is (w/4)·hinge(p) > residual pull
+#     (force part ≤ δ_f = 1, measured ≈ 0.45; typical torque-part pull ≈ 1–2 after the
+#     ×20 weight). w = 25 gives slope 6.25 at full gate and ~3 at mid-ramp (p ≈ 0.35),
+#     dominant with margin; the contact head stays frozen, so p is stationary.
+base: configs/climbing_videos_force_warmstart_t7mid.yaml
+
+physics:
+  loss:
+    force_noncontact: 25.0
+    noncontact_gate: {kind: hinge_l1, p_lo: 0.2, p_hi: 0.5}
+
+output:
+  exp_name: climb4_force_t7hinge

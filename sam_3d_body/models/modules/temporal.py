@@ -157,6 +157,12 @@ class ContactTemporalModule(nn.Module):
         image placement uses the same width for its image-feature bottleneck.
     :param position_scale: multiplier applied to elapsed-second timestamps before
         sinusoidal encoding. ``30`` turns 30-fps timestamps into frame offsets.
+    :param window_frames: optional odd ``>= 3`` centered attention window. When set
+        and a clip is longer, :meth:`forward` attends only the central
+        ``window_frames`` frames (positions re-zeroed to the window start), letting
+        a checkpoint trained at ``T = window_frames`` run inside a longer clip while
+        seeing exactly its native window. ``None`` disables windowing (attend the
+        whole clip). Unsupported with ``pre_decoder`` (:meth:`forward_image`).
     """
 
     def __init__(
@@ -172,17 +178,27 @@ class ContactTemporalModule(nn.Module):
         image_dim: Optional[int] = None,
         bottleneck_dim: Optional[int] = None,
         position_scale: float = 1.0,
+        window_frames: Optional[int] = None,
     ):
         super().__init__()
         if attend not in ("joint", "per_token"):
             raise ValueError(f"attend must be 'joint' or 'per_token'; got {attend!r}")
         if placement not in ("post_decoder", "between_layers", "pre_decoder"):
             raise ValueError(f"unknown temporal placement {placement!r}")
+        if window_frames is not None:
+            if int(window_frames) < 3 or int(window_frames) % 2 == 0:
+                raise ValueError(
+                    f"window_frames must be an odd int >= 3; got {window_frames}")
+            if placement == "pre_decoder":
+                raise ValueError(
+                    "window_frames is unsupported with placement='pre_decoder' "
+                    "(forward_image has no windowing path)")
 
         self.dim = dim
         self.attend = attend
         self.causal = bool(causal)
         self.placement = placement
+        self.window_frames = None if window_frames is None else int(window_frames)
         self.position_scale = float(position_scale)
         if not math.isfinite(self.position_scale) or self.position_scale <= 0:
             raise ValueError("position_scale must be finite and positive")
@@ -308,6 +324,40 @@ class ContactTemporalModule(nn.Module):
             raise AssertionError(
                 f"batch {b_flat} not divisible by seq_len {seq_len}")
         n_clips = b_flat // seq_len
+
+        # --- centered attention window (e.g. a T=5-native checkpoint in T=7) ---
+        # Attend only the central window; frames outside pass through unchanged.
+        if self.window_frames is not None and seq_len > self.window_frames:
+            w = self.window_frames
+            if (seq_len - w) % 2 != 0:
+                raise AssertionError(
+                    f"window_frames {w} must be exactly centered in seq_len "
+                    f"{seq_len} (seq_len - window_frames must be even)")
+            lo = (seq_len - w) // 2
+            clips = tokens.reshape(n_clips, seq_len, K, input_dim)
+            win_tokens = clips[:, lo:lo + w].reshape(n_clips * w, K, input_dim)
+            if frame_pos_sec is not None:
+                pos = frame_pos_sec.view(n_clips, seq_len)[:, lo:lo + w]
+                # Re-zero to the window's first frame: frame_pos_sec is elapsed
+                # seconds from the clip's first frame, but the windowed weights
+                # were trained on windows starting at zero.
+                win_pos = (pos - pos[:, :1]).reshape(n_clips * w)
+            else:
+                win_pos = None
+            if frame_valid is not None:
+                win_valid = frame_valid.view(n_clips, seq_len)[:, lo:lo + w].reshape(
+                    n_clips * w)
+            else:
+                win_valid = None
+            # Recurse: window == seq_len inside, so this branch is inert there.
+            win_out = self.forward(
+                win_tokens, w, win_pos, win_valid, attend=attend, causal=causal
+            ).reshape(n_clips, w, K, input_dim)
+            return torch.cat(
+                [clips[:, :lo], win_out, clips[:, lo + w:]], dim=1
+            ).reshape(b_flat, K, input_dim)
+        # --- end centered attention window ---
+
         residual = tokens
         working = self.token_in_proj(tokens) if hasattr(self, "token_in_proj") else tokens
         C = working.shape[-1]

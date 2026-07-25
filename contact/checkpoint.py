@@ -85,7 +85,10 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
     Known, deliberate gap: the ``temporal``/``force_temporal`` sub-signatures omit
     ``dropout``. Every shipped artifact uses ``0.0``, and adding the key now would
     orphan existing checkpoints whose stored signatures lack it (their comparison
-    would spuriously mismatch). Absorb it at the next signature-version bump.
+    would spuriously mismatch). Absorb it at the next signature-version bump. The
+    ``temporal`` sub-signature also omits ``window_frames`` on purpose: it is an
+    inference attention-window choice (like ``frames_per_clip``), not a weight-shape
+    or head-semantic key, so a windowed run must load its non-windowed checkpoint.
     """
     if config is None:
         return None
