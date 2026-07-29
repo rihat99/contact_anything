@@ -208,7 +208,7 @@ DEFAULTS: dict[str, Any] = {
     },
 }
 
-_KNOWN_DATASETS = frozenset({"damon", "climbing", "climbing_videos", "climbing_corpus"})
+_KNOWN_DATASETS = frozenset({"damon", "climbing", "climbing_corpus"})
 _KNOWN_TARGETS = frozenset({"vertex", "joint"})
 _TEMPORAL_PLACEMENTS = frozenset({"post_decoder", "between_layers", "pre_decoder"})
 _TEMPORAL_ATTEND = frozenset({"joint", "per_token"})
@@ -404,11 +404,10 @@ def _validate_physics(cfg: dict, force_head: dict) -> None:
             "physics.enabled requires model.force_head.frame 'local_world_aligned' "
             "or 'local' — the physics loss rotates predictions into the world "
             "through the camera extrinsics, which the 'root' frame does not use")
-    if not any(entry["name"] in ("climbing_videos", "climbing_corpus")
-               for entry in cfg["data"]["datasets"]):
+    if not any(entry["name"] == "climbing_corpus" for entry in cfg["data"]["datasets"]):
         raise ValueError(
-            "physics.enabled requires a video dataset (climbing_videos or "
-            "climbing_corpus) in data.datasets")
+            "physics.enabled requires a climbing_corpus dataset in data.datasets "
+            "(per-frame extrinsics + gravity come from the corpus loader)")
     frames_per_clip = int(cfg["data"]["sequence"]["frames_per_clip"])
     if frames_per_clip < min_frames:
         raise ValueError(
@@ -611,6 +610,11 @@ def _validate_semantics(cfg: dict) -> None:
     for entry in cfg["data"]["datasets"]:
         if not isinstance(entry, dict) or "name" not in entry or "config" not in entry:
             raise ValueError(f"each data.datasets entry needs 'name' and 'config'; got {entry!r}")
+        if entry["name"] == "climbing_videos":
+            raise ValueError(
+                "dataset 'climbing_videos' (the exported ClimbingVideos_v1 loader) is "
+                "legacy — train on 'climbing_corpus' (configs/datasets/climbing_corpus.yaml) "
+                "instead; the retired loader lives in legacy/climbing_videos.py")
         if entry["name"] not in _KNOWN_DATASETS:
             raise ValueError(
                 f"unknown dataset {entry['name']!r}; choose from {sorted(_KNOWN_DATASETS)}")
@@ -623,11 +627,11 @@ def _validate_semantics(cfg: dict) -> None:
         raise ValueError("data.eval_split must be 'val' or 'test'")
     if eval_split == "test" and (
         len(cfg["data"]["datasets"]) != 1
-        or cfg["data"]["datasets"][0]["name"] not in ("climbing_videos", "climbing_corpus")
+        or cfg["data"]["datasets"][0]["name"] != "climbing_corpus"
     ):
         raise ValueError(
-            "data.eval_split='test' requires a single climbing_videos or "
-            "climbing_corpus dataset (the manually annotated test split)")
+            "data.eval_split='test' requires a single climbing_corpus dataset "
+            "(the manually annotated test split)")
 
     tb_metrics = cfg["logging"]["tensorboard_metrics"]
     if tb_metrics is not None and (

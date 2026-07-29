@@ -768,7 +768,7 @@ def test_physics_config_validation():
                      "contact_min_bw": 0.05, "force_smooth": 0.1, "force_l2": 0.01,
                      "torque_l2": 0.01, "torque_smooth": 0.0},
         },
-        "data": {"datasets": [{"name": "climbing_videos", "config": "x"}],
+        "data": {"datasets": [{"name": "climbing_corpus", "config": "x"}],
                  "sequence": {"frames_per_clip": 8}},
     }
     _validate_physics(base, force_off)                       # disabled: only leaf sanity
@@ -782,7 +782,7 @@ def test_physics_config_validation():
 
     no_video = copy.deepcopy(enabled)
     no_video["data"]["datasets"] = [{"name": "damon", "config": "x"}]
-    with pytest.raises(ValueError, match="climbing_videos"):
+    with pytest.raises(ValueError, match="climbing_corpus"):
         _validate_physics(no_video, force_on)
 
     short = copy.deepcopy(enabled)

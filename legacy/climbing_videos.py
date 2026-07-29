@@ -40,7 +40,9 @@ import yaml
 from PIL import Image
 from torch.utils.data import Dataset
 
-from ..targets import ALWAYS_NON_CONTACT_8, NUM_BODY_22, OBSERVABLE_14
+# Absolute import (was ``from ..targets import ...``): this module now lives
+# in legacy/, importable as ``legacy.climbing_videos`` (used by viewer/).
+from contact.targets import ALWAYS_NON_CONTACT_8, NUM_BODY_22, OBSERVABLE_14
 
 DEFAULT_ROOT = "/data3/rikhat.akizhanov/datasets/ClimbingVideos_v1"
 

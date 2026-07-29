@@ -94,7 +94,7 @@ data:
   sequence: {frames_per_clip: 8, frame_stride: 2, jitter: true, target_frame: all}
 
 physics:                              # Step 06: RNEA root-wrench physics loss on the forces
-  enabled: false                      # requires force_head.enabled + a climbing_videos/corpus dataset
+  enabled: false                      # requires force_head.enabled + a climbing_corpus dataset
   use_warp: false                     # opt into BetterRobot's fused CUDA FK/RNEA lanes
   model_path: null                    # null -> $BETTERHUMAN_MODELS_DIR then sibling BetterHuman
   lod: 1                              # MHR level of detail (1 matches SAM-3D-Body)

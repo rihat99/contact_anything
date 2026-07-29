@@ -220,7 +220,7 @@ def _metrics(pred, gt):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--checkpoint", required=True, help="trained contact .pth")
-    ap.add_argument("--config", type=Path, default=REPO / "configs" / "climbing_baseline.yaml",
+    ap.add_argument("--config", type=Path, required=True,
                     help="config to build the (shared) model architecture from")
     ap.add_argument("--num_samples", type=int, default=12)
     ap.add_argument("--split", default="val", choices=["val", "train"])

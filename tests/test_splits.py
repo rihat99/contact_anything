@@ -11,7 +11,8 @@ from contact.data.splits import (
     video_id_from_scene,
 )
 
-_VIDEO_ROOT = Path("/data3/rikhat.akizhanov/datasets/ClimbingVideos_v1")
+_CORPUS_ROOT = Path("/data3/rikhat.akizhanov/better/data/ClimbingVideos")
+_HAS_CORPUS = (_CORPUS_ROOT / "scenes" / "scenes.db").is_file()
 
 
 def test_video_id_strips_only_chunk_suffix():
@@ -55,10 +56,10 @@ def test_stills_split_deterministic_and_partition():
     assert set(train).isdisjoint(val)
 
 
-@pytest.mark.skipif(not _VIDEO_ROOT.exists(), reason="ClimbingVideos_v1 not present")
+@pytest.mark.skipif(not _HAS_CORPUS, reason="ClimbingVideos corpus not present")
 def test_video_group_split_no_video_crosses():
-    from contact.data.climbing_videos import list_scenes
-    scenes = list_scenes(_VIDEO_ROOT, "train")
+    from contact.data.climbing_corpus import list_corpus_scenes
+    scenes = list_corpus_scenes(_CORPUS_ROOT, "train")
     vids = [video_id_from_scene(s) for s in scenes]
     train, val = group_train_val_split(vids, 0.15, 42)
     train_scene_vids = {video_id_from_scene(s) for s in scenes if video_id_from_scene(s) in train}
@@ -66,16 +67,17 @@ def test_video_group_split_no_video_crosses():
     assert train_scene_vids.isdisjoint(val_scene_vids)
 
 
-@pytest.mark.skipif(not _VIDEO_ROOT.exists(), reason="ClimbingVideos_v1 not present")
+@pytest.mark.skipif(not _HAS_CORPUS, reason="ClimbingVideos corpus not present")
 def test_stateless_jitter_reproducible_across_fresh_instances():
     # Two *independent* dataset instances (a resume) must pick identical windows
     # for the same (seed, epoch) — the jitter must not depend on process state.
-    from contact.data.climbing_videos import ClimbingVideosDataset, list_scenes
-    scenes = list_scenes(_VIDEO_ROOT, "train")[:6]
+    from contact.data.climbing_corpus import ClimbingCorpusDataset, list_corpus_scenes
+    scenes = list_corpus_scenes(_CORPUS_ROOT, "train")[:6]
 
     def keys_for_epoch(epoch):
-        ds = ClimbingVideosDataset(_VIDEO_ROOT, scenes=scenes, mode="train",
-                                   frames_per_clip=8, frame_stride=2, jitter=True, seed=42)
+        ds = ClimbingCorpusDataset(_CORPUS_ROOT, scenes=scenes, split="train",
+                                   frames_per_clip=8, frame_stride=2, jitter=True,
+                                   seed=42, load_images=False)
         ds.set_epoch(epoch)
         return [ds[i][0]["key"] for i in range(min(len(ds), 12))]
 
@@ -83,12 +85,12 @@ def test_stateless_jitter_reproducible_across_fresh_instances():
     assert keys_for_epoch(0) != keys_for_epoch(1)        # epoch actually re-jitters
 
 
-@pytest.mark.skipif(not _VIDEO_ROOT.exists(), reason="ClimbingVideos_v1 not present")
+@pytest.mark.skipif(not _HAS_CORPUS, reason="ClimbingVideos corpus not present")
 def test_val_windows_are_deterministic_sliding():
-    from contact.data.climbing_videos import ClimbingVideosDataset, list_scenes
-    scenes = list_scenes(_VIDEO_ROOT, "train")[:6]
-    ds = ClimbingVideosDataset(_VIDEO_ROOT, scenes=scenes, mode="val",
-                               frames_per_clip=8, frame_stride=2)
+    from contact.data.climbing_corpus import ClimbingCorpusDataset, list_corpus_scenes
+    scenes = list_corpus_scenes(_CORPUS_ROOT, "train")[:6]
+    ds = ClimbingCorpusDataset(_CORPUS_ROOT, scenes=scenes, split="val",
+                               frames_per_clip=8, frame_stride=2, load_images=False)
     ds.set_epoch(0)
     first = [ds[i][0]["key"] for i in range(min(len(ds), 12))]
     ds.set_epoch(5)                                      # epoch must not move val windows

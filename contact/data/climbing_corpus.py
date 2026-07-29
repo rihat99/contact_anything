@@ -1,8 +1,8 @@
 """ClimbingVideos corpus — per-joint contact (+ GT force) clips read from ``features/``.
 
 Training-time replacement for the exported ClimbingVideos_v1 loader
-(:class:`~contact.data.climbing_videos.ClimbingVideosDataset`): reads the raw
-pipeline corpus at ``/data3/rikhat.akizhanov/better/data/ClimbingVideos``
+(``ClimbingVideosDataset``, retired to ``legacy/climbing_videos.py``): reads the
+raw pipeline corpus at ``/data3/rikhat.akizhanov/better/data/ClimbingVideos``
 directly — ``scenes/scenes.db`` (scene selection + train/test split),
 ``features/human_optim/<shard>/<scene>/contacts_<level>.npz`` (52-joint labels,
 folded to the 22 SMPL-X body joints exactly as the v1 exporter did),
@@ -272,10 +272,10 @@ def _rows_by_object_id(
 class ClimbingCorpusDataset(Dataset):
     """Windowed per-joint contact (+ force) clips straight from the corpus.
 
-    Duck-types :class:`~contact.data.climbing_videos.ClimbingVideosDataset`
-    (``supervised_targets``/``topology``/``name``/``set_epoch``, list-of-frame-
-    dict clips, ``_scenes``/``_items`` internals), so the existing collate and
-    sliding-window machinery run unchanged.
+    Duck-types the retired v1 ``ClimbingVideosDataset`` (``legacy/
+    climbing_videos.py``: ``supervised_targets``/``topology``/``name``/
+    ``set_epoch``, list-of-frame-dict clips, ``_scenes``/``_items`` internals),
+    so the existing collate and sliding-window machinery run unchanged.
 
     :param corpus_root: corpus root containing ``scenes/``, ``features/``, ``frames/``.
     :param scenes: explicit scene ids; ``None`` discovers them from the DB and,

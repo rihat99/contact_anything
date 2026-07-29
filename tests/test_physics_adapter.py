@@ -148,20 +148,24 @@ def _requires_gpu_checkpoint(fn):
 
 
 def _real_clip_batch(seq_len: int, n_clips: int):
-    from contact.data.climbing_videos import DEFAULT_ROOT, ClimbingVideosDataset, list_scenes
+    from contact.data.climbing_corpus import (
+        DEFAULT_ROOT, ClimbingCorpusDataset, list_corpus_scenes)
     from contact.data.collate import batch_to_device, make_collate
     from contact.model import build_model
     from contact.targets import TargetSpec
 
-    scenes = list_scenes(DEFAULT_ROOT, "train")
+    try:
+        scenes = list_corpus_scenes(DEFAULT_ROOT, "train")
+    except FileNotFoundError:
+        scenes = []
     if not scenes:
-        pytest.skip("ClimbingVideos_v1 corpus unavailable")
+        pytest.skip("ClimbingVideos corpus unavailable")
     cfg = load_config(os.path.join(REPO, "configs", "climbing_videos_joint.yaml"))
     model, _ = build_model(cfg, "cuda")
     model.eval()
-    dataset = ClimbingVideosDataset(
-        root=DEFAULT_ROOT, scenes=scenes[:1], mode="val", split_dir="train",
-        frames_per_clip=seq_len, frame_stride=2, jitter=False, require_labels=True)
+    dataset = ClimbingCorpusDataset(
+        DEFAULT_ROOT, scenes=scenes[:1], split="val",
+        frames_per_clip=seq_len, frame_stride=2, jitter=False)
     if len(dataset) < n_clips:
         pytest.skip("scene too short for the requested clip batch")
     collate = make_collate(tuple(model.cfg.MODEL.IMAGE_SIZE), TargetSpec.from_config(cfg))

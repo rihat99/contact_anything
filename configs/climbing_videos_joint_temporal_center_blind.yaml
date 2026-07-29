@@ -5,11 +5,79 @@
 # never runs. The four tokens are then pure learned queries whose only input is
 # self-attention over the frozen SAM-3D-Body tokens, so whatever F1 this reaches
 # is what the pose/keypoint representation alone carries about contact.
-base: configs/climbing_videos_joint_temporal_center_v2.yaml
+#
+# Self-contained override of base.yaml (flattened from the former include chain
+# climbing_videos_joint.yaml -> _joint_temporal.yaml -> _joint_temporal_center.yaml
+# -> _joint_temporal_center_v2.yaml, now in legacy/configs/ except the kept v2).
+# Inlined design rationale from that chain:
+# - Four-extremity contact — joint target only, vertex off. Per-frame training is
+#   confidence-weighted; each output has one dedicated contact token anchored to
+#   its predicted MHR70 wrist or ankle: left hand, right hand, left foot, right foot.
+# - Phase 3 temporal: the zero-gated lightweight ContactTemporalModule runs over
+#   T=5 contact-token clips after the decoder.
+# - Center supervision: non-causal T=5 — all five frames provide context, but only
+#   the middle frame contributes to the training loss, metrics, and test F1.
+# - v2 length: 17 epochs x 893 steps = 15,181 steps (cosine completes at ~15k).
+base: configs/base.yaml
 
 model:
+  init_contact_checkpoint: null       # train the complete contact stack from scratch
+  temporal:
+    enabled: true
+    placement: post_decoder
+    bottleneck_dim: 256
+    num_layers: 1
+    num_heads: 4
+    mlp_ratio: 2.0
+    attend: per_token                 # each limb mixes only with itself through time
+    causal: false
+    position_scale: 30.0              # 30-fps seconds -> well-separated frame offsets
   contact_head:
+    contact_keypoint_indices: [62, 41, 13, 14]
+    num_global_tokens: 0
+    pool_mode: per_token
     blind_to_image: true
+
+contact:
+  primary_target: joint
+  targets:
+    vertex: {enabled: false}
+    joint:
+      enabled: true
+      joint_set: extremities_4        # left/right hand, then left/right foot (ankle OR foot)
+      supervise_subset: null
+      use_confidence_weights: true    # low-certainty labels have proportionally less influence
+      loss: {focal_alpha: 0.60, focal_gamma: 2.0, focal_weight: 5.0,
+             dice_weight: 0.0, sparsity_weight: 0.0}
+
+data:
+  eval_split: test                    # train on all generated labels; evaluate on manual labels
+  frames_per_batch: 60                # 12 clips/GPU; global batch = 120 frames on two GPUs
+  sequence: {frames_per_clip: 5, frame_stride: 1, jitter: true, target_frame: center}
+  # Retargeted from the exported ClimbingVideos_v1 to the corpus-direct loader
+  # (v1 is legacy): labels = corpus contacts_1 with the same 52->22 fold;
+  # gravity_world is now exactly [0, 1, 0] (the kindyn convention) instead of
+  # v1's camera-0 derivation; the grouped split derives from scenes/scenes.db
+  # but yields the same 331 train scenes.
+  datasets:
+    - {name: climbing_corpus, config: configs/datasets/climbing_corpus.yaml}
+
+optim:
+  lr: 3.75e-4                         # global-batch scaling from 4e-4 at 128 frames
+  epochs: 17
+
+logging:
+  wandb: {enabled: false}             # keep this training run and its metadata local
+  tensorboard_metrics:                # compact dashboard; detailed limb metrics stay internal
+    - train/loss
+    - train/lr
+    - train/grad_norm
+    - train/joint/f1
+    - test/loss
+    - test/joint/precision
+    - test/joint/recall
+    - test/joint/f1
 
 output:
   exp_name: climb4_t5mid_blind
+  monitor: test/joint_f1

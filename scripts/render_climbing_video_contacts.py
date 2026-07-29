@@ -48,10 +48,10 @@ sys.path.insert(0, str(REPO))
 
 from contact import checkpoint as ckpt_io
 from contact.config import load_config
-from contact.data.climbing_videos import (
-    ClimbingVideosDataset,
-    list_completed_test_scenes,
-    list_scenes,
+from contact.data.climbing_corpus import (
+    ClimbingCorpusDataset,
+    list_annotated_test_scenes,
+    list_corpus_scenes,
 )
 from contact.data.collate import batch_to_device, make_collate
 from contact.data.splits import video_id_from_scene
@@ -78,7 +78,7 @@ def _hex_to_bgr(color: str) -> tuple[int, int, int]:
 
 
 # One arrow colour per force output (left_hand, right_hand, left_foot, right_foot),
-# matching scripts/demo_climbing_videos.py::FORCE_COLORS (there in RGB hex).
+# matching legacy/demo_climbing_videos.py::FORCE_COLORS (there in RGB hex).
 FORCE_COLORS = ("#e0530f", "#f0a500", "#1c72d8", "#2fb3ad")
 FORCE_COLORS_BGR = tuple(_hex_to_bgr(color) for color in FORCE_COLORS)
 FORCE_METERS_PER_BW = 1.0       # 3D arrow length in metres per unit body weight of |f|
@@ -105,10 +105,11 @@ def select_random_scenes(
     return selected
 
 
-def _dataset_root(cfg: dict) -> str:
-    entry = next(d for d in cfg["data"]["datasets"] if d["name"] == "climbing_videos")
-    dataset_cfg = yaml.safe_load(Path(entry["config"]).read_text()) or {}
-    return str(dataset_cfg["data"]["root"])
+def _dataset_options(cfg: dict) -> tuple[str, int]:
+    """Corpus root + contact level from the run config's climbing_corpus entry."""
+    entry = next(d for d in cfg["data"]["datasets"] if d["name"] == "climbing_corpus")
+    dataset_cfg = (yaml.safe_load(Path(entry["config"]).read_text()) or {})["data"]
+    return str(dataset_cfg["root"]), int(dataset_cfg.get("contact_level", 1))
 
 
 def _emit_margin(seq_len: int) -> int:
@@ -207,7 +208,7 @@ def sliding_window_requests(
     return dict(requests)
 
 
-def _frame_index_map(ds: ClimbingVideosDataset, scene: str) -> dict[tuple[int, int], int]:
+def _frame_index_map(ds: ClimbingCorpusDataset, scene: str) -> dict[tuple[int, int], int]:
     """Map valid ``(person, frame_position)`` rows to the dataset's T=1 items."""
     result = {}
     for index, (item_scene, person, frame_position, _) in enumerate(ds._items):
@@ -245,7 +246,7 @@ def _scene_ground_truth(data: dict) -> tuple[np.ndarray, np.ndarray]:
 
 def _predict_requests(
     model,
-    ds: ClimbingVideosDataset,
+    ds: ClimbingCorpusDataset,
     scene: str,
     requests: list[tuple[int, tuple[int, ...], tuple[int, ...]]],
     seq_len: int,
@@ -317,7 +318,7 @@ def _predict_requests(
         if collect_force:
             batch_forces = output["force"]["joint_forces"].float().cpu().numpy()
             # Camera-frame 3D position of each anchor (keypoints_3d + cam translation),
-            # matching demo_climbing_videos._draw_force_arrows' ``point_cam``.
+            # matching legacy/demo_climbing_videos.py::_draw_force_arrows' ``point_cam``.
             batch_anchor_cam = (
                 output["mhr"]["pred_keypoints_3d"][:, anchor_indices]
                 + output["mhr"]["pred_cam_t"][:, None, :]
@@ -345,10 +346,11 @@ def _predict_scene(
     scene: str,
     batch_size: int,
     device: str,
-    split_dir: str = "test",
+    split: str = "test",
+    contact_level: int = 1,
     require_labels: bool = False,
     collect_force: bool = False,
-) -> tuple[ClimbingVideosDataset, np.ndarray, np.ndarray, dict[str, np.ndarray] | None]:
+) -> tuple[ClimbingCorpusDataset, np.ndarray, np.ndarray, dict[str, np.ndarray] | None]:
     """Return dataset, ``probs[P,N,4]``, keypoints ``[P,N,4,2]`` and force data.
 
     The item store is a per-frame (T=1) dataset; inference windows follow the
@@ -356,15 +358,15 @@ def _predict_scene(
     in which case it carries ``forces[P,N,4,3]`` and camera-frame anchor positions
     ``anchor_cam[P,N,4,3]`` for the force-arrow projection.
     """
-    ds = ClimbingVideosDataset(
-        root=root,
+    ds = ClimbingCorpusDataset(
+        root,
         scenes=[scene],
-        mode="val",
-        split_dir=split_dir,
+        split=split,
         frames_per_clip=1,
         frame_stride=1,
         jitter=False,
         seed=int(cfg["data"]["seed"]),
+        contact_level=contact_level,
         use_confidence_weights=False,
         require_labels=require_labels,
     )
@@ -513,7 +515,7 @@ def _draw_force_arrows(
 
 def _render_scene(
     scene: str,
-    ds: ClimbingVideosDataset,
+    ds: ClimbingCorpusDataset,
     probs: np.ndarray,
     points: np.ndarray,
     threshold: float,
@@ -523,7 +525,7 @@ def _render_scene(
     force_data: dict[str, np.ndarray] | None = None,
 ) -> dict:
     data = ds._scenes[scene]
-    frames_dir = data["dir"] / "frames"
+    frames_dir = data["frames_dir"]
     n_frames = len(data["frame_indices"])
     first = cv2.imread(str(frames_dir / "000000.jpg"), cv2.IMREAD_COLOR)
     if first is None:
@@ -631,11 +633,11 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = load_config(args.config)
-    root = _dataset_root(cfg)
+    root, contact_level = _dataset_options(cfg)
     scenes = (
-        list_completed_test_scenes(root)
+        list_annotated_test_scenes(root)
         if args.split == "test" and args.overlay_labels
-        else list_scenes(root, args.split)
+        else list_corpus_scenes(root, args.split)
     )
     selected = select_random_scenes(scenes, args.num_videos, args.seed)
     if len(selected) < args.num_videos:
@@ -649,7 +651,7 @@ def main() -> int:
     model.eval()
 
     # Draw force arrows only for a local_world_aligned force head; other frames
-    # need FK not run here (guarded like scripts/demo_climbing_videos.py).
+    # need FK not run here (guarded like legacy/demo_climbing_videos.py).
     force_enabled = bool(cfg["model"]["force_head"]["enabled"])
     force_frame = cfg["model"]["force_head"]["frame"] if force_enabled else None
     collect_force = force_enabled and force_frame == "local_world_aligned"
@@ -666,7 +668,8 @@ def main() -> int:
         print(f"[rank {rank}] [{index}/{len(selected)}] {video_id} -> {scene}")
         ds, probs, points, force_data = _predict_scene(
             model, cfg, root, scene, args.batch_size, device,
-            split_dir=args.split,
+            split=args.split,
+            contact_level=contact_level,
             require_labels=args.overlay_labels,
             collect_force=collect_force,
         )

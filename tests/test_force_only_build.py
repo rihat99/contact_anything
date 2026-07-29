@@ -141,7 +141,7 @@ def test_explicit_force_anchors_with_physics_rejected(tmp_path):
 physics: {enabled: true}
 data:
   datasets:
-    - {name: climbing_videos, config: configs/datasets/climbing_videos.yaml}
+    - {name: climbing_corpus, config: configs/datasets/climbing_corpus.yaml}
   sequence: {frames_per_clip: 8}
 """))
 

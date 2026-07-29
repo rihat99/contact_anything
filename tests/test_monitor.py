@@ -147,25 +147,6 @@ def test_resume_diff_normalizes_historical_physics_configs():
     assert any("physics" in d for d in tm._resume_config_diffs(changed, current))
 
 
-_COLLAPSED_CFG = REPO / "output" / "climb4_force_warmstart_t8_20260722_221755" / "config.yaml"
-
-
-@pytest.mark.skipif(not _COLLAPSED_CFG.exists(),
-                    reason="historical collapsed-run output not on this box")
-def test_resume_accepts_collapsed_t8_saved_config():
-    # The collapsed run's on-disk saved config (has physics but predates the new
-    # keys) vs today's resolution of the same experiment yaml: no identity diff.
-    import yaml
-
-    from contact.config import load_config
-
-    tm = _train_module()
-    saved = yaml.safe_load(_COLLAPSED_CFG.read_text())
-    current = load_config(
-        REPO / "configs" / "climbing_videos_force_warmstart_temporal.yaml")
-    assert tm._resume_config_diffs(saved, current) == []
-
-
 def test_ensure_resume_identity_shared_by_both_resume_paths():
     # The helper the explicit --resume PATH branch now calls (Trainer.__init__)
     # and the auto path already called: silent on identical, RuntimeError on diff.

@@ -44,12 +44,6 @@ output:
 
 
 def test_ported_baselines_keep_semantics():
-    damon = load_config(REPO / "configs" / "damon_baseline.yaml")
-    assert [d["name"] for d in damon["data"]["datasets"]] == ["damon"]
-    assert damon["contact"]["targets"]["vertex"]["enabled"] is True
-    assert damon["contact"]["targets"]["joint"]["enabled"] is False
-    assert damon["model"]["contact_head"]["pool_mode"] == "concat"
-
     joint = load_config(REPO / "configs" / "climbing_videos_joint.yaml")
     assert joint["contact"]["primary_target"] == "joint"
     assert joint["contact"]["targets"]["vertex"]["enabled"] is False
@@ -78,11 +72,12 @@ def test_ported_baselines_keep_semantics():
     assert joint["model"]["contact_head"]["contact_keypoint_indices"] == [62, 41, 13, 14]
     assert joint["model"]["contact_head"]["num_global_tokens"] == 0
     assert joint["model"]["contact_head"]["pool_mode"] == "per_token"
+    assert [d["name"] for d in joint["data"]["datasets"]] == ["climbing_corpus"]
     assert joint["output"]["exp_name"] == "climb4_frame"
     assert joint["output"]["monitor"] == "test/joint_f1"
 
-    temporal = load_config(REPO / "configs" / "climbing_videos_joint_temporal.yaml")
-    assert temporal["model"]["temporal"] == {
+    v2 = load_config(REPO / "configs" / "climbing_videos_joint_temporal_center_v2.yaml")
+    assert v2["model"]["temporal"] == {
         "enabled": True,
         "placement": "post_decoder",
         "bottleneck_dim": 256,
@@ -95,67 +90,60 @@ def test_ported_baselines_keep_semantics():
         "position_scale": 30.0,
         "window_frames": None,
     }
-    assert temporal["data"]["sequence"]["frames_per_clip"] == 5
-    assert temporal["data"]["sequence"]["frame_stride"] == 1
-    assert temporal["data"]["sequence"]["target_frame"] == "all"
-    assert temporal["data"]["frames_per_batch"] == 60
-    assert temporal["optim"]["lr"] == pytest.approx(3.75e-4)
-    assert temporal["model"]["init_contact_checkpoint"] is None
-    assert temporal["output"]["exp_name"] == "climb4_t5"
+    assert v2["data"]["sequence"] == {
+        "frames_per_clip": 5, "frame_stride": 1, "jitter": True, "target_frame": "center"}
+    assert v2["data"]["frames_per_batch"] == 60
+    assert v2["optim"]["lr"] == pytest.approx(3.75e-4)
+    assert v2["optim"]["epochs"] == 17
+    assert v2["model"]["init_contact_checkpoint"] is None
+    assert v2["output"]["exp_name"] == "climb4_t5mid_v2"
 
-    center = load_config(REPO / "configs" / "climbing_videos_joint_temporal_center.yaml")
-    assert center["model"]["temporal"]["enabled"] is True
-    assert center["model"]["temporal"]["causal"] is False
-    assert center["data"]["sequence"]["frames_per_clip"] == 5
-    assert center["data"]["sequence"]["target_frame"] == "center"
-    assert center["model"]["init_contact_checkpoint"] is None
-    assert center["output"]["exp_name"] == "climb4_t5mid"
-
-
-def test_force_warmstart_temporal_launch_config():
-    cfg = load_config(REPO / "configs" / "climbing_videos_force_warmstart_temporal.yaml")
-    assert cfg["model"]["init_contact_checkpoint"] == (
-        "output/climb4_frame_20260716_122726/best.pth"
-    )
-    assert cfg["model"]["temporal"]["enabled"] is False
-    assert cfg["model"]["force_temporal"]["enabled"] is True
-    assert cfg["physics"]["use_warp"] is True
-    assert cfg["data"]["eval_split"] == "test"
-    assert cfg["output"]["monitor"] == "test/physics_residual"
+    blind = load_config(
+        REPO / "configs" / "climbing_videos_joint_temporal_center_blind.yaml")
+    assert blind["model"]["contact_head"]["blind_to_image"] is True
+    assert blind["output"]["exp_name"] == "climb4_t5mid_blind"
+    # The ablation is the identical recipe apart from blindness and its name.
+    blind["model"]["contact_head"]["blind_to_image"] = False
+    blind["output"]["exp_name"] = v2["output"]["exp_name"]
+    assert blind == v2
 
 
-def test_force_warmstart_t16_launch_config():
-    cfg = load_config(REPO / "configs" / "climbing_videos_force_warmstart_t16.yaml")
-    # Regime (a), TEMPORAL contact source (climb4_t5, measured F1 0.8878 at
-    # T=16/stride 2), force-only training.
+def test_force_t7hinge_launch_config():
+    cfg = load_config(REPO / "configs" / "climbing_videos_force_warmstart_t7hinge.yaml")
+    # Regime (a): frozen t5mid temporal contact source, force-only training on
+    # T=7 center-frame clips with the hinge-gated non-contact penalty.
     assert cfg["train"]["freeze_contact"] is True
     assert cfg["model"]["force_head"]["enabled"] is True
     assert cfg["model"]["init_contact_checkpoint"] == (
-        "output/climb4_t5_20260716_183709/best.pth")
-    # The contact temporal block must byte-match the source run's architecture
-    # (configs/climbing_videos_joint_temporal.yaml) or the warm start hard-fails.
-    source = load_config(REPO / "configs" / "climbing_videos_joint_temporal.yaml")
-    assert cfg["model"]["temporal"] == source["model"]["temporal"]
-    assert cfg["model"]["temporal"]["enabled"] is True
+        "output/climb4_t5mid_20260717_140624/best.pth")
+    # The contact temporal block must byte-match the t5mid source architecture
+    # (kept as configs/climbing_videos_joint_temporal_center_v2.yaml) or the warm
+    # start hard-fails; window_frames restricts attention to the native T=5.
+    source = load_config(
+        REPO / "configs" / "climbing_videos_joint_temporal_center_v2.yaml")
+    assert cfg["model"]["temporal"] == {
+        **source["model"]["temporal"], "window_frames": 5}
     assert cfg["model"]["force_temporal"] == {
         "enabled": True, "bottleneck_dim": 256, "num_layers": 1, "num_heads": 4,
-        "mlp_ratio": 2.0, "attend": "per_token", "causal": False, "dropout": 0.0,
+        "mlp_ratio": 2.0, "attend": "joint", "causal": False, "dropout": 0.0,
         "position_scale": 30.0}
-    # Decisive-run knobs: 16-frame clips at stride 2 -> 10 residual frames.
-    assert cfg["data"]["sequence"] == {
-        "frames_per_clip": 16, "frame_stride": 2, "jitter": True, "target_frame": "all"}
-    assert cfg["data"]["frames_per_batch"] == 32
-    # Robust residual + jerk filter + relaxed regularisers.
+    assert cfg["physics"]["use_warp"] is True
+    assert cfg["physics"]["max_cam_jump_m"] == pytest.approx(0.5)
     assert cfg["physics"]["loss"]["residual_robust"] == {
         "kind": "pseudo_huber", "delta_force": 1.0, "delta_torque": 0.5}
-    assert cfg["physics"]["max_cam_jump_m"] == pytest.approx(0.5)
-    assert cfg["physics"]["loss"]["force_noncontact"] == pytest.approx(2.0)
-    assert cfg["physics"]["loss"]["force_at_contact"] == 0.0
+    assert cfg["physics"]["loss"]["residual_torque_weight"] == pytest.approx(20.0)
+    assert cfg["physics"]["loss"]["force_noncontact"] == pytest.approx(25.0)
+    assert cfg["physics"]["loss"]["noncontact_gate"] == {
+        "kind": "hinge_l1", "p_lo": 0.2, "p_hi": 0.5}
+    assert cfg["data"]["sequence"] == {
+        "frames_per_clip": 7, "frame_stride": 1, "jitter": True, "target_frame": "center"}
+    assert cfg["data"]["frames_per_batch"] == 35
+    assert cfg["data"]["eval_split"] == "test"
     assert cfg["loss"]["grad_clip"] == pytest.approx(5.0)
     assert cfg["optim"] == {
         "lr": pytest.approx(1.0e-4), "weight_decay": pytest.approx(1.0e-4),
         "epochs": 30, "warmup_epochs": 1, "lr_min": pytest.approx(1.0e-6)}
-    assert cfg["output"]["exp_name"] == "climb4_force_t16"
+    assert cfg["output"]["exp_name"] == "climb4_force_t7hinge"
     assert cfg["output"]["monitor"] == "test/physics_residual"
 
 
@@ -226,7 +214,7 @@ def test_physics_residual_monitor_requires_residual_weight(tmp_path):
     # the residual objective runs — a zero weight would starve the monitor forever.
     with pytest.raises(ValueError, match="physics_residual.*requires physics.loss.residual > 0"):
         load_config(_write(tmp_path, """
-base: configs/climbing_videos_force_warmstart_t16.yaml
+base: configs/climbing_videos_force_warmstart_t7hinge.yaml
 physics:
   loss:
     residual: 0.0
@@ -490,14 +478,25 @@ data:
 """))
 
 
-def test_manual_test_eval_requires_climbing_videos_only(tmp_path):
-    with pytest.raises(ValueError, match="single climbing_videos or"):
+def test_manual_test_eval_requires_climbing_corpus_only(tmp_path):
+    with pytest.raises(ValueError, match="single climbing_corpus dataset"):
         load_config(_write(tmp_path, """
 base: configs/base.yaml
 data:
   eval_split: test
   datasets:
     - {name: damon, config: configs/datasets/damon.yaml}
+"""))
+
+
+def test_legacy_climbing_videos_dataset_rejected_with_pointer(tmp_path):
+    # The exported-v1 loader is retired; the error must point at legacy/.
+    with pytest.raises(ValueError, match=r"legacy.*climbing_corpus"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+data:
+  datasets:
+    - {name: climbing_videos, config: configs/datasets/climbing_videos.yaml}
 """))
 
 

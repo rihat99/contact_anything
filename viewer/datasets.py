@@ -11,11 +11,13 @@ import yaml
 
 from contact.data import (
     ClimbingImagesDataset,
-    ClimbingVideosDataset,
     DamonDataset,
     LemonDataset,
     RichDataset,
 )
+# The viewer still reads the exported ClimbingVideos_v1 from disk; its loader is
+# retired from the training pipeline and lives in legacy/.
+from legacy.climbing_videos import ClimbingVideosDataset
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = REPO_ROOT / "configs" / "datasets"

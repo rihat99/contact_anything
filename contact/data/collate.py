@@ -1,7 +1,7 @@
 """Batch assembly — datasets -> SAM-3D-Body batch, images and clips alike.
 
 Each dataset item is either a single frame-dict (still-image datasets) or a
-**clip** (list of ``T`` frame-dicts, from :class:`ClimbingVideosDataset`). The
+**clip** (list of ``T`` frame-dicts, from :class:`ClimbingCorpusDataset`). The
 collate normalises stills to length-1 clips, asserts the batch is homogeneous in
 ``T``, flattens ``[B_clips, T, ...]`` to a model batch ``[B_clips*T, ...]``, runs
 the SAM-3D-Body top-down transform per frame, and builds the per-target
@@ -38,11 +38,6 @@ from .climbing_corpus import (
     list_corpus_scenes,
 )
 from .climbing_images import ClimbingImagesDataset
-from .climbing_videos import (
-    ClimbingVideosDataset,
-    list_completed_test_scenes,
-    list_scenes,
-)
 from .damon import DamonDataset
 from .splits import group_train_val_split, train_val_indices, video_id_from_scene
 
@@ -166,7 +161,7 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec):
         out["cam_valid"] = torch.tensor(
             ["cam_from_world" in f for f in frames], dtype=torch.bool)     # [B]
         # Camera-center jump (metres) between consecutive SAMPLED clip frames for
-        # the physics camera-jerk filter (stride-consistent; see climbing_videos.py);
+        # the physics camera-jerk filter (stride-consistent; see climbing_corpus.py);
         # 0.0 for frames without cameras (still images) or the first row of a clip.
         out["cam_jump_m"] = torch.tensor(
             [float(f.get("cam_jump_m", 0.0)) for f in frames], dtype=torch.float32)  # [B]
@@ -259,10 +254,6 @@ def _build_image_dataset(spec: dict):
     raise ValueError(f"{name!r} is not a still-image dataset")
 
 
-def _video_root(config: str) -> str:
-    return yaml.safe_load(Path(config).read_text())["data"]["root"]
-
-
 def _manifest_image_indices(manifest: dict, n: int) -> Tuple[list, list]:
     """Read the still-image split from a manifest; reject out-of-range indices."""
     if "images" not in manifest:
@@ -324,15 +315,15 @@ def make_loaders(
     """Build interleaved train + configured-evaluation loaders.
 
     Still-image datasets (damon/climbing) are concatenated and split randomly by
-    ``val_ratio``/``seed`` (T=1 clips). ClimbingVideos datasets are split by
+    ``val_ratio``/``seed`` (T=1 clips). ClimbingCorpus datasets are split by
     source video (no video crosses train/val) into windowed clips (T), unless
-    ``data.eval_split=test``: then every generated-label train scene is used for
-    training and completed manual test scenes form evaluation. Batches keep a
+    ``data.eval_split=test``: then every curated train scene is used for
+    training and annotated manual test scenes form evaluation. Batches keep a
     fixed ``frames_per_batch`` budget: ``B_clips = frames_per_batch // T``.
 
     :param manifest: when given, splits are taken **from the manifest** instead of
         re-derived (``{"images": {"train": [idx...], "val": [idx...]},
-        "video:<config>": {"train": [vid...], "val": [vid...]}}``); missing
+        "corpus:<config>": {"train": [vid...], "val": [vid...]}}``); missing
         members raise. Used by evaluate/resume to reproduce the exact split a
         checkpoint was trained on rather than the current directory's derivation.
     :param distributed_rank: Process rank for ``DistributedSampler`` sharding.
@@ -356,7 +347,6 @@ def make_loaders(
     use_conf = bool(cfg["contact"]["targets"]["joint"]["use_confidence_weights"])
 
     image_specs = [s for s in specs if s["name"] in ("damon", "climbing")]
-    video_specs = [s for s in specs if s["name"] == "climbing_videos"]
     corpus_specs = [s for s in specs if s["name"] == "climbing_corpus"]
 
     datasets_for_validation = []
@@ -380,65 +370,6 @@ def make_loaders(
         if distributed_rank == 0:
             print(f"Image datasets [{sizes}] -> total={len(ds)} "
                   f"train={len(train_idx)} val={len(val_idx)} (val_ratio={val_ratio}, seed={seed})")
-
-    if video_specs:
-        clips_per_batch = max(1, frames_per_batch // clip_len)
-        for s in video_specs:
-            root = _video_root(s["config"])
-            key = f"video:{s['config']}"
-            all_train_scenes = list_scenes(root, "train")
-            if eval_split == "test":
-                all_test_scenes = list_completed_test_scenes(root)
-                if manifest is not None:
-                    train_scenes, eval_scenes = _manifest_train_test_scenes(
-                        manifest, key, all_train_scenes, all_test_scenes)
-                else:
-                    train_scenes, eval_scenes = all_train_scenes, all_test_scenes
-                train_ds = ClimbingVideosDataset(
-                    root, scenes=train_scenes, mode="train", split_dir="train",
-                    frames_per_clip=clip_len, frame_stride=int(seq["frame_stride"]),
-                    jitter=bool(seq["jitter"]), seed=seed,
-                    use_confidence_weights=use_conf)
-                eval_ds = ClimbingVideosDataset(
-                    root, scenes=eval_scenes, mode="val", split_dir="test",
-                    frames_per_clip=clip_len, frame_stride=int(seq["frame_stride"]),
-                    jitter=False, seed=seed, use_confidence_weights=use_conf)
-                out_manifest[key] = {
-                    "train": sorted(train_scenes), "test": sorted(eval_scenes)}
-                if distributed_rank == 0:
-                    print(
-                        f"ClimbingVideos [{s['config']}]: all train scenes={len(train_scenes)} "
-                        f"manual test scenes={len(eval_scenes)} | clips train={len(train_ds)} "
-                        f"test={len(eval_ds)} (T={clip_len})")
-            else:
-                scenes = all_train_scenes
-                if manifest is not None:
-                    train_vids, val_vids = _manifest_video_ids(manifest, key, scenes)
-                else:
-                    train_vids, val_vids = group_train_val_split(
-                        (video_id_from_scene(sc) for sc in scenes), val_ratio, seed)
-                train_scenes = [sc for sc in scenes if video_id_from_scene(sc) in train_vids]
-                eval_scenes = [sc for sc in scenes if video_id_from_scene(sc) in val_vids]
-                train_ds = ClimbingVideosDataset(
-                    root, scenes=train_scenes, mode="train",
-                    frames_per_clip=clip_len, frame_stride=int(seq["frame_stride"]),
-                    jitter=bool(seq["jitter"]), seed=seed,
-                    use_confidence_weights=use_conf)
-                eval_ds = ClimbingVideosDataset(
-                    root, scenes=eval_scenes, mode="val",
-                    frames_per_clip=clip_len, frame_stride=int(seq["frame_stride"]),
-                    jitter=False, seed=seed,
-                    use_confidence_weights=use_conf)
-                out_manifest[key] = {"train": sorted(train_vids), "val": sorted(val_vids)}
-                if distributed_rank == 0:
-                    print(
-                        f"ClimbingVideos [{s['config']}]: videos train={len(train_vids)} "
-                        f"val={len(val_vids)} | scenes train={len(train_scenes)} "
-                        f"val={len(eval_scenes)} | clips train={len(train_ds)} "
-                        f"val={len(eval_ds)} (T={clip_len})")
-            datasets_for_validation.extend((train_ds, eval_ds))
-            train_parts.append((train_ds, clips_per_batch, True))
-            eval_parts.append((eval_ds, clips_per_batch, False))
 
     if corpus_specs:
         clips_per_batch = max(1, frames_per_batch // clip_len)

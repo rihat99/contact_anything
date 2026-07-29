@@ -8,7 +8,7 @@ Real SAM-3D-Body checkpoint required. Two things the trainer wiring must get rig
   (force tokens never perturb contact logits) proved exactly in
   ``test_force_invariance.py``; here it is checked end-to-end through a real
   checkpoint. Skips (does NOT fabricate) when no ``climb4_frame`` contact run exists.
-* **End-to-end smoke** — two DDP-wrapped training steps on a real climbing_videos
+* **End-to-end smoke** — two DDP-wrapped training steps on a real climbing_corpus
   micro-batch with physics enabled: finite loss, force params move, frozen base does
   not; then one physics-INACTIVE batch through the same ``find_unused_parameters=False``
   DDP step (relies on PhysicsLoss's always-graph-connected ``joint_forces`` zero).
@@ -28,7 +28,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from contact import checkpoint as ckpt_io
 from contact.config import load_config
-from contact.data.climbing_videos import ClimbingVideosDataset, list_scenes
+from contact.data.climbing_corpus import ClimbingCorpusDataset, list_corpus_scenes
 from contact.data.collate import batch_to_device, make_collate
 from contact.engine import forward_model
 from contact.losses import MultiTargetContactLoss
@@ -39,8 +39,6 @@ from contact.targets import NUM_BODY_22, TargetSpec
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOINT_CFG = os.path.join(REPO, "configs", "climbing_videos_joint.yaml")
-WARMSTART_CFG = os.path.join(REPO, "configs", "climbing_videos_force_warmstart.yaml")
-SCRATCH_CFG = os.path.join(REPO, "configs", "climbing_videos_force_scratch.yaml")
 _CKPT = load_config(os.path.join(REPO, "configs", "base.yaml"))["model"]["checkpoint_path"]
 
 pytestmark = [
@@ -58,6 +56,22 @@ def _best_contact_ckpt() -> str | None:
     cands = sorted(glob.glob(os.path.join(REPO, "output", "climb4_frame_*", "best.pth")),
                    key=os.path.getmtime)
     return cands[-1] if cands else None
+
+
+def _force_cfg(*, freeze_contact: bool, use_warp: bool) -> dict:
+    """Rebuild the retired warmstart / scratch experiment configs over the kept
+    flattened joint config (the original yamls live in legacy/configs/): force
+    head + RNEA physics on T=8 clips, contact frozen (regime a) or trainable (b).
+    """
+    cfg = load_config(JOINT_CFG)
+    cfg["model"]["force_head"]["enabled"] = True
+    cfg["physics"]["enabled"] = True
+    cfg["physics"]["use_warp"] = use_warp
+    cfg["train"]["freeze_contact"] = freeze_contact
+    cfg["data"]["frames_per_batch"] = 32
+    cfg["data"]["sequence"] = {"frames_per_clip": 8, "frame_stride": 1,
+                               "jitter": True, "target_frame": "all"}
+    return cfg
 
 
 def _mhr_available() -> bool:
@@ -138,7 +152,7 @@ def test_warm_start_preserves_contact_logits():
 
     # Force model: freeze_contact build (contact frozen) + warm-start the contact
     # branch from the same checkpoint (force branch stays fresh, zero-init).
-    force_cfg = load_config(WARMSTART_CFG)
+    force_cfg = _force_cfg(freeze_contact=True, use_warp=True)
     force_cfg["model"]["init_contact_checkpoint"] = ckpt
     torch.manual_seed(0)
     force_model, _ = build_model(force_cfg, "cuda")
@@ -164,15 +178,16 @@ def test_warm_start_preserves_contact_logits():
 # --------------------------------------------------------------- DDP smoke
 
 def _real_micro_batch(cfg, model, n_clips=2, seq_len=8):
-    """Two real climbing_videos clips (T=8) collated + moved to CUDA, or None."""
-    ds_cfg = yaml.safe_load(open(os.path.join(REPO, "configs", "datasets", "climbing_videos.yaml")))
+    """Two real climbing_corpus clips (T=8) collated + moved to CUDA, or None."""
+    ds_cfg = yaml.safe_load(open(os.path.join(REPO, "configs", "datasets", "climbing_corpus.yaml")))
     root = ds_cfg["data"]["root"]
-    if not os.path.isdir(root):
+    if not os.path.isfile(os.path.join(root, "scenes", "scenes.db")):
         return None
-    scenes = list_scenes(root, "train")[:6]
-    ds = ClimbingVideosDataset(
-        root=root, scenes=scenes, mode="train", split_dir="train",
+    scenes = list_corpus_scenes(root, "train")[:6]
+    ds = ClimbingCorpusDataset(
+        root, scenes=scenes, split="train",
         frames_per_clip=seq_len, frame_stride=1, jitter=False,
+        contact_level=int(ds_cfg["data"].get("contact_level", 1)),
         use_confidence_weights=True)
     if len(ds) < n_clips:
         return None
@@ -188,12 +203,12 @@ def test_force_physics_ddp_training_smoke():
     if not _mhr_available():
         pytest.skip("MHR archive unavailable — physics loss cannot be built")
 
-    cfg = load_config(SCRATCH_CFG)
+    cfg = _force_cfg(freeze_contact=False, use_warp=False)
     torch.manual_seed(0)
     model, _ = build_model(cfg, "cuda")
     batch = _real_micro_batch(cfg, model)
     if batch is None:
-        pytest.skip("no real climbing_videos train clips available for the smoke batch")
+        pytest.skip("no real climbing_corpus train clips available for the smoke batch")
 
     physics = PhysicsLoss(cfg, device="cuda")
     loss_fn = MultiTargetContactLoss(cfg).to("cuda")

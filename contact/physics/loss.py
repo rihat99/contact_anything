@@ -297,7 +297,7 @@ class PhysicsLoss:
         is applied *after* the guard and only *removes* clips (never raises): an
         otherwise-eligible clip whose max ``cam_jump_m`` — the camera-center
         displacement between consecutive SAMPLED clip frames (stride-consistent,
-        see ``climbing_videos.py``) — exceeds the threshold becomes ineligible.
+        see ``climbing_corpus.py``) — exceeds the threshold becomes ineligible.
         Returns ``(eligible, n_jerk_excluded)``.
         """
         if seq_len < self.min_frames:

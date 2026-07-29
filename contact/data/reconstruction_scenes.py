@@ -12,7 +12,7 @@ same OpenCV-decode + JPEG-quality-95 re-encode (:func:`extract_frames`).
 
 The class is **label-free and inference-only**: every item is one valid
 ``(person, frame)`` returned as a length-1 clip whose dict matches
-:class:`~contact.data.climbing_videos.ClimbingVideosDataset` items (zero-filled
+:class:`~contact.data.climbing_corpus.ClimbingCorpusDataset` items (zero-filled
 supervision, exactly the ``require_labels=False`` path), so the centered
 sliding-window machinery in ``scripts/render_climbing_video_contacts.py``
 (``sliding_window_requests`` / ``_predict_requests``) runs on it unchanged.

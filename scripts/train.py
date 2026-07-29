@@ -9,7 +9,6 @@ loop, scheduler, monitor-based best selection, and resume.
 
 Usage::
 
-    python scripts/train.py --config configs/damon_baseline.yaml
     python scripts/train.py --config configs/climbing_videos_joint.yaml
     CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
         scripts/train.py --config configs/climbing_videos_joint.yaml
@@ -661,7 +660,7 @@ class Trainer:
         n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         fpb = int(self.cfg["data"]["frames_per_batch"])
         clip_len = int(self.cfg["data"]["sequence"]["frames_per_clip"])
-        has_video = any(d["name"] in ("climbing_videos", "climbing_corpus")
+        has_video = any(d["name"] == "climbing_corpus"
                         for d in self.cfg["data"]["datasets"])
         layout = (f"video: {max(1, fpb // clip_len)} clips x T={clip_len}"
                   if has_video else f"stills: {fpb} frames x T=1")
@@ -1041,7 +1040,7 @@ class Trainer:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--config", type=Path, default=REPO / "configs" / "damon_baseline.yaml")
+    p.add_argument("--config", type=Path, required=True)
     p.add_argument("--device", default="cuda")
     p.add_argument("--resume", type=str, default=None,
                    help="'auto' (newest */last.pth under output.dir) or a checkpoint path")

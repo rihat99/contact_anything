@@ -35,20 +35,20 @@ All commands run from the repo root.
 
 ```bash
 # Train (config = experiment yaml; resume: --resume auto | --resume path/to/last.pth)
-python scripts/train.py --config configs/damon_baseline.yaml
-python scripts/train.py --config configs/climbing_videos_joint_temporal.yaml
+python scripts/train.py --config configs/climbing_videos_joint.yaml
+python scripts/train.py --config configs/climbing_videos_joint_temporal_center_v2.yaml
 # Two-GPU DDP (`data.frames_per_batch` is per GPU):
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
   scripts/train.py --config configs/climbing_videos_joint.yaml
 
-# Force (physics) training — regime (a) warm-start (contact frozen, force-only) or (b) scratch.
-# Needs the editable better-robot / better-human from the sibling ../BetterRobot / ../BetterHuman
-# checkouts (step-01 env wiring); the MHR archive resolves via that checkout, or set
-# $BETTERHUMAN_MODELS_DIR. See docs/forces.md.
-python scripts/train.py --config configs/climbing_videos_force_warmstart.yaml
-python scripts/train.py --config configs/climbing_videos_force_scratch.yaml
+# Force training. Physics (RNEA) regime (a) needs the editable better-robot / better-human from
+# the sibling ../BetterRobot / ../BetterHuman checkouts (step-01 env wiring); the MHR archive
+# resolves via that checkout, or set $BETTERHUMAN_MODELS_DIR. See docs/forces.md.
+python scripts/train.py --config configs/climbing_videos_force_warmstart_t7hinge.yaml
+# Supervised kindyn forces (force-only build, six groups, no physics/extrinsics):
+python scripts/train.py --config configs/climbing_corpus_force_supervised.yaml
 
-# Evaluate on grouped val or the physical manually annotated ClimbingVideos test split.
+# Evaluate on grouped val or the manually annotated corpus test split (30 scenes).
 # Reports P/R/F1/F2/IoU, per-extremity metrics and a threshold curve.
 python scripts/evaluate.py --checkpoint output/<run>/best.pth --config configs/<experiment>.yaml
 python scripts/evaluate.py --checkpoint output/<run>/last.pth \
@@ -56,14 +56,13 @@ python scripts/evaluate.py --checkpoint output/<run>/last.pth \
 # Force runs add physics-consistency metrics (physics_residual, per-extremity force magnitudes
 # split by predicted contact, gate-violation rates, vertical-force-sum). Lacking a trained force
 # checkpoint, --warm-start builds the untrained force branch from the config's init_contact_checkpoint.
-python scripts/evaluate.py --config configs/climbing_videos_force_warmstart.yaml --warm-start --split test
+python scripts/evaluate.py --config configs/climbing_videos_force_warmstart_t7hinge.yaml --warm-start --split test
 
 # Qualitative demo (GT vs predicted contacts; force arrows when the checkpoint has a force head)
 python scripts/demo.py --checkpoint output/<run>/best.pth --config configs/<experiment>.yaml --num_samples 10
-python scripts/demo_climbing_videos.py --checkpoint output/<run>/last.pth \
-  --config configs/climbing_videos_joint.yaml --split test --threshold 0.3
-python scripts/demo_climbing_videos.py --config configs/climbing_videos_force_warmstart.yaml \
-  --warm-start --split test --threshold 0.3
+# Rendered corpus videos (contact disks + force arrows; shards over torchrun ranks)
+python scripts/render_climbing_video_contacts.py --checkpoint output/<run>/best.pth \
+  --config configs/climbing_videos_joint_temporal_center_v2.yaml --split test --overlay-labels
 
 # Tests (fast CPU suite ~15s; add --runslow-style GPU tests via -m slow)
 python -m pytest tests/ -q -m "not slow"
@@ -73,6 +72,7 @@ python -m pytest tests/ -q                    # everything incl. GPU invariance/
 tensorboard --logdir output/<run>/tensorboard/
 
 # Data preparation
+python scripts/extract_corpus_frames.py           # corpus frames/ JPEG tree (361 scenes, q95)
 python scripts/precompute_masks_damon.py          # SAM3 person masks for DAMON
 python scripts/precompute_cam_params_damon.py     # MoGe2 intrinsics for DAMON
 python scripts/build_climbing_images.py --config configs/datasets/climbing_images.yaml
@@ -86,7 +86,7 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
 | `sam_3d_body/` | Vendored SAM 3D Body fork. Upstream code untouched; our additions are the contact head/tokens, `models/modules/temporal.py`, and hooks delimited by `# --- contact temporal hook ---` / efficiency-flag comments. |
 | `contact/` | Our library: `config.py` (yaml + `base:` include + strict validation), `model.py` (build/freeze/eval-pin), `targets.py`, `losses.py`, `metrics.py`, `engine.py` (shared forward), `checkpoint.py` (schema v2), `tracking.py` (wandb+TB), `data/` (loaders, collate, splits), `physics/` (`adapter.py` MHR bridge + `loss.py` RNEA residual). |
 | `scripts/` | Thin CLIs: train, evaluate, demo, build_climbing_images, precompute_*, render_results_table. |
-| `configs/` | `base.yaml` (all defaults, commented) + experiment overrides; `configs/datasets/*.yaml` = dataset paths/options. |
+| `configs/` | `base.yaml` (all defaults, commented) + the kept experiment overrides (self-contained, one per `output/` run + the supervised-force experiment); `configs/datasets/*.yaml` = dataset paths/options. Retired experiment yamls live in `legacy/configs/`. |
 | `tests/` | pytest suite (`-m slow` = GPU integration: temporal invariance, grad flow). |
 | `viewer/` | Standalone FastAPI dataset inspector with frame/sequence video skeleton views and still-image contact meshes. |
 | `tools/` | Legacy `view_dataset.py` browser and `climbing_contact_stats.py` (source-tree stats, SMPL-X). |
@@ -103,8 +103,10 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
    wrist then left/right ankle) + `num_global_tokens` extra tokens.
    An **asymmetric attention mask** stops all original tokens from attending to contact tokens —
    pose/keypoint outputs are unaffected by anything contact-side. The optional **force tokens**
-   (four, same extremity anchors, `model.force_head`) are appended *after* the contact tokens and
-   the mask is extended so no earlier token block attends a later one.
+   (`model.force_head`; four inheriting the contact anchors, or an explicit
+   `force_keypoint_indices` list — force-only builds with no contact tokens/head at all are legal)
+   are appended *after* the contact tokens and the mask is extended so no earlier token block
+   attends a later one.
 3. **Per-target contact heads** — `head_contact` is an `nn.ModuleDict`: pooled modes support
    `vertex` → `[B, 6890|10475]` or body-22 joint logits. `pool_mode: per_token` applies one
    shared classifier independently to each token; ClimbingVideos uses four tokens → `[B,4]`.
@@ -115,16 +117,22 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
    `between_layers` (runs at decoder layers 0–4, shared weights), `pre_decoder` (experimental,
    contact-private bottlenecked feature branch). Batches are homogeneous-T flattened clips
    (`[B_clips*T, ...]` + `seq_len`/`frame_pos_sec`/`frame_valid`); single images are T=1.
-5. **Force head + physics** (`model.force_head`, optional) — four force tokens (same extremity
-   anchors) → `head_force` (zero-init) regressing `out["force"]["joint_forces"] [B,4,3]`,
-   dimensionless (units of body weight), order `left_hand,right_hand,left_foot,right_foot`; an
+5. **Force head** (`model.force_head`, optional) — K force tokens → `head_force` (zero-init)
+   regressing `out["force"]["joint_forces"] [B,K,3]`, dimensionless (units of body weight); an
    optional `model.force_temporal` block mirrors the contact temporal module (post_decoder only).
-   No force labels: `contact/physics/` supervises them — `adapter.py` (`MHRAdapter`) maps frozen
-   per-frame MHR params + dataset camera extrinsics onto a BetterHuman **MHR** body and a
-   world-frame `q` trajectory; `loss.py` (`PhysicsLoss`) smooths `q`, finite-differences to v/a,
-   runs **RNEA** with the predicted forces as external wrenches, and minimises the 6D
-   root-wrench residual (plus contact-gated / smoothness / L2 regularisers). Full formulation,
-   frames, and conventions: `docs/forces.md`.
+   Two mutually exclusive supervision signals:
+   - **Physics** (`physics.enabled`, K=4 inheriting the extremity contact anchors, order
+     `left_hand,right_hand,left_foot,right_foot`): no labels — `contact/physics/` supervises.
+     `adapter.py` (`MHRAdapter`) maps frozen per-frame MHR params + dataset camera extrinsics onto
+     a BetterHuman **MHR** body and a world-frame `q` trajectory; `loss.py` (`PhysicsLoss`)
+     smooths `q`, finite-differences to v/a, runs **RNEA** with the predicted forces as external
+     wrenches, and minimises the 6D root-wrench residual (plus contact-gated / smoothness / L2
+     regularisers).
+   - **Supervised kindyn forces** (`force_supervision.enabled`, force-only build with six explicit
+     anchors `[62,41,15,18,17,20]` = kindyn groups `LH,RH,LF(toe),RF(toe),LA(heel),RA(heel)`):
+     `contact/force_supervision.py` trains against the corpus `kindyn_1.npz` GT forces —
+     body-weight units, body-root frame, no extrinsics anywhere in the objective.
+   Full formulation, frames, and conventions: `docs/forces.md`.
 
 ### Invariants (do not break)
 
@@ -163,8 +171,9 @@ Key sections (see `configs/base.yaml` for full commented defaults):
 |---|---|
 | `model.contact_head` | anchor indices, global tokens, pooling (`concat`/`attention`/`per_token`), MLP, grid sampling |
 | `model.temporal` | enabled, placement, layers/heads, `attend: joint|per_token`, `causal` |
-| `model.force_head` / `model.force_temporal` | force branch: enabled, `frame: local_world_aligned|local`, MLP; force temporal (post_decoder only) |
+| `model.force_head` / `model.force_temporal` | force branch: enabled, `frame: local_world_aligned|local|root`, `force_keypoint_indices` (null = inherit contact anchors; explicit list enables force-only builds), MLP; force temporal (post_decoder only) |
 | `physics` | RNEA loss: enabled, MHR `model_path`/`lod`, `gravity`, `min_frames`, `smoothing_kernel`, per-term `loss.*` weights (all dimensionless) |
+| `force_supervision` | supervised kindyn GT-force loss (exclusive with `physics`): `target_frame`, Huber `force`/`huber_delta_bw`, `outlier_bw` cut, `noncontact` L1 |
 | `train.freeze_contact` | regime (a): freeze contact, train force only (requires `model.init_contact_checkpoint`) |
 | `contact.topology` | `smpl` / `smplx` (`mhr` → NotImplementedError) |
 | `contact.targets.vertex/joint` | enabled, weight, loss params, `joint_set`, subset masking, `derive_from_vertex`, confidence weights |
@@ -179,21 +188,28 @@ Key sections (see `configs/base.yaml` for full commented defaults):
 |---|---|---|---|
 | `damon` (DECO) | still | per-vertex | SMPL 6890 |
 | `climbing_images` (ClimbingImages_v1) | still | per-vertex (+SMPL params) | SMPL 6890 |
-| `climbing_videos` (ClimbingVideos_v1) | video clips | raw body-22; training can reduce to four extremities | SMPL-X joints |
+| `climbing_corpus` (raw ClimbingVideos corpus) | video clips | raw body-22 (contacts_1/2, 52→22 fold); training can reduce to four extremities; optional kindyn GT **forces** for six groups (`left_hand, right_hand, left_foot`=toe`, right_foot, left_ankle`=heel`, right_ankle`) in bw units, body-root frame | SMPL-X joints |
 | `lemon`, `rich` | still (viewer-only) | per-vertex | SMPL(-H) 6890 |
+| `climbing_videos` (ClimbingVideos_v1 export) | **legacy** — loader in `legacy/climbing_videos.py`; viewer-only | raw body-22 | SMPL-X joints |
 
-ClimbingVideos label semantics (important):
-- **Train labels are automatic and cover all 22 joints**. Test labels manually annotate 14
-  observable joints; fingers are folded into the wrist/hand labels, and the other eight joints
-  are fixed non-contact on reviewed frames. The loader **raises** if test labels are requested
-  while `contacts.npz` has `pending=True`.
-- Video joint labels are **motion-gated "stable contact"** (stillness/hysteresis in the exporter),
-  a different task from instantaneous contact derived from still-image vertices — which is why
-  `derive_from_vertex` defaults to false. The same gap applies to **forces** (R8): stable-contact
-  labels ≠ instantaneous load, so the physics loss gates on predicted probs, not labels (D8).
-- Video scenes also carry **per-frame camera extrinsics** (`cam_from_world`, OpenCV, metric),
-  `gravity_world`, and `cam_scale`, exported from the reconstruction pipeline for the physics loss
-  (still images carry `cam_valid=False`). See `docs/forces.md`.
+ClimbingVideos corpus label semantics (important):
+- The corpus is read **directly** from `/data3/.../better/data/ClimbingVideos`
+  (`scenes/scenes.db` curated split: 331 train / 30 test scenes; pre-extracted `frames/` JPEG
+  tree; `features/` contacts, sam3 masks/bboxes, geometry, kindyn). The exported
+  ClimbingVideos_v1 dataset is redundant and its loader is legacy.
+- **Train labels are automatic and cover all 22 joints** (contacts_1 by default; the 52→22 hand
+  fold is bit-exact with the v1 exporter). Test labels manually annotate 14 observable joints;
+  fingers are folded into the wrist/hand labels, and the other eight joints are fixed
+  non-contact on reviewed frames. Test-scene discovery requires `annotation.npz` to exist.
+- Video joint labels are **motion-gated "stable contact"** (stillness/hysteresis in the
+  estimator), a different task from instantaneous contact derived from still-image vertices —
+  which is why `derive_from_vertex` defaults to false. The same gap applies to **forces** (R8):
+  stable-contact labels ≠ instantaneous load, so the physics loss gates on predicted probs, not
+  labels (D8). The **supervised** force loss instead gates on kindyn's own contact mask
+  (= contacts_2, the mask the forces were solved under).
+- Video scenes also carry **per-frame camera extrinsics** (`cam_from_world`, OpenCV, metric) and
+  `gravity_world` = exactly `[0, 1, 0]` (kindyn convention, world y down — not v1's camera-0
+  derivation) for the physics loss (still images carry `cam_valid=False`). See `docs/forces.md`.
 - Train/val split is grouped by **source video** (chunks of one video never straddle splits).
 - The four-output target order is `left_hand, right_hand, left_foot, right_foot`; each foot is
   `ankle OR foot`. A known positive wins under partial annotation, while a known negative needs

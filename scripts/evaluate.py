@@ -5,7 +5,7 @@ Builds the model + val loader from ``--config`` (the same
 loaded contact weights over the val split, and reports micro-averaged per-target
 precision / recall / F1 / F2 / IoU via ``contact.metrics``. Works for both a
 vertex config (e.g. DAMON) and a joint config. ``--split test`` is supported for
-ClimbingVideos and reads the physical manually annotated test directory.
+the ClimbingVideos corpus and reads the manually annotated DB test scenes.
 
 When the run enables the force branch + the RNEA physics loss, a second
 **physics-consistency** section is reported (headline ``physics_residual``,
@@ -17,7 +17,7 @@ from the config's ``model.init_contact_checkpoint`` to exercise the pipeline.
 Usage::
 
     CUDA_VISIBLE_DEVICES=0 python scripts/evaluate.py \
-        --config configs/damon_baseline.yaml \
+        --config configs/climbing_videos_joint.yaml \
         --checkpoint output/<run>/best.pth --out output/eval.jsonl
 """
 from __future__ import annotations
@@ -36,7 +36,7 @@ sys.path.insert(0, str(REPO))
 
 from contact import checkpoint as ckpt_io
 from contact.config import load_config
-from contact.data.climbing_videos import ClimbingVideosDataset
+from contact.data.climbing_corpus import ClimbingCorpusDataset
 from contact.data.collate import batch_to_device, make_collate, make_loaders
 from contact.engine import forward_contact, forward_model, select_temporal_supervision
 from contact.metrics import (
@@ -374,21 +374,22 @@ def _print_affine(a: dict) -> None:
 
 
 def _manual_test_loader(cfg: dict, image_size: tuple[int, int], spec: TargetSpec):
-    video_entries = [d for d in cfg["data"]["datasets"] if d["name"] == "climbing_videos"]
-    if len(video_entries) != 1 or len(cfg["data"]["datasets"]) != 1:
-        raise ValueError("--split test requires a ClimbingVideos-only data config")
-    dataset_cfg = yaml.safe_load(Path(video_entries[0]["config"]).read_text()) or {}
+    corpus_entries = [d for d in cfg["data"]["datasets"] if d["name"] == "climbing_corpus"]
+    if len(corpus_entries) != 1 or len(cfg["data"]["datasets"]) != 1:
+        raise ValueError("--split test requires a climbing_corpus-only data config")
+    dataset_cfg = (yaml.safe_load(Path(corpus_entries[0]["config"]).read_text()) or {})["data"]
     sequence = cfg["data"]["sequence"]
-    ds = ClimbingVideosDataset(
-        root=dataset_cfg["data"]["root"],
-        mode="val",
-        split_dir="test",
+    ds = ClimbingCorpusDataset(
+        dataset_cfg["root"],
+        split="test",
         frames_per_clip=int(sequence["frames_per_clip"]),
         frame_stride=int(sequence["frame_stride"]),
         jitter=False,
         seed=int(cfg["data"]["seed"]),
+        contact_level=int(dataset_cfg.get("contact_level", 1)),
         use_confidence_weights=bool(
             cfg["contact"]["targets"]["joint"]["use_confidence_weights"]),
+        load_forces=bool(dataset_cfg.get("load_forces", False)),
     )
     clips_per_batch = max(
         1, int(cfg["data"]["frames_per_batch"]) // int(sequence["frames_per_clip"]))
@@ -449,6 +450,28 @@ def main() -> int:
             trained_datasets = (state.get("config", {}) or {}).get("data", {}).get("datasets")
             if trained_datasets == cfg["data"]["datasets"]:
                 manifest = state["split_manifest"]
+                # Old checkpoints (trained on the exported ClimbingVideos_v1)
+                # store "video:<config>" manifest keys; the corpus branch reads
+                # "corpus:<config>". A missing corpus key must not make old
+                # checkpoints unevaluable — fall back to fresh derivation, loudly.
+                missing = [
+                    f"corpus:{d['config']}" for d in cfg["data"]["datasets"]
+                    if d["name"] == "climbing_corpus"
+                    and f"corpus:{d['config']}" not in manifest
+                ]
+                if missing:
+                    print(
+                        f"WARNING: checkpoint split manifest has no {missing} "
+                        "entry (pre-corpus checkpoint) — re-deriving the grouped "
+                        "split fresh instead of reproducing the exact split the "
+                        "checkpoint was trained on")
+                    manifest = None
+            else:
+                print(
+                    "WARNING: checkpoint data.datasets differ from this config "
+                    f"(trained on {trained_datasets!r}) — re-deriving the grouped "
+                    "split fresh instead of reproducing the exact split the "
+                    "checkpoint was trained on")
         _, val_loader, _ = make_loaders(
             cfg, tuple(model.cfg.MODEL.IMAGE_SIZE), manifest=manifest)
     targets = [t for t in ("vertex", "joint") if cfg["contact"]["targets"][t]["enabled"]]

@@ -1,4 +1,4 @@
-# Four-extremity contact on ClimbingVideos_v1 — joint target only, vertex off.
+# Four-extremity contact on the ClimbingVideos corpus — joint target only, vertex off.
 # Per-frame, confidence-weighted training (no temporal module). Each output has
 # one dedicated contact token anchored to its predicted MHR70 wrist or ankle:
 # left hand, right hand, left foot, right foot.
@@ -28,8 +28,13 @@ data:
   eval_split: test                     # train on all generated labels; evaluate on manual labels
   frames_per_batch: 64                # per GPU; two-GPU DDP gives global batch 128
   sequence: {frames_per_clip: 1, frame_stride: 1, jitter: false}
+  # Retargeted from the exported ClimbingVideos_v1 to the corpus-direct loader
+  # (v1 is legacy): labels = corpus contacts_1 with the same 52->22 fold;
+  # gravity_world is now exactly [0, 1, 0] (the kindyn convention) instead of
+  # v1's camera-0 derivation; the grouped split derives from scenes/scenes.db
+  # but yields the same 331 train scenes.
   datasets:
-    - {name: climbing_videos, config: configs/datasets/climbing_videos.yaml}
+    - {name: climbing_corpus, config: configs/datasets/climbing_corpus.yaml}
 
 optim:
   lr: 4.0e-4                          # linear scaling from 1e-4 at global batch 32

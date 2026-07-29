@@ -225,14 +225,14 @@ def test_validate_targets_derive_from_vertex_supervises_joint():
 
 def test_validate_targets_video_supervises_joint():
     cfg = _base_cfg(vertex=False, joint=True)
-    validate_targets(cfg, [_FakeDataset("climbing_videos", {"joint"}, None)])  # no raise
+    validate_targets(cfg, [_FakeDataset("climbing_corpus", {"joint"}, None)])  # no raise
 
 
 def test_validate_targets_rejects_dataset_with_no_enabled_target():
     # joint-only config: a DAMON (vertex-only) loader alongside a video loader
     # satisfies the *global* joint check but is itself wholly unsupervised.
     cfg = _base_cfg(vertex=False, joint=True)
-    datasets = [_FakeDataset("climbing_videos", {"joint"}, None),
+    datasets = [_FakeDataset("climbing_corpus", {"joint"}, None),
                 _FakeDataset("damon", {"vertex"}, "smpl")]
     with pytest.raises(ValueError, match="supervises none"):
         validate_targets(cfg, datasets)

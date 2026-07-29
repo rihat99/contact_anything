@@ -379,9 +379,10 @@ test videos with contact disks (inner = label, outer ring = prediction) and
 **force arrows**: the predicted 3D force is treated as a metric segment (1 m
 per body weight) at the extremity's camera-frame position and
 perspective-projected through the dataset's per-frame intrinsics, so on-image
-direction and foreshortening are the real camera's. `scripts/demo_climbing_videos.py`
-draws force arrows on still panels too (via the model's own intrinsics, with
-screen-space length — a simpler scheme than the video renderer's).
+direction and foreshortening are the real camera's. The retired
+`legacy/demo_climbing_videos.py` drew force arrows on still panels too (via the
+model's own intrinsics, with screen-space length — a simpler scheme than the
+video renderer's).
 
 ## Assumptions and known limitations
 
@@ -409,14 +410,70 @@ screen-space length — a simpler scheme than the video renderer's).
   0.0; adding the key now would orphan existing checkpoints — to be absorbed
   at the next signature-version bump).
 
+## Supervised forces from the corpus (kindyn)
+
+The physics residual taught us its structural lesson (§ the collapse): the force part of the
+root wrench pins only the *sum*, and the allocation signal in the torque part is ~23× weaker.
+The corpus removes the need to fight that geometry. Its reconstruction pipeline already runs an
+inverse-dynamics solve per scene (`features/human_optim/<scene>/kindyn_1.npz`): forces solved
+jointly with the pose under an RNEA base-wrench objective, for **six** contact groups instead of
+our four — each foot splits into its big-toe joint and its heel. Those solved forces become
+plain regression labels, and `contact/force_supervision.py` trains the force branch against
+them directly. Physics and supervised training are **mutually exclusive** by config validation
+(`physics.enabled` vs `force_supervision.enabled`): one supervision signal per run.
+
+**The six groups and their anchors.** The head grows to six force tokens with its own MHR70
+anchor list, decoupled from the contact anchors via `model.force_head.force_keypoint_indices`:
+`[62, 41, 15, 18, 17, 20]` = left wrist, right wrist, left big-toe tip, right big-toe tip, left
+heel, right heel — exactly kindyn's column order `left_hand, right_hand, left_foot(toe),
+right_foot(toe), left_ankle(heel), right_ankle(heel)`. Hands still fold the fifteen finger
+joints onto the wrist.
+
+**Frame and units.** GT forces are stored in newtons in the scene world frame; the loader
+(`contact/data/climbing_corpus.py`) normalises by each person's solved body weight
+(`total_mass · g`) and rotates **world → body-root** with the kindyn root quaternion
+(`q[3:7]`, xyzw, verified numerically against the stored axis-angle `global_orient`). The head
+predicts in that body-root frame directly (`model.force_head.frame: root`) — **no camera
+extrinsics appear anywhere in the objective**, unlike the physics loss whose
+`local_world_aligned` frame needs the per-frame camera to reach the world. Recovering world
+forces at analysis time is the inverse rotation through the predicted root pose (plus
+extrinsics if a camera frame is wanted).
+
+**The loss** (`ForceSupervisedLoss`) has two terms, in the same `(numerator, mass)` contract as
+the physics terms so DDP reduction stays an exact global mean:
+
+- **force** — smooth-L1 (Huber, `huber_delta_bw` 0.5) between prediction and GT on valid
+  **in-contact** limb-frames. Huber because the solver's tails are heavy (in-contact `|f|` p99
+  ≈ 1.6 bw, max 48 bw): quadratic near zero for a clean mean, linear past the delta so spikes
+  cannot dominate the gradient. On top of that, limb-frames whose GT magnitude exceeds
+  `outlier_bw` (4 bw) are **excluded outright** — those are solver blowups on bad
+  reconstructions, ~0.1 % of frames, not supervision.
+- **noncontact** — plain L1 on the predicted magnitude of valid **non-contact** limb-frames.
+  The gate is kindyn's own contact mask (bit-identical to contacts_2 — the exact mask the
+  forces were solved under), not predicted probabilities: there is no contact branch in this
+  run at all. GT is identically zero there by construction (zero force means *unlabeled*, not
+  measured-zero), and L1's constant slope at `‖f‖ → 0` admits exact zeros — the t7hinge lesson
+  carried over.
+
+**Force-only build.** Setting both contact targets off with explicit force anchors builds a
+model with *no contact tokens and no contact head at all* — the six force tokens are the only
+trainable addition, the block-triangular mask degenerates to original ⊥ force, and
+`out["contact"]` is `None`. `tests/test_force_only_build.py` proves the trainable set, the mask
+pattern, and MHR noise-floor invariance for this shape. The first experiment is
+`configs/climbing_corpus_force_supervised.yaml` (`corpus6_force_sup_t7`): T=7 / stride 1 clips
+with center-frame supervision, force temporal attention on and `attend: joint` (the allocation
+coupling argument from t7mid still applies), monitor `val/force_mae` (mean in-contact error
+norm, bw, minimised).
+
 ## Pointers
 
 - Code: `contact/physics/adapter.py` (SAM ↔ BetterHuman bridge),
   `contact/physics/loss.py` (objective + diagnostics + affine baselines),
+  `contact/force_supervision.py` (supervised kindyn-force loss),
   `sam_3d_body/models/heads/force_head.py`.
-- Configs: `configs/climbing_videos_force_warmstart_t16.yaml` (the current,
-  redesigned run — heavily annotated), `configs/climbing_videos_force_warmstart.yaml`
-  (regime a base), `configs/climbing_videos_force_scratch.yaml` (regime b);
-  defaults in `configs/base.yaml`.
+- Configs: `configs/climbing_videos_force_warmstart_t7hinge.yaml` (the kept physics run,
+  flattened + heavily annotated), `configs/climbing_corpus_force_supervised.yaml` (supervised
+  kindyn forces); defaults in `configs/base.yaml`. Retired physics-run configs
+  (`_warmstart`, `_scratch`, `_t16`, `_t7mid`, …) are archived in `legacy/configs/`.
 - Design record with the original decision/risk register: `plan/README.md`
   and `plan/for_agents/`.
