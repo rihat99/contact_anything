@@ -1,0 +1,12 @@
+name: climbing_corpus
+
+# The ClimbingVideos corpus read directly (no exported dataset): frames/ JPEG
+# tree, sam3 masks/bboxes, per-frame intrinsics/extrinsics, contacts level 1|2
+# joint labels, and (load_forces) the kindyn GT forces — six groups
+# [left_hand, right_hand, left_foot(toe), right_foot, left_ankle(heel),
+# right_ankle] in body-weight units, rotated to the body-root frame.
+# Split source of truth is scenes/scenes.db (331 train / 30 test).
+data:
+  root: /data3/rikhat.akizhanov/better/data/ClimbingVideos
+  contact_level: 1        # contacts_1 (kinematic_1 readout, v1-export semantics) | 2 (kinematic_2)
+  load_forces: false      # kindyn_1.npz -> force_gt / force_contact / force_valid per frame

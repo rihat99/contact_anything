@@ -70,7 +70,7 @@ ALWAYS_NON_CONTACT_8 = [0, 3, 6, 9, 12, 13, 14, 15]
 # 24-joint SMPL ownership map lands in the 22-joint body set.
 _SMPL_HAND_TO_WRIST = {22: 20, 23: 21}
 
-SMPL_NEUTRAL_NPZ = "/data3/rikhat.akizhanov/better/better_human/models/smpl/SMPL_NEUTRAL.npz"
+SMPL_NEUTRAL_NPZ = "/data3/rikhat.akizhanov/better/BetterHuman/models/smpl/SMPL_NEUTRAL.npz"
 
 _OWNER_CACHE: dict[str, Tensor] = {}
 
@@ -418,11 +418,16 @@ def validate_targets(cfg: dict, datasets: Sequence) -> None:
     targets = cfg["contact"]["targets"]
     enabled = {name for name in ("vertex", "joint") if targets[name]["enabled"]}
     derive = bool(targets["joint"]["derive_from_vertex"])
+    # A supervised-force run (force_supervision.enabled) counts a dataset that
+    # supplies GT forces as supervising — force-only configs have no contact
+    # target at all, and mixed configs may include a forces-only dataset.
+    force_supervised = bool((cfg.get("force_supervision") or {}).get("enabled", False))
 
     supplied: set[str] = set()
     for ds in datasets:
         native = set(getattr(ds, "supervised_targets", set()))
         ds_supervised = _dataset_supervised(native, enabled, derive)
+        ds_forces = force_supervised and bool(getattr(ds, "load_forces", False))
         supplied |= ds_supervised
         if "vertex" in native:
             ds_topology = getattr(ds, "topology", None)
@@ -430,12 +435,13 @@ def validate_targets(cfg: dict, datasets: Sequence) -> None:
                 raise ValueError(
                     f"dataset {getattr(ds, 'name', ds)!r} supplies vertex labels in "
                     f"topology {ds_topology!r} but contact.topology is {topology!r}")
-        if not ds_supervised:
+        if not ds_supervised and not ds_forces:
             raise ValueError(
                 f"dataset {getattr(ds, 'name', ds)!r} supervises none of the enabled "
                 f"target(s) {sorted(enabled)} (it supplies {sorted(native)}); every "
-                f"configured dataset must supervise ≥1 enabled target or it only "
-                f"contributes all-masked batches")
+                f"configured dataset must supervise ≥1 enabled target (or supply GT "
+                f"forces under force_supervision) or it only contributes all-masked "
+                f"batches")
 
     missing = enabled - supplied
     if missing:

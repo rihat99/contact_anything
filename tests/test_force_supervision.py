@@ -1,0 +1,134 @@
+"""Tests for the supervised six-group force loss."""
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+
+from contact.force_supervision import ForceSupervisedLoss
+
+K = 6
+
+
+def make_cfg(**loss_overrides) -> dict:
+    loss = {"force": 1.0, "noncontact": 1.0, "huber_delta_bw": 0.5, "outlier_bw": 4.0}
+    loss.update(loss_overrides)
+    return {"force_supervision": {"target_frame": "all", "loss": loss}}
+
+
+def make_batch(n_rows: int, gt: torch.Tensor, contact: torch.Tensor,
+               valid: torch.Tensor | None = None, seq_len: int = 1) -> dict:
+    return {
+        "force_gt": gt,
+        "force_contact": contact,
+        "force_valid": torch.ones(n_rows, dtype=torch.bool) if valid is None else valid,
+        "frame_valid": torch.ones(n_rows, dtype=torch.bool),
+        "seq_len": seq_len,
+    }
+
+
+def out_for(pred: torch.Tensor) -> dict:
+    return {"force": {"joint_forces": pred}}
+
+
+def test_exact_values_single_row():
+    """Hand-computed Huber + noncontact L1 on one frame, two active groups."""
+    loss_fn = ForceSupervisedLoss(make_cfg(), device="cpu")
+    pred = torch.zeros(1, K, 3)
+    pred[0, 0] = torch.tensor([0.1, 0.0, 0.0])      # in contact, small error
+    pred[0, 2] = torch.tensor([0.0, 2.0, 0.0])      # in contact, large error
+    pred[0, 1] = torch.tensor([0.3, 0.0, -0.4])     # NOT in contact -> L1 penalty
+    gt = torch.zeros(1, K, 3)
+    gt[0, 0] = torch.tensor([0.2, 0.0, 0.0])
+    gt[0, 2] = torch.tensor([0.0, 0.5, 0.0])
+    contact = torch.zeros(1, K, dtype=torch.bool)
+    contact[0, [0, 2]] = True
+
+    total, parts = loss_fn(out_for(pred), make_batch(1, gt, contact))
+    # group 0: |e|=0.1 < delta=0.5 -> 0.5*0.1^2/0.5 = 0.01; group 2: |e|=1.5 ->
+    # 1.5 - 0.5/2 = 1.25 (smooth_l1 with beta): expected numerator 1.26, mass 2.
+    assert parts["terms"]["force"]["weight_mass"] == 2.0
+    assert math.isclose(parts["terms"]["force"]["loss"], 1.26 / 2.0, rel_tol=1e-5)
+    # noncontact: L1 over remaining 4 groups; only group 1 nonzero: 0.3 + 0.4.
+    assert parts["terms"]["noncontact"]["weight_mass"] == 4.0
+    assert math.isclose(parts["terms"]["noncontact"]["loss"], 0.7 / 4.0, rel_tol=1e-5)
+    assert math.isclose(float(total), 1.26 / 2.0 + 0.7 / 4.0, rel_tol=1e-5)
+    # headline: mean error norm over contact entries = (0.1 + 1.5) / 2.
+    assert math.isclose(parts["force_mae"]["loss"], 0.8, rel_tol=1e-5)
+
+
+def test_outlier_frames_excluded():
+    loss_fn = ForceSupervisedLoss(make_cfg(outlier_bw=4.0), device="cpu")
+    gt = torch.zeros(1, K, 3)
+    gt[0, 0, 1] = -10.0                              # 10 bw solver blowup
+    gt[0, 1, 1] = -0.5
+    contact = torch.zeros(1, K, dtype=torch.bool)
+    contact[0, [0, 1]] = True
+    _, parts = loss_fn(out_for(torch.zeros(1, K, 3)), make_batch(1, gt, contact))
+    assert parts["n_outlier_excluded"] == 1
+    assert parts["terms"]["force"]["weight_mass"] == 1.0  # only group 1 remains
+    # An excluded limb-frame is dropped, not moved to the noncontact term.
+    assert parts["terms"]["noncontact"]["weight_mass"] == 4.0
+
+
+def test_center_frame_selection():
+    """T=3 clips supervise only the middle row; off-center rows are ignored."""
+    cfg = make_cfg()
+    cfg["force_supervision"]["target_frame"] = "center"
+    loss_fn = ForceSupervisedLoss(cfg, device="cpu")
+    pred = torch.zeros(3, K, 3)
+    pred[0, 0, 0] = 99.0                             # off-center garbage: ignored
+    pred[1, 0, 0] = 1.0                              # center row
+    gt = torch.zeros(3, K, 3)
+    gt[1, 0, 0] = 1.0
+    contact = torch.zeros(3, K, dtype=torch.bool)
+    contact[:, 0] = True
+    total, parts = loss_fn(out_for(pred), make_batch(3, gt, contact, seq_len=3))
+    assert parts["terms"]["force"]["weight_mass"] == 1.0
+    assert float(total) == pytest.approx(0.0, abs=1e-6)
+
+    cfg["force_supervision"]["target_frame"] = "center"
+    with pytest.raises(ValueError, match="odd seq_len"):
+        loss_fn(out_for(pred[:2]), make_batch(2, gt[:2], contact[:2], seq_len=2))
+
+
+def test_empty_supervision_keeps_graph_and_terms():
+    """No valid rows: mass-0 terms, zero total, gradient still reaches pred."""
+    loss_fn = ForceSupervisedLoss(make_cfg(), device="cpu")
+    pred = torch.randn(2, K, 3, requires_grad=True)
+    valid = torch.zeros(2, dtype=torch.bool)
+    batch = make_batch(2, torch.zeros(2, K, 3), torch.zeros(2, K, dtype=torch.bool),
+                       valid=valid)
+    total, parts = loss_fn(out_for(pred), batch)
+    assert float(total.detach()) == 0.0
+    assert set(parts["terms"]) == {"force", "noncontact"}
+    assert all(t["weight_mass"] == 0.0 for t in parts["terms"].values())
+    total.backward()
+    assert pred.grad is not None and torch.all(pred.grad == 0)
+
+
+def test_invalid_frames_masked():
+    loss_fn = ForceSupervisedLoss(make_cfg(), device="cpu")
+    gt = torch.ones(2, K, 3)
+    contact = torch.ones(2, K, dtype=torch.bool)
+    valid = torch.tensor([True, False])
+    _, parts = loss_fn(out_for(torch.zeros(2, K, 3)),
+                       make_batch(2, gt, contact, valid=valid))
+    assert parts["terms"]["force"]["weight_mass"] == float(K)
+    assert parts["n_supervised_rows"] == 1
+
+
+def test_shape_mismatch_raises():
+    loss_fn = ForceSupervisedLoss(make_cfg(), device="cpu")
+    batch = make_batch(1, torch.zeros(1, K, 3), torch.zeros(1, K, dtype=torch.bool))
+    with pytest.raises(ValueError, match="does not match GT"):
+        loss_fn(out_for(torch.zeros(1, 4, 3)), batch)
+
+
+def test_zero_weight_term_omitted():
+    loss_fn = ForceSupervisedLoss(make_cfg(noncontact=0.0), device="cpu")
+    gt = torch.zeros(1, K, 3)
+    contact = torch.zeros(1, K, dtype=torch.bool)
+    _, parts = loss_fn(out_for(torch.zeros(1, K, 3)), make_batch(1, gt, contact))
+    assert set(parts["terms"]) == {"force"}

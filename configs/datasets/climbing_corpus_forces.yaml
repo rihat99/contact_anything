@@ -1,0 +1,8 @@
+name: climbing_corpus
+
+# climbing_corpus with the kindyn GT forces enabled — used by the supervised
+# force experiments. See climbing_corpus.yaml for the layout description.
+data:
+  root: /data3/rikhat.akizhanov/better/data/ClimbingVideos
+  contact_level: 1
+  load_forces: true       # kindyn_1.npz -> force_gt / force_contact / force_valid per frame

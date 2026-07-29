@@ -31,6 +31,12 @@ from sam_3d_body.data.transforms import (
 from sam_3d_body.data.utils.prepare_batch import NoCollate
 
 from ..targets import TargetSpec, validate_targets
+from .climbing_corpus import (
+    FORCE_GROUP_NAMES,
+    ClimbingCorpusDataset,
+    list_annotated_test_scenes,
+    list_corpus_scenes,
+)
 from .climbing_images import ClimbingImagesDataset
 from .climbing_videos import (
     ClimbingVideosDataset,
@@ -164,6 +170,22 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec):
         # 0.0 for frames without cameras (still images) or the first row of a clip.
         out["cam_jump_m"] = torch.tensor(
             [float(f.get("cam_jump_m", 0.0)) for f in frames], dtype=torch.float32)  # [B]
+
+        # Supervised GT forces (climbing_corpus with load_forces): body-root
+        # frame, body-weight units, kindyn group order. Frames without forces
+        # fall back to zeros with force_valid=False, so mixed batches collate.
+        n_groups = len(FORCE_GROUP_NAMES)
+        out["force_gt"] = torch.stack([
+            torch.as_tensor(f["force_gt"], dtype=torch.float32)
+            if "force_gt" in f else torch.zeros(n_groups, 3, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 6, 3]
+        out["force_contact"] = torch.stack([
+            torch.as_tensor(f["force_contact"], dtype=torch.bool)
+            if "force_contact" in f else torch.zeros(n_groups, dtype=torch.bool)
+            for f in frames], dim=0)                                       # [B, 6]
+        out["force_valid"] = torch.tensor(
+            [bool(f.get("force_valid", False)) for f in frames],
+            dtype=torch.bool)                                              # [B]
         return out
 
     return _collate
@@ -335,6 +357,7 @@ def make_loaders(
 
     image_specs = [s for s in specs if s["name"] in ("damon", "climbing")]
     video_specs = [s for s in specs if s["name"] == "climbing_videos"]
+    corpus_specs = [s for s in specs if s["name"] == "climbing_corpus"]
 
     datasets_for_validation = []
     train_parts: list[tuple] = []   # (dataset, batch_size, shuffle)
@@ -410,6 +433,62 @@ def make_loaders(
                 if distributed_rank == 0:
                     print(
                         f"ClimbingVideos [{s['config']}]: videos train={len(train_vids)} "
+                        f"val={len(val_vids)} | scenes train={len(train_scenes)} "
+                        f"val={len(eval_scenes)} | clips train={len(train_ds)} "
+                        f"val={len(eval_ds)} (T={clip_len})")
+            datasets_for_validation.extend((train_ds, eval_ds))
+            train_parts.append((train_ds, clips_per_batch, True))
+            eval_parts.append((eval_ds, clips_per_batch, False))
+
+    if corpus_specs:
+        clips_per_batch = max(1, frames_per_batch // clip_len)
+        for s in corpus_specs:
+            ccfg = yaml.safe_load(Path(s["config"]).read_text())["data"]
+            root = ccfg["root"]
+            key = f"corpus:{s['config']}"
+            common = dict(
+                frames_per_clip=clip_len, frame_stride=int(seq["frame_stride"]),
+                seed=seed, contact_level=int(ccfg.get("contact_level", 1)),
+                use_confidence_weights=use_conf,
+                load_forces=bool(ccfg.get("load_forces", False)))
+            all_train_scenes = list_corpus_scenes(root, "train")
+            if eval_split == "test":
+                all_test_scenes = list_annotated_test_scenes(root)
+                if manifest is not None:
+                    train_scenes, eval_scenes = _manifest_train_test_scenes(
+                        manifest, key, all_train_scenes, all_test_scenes)
+                else:
+                    train_scenes, eval_scenes = all_train_scenes, all_test_scenes
+                train_ds = ClimbingCorpusDataset(
+                    root, scenes=train_scenes, split="train",
+                    jitter=bool(seq["jitter"]), **common)
+                eval_ds = ClimbingCorpusDataset(
+                    root, scenes=eval_scenes, split="test", jitter=False, **common)
+                out_manifest[key] = {
+                    "train": sorted(train_scenes), "test": sorted(eval_scenes)}
+                if distributed_rank == 0:
+                    print(
+                        f"ClimbingCorpus [{s['config']}]: all train scenes={len(train_scenes)} "
+                        f"manual test scenes={len(eval_scenes)} | clips train={len(train_ds)} "
+                        f"test={len(eval_ds)} (T={clip_len})")
+            else:
+                scenes = all_train_scenes
+                if manifest is not None:
+                    train_vids, val_vids = _manifest_video_ids(manifest, key, scenes)
+                else:
+                    train_vids, val_vids = group_train_val_split(
+                        (video_id_from_scene(sc) for sc in scenes), val_ratio, seed)
+                train_scenes = [sc for sc in scenes if video_id_from_scene(sc) in train_vids]
+                eval_scenes = [sc for sc in scenes if video_id_from_scene(sc) in val_vids]
+                train_ds = ClimbingCorpusDataset(
+                    root, scenes=train_scenes, split="train",
+                    jitter=bool(seq["jitter"]), **common)
+                eval_ds = ClimbingCorpusDataset(
+                    root, scenes=eval_scenes, split="val", jitter=False, **common)
+                out_manifest[key] = {"train": sorted(train_vids), "val": sorted(val_vids)}
+                if distributed_rank == 0:
+                    print(
+                        f"ClimbingCorpus [{s['config']}]: videos train={len(train_vids)} "
                         f"val={len(val_vids)} | scenes train={len(train_scenes)} "
                         f"val={len(eval_scenes)} | clips train={len(train_ds)} "
                         f"val={len(eval_ds)} (T={clip_len})")

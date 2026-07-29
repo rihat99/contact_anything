@@ -41,8 +41,14 @@ model:
     dropout: 0.0
     position_scale: 1.0               # multiply elapsed seconds before sinusoidal time encoding
   force_head:                         # Step 04: per-extremity 3D force regression (zero-init head)
-    enabled: false                    # requires the extremities_4 per_token joint target
-    frame: local_world_aligned        # local_world_aligned | local (consumed by the physics loss)
+    enabled: false                    # requires the extremities_4 per_token joint target,
+                                      # OR explicit force_keypoint_indices (decoupled/force-only)
+    # null = inherit the contact anchors (legacy 4-token behaviour, physics-compatible).
+    # A list of MHR70 indices decouples the force tokens from contact and permits
+    # force-only builds (no contact branch); the supervised 6-group experiment uses
+    # [62, 41, 15, 18, 17, 20] = L/R wrist, L/R big-toe-tip, L/R heel (kindyn order).
+    force_keypoint_indices: null
+    frame: local_world_aligned        # local_world_aligned | local (physics) | root (supervised GT)
     mlp_depth: 2
     mlp_channel_div_factor: 4
     dropout: 0.0
@@ -88,7 +94,7 @@ data:
   sequence: {frames_per_clip: 8, frame_stride: 2, jitter: true, target_frame: all}
 
 physics:                              # Step 06: RNEA root-wrench physics loss on the forces
-  enabled: false                      # requires force_head.enabled + a climbing_videos dataset
+  enabled: false                      # requires force_head.enabled + a climbing_videos/corpus dataset
   use_warp: false                     # opt into BetterRobot's fused CUDA FK/RNEA lanes
   model_path: null                    # null -> $BETTERHUMAN_MODELS_DIR then sibling BetterHuman
   lod: 1                              # MHR level of detail (1 matches SAM-3D-Body)
@@ -117,6 +123,20 @@ physics:                              # Step 06: RNEA root-wrench physics loss o
     force_l2: 0.01                    # ||f||^2 magnitude regulariser
     torque_l2: 0.01                   # ||tau_j||^2 joint-torque regulariser (residual frames)
     torque_smooth: 0.0                # ||tau_j(t) - tau_j(t-1)||^2 (needs >=2 residual frames)
+
+# Supervised GT-force loss (corpus kindyn forces; mutually exclusive with physics).
+# Predictions and targets are in body-weight units, body-root frame (no camera
+# extrinsics anywhere: GT world forces are rotated by the kindyn root quaternion,
+# and the head learns that frame directly — set model.force_head.frame: root).
+force_supervision:
+  enabled: false                      # requires force_head.enabled + a climbing_corpus dataset
+                                      # with load_forces: true
+  target_frame: center                # center | all (rows per clip contributing to the loss)
+  loss:
+    force: 1.0                        # Huber on valid in-contact limb-frames
+    huber_delta_bw: 0.5               # smooth-L1 quadratic->linear transition (bw)
+    outlier_bw: 4.0                   # drop limb-frames with |gt| above this (solver blowups; 0 = off)
+    noncontact: 1.0                   # L1 zero-force penalty on valid non-contact limb-frames
 
 loss: {dice_eps: 1.0e-5, grad_clip: 1.0}
 

@@ -23,6 +23,7 @@ pipeline; it reads a prebuilt dataset (``scripts/build_climbing_images.py``).
 See ``climbing_images.py`` for the full schema.
 """
 
+from .climbing_corpus import ClimbingCorpusDataset
 from .climbing_images import ClimbingImagesDataset
 from .climbing_videos import ClimbingVideosDataset
 from .damon import DamonDataset
@@ -30,6 +31,7 @@ from .lemon import LemonDataset
 from .rich import RichDataset
 
 __all__ = [
+    "ClimbingCorpusDataset",
     "ClimbingImagesDataset",
     "ClimbingVideosDataset",
     "DamonDataset",

@@ -52,8 +52,11 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
     out_dims = TargetSpec.from_config(cfg).output_dims()   # {name: dim} for enabled targets
 
     model_cfg.defrost()
-    # Always rebuild contact tokens from train config.
-    model_cfg.MODEL.DECODER.DO_CONTACT_TOKENS = True
+    # Rebuild contact tokens from train config; no enabled contact target means
+    # a force-only build with no contact tokens/head at all. CONTACT_HEAD is
+    # still patched below (self-describing config; the force branch reads the
+    # shared GRID_SIZE / GRID_RADIUS from it).
+    model_cfg.MODEL.DECODER.DO_CONTACT_TOKENS = bool(out_dims)
     if "CONTACT_HEAD" not in model_cfg.MODEL:
         model_cfg.MODEL.CONTACT_HEAD = CfgNode()
     ch = model_cfg.MODEL.CONTACT_HEAD
@@ -92,8 +95,12 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
     # DO_FORCE_TOKENS. The `frame` key is consumed by the physics loss (step 06),
     # not the model, so it is not mirrored here.
     fhcfg = cfg["model"].get("force_head", {}) or {}
+    force_kp = fhcfg.get("force_keypoint_indices")
     model_cfg.MODEL.DECODER.DO_FORCE_TOKENS = bool(fhcfg.get("enabled", False))
     model_cfg.MODEL.FORCE_HEAD = CfgNode({
+        # None = inherit the contact anchors (legacy); else the force tokens
+        # get their own MHR70 anchor list (required for force-only builds).
+        "KEYPOINT_INDICES":       None if force_kp is None else [int(i) for i in force_kp],
         "MLP_DEPTH":              int(fhcfg.get("mlp_depth", 2)),
         "MLP_CHANNEL_DIV_FACTOR": int(fhcfg.get("mlp_channel_div_factor", 4)),
         "DROPOUT":                float(fhcfg.get("dropout", 0.0)),

@@ -66,6 +66,8 @@ DEFAULTS: dict[str, Any] = {
         },
         "force_head": {                     # Step 04: per-extremity 3D force regression
             "enabled": False,
+            "force_keypoint_indices": None, # None = inherit the contact anchors (legacy);
+                                            # else own MHR70 anchor list (enables force-only builds)
             "frame": "local_world_aligned", # local_world_aligned | local (consumed by physics loss)
             "mlp_depth": 2,
             "mlp_channel_div_factor": 4,
@@ -162,6 +164,16 @@ DEFAULTS: dict[str, Any] = {
             "torque_smooth": 0.0,       # ||tau_j(t) - tau_j(t-1)||^2 (>=2 residual frames)
         },
     },
+    "force_supervision": {              # supervised GT-force loss (corpus kindyn forces)
+        "enabled": False,               # requires model.force_head.enabled; excludes physics.enabled
+        "target_frame": "center",       # center | all (rows per clip contributing to the loss)
+        "loss": {
+            "force": 1.0,               # Huber on in-contact limb-frames (bw units)
+            "huber_delta_bw": 0.5,      # smooth-L1 quadratic->linear transition (bw)
+            "outlier_bw": 4.0,          # exclude limb-frames with |gt| above this (0 = off)
+            "noncontact": 1.0,          # L1 zero-force penalty on non-contact limb-frames
+        },
+    },
     "loss": {"dice_eps": 1.0e-5, "grad_clip": 1.0},
     "train": {                          # Phase 4 efficiency flags (grad-asserted no-ops)
         "detach_interm_preds": True,    # run interm MHR/camera preds under no_grad
@@ -196,13 +208,13 @@ DEFAULTS: dict[str, Any] = {
     },
 }
 
-_KNOWN_DATASETS = frozenset({"damon", "climbing", "climbing_videos"})
+_KNOWN_DATASETS = frozenset({"damon", "climbing", "climbing_videos", "climbing_corpus"})
 _KNOWN_TARGETS = frozenset({"vertex", "joint"})
 _TEMPORAL_PLACEMENTS = frozenset({"post_decoder", "between_layers", "pre_decoder"})
 _TEMPORAL_ATTEND = frozenset({"joint", "per_token"})
 _KNOWN_JOINT_SETS = frozenset(JOINT_SET_NAMES)
 _CONTACT_POOL_MODES = frozenset({"attention", "concat", "per_token"})
-_FORCE_FRAMES = frozenset({"local_world_aligned", "local"})
+_FORCE_FRAMES = frozenset({"local_world_aligned", "local", "root"})
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -385,9 +397,18 @@ def _validate_physics(cfg: dict, force_head: dict) -> None:
         raise ValueError(
             "physics.enabled requires model.force_head.enabled=true "
             "(the physics loss supervises the predicted forces)")
-    if not any(entry["name"] == "climbing_videos" for entry in cfg["data"]["datasets"]):
+    # ``.get`` so the direct pre-schema unit test (minimal force_head dict)
+    # still runs; ``load_config`` always supplies ``frame`` from the defaults.
+    if str(force_head.get("frame", "local_world_aligned")) == "root":
         raise ValueError(
-            "physics.enabled requires a video dataset (climbing_videos) in data.datasets")
+            "physics.enabled requires model.force_head.frame 'local_world_aligned' "
+            "or 'local' — the physics loss rotates predictions into the world "
+            "through the camera extrinsics, which the 'root' frame does not use")
+    if not any(entry["name"] in ("climbing_videos", "climbing_corpus")
+               for entry in cfg["data"]["datasets"]):
+        raise ValueError(
+            "physics.enabled requires a video dataset (climbing_videos or "
+            "climbing_corpus) in data.datasets")
     frames_per_clip = int(cfg["data"]["sequence"]["frames_per_clip"])
     if frames_per_clip < min_frames:
         raise ValueError(
@@ -406,6 +427,40 @@ def _validate_physics(cfg: dict, force_head: dict) -> None:
             f"least {5 + 2 * radius} or shorten physics.smoothing_kernel")
 
 
+def _validate_force_supervision(cfg: dict, force_head: dict) -> None:
+    """Validate the ``force_supervision:`` section (supervised kindyn forces)."""
+    fs = cfg["force_supervision"]
+    target_frame = str(fs["target_frame"])
+    if target_frame not in ("all", "center"):
+        raise ValueError("force_supervision.target_frame must be 'all' or 'center'")
+    for key in ("force", "noncontact", "outlier_bw"):
+        value = float(fs["loss"][key])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"force_supervision.loss.{key} must be finite and >= 0")
+    delta = float(fs["loss"]["huber_delta_bw"])
+    if not math.isfinite(delta) or delta <= 0:
+        raise ValueError("force_supervision.loss.huber_delta_bw must be finite and positive")
+
+    if not fs["enabled"]:
+        return
+    if not force_head["enabled"]:
+        raise ValueError(
+            "force_supervision.enabled requires model.force_head.enabled=true "
+            "(the supervised loss reads the predicted forces)")
+    if cfg["physics"]["enabled"]:
+        raise ValueError(
+            "force_supervision.enabled and physics.enabled are mutually exclusive — "
+            "pick one supervision signal for the force branch")
+    if not any(entry["name"] == "climbing_corpus" for entry in cfg["data"]["datasets"]):
+        raise ValueError(
+            "force_supervision.enabled requires a climbing_corpus dataset in "
+            "data.datasets (GT forces come from the corpus kindyn_1.npz)")
+    if target_frame == "center" and int(cfg["data"]["sequence"]["frames_per_clip"]) % 2 == 0:
+        raise ValueError(
+            "force_supervision.target_frame='center' requires an odd "
+            "data.sequence.frames_per_clip")
+
+
 def _validate_semantics(cfg: dict) -> None:
     """Cross-key checks that pure key validation cannot express."""
     topology = cfg["contact"]["topology"]
@@ -416,8 +471,17 @@ def _validate_semantics(cfg: dict) -> None:
         raise ValueError(f"contact.primary_target must be one of {sorted(_KNOWN_TARGETS)}; got {primary!r}")
 
     targets = cfg["contact"]["targets"]
-    if not any(targets[name]["enabled"] for name in _KNOWN_TARGETS):
-        raise ValueError("no contact target is enabled — enable at least one of vertex/joint")
+    contact_enabled = any(targets[name]["enabled"] for name in _KNOWN_TARGETS)
+    force_head = cfg["model"]["force_head"]
+    force_kp = force_head["force_keypoint_indices"]
+    if not contact_enabled and not (force_head["enabled"] and force_kp is not None):
+        # Force-only builds (no contact tokens/head at all) are legal, but only
+        # with the force branch on and its own explicit anchors — null anchors
+        # inherit from the contact tokens, which do not exist here.
+        raise ValueError(
+            "no contact target is enabled — enable at least one of vertex/joint, "
+            "or configure a force-only build (model.force_head.enabled=true with "
+            "explicit model.force_head.force_keypoint_indices)")
 
     joint_cfg = targets["joint"]
     joint_set = joint_cfg["joint_set"]
@@ -459,6 +523,11 @@ def _validate_semantics(cfg: dict) -> None:
                 f"got {mismatched}")
 
     temporal = cfg["model"]["temporal"]
+    if temporal["enabled"] and not contact_enabled:
+        raise ValueError(
+            "model.temporal.enabled requires an enabled contact target (the contact "
+            "temporal module attends the contact tokens, which a force-only build "
+            "does not create — use model.force_temporal for the force tokens)")
     if temporal["placement"] not in _TEMPORAL_PLACEMENTS:
         raise ValueError(
             f"model.temporal.placement must be one of {sorted(_TEMPORAL_PLACEMENTS)}; "
@@ -477,18 +546,32 @@ def _validate_semantics(cfg: dict) -> None:
             f"model.temporal.window_frames must be null or an odd int >= 3; "
             f"got {window_frames!r}")
 
-    force_head = cfg["model"]["force_head"]
     if force_head["frame"] not in _FORCE_FRAMES:
         raise ValueError(
             f"model.force_head.frame must be one of {sorted(_FORCE_FRAMES)}; "
             f"got {force_head['frame']!r}")
+    if force_kp is not None and (
+        not isinstance(force_kp, list) or len(force_kp) == 0
+        or not all(isinstance(i, int) and not isinstance(i, bool) for i in force_kp)
+        or not all(0 <= i < 70 for i in force_kp)
+    ):
+        raise ValueError(
+            "model.force_head.force_keypoint_indices must be null or a non-empty "
+            f"list of MHR70 indices in [0, 70); got {force_kp!r}")
     if force_head["enabled"]:
-        joint_enabled = targets["joint"]["enabled"]
-        if not (joint_enabled and joint_set == "extremities_4" and pool_mode == "per_token"):
+        if force_kp is None:
+            joint_enabled = targets["joint"]["enabled"]
+            if not (joint_enabled and joint_set == "extremities_4" and pool_mode == "per_token"):
+                raise ValueError(
+                    "model.force_head.enabled requires the joint target enabled with "
+                    "joint_set='extremities_4' and model.contact_head.pool_mode='per_token' "
+                    "(force tokens reuse the four extremity contact anchors), or explicit "
+                    "model.force_head.force_keypoint_indices to decouple the anchors")
+        elif cfg["physics"]["enabled"]:
             raise ValueError(
-                "model.force_head.enabled requires the joint target enabled with "
-                "joint_set='extremities_4' and model.contact_head.pool_mode='per_token' "
-                "(force tokens reuse the four extremity contact anchors)")
+                "physics.enabled requires model.force_head.force_keypoint_indices=null "
+                "(the physics loss gates on the four extremity contact probabilities, "
+                "which is only sound when the force anchors are the contact anchors)")
 
     force_temporal = cfg["model"]["force_temporal"]
     if force_temporal["enabled"] and not force_head["enabled"]:
@@ -498,8 +581,13 @@ def _validate_semantics(cfg: dict) -> None:
     _validate_temporal_common(force_temporal, "model.force_temporal")
 
     _validate_physics(cfg, force_head)
+    _validate_force_supervision(cfg, force_head)
 
     if cfg["train"]["freeze_contact"]:
+        if not contact_enabled:
+            raise ValueError(
+                "train.freeze_contact=true requires an enabled contact target — a "
+                "force-only build has no contact branch to freeze")
         if not force_head["enabled"]:
             raise ValueError(
                 "train.freeze_contact=true requires model.force_head.enabled=true "
@@ -535,10 +623,11 @@ def _validate_semantics(cfg: dict) -> None:
         raise ValueError("data.eval_split must be 'val' or 'test'")
     if eval_split == "test" and (
         len(cfg["data"]["datasets"]) != 1
-        or cfg["data"]["datasets"][0]["name"] != "climbing_videos"
+        or cfg["data"]["datasets"][0]["name"] not in ("climbing_videos", "climbing_corpus")
     ):
         raise ValueError(
-            "data.eval_split='test' requires a ClimbingVideos-only data config")
+            "data.eval_split='test' requires a single climbing_videos or "
+            "climbing_corpus dataset (the manually annotated test split)")
 
     tb_metrics = cfg["logging"]["tensorboard_metrics"]
     if tb_metrics is not None and (

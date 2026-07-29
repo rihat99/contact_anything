@@ -143,6 +143,12 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
             "mlp_channel_div_factor": int(fhcfg.get("mlp_channel_div_factor", 4)),
             "dropout": float(fhcfg.get("dropout", 0.0)),
         }
+        # Decoupled force anchors change what each token regresses, so they are
+        # semantic. Added only when set: legacy checkpoints (null = inherit the
+        # contact anchors) keep their stored signatures byte-identical.
+        force_kp = fhcfg.get("force_keypoint_indices")
+        if force_kp is not None:
+            force["force_keypoint_indices"] = [int(i) for i in force_kp]
     else:
         force = {"enabled": False}
 

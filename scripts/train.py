@@ -41,6 +41,7 @@ sys.path.insert(0, str(REPO))
 from contact import checkpoint as ckpt_io
 from contact.config import DEFAULTS as CONFIG_DEFAULTS
 from contact.config import _deep_merge, load_config
+from contact.data.climbing_corpus import FORCE_GROUP_NAMES
 from contact.data.collate import batch_to_device, make_loaders
 from contact.engine import forward_model, select_temporal_supervision
 from contact.losses import MultiTargetContactLoss, ddp_global_mean_term
@@ -65,18 +66,20 @@ class _ContactForward(nn.Module):
     """Give DDP a conventional ``forward`` around SAM-3D-Body's step API.
 
     Returns the full forward output (``"contact"``, ``"mhr"``, ``"force"``): the
-    contact loss reads ``out["contact"]`` and the physics loss reads
-    ``out["mhr"]`` / ``out["force"]`` — both must share one DDP-wrapped forward so
-    every trainable param sits on a single backward graph.
+    contact loss reads ``out["contact"]`` and the physics/force losses read
+    ``out["mhr"]`` / ``out["force"]`` — all must share one DDP-wrapped forward so
+    every trainable param sits on a single backward graph. Force-only builds
+    (no contact targets) legitimately produce no contact output.
     """
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, require_contact: bool = True):
         super().__init__()
         self.model = model
+        self.require_contact = require_contact
 
     def forward(self, batch: dict) -> dict:
         out = forward_model(self.model, batch)
-        if out.get("contact") is None:
+        if self.require_contact and out.get("contact") is None:
             raise RuntimeError("model produced no contact output — check DO_CONTACT_TOKENS.")
         return out
 
@@ -303,8 +306,14 @@ class Trainer:
             (self.out_dir / "split_manifest.json").write_text(
                 json.dumps(self.split_manifest, indent=2))
 
-        self.loss_fn = MultiTargetContactLoss(self.cfg).to(device)
-        self.targets = self.loss_fn.target_names
+        self.contact_enabled = any(
+            self.cfg["contact"]["targets"][t]["enabled"] for t in ("vertex", "joint"))
+        if self.contact_enabled:
+            self.loss_fn = MultiTargetContactLoss(self.cfg).to(device)
+            self.targets = self.loss_fn.target_names
+        else:                     # force-only build: no contact branch, no contact loss
+            self.loss_fn = None
+            self.targets = ()
 
         # Physics-force objective (step 06/07). Built once on the training device;
         # loads the MHR body inside. Regime (a) (``train.freeze_contact``) drops the
@@ -312,19 +321,26 @@ class Trainer:
         self.physics_enabled = bool(self.cfg["physics"]["enabled"])
         self.freeze_contact = bool(self.cfg["train"]["freeze_contact"])
         self.physics_loss = None
+        # Supervised GT-force objective (corpus kindyn forces) — the alternative
+        # force supervision; config validation makes it exclusive with physics.
+        self.force_supervised = bool(self.cfg["force_supervision"]["enabled"])
+        self.force_loss = None
+        if self.force_supervised:
+            from contact.force_supervision import ForceSupervisedLoss
+            self.force_loss = ForceSupervisedLoss(self.cfg, device=device)
         if self.physics_enabled:
             from contact.physics.loss import PhysicsLoss
             self.physics_loss = PhysicsLoss(self.cfg, device=device)
-        elif self.cfg["model"]["force_head"]["enabled"]:
+        elif self.cfg["model"]["force_head"]["enabled"] and not self.force_supervised:
             # Trainer-only guard (evaluate/demo legitimately build force models
-            # without a physics objective): the force branch is supervised solely
-            # by the physics loss, so training it without one leaves the force
-            # params gradient-less — a silent no-op single-process and a
-            # find_unused_parameters=False crash under DDP.
+            # without a force objective): the force branch is supervised solely
+            # by the physics or GT-force loss, so training it without one leaves
+            # the force params gradient-less — a silent no-op single-process and
+            # a find_unused_parameters=False crash under DDP.
             raise ValueError(
-                "model.force_head.enabled requires physics.enabled=true for "
-                "training: without the physics loss the force params never "
-                "receive gradients")
+                "model.force_head.enabled requires physics.enabled=true or "
+                "force_supervision.enabled=true for training: without a force "
+                "objective the force params never receive gradients")
 
         # Regime-(b) physics-gradient leak guard: the documented physics/contact
         # gradient isolation holds only in regime (a) (contact frozen). When physics
@@ -356,7 +372,8 @@ class Trainer:
             if "joint" in self.targets and target_spec.joint_dims <= 32 else {}
         )
         primary = self.cfg["contact"]["primary_target"]
-        self.primary = primary if primary in self.targets else self.targets[0]
+        self.primary = (primary if primary in self.targets
+                        else (self.targets[0] if self.targets else None))
         self.eval_split = str(self.cfg["data"]["eval_split"])
         self.target_frame = str(self.cfg["data"]["sequence"]["target_frame"])
 
@@ -378,7 +395,8 @@ class Trainer:
         # `.../loss` and the physics-residual pseudo-target are minimised; the
         # classification metrics (f1/iou/...) are maximised.
         self.monitor_mode = (
-            "min" if self.monitor.endswith(("/loss", "/physics_residual")) else "max")
+            "min" if self.monitor.endswith(("/loss", "/physics_residual", "/force_mae"))
+            else "max")
 
         self.epoch        = 0
         self.global_step  = 0
@@ -416,7 +434,7 @@ class Trainer:
                 print(f"Resumed at epoch {self.epoch}  step {self.global_step}  "
                       f"best {self.monitor}={self.best_metric:.4f}")
 
-        forward_module = _ContactForward(self.model)
+        forward_module = _ContactForward(self.model, require_contact=self.contact_enabled)
         if self.distributed:
             self.forward_module = DistributedDataParallel(
                 forward_module,
@@ -460,6 +478,8 @@ class Trainer:
         }
         if getattr(self, "physics_enabled", False):
             valid.add(f"{self.eval_split}/physics_residual")
+        if getattr(self, "force_supervised", False):
+            valid.add(f"{self.eval_split}/force_mae")
         if self.monitor not in valid:
             raise ValueError(
                 f"output.monitor {self.monitor!r} is not a valid metric; choose one of "
@@ -623,11 +643,26 @@ class Trainer:
         scalars[f"{prefix}/physics/n_jerk_excluded_clips"] = phys_parts["n_jerk_excluded_clips"]
         return scalars
 
+    @staticmethod
+    def _force_scalars(prefix: str, force_parts: dict) -> dict:
+        """Flatten ForceSupervisedLoss parts into ``{prefix}/force_sup/*`` scalars."""
+        scalars = {f"{prefix}/force_sup/loss": force_parts["loss"]}
+        for name, term in force_parts["terms"].items():
+            scalars[f"{prefix}/force_sup/{name}"] = term["loss"]
+            scalars[f"{prefix}/force_sup/{name}_mass"] = term["weight_mass"]
+        scalars[f"{prefix}/force_sup/mae"] = force_parts["force_mae"]["loss"]
+        scalars[f"{prefix}/force_sup/noncontact_mag"] = force_parts["noncontact_mag"]
+        scalars[f"{prefix}/force_sup/n_outliers"] = force_parts["n_outlier_excluded"]
+        for name, value in zip(FORCE_GROUP_NAMES, force_parts["per_group_mae"]):
+            scalars[f"{prefix}/force_sup/mae_{name}"] = value
+        return scalars
+
     def _print_run_summary(self) -> None:
         n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         fpb = int(self.cfg["data"]["frames_per_batch"])
         clip_len = int(self.cfg["data"]["sequence"]["frames_per_clip"])
-        has_video = any(d["name"] == "climbing_videos" for d in self.cfg["data"]["datasets"])
+        has_video = any(d["name"] in ("climbing_videos", "climbing_corpus")
+                        for d in self.cfg["data"]["datasets"])
         layout = (f"video: {max(1, fpb // clip_len)} clips x T={clip_len}"
                   if has_video else f"stills: {fpb} frames x T=1")
         supervised = (
@@ -661,31 +696,43 @@ class Trainer:
             window_frames += frames
 
             out = self.forward_module(batch)
-            logits, targets = self._supervision(out["contact"], batch)
-            contact_loss, parts = self.loss_fn(logits, targets)
-            contact_loss, contact_active = self._ddp_weighted_loss(contact_loss, parts)
+            if self.loss_fn is not None:
+                logits, targets = self._supervision(out["contact"], batch)
+                contact_loss, parts = self.loss_fn(logits, targets)
+                contact_loss, contact_active = self._ddp_weighted_loss(contact_loss, parts)
+            else:                        # force-only build: no contact branch at all
+                logits, targets, parts = {}, {}, {}
+                contact_loss, contact_active = None, False
 
             # Regime (a) (``freeze_contact``): contact params are frozen, so the
             # contact loss is dropped from the objective (its metrics stay logged)
-            # and physics is the sole objective. Otherwise the total is contact +
-            # physics (either may be absent).
+            # and the force objective (physics or supervised) is the sole one.
+            # Otherwise the total is contact + force objective (either may be absent).
             phys_parts = None
-            physics_active = False
-            total = None if self.freeze_contact else contact_loss
+            force_parts = None
+            physics_active = force_active = False
+            total = (None if (self.freeze_contact or contact_loss is None)
+                     else contact_loss)
             if self.physics_loss is not None:
                 phys_total, phys_parts = self.physics_loss(out, batch)
                 phys_loss, physics_active = self._ddp_physics_loss(phys_total, phys_parts)
                 total = phys_loss if total is None else total + phys_loss
+            if self.force_loss is not None:
+                force_total, force_parts = self.force_loss(out, batch)
+                # ForceSupervisedLoss shares PhysicsLoss's (numerator, mass) term
+                # contract, so the same exact-DDP reducer applies.
+                force_scaled, force_active = self._ddp_physics_loss(force_total, force_parts)
+                total = force_scaled if total is None else total + force_scaled
             if total is None:
                 raise RuntimeError(
-                    "train.freeze_contact is set but no physics objective is enabled — "
-                    "nothing to train")
+                    "no training objective: the contact loss is frozen/absent and "
+                    "neither physics nor force_supervision is enabled")
 
             # A batch with zero active supervision (an all-invalid video window, or a
             # fully physics-ineligible clip) has zero gradient — but AdamW weight
             # decay would still nudge the weights. Skip the optimiser step for those.
-            active = (physics_active if self.freeze_contact
-                      else (contact_active or physics_active))
+            active = ((contact_active and not self.freeze_contact)
+                      or physics_active or force_active)
             loss = total
             finite = torch.tensor(
                 int(bool(torch.isfinite(loss).item())), device=self.device,
@@ -755,11 +802,17 @@ class Trainer:
                                 scalars[f"train/{t}/{output_name}/{key}"] = output_metrics[key]
                 if phys_parts is not None:
                     scalars.update(self._physics_scalars("train", phys_parts))
+                if force_parts is not None:
+                    scalars.update(self._force_scalars("train", force_parts))
                 self.logger.log(scalars, self.global_step)
 
             if self.is_main:
-                pbar.set_postfix(loss=f"{loss.item():.3f}",
-                                 f1=f"{prf1(batch_counts[self.primary])['f1']:.3f}")
+                postfix = {"loss": f"{loss.item():.3f}"}
+                if self.primary is not None:
+                    postfix["f1"] = f"{prf1(batch_counts[self.primary])['f1']:.3f}"
+                elif force_parts is not None:
+                    postfix["fmae"] = f"{force_parts['force_mae']['loss']:.3f}"
+                pbar.set_postfix(**postfix)
             self.global_step += 1
 
         running_loss, n, epoch_frames, skipped, counts = self._reduce_epoch_stats(
@@ -813,14 +866,21 @@ class Trainer:
         # deliberately excluded — their mix should not decide "best". Reuses
         # PhysicsLoss's additive numerator/mass.
         phys_residual_num, phys_residual_mass = 0.0, 0.0
+        # Supervised force MAE: same exact global mass-weighted mean pattern as
+        # the physics residual (ForceSupervisedLoss exposes the additive
+        # numerator/mass headline under parts["force_mae"]).
+        force_mae_num, force_mae_mass = 0.0, 0.0
         for batch in tqdm(
             self.eval_loader, desc=self.eval_split, disable=not self.is_main,
         ):
             batch  = batch_to_device(batch, self.device)
             out = self.forward_module(batch)
-            logits, targets = self._supervision(out["contact"], batch)
-            loss, _ = self.loss_fn(logits, targets)
-            running_loss += loss.item()
+            if self.loss_fn is not None:
+                logits, targets = self._supervision(out["contact"], batch)
+                loss, _ = self.loss_fn(logits, targets)
+                running_loss += loss.item()
+            else:
+                logits, targets = {}, {}
             n += 1
             if self.physics_loss is not None:
                 _, phys_parts = self.physics_loss(out, batch)
@@ -828,6 +888,15 @@ class Trainer:
                 if rterm is not None:
                     phys_residual_num += float(rterm["weighted_numerator_tensor"].detach())
                     phys_residual_mass += rterm["weight_mass"]
+            if self.force_loss is not None:
+                _, force_parts = self.force_loss(out, batch)
+                mterm = force_parts["force_mae"]
+                force_mae_num += float(mterm["weighted_numerator_tensor"].detach())
+                force_mae_mass += mterm["weight_mass"]
+                if self.loss_fn is None:
+                    # Force-only runs: ``{split}/loss`` is the force objective
+                    # (contact runs keep val/loss contact-only, physics precedent).
+                    running_loss += force_parts["loss"]
             for t in self.targets:
                 tgt = targets[t]
                 add_counts(counts[t], contact_counts(logits[t], tgt["gt"], tgt["mask"]))
@@ -851,6 +920,18 @@ class Trainer:
             metrics["physics"] = {"residual": _physics_residual_headline(
                 phys_residual_num, phys_residual_mass,
                 required=self.monitor.endswith("/physics_residual"))}
+        if self.force_loss is not None:
+            if self.distributed:
+                packed = torch.tensor(
+                    [force_mae_num, force_mae_mass],
+                    dtype=torch.float64, device=self.device)
+                dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+                force_mae_num, force_mae_mass = packed.cpu().tolist()
+            # Same zero-mass semantics as the physics headline: an eval split with
+            # no supervised in-contact limb-frame must never look like MAE 0.
+            metrics["force"] = {"mae": _physics_residual_headline(
+                force_mae_num, force_mae_mass,
+                required=self.monitor.endswith("/force_mae"))}
         return {"loss": running_loss / max(n, 1),
                 "metrics": metrics,
                 "per_output": {
@@ -891,6 +972,8 @@ class Trainer:
                 phys_note = ""
                 if "physics" in v["metrics"]:
                     phys_note = f"  physics_residual {v['metrics']['physics']['residual']:.4f}"
+                if "force" in v["metrics"]:
+                    phys_note += f"  force_mae {v['metrics']['force']['mae']:.4f}"
                 if self.is_main:
                     print(f"           {self.eval_split:<4s} loss {v['loss']:.4f}  {vsummary}{phys_note}")
                 val_scalars = {f"{self.eval_split}/loss": v["loss"]}
@@ -907,6 +990,9 @@ class Trainer:
                 if "physics" in v["metrics"]:
                     val_scalars[f"{self.eval_split}/physics/residual"] = (
                         v["metrics"]["physics"]["residual"])
+                if "force" in v["metrics"]:
+                    val_scalars[f"{self.eval_split}/force_sup/mae"] = (
+                        v["metrics"]["force"]["mae"])
                 self.logger.log(val_scalars, self.global_step)
                 val_metric = self._monitor_value(v)
 

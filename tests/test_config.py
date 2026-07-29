@@ -354,6 +354,7 @@ def test_force_head_defaults_load():
     cfg = load_config(REPO / "configs" / "base.yaml")
     assert cfg["model"]["force_head"] == {
         "enabled": False,
+        "force_keypoint_indices": None,
         "frame": "local_world_aligned",
         "mlp_depth": 2,
         "mlp_channel_div_factor": 4,
@@ -490,7 +491,7 @@ data:
 
 
 def test_manual_test_eval_requires_climbing_videos_only(tmp_path):
-    with pytest.raises(ValueError, match="ClimbingVideos-only"):
+    with pytest.raises(ValueError, match="single climbing_videos or"):
         load_config(_write(tmp_path, """
 base: configs/base.yaml
 data:

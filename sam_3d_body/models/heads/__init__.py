@@ -45,9 +45,14 @@ def build_head(cfg, head_type="mhr", enable_hand_model=False, default_scale_fact
         )
     elif head_type == "force":
         force_cfg = cfg.MODEL.get("FORCE_HEAD", dict())
-        # Force tokens reuse the contact keypoint anchors (D2), so the number of
-        # force tokens equals the number of anchored contact tokens.
-        num_kp = cfg.MODEL.get("CONTACT_HEAD", dict()).get("NUM_CONTACTS", 21)
+        # Force anchors: FORCE_HEAD.KEYPOINT_INDICES when explicitly set,
+        # otherwise the contact keypoint anchors (D2, legacy default) — the
+        # number of force tokens follows the resolved anchor list.
+        force_kp = force_cfg.get("KEYPOINT_INDICES", None)
+        if force_kp is not None:
+            num_kp = len(force_kp)
+        else:
+            num_kp = cfg.MODEL.get("CONTACT_HEAD", dict()).get("NUM_CONTACTS", 21)
         return ForceHead(
             input_dim=cfg.MODEL.DECODER.DIM,
             num_force_tokens=num_kp,

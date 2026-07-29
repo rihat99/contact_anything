@@ -291,17 +291,36 @@ class SAM3DBody(BaseModel):
             # --- end contact temporal hook ---
 
         # --- force hook (module construction) ---
-        # Force tokens/head mirror the contact machinery: the four extremity
-        # contact anchors (D2), an own embedding + posemb/feat linears, and a
-        # per-token regression head. Every param carries "force" in its name so
-        # the generalized freeze/eval filters ("contact" OR "force") pick it up.
+        # Force tokens/head mirror the contact machinery: keypoint anchors, an
+        # own embedding + posemb/feat linears, and a per-token regression head.
+        # Every param carries "force" in its name so the generalized freeze/eval
+        # filters ("contact" OR "force") pick it up.
         if self.cfg.MODEL.DECODER.get("DO_FORCE_TOKENS", False):
-            assert self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False), (
-                "DO_FORCE_TOKENS requires DO_CONTACT_TOKENS: force tokens reuse "
-                "the contact keypoint anchors (contact_keypoint_indices)."
+            force_head_cfg = self.cfg.MODEL.get("FORCE_HEAD", dict())
+            # Force anchors: FORCE_HEAD.KEYPOINT_INDICES when explicitly set,
+            # otherwise the contact anchors (D2, legacy default — requires the
+            # contact tokens to exist). No global force tokens either way.
+            force_kp_indices = force_head_cfg.get("KEYPOINT_INDICES", None)
+            if force_kp_indices is None:
+                assert self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False), (
+                    "DO_FORCE_TOKENS without FORCE_HEAD.KEYPOINT_INDICES requires "
+                    "DO_CONTACT_TOKENS: the force tokens then reuse the contact "
+                    "keypoint anchors (contact_keypoint_indices)."
+                )
+                force_kp_indices = self.contact_keypoint_indices
+            force_kp_indices = list(force_kp_indices)
+            assert all(0 <= int(i) < 70 for i in force_kp_indices), (
+                f"force keypoint indices must be MHR70 indices in [0, 70); "
+                f"got {force_kp_indices}"
             )
-            # Force anchors ARE the contact anchors; no global force tokens.
-            self.num_force_tokens = len(self.contact_keypoint_indices)
+            self.force_keypoint_indices = [int(i) for i in force_kp_indices]
+            self.num_force_tokens = len(self.force_keypoint_indices)
+            if not self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
+                # Force-only build: the anchored update's grid-sampling params
+                # are normally set by the contact block above.
+                contact_head_cfg = self.cfg.MODEL.get("CONTACT_HEAD", dict())
+                self.contact_grid_size   = contact_head_cfg.get("GRID_SIZE", 1)
+                self.contact_grid_radius = contact_head_cfg.get("GRID_RADIUS", 0.1)
             self.force_embedding = nn.Embedding(
                 self.num_force_tokens, self.cfg.MODEL.DECODER.DIM
             )
@@ -629,7 +648,9 @@ class SAM3DBody(BaseModel):
                 )  # B x 3 + 70 + 70 x 1024
 
             # Add contact tokens if enabled
-            if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
+            do_contact_tokens = self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False)
+            do_force_tokens = self.cfg.MODEL.DECODER.get("DO_FORCE_TOKENS", False)
+            if do_contact_tokens:
                 contact_emb_start_idx = token_embeddings.shape[1]
                 token_embeddings = torch.cat(
                     [
@@ -651,48 +672,46 @@ class SAM3DBody(BaseModel):
                     dim=1,
                 )
 
-                # --- force hook (append tokens after contact) ---
-                # Force tokens live after the contact block; the mask below is
-                # built once the sequence is complete so N_total is correct.
-                if self.cfg.MODEL.DECODER.get("DO_FORCE_TOKENS", False):
-                    force_emb_start_idx = token_embeddings.shape[1]
-                    token_embeddings = torch.cat(
-                        [
-                            token_embeddings,
-                            self.force_embedding.weight[None, :, :].repeat(
-                                batch_size, 1, 1
-                            ),
-                        ],
-                        dim=1,
-                    )
-                    # No positional embeddings for force tokens
-                    token_augment = torch.cat(
-                        [
-                            token_augment,
-                            torch.zeros_like(
-                                token_embeddings[:, token_augment.shape[1] :, :]
-                            ),
-                        ],
-                        dim=1,
-                    )
-                # --- end force hook ---
+            # --- force hook (append tokens after contact) ---
+            # Force tokens live after the contact block (or directly after the
+            # original tokens in a force-only build); the mask below is built
+            # once the sequence is complete so N_total is correct.
+            if do_force_tokens:
+                force_emb_start_idx = token_embeddings.shape[1]
+                token_embeddings = torch.cat(
+                    [
+                        token_embeddings,
+                        self.force_embedding.weight[None, :, :].repeat(
+                            batch_size, 1, 1
+                        ),
+                    ],
+                    dim=1,
+                )
+                # No positional embeddings for force tokens
+                token_augment = torch.cat(
+                    [
+                        token_augment,
+                        torch.zeros_like(
+                            token_embeddings[:, token_augment.shape[1] :, :]
+                        ),
+                    ],
+                    dim=1,
+                )
+            # --- end force hook ---
 
+            if do_contact_tokens or do_force_tokens:
                 # Asymmetric attention mask: no earlier token block may attend a
                 # later one (True=allowed). Original tokens never attend contact
                 # or force tokens; contact tokens never attend force tokens; each
                 # extra block can still attend everything before it to learn from
                 # it. Built after all extra blocks so N_total is final.
-                N_total = token_embeddings.shape[1]
-                token_mask = torch.ones(
-                    batch_size, N_total, N_total,
-                    dtype=torch.bool,
-                    device=token_embeddings.device,
+                token_mask = self._build_block_token_mask(
+                    batch_size,
+                    token_embeddings.shape[1],
+                    ([contact_emb_start_idx] if do_contact_tokens else [])
+                    + ([force_emb_start_idx] if do_force_tokens else []),
+                    token_embeddings.device,
                 )
-                token_mask[:, :contact_emb_start_idx, contact_emb_start_idx:] = False
-                # --- force hook (extend mask: nothing before force attends it) ---
-                if self.cfg.MODEL.DECODER.get("DO_FORCE_TOKENS", False):
-                    token_mask[:, :force_emb_start_idx, force_emb_start_idx:] = False
-                # --- end force hook ---
 
                 # --- contact blind hook (gate the image cross-attention) ---
                 # Every token cross-attends the image embeddings, and that
@@ -702,9 +721,9 @@ class SAM3DBody(BaseModel):
                 # Cross-attention is independent per query row (keys/values are
                 # image-only), so this removes the contact tokens' image access
                 # without perturbing any other row by a single ulp.
-                if self.contact_blind_to_image:
+                if do_contact_tokens and self.contact_blind_to_image:
                     token_context_gate = torch.ones(
-                        1, N_total, 1,
+                        1, token_embeddings.shape[1], 1,
                         dtype=token_embeddings.dtype,
                         device=token_embeddings.device,
                     )
@@ -2277,10 +2296,30 @@ class SAM3DBody(BaseModel):
 
         return token_embeddings, token_augment, pose_output, layer_idx
 
+    @staticmethod
+    def _build_block_token_mask(batch_size, num_total, block_starts, device):
+        """Asymmetric token-token attention mask for the appended token blocks.
+
+        ``block_starts`` lists the start index of every appended block (contact
+        and/or force) in ascending order. For each start ``s``, every token
+        before ``s`` is barred from attending any token at ``>= s`` — so no
+        earlier token block may attend a later one (True=allowed): original
+        tokens never attend contact or force tokens, contact tokens never attend
+        force tokens, while each appended block still attends everything before
+        it. Returns a bool mask of shape ``(batch_size, num_total, num_total)``.
+        """
+        token_mask = torch.ones(
+            batch_size, num_total, num_total, dtype=torch.bool, device=device,
+        )
+        for start in block_starts:
+            token_mask[:, :start, start:] = False
+        return token_mask
+
     def _anchored_token_update(
         self,
         start_idx,
         num_anchor,
+        kp_indices,
         posemb_linear,
         feat_linear,
         image_embeddings,
@@ -2294,13 +2333,12 @@ class SAM3DBody(BaseModel):
         1. writes a 2D-keypoint positional encoding into ``token_augment`` and
         2. adds grid-sampled backbone features into ``token_embeddings``,
 
-        both anchored at ``self.contact_keypoint_indices`` (the anchors are shared
-        by the contact and force banks, D2) with the caller's own ``posemb_linear``
-        / ``feat_linear``. Anchors outside the frame or behind the camera
-        contribute zero. Returns the updated ``(token_embeddings, token_augment)``.
+        both anchored at the caller's ``kp_indices`` MHR70 anchor list
+        (``contact_keypoint_indices`` / ``force_keypoint_indices``) with the
+        caller's own ``posemb_linear`` / ``feat_linear``. Anchors outside the
+        frame or behind the camera contribute zero. Returns the updated
+        ``(token_embeddings, token_augment)``.
         """
-        kp_indices = self.contact_keypoint_indices
-
         # Get predicted 2D keypoint positions in crop space (-0.5 to 0.5)
         pred_kps_2d = pose_output["pred_keypoints_2d_cropped"].clone()  # [B, 70, 2]
         pred_kps_depth = pose_output["pred_keypoints_2d_depth"].clone()  # [B, 70]
@@ -2427,6 +2465,7 @@ class SAM3DBody(BaseModel):
         if not getattr(self, "contact_blind_to_image", False):
             token_embeddings, token_augment = self._anchored_token_update(
                 contact_emb_start_idx, self.num_contact_tokens,
+                self.contact_keypoint_indices,
                 self.contact_posemb_linear, self.contact_feat_linear,
                 image_embeddings, pose_output, token_embeddings, token_augment,
             )
@@ -2462,9 +2501,9 @@ class SAM3DBody(BaseModel):
         """Update force tokens after each intermediate decoder layer.
 
         Same anchored update as :meth:`contact_token_update_fn` (2D-keypoint posemb
-        + grid-sampled features at the shared extremity anchors, D2), applied to the
-        force-token slice with the force linears. No temporal hook — force temporal
-        is post_decoder only (step 05).
+        + grid-sampled features at ``force_keypoint_indices`` — the contact anchors
+        when inherited, D2), applied to the force-token slice with the force
+        linears. No temporal hook — force temporal is post_decoder only (step 05).
         """
         # Skip after the last layer (same pattern as contact_token_update_fn)
         if layer_idx == len(decoder_layers) - 1:
@@ -2472,6 +2511,7 @@ class SAM3DBody(BaseModel):
 
         token_embeddings, token_augment = self._anchored_token_update(
             force_emb_start_idx, self.num_force_tokens,
+            self.force_keypoint_indices,
             self.force_posemb_linear, self.force_feat_linear,
             image_embeddings, pose_output, token_embeddings, token_augment,
         )
