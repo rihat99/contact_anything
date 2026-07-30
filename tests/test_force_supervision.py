@@ -12,7 +12,8 @@ K = 6
 
 
 def make_cfg(**loss_overrides) -> dict:
-    loss = {"force": 1.0, "noncontact": 1.0, "huber_delta_bw": 0.5, "outlier_bw": 4.0}
+    loss = {"force": 1.0, "noncontact": 1.0, "huber_delta_bw": 0.5, "outlier_bw": 4.0,
+            "group_weights": None}
     loss.update(loss_overrides)
     return {"force_supervision": {"target_frame": "all", "loss": loss}}
 
@@ -124,6 +125,37 @@ def test_shape_mismatch_raises():
     batch = make_batch(1, torch.zeros(1, K, 3), torch.zeros(1, K, dtype=torch.bool))
     with pytest.raises(ValueError, match="does not match GT"):
         loss_fn(out_for(torch.zeros(1, 4, 3)), batch)
+
+
+def test_group_weights_weighted_mean():
+    """Weights enter numerator AND mass; the headline MAE stays unweighted."""
+    weights = [1.0, 1.0, 2.0, 2.0, 2.0, 2.0]
+    loss_fn = ForceSupervisedLoss(make_cfg(group_weights=weights), device="cpu")
+    pred = torch.zeros(1, K, 3)
+    gt = torch.zeros(1, K, 3)
+    gt[0, 0, 0] = 0.1                                # hand group, weight 1
+    gt[0, 2, 0] = 0.1                                # foot group, weight 2
+    contact = torch.zeros(1, K, dtype=torch.bool)
+    contact[0, [0, 2]] = True
+    _, parts = loss_fn(out_for(pred), make_batch(1, gt, contact))
+    # Same per-entry Huber value h = 0.5*0.1^2/0.5 = 0.01; weighted mean
+    # (1*h + 2*h) / (1 + 2) = h — equal errors are unaffected by weighting.
+    assert parts["terms"]["force"]["weight_mass"] == 3.0
+    assert math.isclose(parts["terms"]["force"]["loss"], 0.01, rel_tol=1e-5)
+    # Unequal errors: the foot entry dominates 2:1.
+    gt[0, 0, 0] = 0.3                                # h_hand = 0.5*0.09/0.5 = 0.09
+    _, parts = loss_fn(out_for(pred), make_batch(1, gt, contact))
+    assert math.isclose(
+        parts["terms"]["force"]["loss"], (1 * 0.09 + 2 * 0.01) / 3.0, rel_tol=1e-5)
+    # Headline MAE is unweighted: (0.3 + 0.1) / 2.
+    assert math.isclose(parts["force_mae"]["loss"], 0.2, rel_tol=1e-5)
+
+
+def test_group_weights_length_mismatch_raises():
+    loss_fn = ForceSupervisedLoss(make_cfg(group_weights=[1.0, 2.0]), device="cpu")
+    batch = make_batch(1, torch.zeros(1, K, 3), torch.zeros(1, K, dtype=torch.bool))
+    with pytest.raises(ValueError, match="group_weights"):
+        loss_fn(out_for(torch.zeros(1, K, 3)), batch)
 
 
 def test_zero_weight_term_omitted():

@@ -137,6 +137,10 @@ force_supervision:
     huber_delta_bw: 0.5               # smooth-L1 quadratic->linear transition (bw)
     outlier_bw: 4.0                   # drop limb-frames with |gt| above this (solver blowups; 0 = off)
     noncontact: 1.0                   # L1 zero-force penalty on valid non-contact limb-frames
+    group_weights: null               # per-group Huber weights (kindyn order), weighted-mean
+                                      # semantics; null = uniform. Upweight the legs: hands
+                                      # dominate contact rate AND GT magnitude, and with uniform
+                                      # weights the leg groups collapse to zero output.
 
 loss: {dice_eps: 1.0e-5, grad_clip: 1.0}
 

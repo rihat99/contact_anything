@@ -17,7 +17,13 @@ mean under DDP):
   has heavy tails (in-contact ``|f|`` p99 ≈ 1.6 bw, max 48 bw): quadratic near
   zero for a clean mean, linear past ``huber_delta_bw`` so spikes cannot
   dominate the gradient. Limb-frames whose GT magnitude exceeds ``outlier_bw``
-  are excluded outright (solver blowups on bad reconstructions).
+  are excluded outright (solver blowups on bad reconstructions). Optional
+  ``group_weights`` (kindyn group order) turn the term into a per-group
+  weighted mean — weights enter both the numerator and the mass, so upweighted
+  groups get proportionally more gradient without changing the term's scale.
+  Motivation: with uniform weights the first supervised run collapsed the four
+  leg groups to exactly zero (hands dominate both contact rate and GT
+  magnitude); upweighting the legs counteracts that.
 - ``noncontact`` — L1 magnitude penalty on valid **non-contact** limb-frames.
   GT is identically zero there by construction (the kindyn solve only placed
   forces where its contacts_2-derived labels said contact), so this is the
@@ -60,6 +66,10 @@ class ForceSupervisedLoss:
         self.weights = {name: float(loss_cfg[name]) for name in _TERM_NAMES}
         self.huber_delta = float(loss_cfg["huber_delta_bw"])
         self.outlier_bw = float(loss_cfg["outlier_bw"])
+        gw = loss_cfg["group_weights"]
+        self.group_weights = (
+            None if gw is None
+            else torch.tensor([float(w) for w in gw], dtype=dtype))
         self.device = torch.device(device)
         self.dtype = dtype
 
@@ -122,8 +132,20 @@ class ForceSupervisedLoss:
         huber = F.smooth_l1_loss(
             pred, gt, reduction="none", beta=self.huber_delta).sum(dim=-1)  # (rows, K)
         l1_mag = pred.abs().sum(dim=-1)                                     # (rows, K)
+        if self.group_weights is not None:
+            if self.group_weights.numel() != pred.shape[1]:
+                raise ValueError(
+                    f"force_supervision.loss.group_weights has "
+                    f"{self.group_weights.numel()} entries but the model predicts "
+                    f"{pred.shape[1]} force groups")
+            gw = self.group_weights.to(self.device)[None, :]                # (1, K)
+            force_num = (huber * in_contact * gw).sum()
+            force_mass = float((in_contact * gw).sum())
+        else:
+            force_num = (huber * in_contact).sum()
+            force_mass = float(in_contact.sum())
         terms: dict[str, tuple[Tensor, float]] = {
-            "force": ((huber * in_contact).sum(), float(in_contact.sum())),
+            "force": (force_num, force_mass),
             "noncontact": ((l1_mag * off_contact).sum(), float(off_contact.sum())),
         }
 

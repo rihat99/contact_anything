@@ -1,7 +1,6 @@
-# Supervised force run #1 — corpus6_force_sup_t7. First experiment on the corpus-direct
-# loader and the first NON-physics force supervision: the kindyn_1.npz solver forces are
-# the labels (six groups: L/R hand, L/R foot=big-toe, L/R ankle=heel — the kindyn column
-# order), body-weight units, body-root frame (GT world forces rotated by the kindyn root
+# Supervised force run #2 — corpus6_force_sup_t7_v2. Kindyn solver forces as labels
+# (six groups: L/R hand, L/R foot=big-toe, L/R ankle=heel — the kindyn column order),
+# body-weight units, body-root frame (GT world forces rotated by the kindyn root
 # quaternion; NO camera extrinsics anywhere in the objective).
 #
 # Force-ONLY build: both contact targets disabled -> no contact tokens, no contact head.
@@ -9,8 +8,22 @@
 #   [62, 41, 15, 18, 17, 20] = L wrist, R wrist, L big-toe-tip, R big-toe-tip, L heel, R heel
 # matching the kindyn group order [LH, RH, LF, RF, LA, RA].
 #
+# v2 changes after run #1 (corpus6_force_sup_t7) collapsed all four leg groups to exact
+# zero output while hands learned (val plateau 0.290 vs 0.267 per-group-constant baseline):
+#   huber_delta_bw 0.5 -> 0.1   foot-scale errors (~0.15 bw) now sit in the Huber's linear
+#                               regime (slope 1/component) instead of quadratic slope ~0.3,
+#                               so in-contact gradients match the noncontact L1's slope.
+#   noncontact 1.0 -> 0.2       the zero-force term was trivially satisfied (mean off-contact
+#                               |pred| 0.012) yet its slope-1 pull made f=0 the optimum for
+#                               the leg groups (contact rate 0.60 vs hands 0.86).
+#   group_weights legs x2       hands dominate both contact rate and GT magnitude (mean
+#                               in-contact |gt| 0.44/0.48 bw vs 0.22-0.28 for legs); weighted
+#                               mean gives the legs proportionally more of the force gradient.
+#   eval_split test             no val holdout: train on all 331 curated train scenes,
+#                               evaluate on the 30 manual-test scenes (all have kindyn).
+#
 # Loss (contact/force_supervision.py):
-#   force      — smooth-L1 (delta 0.5 bw) on valid IN-contact limb-frames; limb-frames
+#   force      — smooth-L1 (delta 0.1 bw) on valid IN-contact limb-frames; limb-frames
 #                with |gt| > 4 bw are dropped (solver blowups, ~0.1% tail, max 48 bw).
 #   noncontact — L1 magnitude on valid NON-contact limb-frames (GT is exactly zero there
 #                by construction; L1's constant slope admits exact zeros — t7hinge lesson).
@@ -40,7 +53,7 @@ contact:
 data:
   datasets:
     - {name: climbing_corpus, config: configs/datasets/climbing_corpus_forces.yaml}
-  eval_split: val                     # grouped source-video holdout (forces exist on every scene)
+  eval_split: test                    # no val: all 331 train scenes train, manual test evaluates
   frames_per_batch: 35                # per GPU -> 5 clips x T=7
   sequence: {frames_per_clip: 7, frame_stride: 1, jitter: true, target_frame: center}
 
@@ -49,9 +62,10 @@ force_supervision:
   target_frame: center                # supervise row T//2 only; the window still informs it
   loss:
     force: 1.0
-    huber_delta_bw: 0.5
+    huber_delta_bw: 0.1
     outlier_bw: 4.0
-    noncontact: 1.0
+    noncontact: 0.2
+    group_weights: [1.0, 1.0, 2.0, 2.0, 2.0, 2.0]   # [LH, RH, LF, RF, LA, RA]
 
 optim:
   lr: 1.0e-4
@@ -72,9 +86,9 @@ logging:
   - train/force_sup/mae
   - train/force_sup/noncontact_mag
   - train/force_sup/n_outliers
-  - val/loss
-  - val/force_sup/mae
+  - test/loss
+  - test/force_sup/mae
 
 output:
-  exp_name: corpus6_force_sup_t7
-  monitor: val/force_mae              # minimised; mean |pred - gt| on in-contact limb-frames (bw)
+  exp_name: corpus6_force_sup_t7_v2
+  monitor: test/force_mae             # minimised; mean |pred - gt| on in-contact limb-frames (bw)

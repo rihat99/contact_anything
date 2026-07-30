@@ -172,6 +172,7 @@ DEFAULTS: dict[str, Any] = {
             "huber_delta_bw": 0.5,      # smooth-L1 quadratic->linear transition (bw)
             "outlier_bw": 4.0,          # exclude limb-frames with |gt| above this (0 = off)
             "noncontact": 1.0,          # L1 zero-force penalty on non-contact limb-frames
+            "group_weights": None,      # per-group Huber weights (kindyn order); null = uniform
         },
     },
     "loss": {"dice_eps": 1.0e-5, "grad_clip": 1.0},
@@ -439,6 +440,20 @@ def _validate_force_supervision(cfg: dict, force_head: dict) -> None:
     delta = float(fs["loss"]["huber_delta_bw"])
     if not math.isfinite(delta) or delta <= 0:
         raise ValueError("force_supervision.loss.huber_delta_bw must be finite and positive")
+    group_weights = fs["loss"]["group_weights"]
+    if group_weights is not None:
+        if not isinstance(group_weights, (list, tuple)) or not group_weights:
+            raise ValueError(
+                "force_supervision.loss.group_weights must be null or a non-empty list")
+        for w in group_weights:
+            if not isinstance(w, (int, float)) or not math.isfinite(float(w)) or float(w) <= 0:
+                raise ValueError(
+                    "force_supervision.loss.group_weights entries must be finite and > 0")
+        anchors = force_head.get("force_keypoint_indices")
+        if anchors is not None and len(group_weights) != len(anchors):
+            raise ValueError(
+                f"force_supervision.loss.group_weights has {len(group_weights)} entries "
+                f"but model.force_head.force_keypoint_indices has {len(anchors)}")
 
     if not fs["enabled"]:
         return
