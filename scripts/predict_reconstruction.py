@@ -8,13 +8,19 @@ checkpoints run over them with the same centered sliding-window inference as
 
   * ``--contact-checkpoint`` -> ``<stem>/predictions/contacts.npz``:
     per-limb probabilities + thresholded booleans.
-  * ``--force-checkpoint``   -> ``<stem>/predictions/forces.npz``:
-    per-limb 3D forces in body-weight units, both in the head's
-    ``local_world_aligned`` frame and rotated into the reconstruction's world
-    frame via the scene's ``cam_from_world`` extrinsics, plus that checkpoint's
-    own (gating) contact probabilities.
+  * ``--force-checkpoint``   -> ``<stem>/predictions/<--force-name>`` (default
+    ``forces.npz``): per-limb 3D forces in body-weight units, in the head's own
+    frame plus a world-frame copy. A ``local_world_aligned`` head is rotated
+    into world via the scene's ``cam_from_world`` extrinsics; a ``root``-frame
+    head (e.g. the supervised six-group model) is rotated by the kindyn root
+    quaternion (``human_optim/kindyn_1.npz`` ``q[..., 3:7]``, xyzw,
+    world-from-root), so that tree must have run the dynamics stage.
 
-Limb order everywhere: ``left_hand, right_hand, left_foot, right_foot``.
+Limb order matches the checkpoint: ``left_hand, right_hand, left_foot,
+right_foot`` for four-output heads, plus ``left_ankle, right_ankle`` (kindyn's
+big-toe/heel split) for the six-group supervised head. Force-only builds (no
+contact head) are supported for ``--force-checkpoint``; they store no
+``contact_probs``.
 
 Example (the ``out/`` corpus, videos named ``<stem>.mp4``)::
 
@@ -27,7 +33,8 @@ Example (the ``out/`` corpus, videos named ``<stem>.mp4``)::
         --force-config output/<force_run>/config.yaml
 
 For per-scene video folders (e.g. campus board), use
-``--video-pattern "{scene}/cam_left.mp4"``.
+``--video-pattern "{scene}/cam_left.mp4"``. The supervised six-group model
+writes next to the originals via ``--force-name forces_sup.npz``.
 """
 from __future__ import annotations
 
@@ -48,6 +55,9 @@ import render_climbing_video_contacts as rcv
 
 from contact import checkpoint as ckpt_io
 from contact.config import load_config
+from contact.data.climbing_corpus import (
+    FORCE_GROUP_NAMES, _rows_by_object_id, quat_xyzw_to_matrix,
+)
 from contact.data.collate import make_collate
 from contact.data.reconstruction_scenes import ReconstructionSceneDataset, extract_frames
 from contact.engine import forward_model  # noqa: F401  (imported by rcv internally)
@@ -55,26 +65,44 @@ from contact.model import build_model
 from contact.targets import EXTREMITY_4_NAMES, TargetSpec
 
 
-def _load(checkpoint: Path, config: Path, device: str) -> dict:
+def _load(checkpoint: Path, config: Path, device: str, kind: str) -> dict:
     """Build a model from ``config``, load ``checkpoint``, return its bundle."""
     cfg = load_config(config)
     model, _ = build_model(cfg, device)
     state = ckpt_io.load(checkpoint, model, config=cfg, map_location=device)
     model.eval()
     spec = TargetSpec.from_config(cfg)
-    if spec.joint_names != EXTREMITY_4_NAMES:
-        raise ValueError(
-            f"{checkpoint}: reconstruction prediction requires extremities_4; "
-            f"got {spec.joint_names}")
-    anchors = list(model.contact_keypoint_indices)
-    if len(anchors) != 4:
-        raise ValueError(f"{checkpoint}: expected four MHR anchors; got {anchors}")
+    has_contact = getattr(model, "num_contact_tokens", 0) > 0
+    if has_contact:
+        if spec.joint_names != EXTREMITY_4_NAMES:
+            raise ValueError(
+                f"{checkpoint}: reconstruction prediction requires extremities_4; "
+                f"got {spec.joint_names}")
+        anchors = list(model.contact_keypoint_indices)
+        if len(anchors) != 4:
+            raise ValueError(f"{checkpoint}: expected four MHR anchors; got {anchors}")
+        limb_names = list(EXTREMITY_4_NAMES)
+    else:                                   # force-only build: anchors are the force tokens'
+        if kind != "force":
+            raise ValueError(f"{checkpoint}: contact prediction needs a contact head")
+        anchors = list(model.force_keypoint_indices)
+        if len(anchors) == len(FORCE_GROUP_NAMES):
+            limb_names = list(FORCE_GROUP_NAMES)
+        elif len(anchors) == 4:
+            limb_names = list(EXTREMITY_4_NAMES)
+        else:
+            raise ValueError(
+                f"{checkpoint}: force-only build with {len(anchors)} outputs — "
+                f"only 4 (extremities) or {len(FORCE_GROUP_NAMES)} (kindyn groups) "
+                f"have a known limb order")
     seq = cfg["data"]["sequence"]
     return {
         "model": model,
         "cfg": cfg,
         "collate": make_collate(tuple(model.cfg.MODEL.IMAGE_SIZE), spec),
         "anchors": anchors,
+        "limb_names": limb_names,
+        "has_contact": has_contact,
         "seq_len": int(seq["frames_per_clip"]),
         "stride": int(seq["frame_stride"]),
         "checkpoint": str(checkpoint),
@@ -87,19 +115,21 @@ def _predict(bundle: dict, ds: ReconstructionSceneDataset, batch_size: int,
              device: str, collect_force: bool):
     """Sliding-window inference of one bundle over one scene.
 
-    :returns: ``probs [P,N,4]``, anchor keypoints ``[P,N,4,2]`` and (when
-        ``collect_force``) ``{"forces": [P,N,4,3], "anchor_cam": [P,N,4,3]}``;
-        NaN rows are frames without a valid prediction.
+    :returns: ``probs [P,N,K]``, anchor keypoints ``[P,N,K,2]`` and (when
+        ``collect_force``) ``{"forces": [P,N,K,3], "anchor_cam": [P,N,K,3]}``;
+        NaN rows are frames without a valid prediction (``probs`` stays NaN
+        throughout for a force-only build).
     """
     data = ds._scenes[ds.scene]
     n_people, n_frames = data["valid_mask"].shape
-    probs = np.full((n_people, n_frames, 4), np.nan, dtype=np.float32)
-    points = np.full((n_people, n_frames, 4, 2), np.nan, dtype=np.float32)
+    n_out = len(bundle["anchors"])
+    probs = np.full((n_people, n_frames, n_out), np.nan, dtype=np.float32)
+    points = np.full((n_people, n_frames, n_out, 2), np.nan, dtype=np.float32)
     force_data = None
     if collect_force:
         force_data = {
-            "forces": np.full((n_people, n_frames, 4, 3), np.nan, dtype=np.float32),
-            "anchor_cam": np.full((n_people, n_frames, 4, 3), np.nan, dtype=np.float32),
+            "forces": np.full((n_people, n_frames, n_out, 3), np.nan, dtype=np.float32),
+            "anchor_cam": np.full((n_people, n_frames, n_out, 3), np.nan, dtype=np.float32),
         }
     requests_by_t = rcv.sliding_window_requests(
         data["valid_mask"], bundle["seq_len"], bundle["stride"])
@@ -115,7 +145,7 @@ def _predict(bundle: dict, ds: ReconstructionSceneDataset, batch_size: int,
 def _provenance(bundle: dict, ds: ReconstructionSceneDataset, video: Path) -> dict:
     data = ds._scenes[ds.scene]
     return {
-        "limbs": np.asarray(EXTREMITY_4_NAMES),
+        "limbs": np.asarray(bundle["limb_names"]),
         "object_ids": data["object_ids"].astype(np.int32),
         "frame_indices": data["frame_indices"].astype(np.int32),
         "valid_mask": data["valid_mask"],
@@ -144,6 +174,8 @@ def main() -> int:
     parser.add_argument("--contact-config", type=Path, default=None)
     parser.add_argument("--force-checkpoint", type=Path, default=None)
     parser.add_argument("--force-config", type=Path, default=None)
+    parser.add_argument("--force-name", default="forces.npz",
+                        help="filename for the force predictions inside predictions/")
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="probability threshold for the stored contact booleans")
     parser.add_argument("--batch-size", type=int, default=16, help="windows per forward")
@@ -177,17 +209,20 @@ def main() -> int:
     bundles = {}
     if args.contact_checkpoint is not None:
         print(f"Loading contact model {args.contact_checkpoint} …")
-        bundles["contact"] = _load(args.contact_checkpoint, args.contact_config, args.device)
+        bundles["contact"] = _load(
+            args.contact_checkpoint, args.contact_config, args.device, "contact")
     if args.force_checkpoint is not None:
         print(f"Loading force model {args.force_checkpoint} …")
-        bundles["force"] = _load(args.force_checkpoint, args.force_config, args.device)
+        bundles["force"] = _load(
+            args.force_checkpoint, args.force_config, args.device, "force")
         force_cfg = bundles["force"]["cfg"]["model"]["force_head"]
         if not force_cfg["enabled"]:
             raise ValueError(f"{args.force_checkpoint}: config has no force head")
-        if force_cfg["frame"] != "local_world_aligned":
+        if force_cfg["frame"] not in ("local_world_aligned", "root"):
             raise ValueError(
-                f"{args.force_checkpoint}: only local_world_aligned force heads are "
-                f"supported; got {force_cfg['frame']!r}")
+                f"{args.force_checkpoint}: only local_world_aligned or root force "
+                f"heads are supported; got {force_cfg['frame']!r}")
+        bundles["force"]["frame"] = force_cfg["frame"]
 
     work_root = args.work_dir or Path(tempfile.mkdtemp(prefix="predict_reconstruction_"))
     work_root.mkdir(parents=True, exist_ok=True)
@@ -215,7 +250,7 @@ def _run_scene(args, bundles: dict, scene: str, index: int, total: int,
     pred_dir = out_dir / "predictions"
     targets = {
         kind: pred_dir / name
-        for kind, name in (("contact", "contacts.npz"), ("force", "forces.npz"))
+        for kind, name in (("contact", "contacts.npz"), ("force", args.force_name))
         if kind in bundles
     }
     if args.skip_existing and all(p.is_file() for p in targets.values()):
@@ -250,27 +285,49 @@ def _run_scene(args, bundles: dict, scene: str, index: int, total: int,
         if "force" in bundles:
             gate_probs, points, force_data = _predict(
                 bundles["force"], ds, args.batch_size, args.device, True)
-            forces = force_data["forces"]                       # [P,N,4,3] LWA, bw
-            # LWA (camera y-up) -> OpenCV camera frame, then cam -> world via
-            # the metric cam_from_world rotation (rotation only: scale-free).
-            f_cam = forces * rcv.FORCE_FLIP[None, None, None, :].astype(np.float32)
-            rot = data["extrinsics"][:, :3, :3]                 # [N,3,3] cam-from-world
-            forces_world = np.einsum("nji,pnkj->pnki", rot, f_cam).astype(np.float32)
+            forces = force_data["forces"]                       # [P,N,K,3] head frame, bw
+            if bundles["force"]["frame"] == "local_world_aligned":
+                # LWA (camera y-up) -> OpenCV camera frame, then cam -> world via
+                # the metric cam_from_world rotation (rotation only: scale-free).
+                f_cam = forces * rcv.FORCE_FLIP[None, None, None, :].astype(np.float32)
+                rot = data["extrinsics"][:, :3, :3]             # [N,3,3] cam-from-world
+                forces_world = np.einsum("nji,pnkj->pnki", rot, f_cam).astype(np.float32)
+                extra = {"lwa_to_opencv_cam_flip": rcv.FORCE_FLIP.astype(np.float32)}
+            else:                                               # root frame
+                kindyn = np.load(
+                    out_dir / "human_optim" / "kindyn_1.npz", allow_pickle=True)
+                q = _rows_by_object_id(
+                    np.asarray(kindyn["q"], np.float32), kindyn["object_ids"],
+                    data["object_ids"], scene, "kindyn")        # [P,N,nq]
+                kindyn_valid = _rows_by_object_id(
+                    np.asarray(kindyn["valid_mask"], bool), kindyn["object_ids"],
+                    data["object_ids"], scene, "kindyn")        # [P,N]
+                if q.shape[1] != forces.shape[1]:
+                    raise ValueError(
+                        f"{scene}: kindyn covers {q.shape[1]} frames but the tree "
+                        f"has {forces.shape[1]}")
+                rot_wr = quat_xyzw_to_matrix(q[..., 3:7])       # [P,N,3,3] world-from-root
+                forces_world = np.einsum(
+                    "pnij,pnkj->pnki", rot_wr, forces).astype(np.float32)
+                forces_world[~kindyn_valid] = np.nan            # no root orientation there
+                extra = {"root_rotation_source":
+                         "human_optim/kindyn_1.npz q[...,3:7] xyzw world-from-root"}
+            if bundles["force"]["has_contact"]:
+                extra["contact_probs"] = gate_probs
             np.savez_compressed(
                 targets["force"],
                 forces=forces,
                 forces_world=forces_world,
-                contact_probs=gate_probs,
                 anchor_points_2d=points,
                 anchor_cam=force_data["anchor_cam"],
                 units="body_weight",
-                force_frame="local_world_aligned",
-                lwa_to_opencv_cam_flip=rcv.FORCE_FLIP.astype(np.float32),
+                force_frame=bundles["force"]["frame"],
+                **extra,
                 **_provenance(bundles["force"], ds, video),
             )
             mag = np.linalg.norm(forces, axis=-1)
             mag = mag[np.isfinite(mag)]
-            print(f"  forces.npz: mean |f| {float(mag.mean()):.3f} bw, "
+            print(f"  {targets['force'].name}: mean |f| {float(mag.mean()):.3f} bw, "
                   f"frac >0.05 bw {float((mag > 0.05).mean()):.3f}")
 
     shutil.rmtree(frames_dir, ignore_errors=True)
