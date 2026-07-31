@@ -20,8 +20,13 @@ top of each contact disk: the predicted 3D force is a metric segment of
 ``FORCE_METERS_PER_BW`` metres per body weight at the extremity's camera-frame
 3D position, perspective-projected through the dataset's per-frame intrinsics
 (so on-image direction and foreshortening are the camera's own), then attached
-to the extremity's 2D keypoint (colour by extremity). Only the
-``local_world_aligned`` force frame is drawn.
+to the extremity's 2D keypoint (colour by extremity). Two force frames are
+drawn: ``local_world_aligned`` (flipped straight into the OpenCV camera frame)
+and ``root`` (rotated camera-from-root via the scene's kindyn root quaternion
+and per-frame extrinsics — the exact frames the supervised GT was built in).
+The ``root`` path also draws the kindyn **GT force** as a thinner white arrow
+at the same anchor, and supports force-ONLY builds (no contact head): disks are
+skipped and the anchors are the model's ``force_keypoint_indices``.
 
 Launching with ``torchrun`` shards the selected videos across the available
 ranks; each rank owns one GPU and no DDP model wrapper is needed.
@@ -49,9 +54,12 @@ sys.path.insert(0, str(REPO))
 from contact import checkpoint as ckpt_io
 from contact.config import load_config
 from contact.data.climbing_corpus import (
+    FORCE_GROUP_NAMES,
     ClimbingCorpusDataset,
+    _rows_by_object_id,
     list_annotated_test_scenes,
     list_corpus_scenes,
+    quat_xyzw_to_matrix,
 )
 from contact.data.collate import batch_to_device, make_collate
 from contact.data.splits import video_id_from_scene
@@ -77,14 +85,17 @@ def _hex_to_bgr(color: str) -> tuple[int, int, int]:
     return (blue, green, red)
 
 
-# One arrow colour per force output (left_hand, right_hand, left_foot, right_foot),
-# matching legacy/demo_climbing_videos.py::FORCE_COLORS (there in RGB hex).
-FORCE_COLORS = ("#e0530f", "#f0a500", "#1c72d8", "#2fb3ad")
+# One arrow colour per force output. First four match
+# legacy/demo_climbing_videos.py::FORCE_COLORS (there in RGB hex); the last two
+# cover the six-group kindyn order's left_ankle / right_ankle (heels).
+FORCE_COLORS = ("#e0530f", "#f0a500", "#1c72d8", "#2fb3ad", "#8b41c9", "#d1367f")
 FORCE_COLORS_BGR = tuple(_hex_to_bgr(color) for color in FORCE_COLORS)
 FORCE_METERS_PER_BW = 1.0       # 3D arrow length in metres per unit body weight of |f|
 FORCE_MIN_BW = 1.0e-3           # skip near-zero forces (e.g. a zero-init head)
 FORCE_THICKNESS = 8             # arrow line thickness (px); outline adds +3
 FORCE_OUTLINE_BGR = (25, 25, 25)
+GT_FORCE_BGR = (245, 245, 245)  # GT arrows: thin white over the coloured prediction
+GT_FORCE_THICKNESS = 3
 # LWA (camera y-up) -> OpenCV camera frame (y-down, z-forward).
 FORCE_FLIP = np.array([1.0, -1.0, -1.0])
 
@@ -307,9 +318,11 @@ def _predict_requests(
         batch = batch_to_device(collate(clips), device)
         with torch.inference_mode():
             output = forward_model(model, batch)
-        batch_probs = torch.sigmoid(
-            output["contact"]["joint_logits"]
-        ).float().cpu().numpy()
+        contact_output = output.get("contact")
+        batch_probs = (
+            torch.sigmoid(contact_output["joint_logits"]).float().cpu().numpy()
+            if contact_output is not None else None
+        )
         batch_points = (
             output["mhr"]["pred_keypoints_2d"][:, anchor_indices]
             .float().cpu().numpy()
@@ -328,11 +341,12 @@ def _predict_requests(
             for offset in emitted_offsets:
                 row = clip_index * seq_len + offset
                 frame_position = positions[offset]
-                if np.isfinite(probs[person, frame_position]).any():
+                if np.isfinite(points[person, frame_position]).any():
                     raise AssertionError(
                         f"duplicate prediction for {scene} person={person} "
                         f"frame={frame_position}")
-                probs[person, frame_position] = batch_probs[row]
+                if batch_probs is not None:
+                    probs[person, frame_position] = batch_probs[row]
                 points[person, frame_position] = batch_points[row]
                 if collect_force:
                     force_data["forces"][person, frame_position] = batch_forces[row]
@@ -350,13 +364,19 @@ def _predict_scene(
     contact_level: int = 1,
     require_labels: bool = False,
     collect_force: bool = False,
-) -> tuple[ClimbingCorpusDataset, np.ndarray, np.ndarray, dict[str, np.ndarray] | None]:
-    """Return dataset, ``probs[P,N,4]``, keypoints ``[P,N,4,2]`` and force data.
+    force_frame: str | None = None,
+) -> tuple[ClimbingCorpusDataset, np.ndarray, np.ndarray, dict | None]:
+    """Return dataset, ``probs[P,N,K]``, keypoints ``[P,N,K,2]`` and force data.
 
     The item store is a per-frame (T=1) dataset; inference windows follow the
     config's ``data.sequence``. ``force_data`` is ``None`` unless ``collect_force``,
-    in which case it carries ``forces[P,N,4,3]`` and camera-frame anchor positions
-    ``anchor_cam[P,N,4,3]`` for the force-arrow projection.
+    in which case it carries ``forces[P,N,K,3]``, camera-frame anchor positions
+    ``anchor_cam[P,N,K,3]`` and, for the ``root`` frame, camera-from-root
+    rotations ``cam_from_root[P,N,3,3]`` plus the kindyn GT (``gt_forces``,
+    root frame, and ``gt_valid``) for GT-arrow overlay.
+
+    A model without a contact head (force-only build) leaves ``probs`` NaN —
+    no disks are drawn — and anchors at its ``force_keypoint_indices``.
     """
     ds = ClimbingCorpusDataset(
         root,
@@ -369,25 +389,60 @@ def _predict_scene(
         contact_level=contact_level,
         use_confidence_weights=False,
         require_labels=require_labels,
+        load_forces=collect_force and force_frame == "root",
     )
     data = ds._scenes[scene]
     n_people, n_frames = data["valid_mask"].shape
-    probs = np.full((n_people, n_frames, 4), np.nan, dtype=np.float32)
-    points = np.full((n_people, n_frames, 4, 2), np.nan, dtype=np.float32)
+    has_contact = getattr(model, "num_contact_tokens", 0) > 0
+    if has_contact:
+        spec = TargetSpec.from_config(cfg)
+        if spec.joint_names != EXTREMITY_4_NAMES:
+            raise ValueError(
+                f"video renderer requires extremities_4; got {spec.joint_set}: "
+                f"{spec.joint_names}")
+        anchor_indices = list(model.contact_keypoint_indices)
+        if len(anchor_indices) != 4:
+            raise ValueError(f"expected four MHR anchors; got {anchor_indices}")
+    else:
+        if not collect_force:
+            raise ValueError(
+                "checkpoint has neither a contact head nor a drawable force head — "
+                "nothing to render")
+        spec = TargetSpec.from_config(cfg)      # force-only: no targets, image-only collate
+        anchor_indices = list(model.force_keypoint_indices)
+    n_outputs = len(anchor_indices)
+    probs = np.full((n_people, n_frames, n_outputs), np.nan, dtype=np.float32)
+    points = np.full((n_people, n_frames, n_outputs, 2), np.nan, dtype=np.float32)
     force_data = None
     if collect_force:
         force_data = {
-            "forces": np.full((n_people, n_frames, 4, 3), np.nan, dtype=np.float32),
-            "anchor_cam": np.full((n_people, n_frames, 4, 3), np.nan, dtype=np.float32),
+            "frame": force_frame,
+            "forces": np.full((n_people, n_frames, n_outputs, 3), np.nan, dtype=np.float32),
+            "anchor_cam": np.full((n_people, n_frames, n_outputs, 3), np.nan, dtype=np.float32),
         }
-    spec = TargetSpec.from_config(cfg)
-    if spec.joint_names != EXTREMITY_4_NAMES:
-        raise ValueError(
-            f"video renderer requires extremities_4; got {spec.joint_set}: {spec.joint_names}")
+        if force_frame == "root":
+            # Camera-from-root per (person, frame): extrinsics (cam-from-world,
+            # OpenCV) composed with the kindyn root quaternion (world-from-root)
+            # — the exact frames the supervised root-frame GT was built in.
+            kindyn = np.load(data["dir"] / "kindyn_1.npz", allow_pickle=True)
+            q = _rows_by_object_id(
+                np.asarray(kindyn["q"], np.float32), np.asarray(kindyn["object_ids"]),
+                data["object_ids"], scene, "kindyn")
+            rot_wr = quat_xyzw_to_matrix(q[..., 3:7])            # [P, N, 3, 3]
+            rot_cw = data["extrinsics"][:, :3, :3]               # [N, 3, 3]
+            force_data["cam_from_root"] = np.einsum(
+                "nij,pnjk->pnik", rot_cw, rot_wr).astype(np.float32)
+            gt = data["force_gt"].astype(np.float32).copy()      # [P, N, 6, 3] root bw
+            gt_valid = (
+                data["force_valid"][:, :, None] & data["force_contact"]
+            )                                                    # [P, N, 6]
+            if gt.shape[2] != n_outputs:
+                raise ValueError(
+                    f"{scene}: kindyn has {gt.shape[2]} force groups but the model "
+                    f"predicts {n_outputs}")
+            force_data["gt_forces"] = gt
+            force_data["gt_valid"] = gt_valid
     collate = make_collate(tuple(model.cfg.MODEL.IMAGE_SIZE), spec)
-    anchor_indices = list(model.contact_keypoint_indices)
-    if len(anchor_indices) != 4:
-        raise ValueError(f"expected four MHR anchors; got {anchor_indices}")
 
     seq = cfg["data"]["sequence"]
     requests_by_t = sliding_window_requests(
@@ -449,68 +504,119 @@ def _draw_contacts(
                         frame, (x, y), inner_radius, label_color, -1, cv2.LINE_AA)
 
 
+def _project_force_arrow(
+    force_cam: np.ndarray,
+    point_cam: np.ndarray,
+    anchor: np.ndarray,
+    cam_int: np.ndarray,
+    size: tuple[int, int],
+) -> tuple[tuple[int, int], tuple[int, int], float] | None:
+    """Project one camera-frame force to an on-image arrow at ``anchor``.
+
+    Returns ``(start_px, end_px, projected_length)`` or ``None`` when the arrow
+    is undrawable (behind the camera, off-image anchor, or degenerate length).
+    """
+    height, width = size
+    fx, fy = float(cam_int[0, 0]), float(cam_int[1, 1])
+    cx, cy = float(cam_int[0, 2]), float(cam_int[1, 2])
+    if not np.isfinite(point_cam).all() or point_cam[2] <= 1e-3:  # behind camera
+        return None
+    if not np.isfinite(anchor).all():
+        return None
+    if anchor[0] < 0 or anchor[0] >= width or anchor[1] < 0 or anchor[1] >= height:
+        return None
+    tip_cam = point_cam + FORCE_METERS_PER_BW * force_cam
+    if tip_cam[2] <= 1e-3:
+        return None
+    base_px = np.array([fx * point_cam[0] / point_cam[2] + cx,
+                        fy * point_cam[1] / point_cam[2] + cy])
+    tip_px = np.array([fx * tip_cam[0] / tip_cam[2] + cx,
+                       fy * tip_cam[1] / tip_cam[2] + cy])
+    delta = tip_px - base_px
+    length = float(np.linalg.norm(delta))
+    if length < 2.0:  # force points almost along the optical axis
+        return None
+    start = (int(round(anchor[0])), int(round(anchor[1])))
+    end = (int(round(anchor[0] + delta[0])), int(round(anchor[1] + delta[1])))
+    return start, end, length
+
+
 def _draw_force_arrows(
     frame: np.ndarray,
     frame_points: np.ndarray,
-    frame_forces: np.ndarray,
-    frame_anchor_cam: np.ndarray,
+    force_data: dict,
+    frame_position: int,
     cam_int: np.ndarray,
 ) -> None:
-    """Draw one predicted-force arrow per extremity per person on top of the disks.
+    """Draw one predicted-force arrow per output per person (plus GT if present).
 
-    The force (``local_world_aligned``, camera y-up) is flipped into the OpenCV
-    camera frame and treated as a metric 3D segment of ``FORCE_METERS_PER_BW``
-    metres per body weight starting at the extremity's camera-frame position.
-    Both endpoints are perspective-projected through the dataset's intrinsics —
-    on-image direction and foreshortening are the real camera's — and the
-    projected segment is attached to the extremity's 2D keypoint (the model's
-    3D and the dataset camera do not share an exact projection).
+    The force is brought into the OpenCV camera frame — ``local_world_aligned``
+    (camera y-up) by the fixed axis flip, ``root`` by the per-(person, frame)
+    camera-from-root rotation — and treated as a metric 3D segment of
+    ``FORCE_METERS_PER_BW`` metres per body weight starting at the extremity's
+    camera-frame position. Both endpoints are perspective-projected through the
+    dataset's intrinsics — on-image direction and foreshortening are the real
+    camera's — and the projected segment is attached to the extremity's 2D
+    keypoint (the model's 3D and the dataset camera do not share an exact
+    projection). Kindyn GT forces (``root`` path) are drawn as thinner white
+    arrows over the coloured predictions.
 
-    :param frame_points: ``[P, 4, 2]`` anchor keypoints (full-image px).
-    :param frame_forces: ``[P, 4, 3]`` predicted forces (body weight, head frame).
-    :param frame_anchor_cam: ``[P, 4, 3]`` camera-frame anchor positions.
+    :param frame_points: ``[P, K, 2]`` anchor keypoints (full-image px).
+    :param force_data: the ``_predict_scene`` force dict (full-scene arrays).
+    :param frame_position: source frame position into those arrays.
     :param cam_int: ``[3, 3]`` dataset camera intrinsics for this frame.
     """
-    height, width = frame.shape[:2]
     fx, fy = float(cam_int[0, 0]), float(cam_int[1, 1])
-    cx, cy = float(cam_int[0, 2]), float(cam_int[1, 2])
     if not (np.isfinite(fx) and np.isfinite(fy)) or fx <= 0 or fy <= 0:
         return
+    size = frame.shape[:2]
+    frame_forces = force_data["forces"][:, frame_position]
+    frame_anchor_cam = force_data["anchor_cam"][:, frame_position]
+    is_root = force_data["frame"] == "root"
+    cam_from_root = force_data["cam_from_root"][:, frame_position] if is_root else None
+    gt_forces = force_data["gt_forces"][:, frame_position] if "gt_forces" in force_data else None
+    gt_valid = force_data["gt_valid"][:, frame_position] if "gt_valid" in force_data else None
+
+    def to_cam(person: int, force: np.ndarray) -> np.ndarray | None:
+        if is_root:
+            rot = np.asarray(cam_from_root[person], dtype=np.float64)
+            return rot @ force if np.isfinite(rot).all() else None
+        return FORCE_FLIP * force
+
     for person in range(frame_forces.shape[0]):
         for out_idx in range(frame_forces.shape[1]):
-            force = np.asarray(frame_forces[person, out_idx], dtype=np.float64)
-            if not np.isfinite(force).all():
-                continue
-            mag = float(np.linalg.norm(force))
-            if mag < FORCE_MIN_BW:
-                continue
             point_cam = np.asarray(frame_anchor_cam[person, out_idx], dtype=np.float64)
-            if not np.isfinite(point_cam).all() or point_cam[2] <= 1e-3:  # behind camera
-                continue
             anchor = np.asarray(frame_points[person, out_idx], dtype=np.float64)
-            if not np.isfinite(anchor).all():
+            force = np.asarray(frame_forces[person, out_idx], dtype=np.float64)
+            if np.isfinite(force).all() and np.linalg.norm(force) >= FORCE_MIN_BW:
+                force_cam = to_cam(person, force)
+                arrow = (
+                    _project_force_arrow(force_cam, point_cam, anchor, cam_int, size)
+                    if force_cam is not None else None)
+                if arrow is not None:
+                    start, end, length = arrow
+                    tip_length = float(np.clip(32.0 / max(length, 1.0), 0.1, 0.5))
+                    color = FORCE_COLORS_BGR[out_idx % len(FORCE_COLORS_BGR)]
+                    cv2.arrowedLine(frame, start, end, FORCE_OUTLINE_BGR,
+                                    FORCE_THICKNESS + 3, cv2.LINE_AA, tipLength=tip_length)
+                    cv2.arrowedLine(frame, start, end, color,
+                                    FORCE_THICKNESS, cv2.LINE_AA, tipLength=tip_length)
+            if gt_forces is None or not bool(gt_valid[person, out_idx]):
                 continue
-            if anchor[0] < 0 or anchor[0] >= width or anchor[1] < 0 or anchor[1] >= height:
+            gt = np.asarray(gt_forces[person, out_idx], dtype=np.float64)
+            if not np.isfinite(gt).all() or np.linalg.norm(gt) < FORCE_MIN_BW:
                 continue
-            tip_cam = point_cam + FORCE_METERS_PER_BW * (FORCE_FLIP * force)
-            if tip_cam[2] <= 1e-3:
-                continue
-            base_px = np.array([fx * point_cam[0] / point_cam[2] + cx,
-                                fy * point_cam[1] / point_cam[2] + cy])
-            tip_px = np.array([fx * tip_cam[0] / tip_cam[2] + cx,
-                               fy * tip_cam[1] / tip_cam[2] + cy])
-            delta = tip_px - base_px
-            length = float(np.linalg.norm(delta))
-            if length < 2.0:  # force points almost along the optical axis
-                continue
-            color = FORCE_COLORS_BGR[out_idx % len(FORCE_COLORS_BGR)]
-            start = (int(round(anchor[0])), int(round(anchor[1])))
-            end = (int(round(anchor[0] + delta[0])), int(round(anchor[1] + delta[1])))
-            tip_length = float(np.clip(32.0 / max(length, 1.0), 0.1, 0.5))
-            cv2.arrowedLine(frame, start, end, FORCE_OUTLINE_BGR,
-                            FORCE_THICKNESS + 3, cv2.LINE_AA, tipLength=tip_length)
-            cv2.arrowedLine(frame, start, end, color,
-                            FORCE_THICKNESS, cv2.LINE_AA, tipLength=tip_length)
+            gt_cam = to_cam(person, gt)
+            arrow = (
+                _project_force_arrow(gt_cam, point_cam, anchor, cam_int, size)
+                if gt_cam is not None else None)
+            if arrow is not None:
+                start, end, length = arrow
+                tip_length = float(np.clip(24.0 / max(length, 1.0), 0.1, 0.5))
+                cv2.arrowedLine(frame, start, end, FORCE_OUTLINE_BGR,
+                                GT_FORCE_THICKNESS + 2, cv2.LINE_AA, tipLength=tip_length)
+                cv2.arrowedLine(frame, start, end, GT_FORCE_BGR,
+                                GT_FORCE_THICKNESS, cv2.LINE_AA, tipLength=tip_length)
 
 
 def _render_scene(
@@ -555,8 +661,8 @@ def _render_scene(
                 _draw_force_arrows(
                     frame,
                     points[:, frame_position],
-                    force_data["forces"][:, frame_position],
-                    force_data["anchor_cam"][:, frame_position],
+                    force_data,
+                    frame_position,
                     data["intrinsics"][frame_position],
                 )
             writer.write(frame)
@@ -650,14 +756,15 @@ def main() -> int:
     state = ckpt_io.load(checkpoint, model, config=cfg, map_location=device)
     model.eval()
 
-    # Draw force arrows only for a local_world_aligned force head; other frames
-    # need FK not run here (guarded like legacy/demo_climbing_videos.py).
+    # Drawable force frames: local_world_aligned (fixed axis flip into the OpenCV
+    # camera) and root (rotated via kindyn root quat + dataset extrinsics, with
+    # GT arrows). 'local' would need FK not run here (legacy demo guard).
     force_enabled = bool(cfg["model"]["force_head"]["enabled"])
     force_frame = cfg["model"]["force_head"]["frame"] if force_enabled else None
-    collect_force = force_enabled and force_frame == "local_world_aligned"
+    collect_force = force_enabled and force_frame in ("local_world_aligned", "root")
     if rank == 0 and force_enabled and not collect_force:
-        print(f"[force] force_head.frame={force_frame!r} != 'local_world_aligned'; "
-              "force arrows need FK not run here — skipping arrows.")
+        print(f"[force] force_head.frame={force_frame!r} not drawable "
+              "(needs FK not run here) — skipping arrows.")
     if rank == 0:
         print(f"Checkpoint epoch {state['epoch']}; threshold {args.threshold:.2f}")
         print("Selected:", ", ".join(f"{video_id}:{scene}" for video_id, scene in selected))
@@ -672,6 +779,7 @@ def main() -> int:
             contact_level=contact_level,
             require_labels=args.overlay_labels,
             collect_force=collect_force,
+            force_frame=force_frame,
         )
         labels, label_mask = (
             _scene_ground_truth(ds._scenes[scene])
@@ -723,17 +831,25 @@ def main() -> int:
             "videos": records,
         }
         if collect_force:
+            force_names = (
+                FORCE_GROUP_NAMES
+                if len(cfg["model"]["force_head"]["force_keypoint_indices"] or []) == 6
+                else EXTREMITY_4_NAMES)
             summary["force_arrows"] = {
                 "encoding": "one arrow per extremity: the predicted 3D force as a "
                             "metric segment at the extremity's camera-frame position, "
                             "perspective-projected through the dataset per-frame "
                             "intrinsics, attached to the anchor 2D keypoint",
-                "colors": dict(zip(EXTREMITY_4_NAMES, FORCE_COLORS)),
+                "colors": dict(zip(force_names, FORCE_COLORS)),
                 "units": "body weight (dimensionless)",
                 "meters_per_body_weight": FORCE_METERS_PER_BW,
                 "min_magnitude_bw": FORCE_MIN_BW,
                 "frame": force_frame,
             }
+            if force_frame == "root":
+                summary["force_arrows"]["gt_arrows"] = (
+                    "kindyn GT forces (root frame) drawn as thinner white arrows "
+                    "on valid in-contact limb-frames")
         (output_dir / "summary.json").write_text(json.dumps(summary, indent=2))
         print(f"Done: {output_dir}")
     if world_size > 1:
