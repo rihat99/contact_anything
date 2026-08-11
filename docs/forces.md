@@ -465,6 +465,49 @@ with center-frame supervision, force temporal attention on and `attend: joint` (
 coupling argument from t7mid still applies), monitor `val/force_mae` (mean in-contact error
 norm, bw, minimised).
 
+### Contact-gated forces and the sum-consistency terms
+
+The joint contact+force experiment (`configs/climbing_corpus_joint_force_gated.yaml`) puts a
+contact branch back next to the six-token supervised force branch — with **six contact tokens
+matched 1:1 to the force groups** — and couples them at the output, not in the loss:
+
+- **The `kindyn_6` contact set.** The contact head grows from the four extremities to six
+  outputs in kindyn group order (LH, RH, LF=big-toe, RF=big-toe, LA=heel, RA=heel), anchored
+  at the same MHR70 keypoints as the force tokens (`[62, 41, 15, 18, 17, 20]`). Labels reduce
+  from the body-22 labels with a **single source joint per group**: the hands are the wrists
+  (fingers already folded there by the 52→22 fold — byte-identical to how `extremities_4`
+  sources its hands), the toe groups the foot joints (10/11), the heel groups the ankles
+  (7/8); gt, supervision and confidence pass straight through
+  (`contact/targets.py::KINDYN_6_GROUPS`, `reduce_body22_to_groups`). The manual test split
+  annotates hands, feet and ankles as separate observable joints, so all six groups are
+  test-supervised.
+- **Contact gate** (`model.force_head.contact_gate`). The FINAL force output — after
+  `force_temporal`, so eval/inference/rendering see it unchanged — becomes
+  `f = f_raw · sigmoid(sharpness · logit)` with the **detached** contact logits: the map is
+  the **identity** (`FORCE_GATE_CONTACT_MAP` in `sam_3d_body/models/heads/force_head.py`) —
+  each force group is gated by its own contact output, heel force by ankle contact, toe force
+  by foot contact. At the default sharpness 4.0 a confident contact (logit 1.0, p 0.73)
+  passes gate 0.982 — nearly 1 in contact, ≈0 on a confident free limb. This replaces the
+  `noncontact` zero-force penalty structurally (the gated experiment sets its weight to 0;
+  the term stays implemented). The detach is unconditional: the force loss must not rewrite
+  the calibrated contact probabilities through the gate — contact keeps training purely from
+  its labels. (The known regime-(b) force→contact attention leak still exists; the gate just
+  avoids adding the far more direct path.) The ungated tensor rides along as
+  `out["force"]["joint_forces_raw"]`. Config validation requires the per_token `kindyn_6`
+  joint target and six explicit force anchors whenever the gate is on.
+- **`sum_force` / `sum_torque`** (in `ForceSupervisedLoss`, same `(numerator, mass)` contract).
+  Huber on the six-group net force `Σᵢ fᵢ` vs GT (same `huber_delta_bw`) and on the net torque
+  `Σᵢ rᵢ × fᵢ` vs GT (units bw·m, own `huber_delta_bwm`), over ALL six groups regardless of the
+  contact mask — GT is exactly zero off-contact by construction, and the gated prediction is
+  ≈0 there. `rᵢ` is the loader's `force_lever` `[6, 3]`: the root-frame, metre lever arm
+  `R(q)ᵀ (joints_world[groupᵢ] − joints_world[pelvis])` from kindyn's `joints_world`, rotated
+  by the same root quaternion as the forces. The SAME arms enter both sides of the loss, so the
+  pelvis origin is a consistency choice, not a physics claim. Rows are skipped when
+  force-invalid or when ANY group is an outlier (one blown-up group poisons the sum), and
+  `sum_torque` additionally skips non-finite lever arms. Both weights stay **below** the
+  per-group `force` term (0.25 vs 1.0 in the experiment) — a dominant sum objective recreates
+  the physics-loss geometry whose constant-sum optimum drove the collapse.
+
 ## Pointers
 
 - Code: `contact/physics/adapter.py` (SAM ↔ BetterHuman bridge),

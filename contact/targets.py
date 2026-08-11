@@ -4,8 +4,9 @@ The model may expose independent heads over the configured contact-token bank:
 
 * ``vertex`` — per-vertex contact in the body-model topology (SMPL 6890 or
   SMPL-X 10475).
-* ``joint`` — contact over either the 22-joint SMPL-X body set or the reduced
-  four-extremity set selected by ``contact.targets.joint.joint_set``.
+* ``joint`` — contact over the 22-joint SMPL-X body set or a reduced set
+  (four extremities, or the six kindyn force groups) selected by
+  ``contact.targets.joint.joint_set``.
 
 Vertex labels come from the still-image datasets; joint labels come from the
 ClimbingVideos dataset.
@@ -48,14 +49,31 @@ NUM_BODY_22 = len(SMPLX_BODY_22)
 # Four contact endpoints used by the climbing-only classifier. Hands are already
 # wrist+finger aggregates in ClimbingVideos_v1; each foot combines the distinct
 # ankle and big-toe/foot labels with a tri-state OR (see
-# :func:`reduce_body22_to_extremities`).
+# :func:`reduce_body22_to_groups`).
 EXTREMITY_4_NAMES = ("left_hand", "right_hand", "left_foot", "right_foot")
 EXTREMITY_4_GROUPS = ((20,), (21,), (7, 10), (8, 11))
 NUM_EXTREMITY_4 = len(EXTREMITY_4_NAMES)
 
+# Six contact outputs matched 1:1 to the corpus kindyn force groups, in kindyn
+# column order: LH, RH, LF=big-toe, RF=big-toe, LA=heel, RA=heel. Every group
+# has a single body-22 source joint — the hands are the wrists (fingers already
+# folded there by the 52->22 fold, exactly how ``extremities_4`` sources its
+# hands), the toe groups the foot joints (10/11), the heel groups the ankles (7/8).
+KINDYN_6_NAMES = (
+    "left_hand", "right_hand", "left_foot", "right_foot", "left_ankle", "right_ankle",
+)
+KINDYN_6_GROUPS = ((20,), (21,), (10,), (11,), (7,), (8,))
+NUM_KINDYN_6 = len(KINDYN_6_NAMES)
+
 JOINT_SET_NAMES = {
     "smplx_body_22": tuple(SMPLX_BODY_22),
     "extremities_4": EXTREMITY_4_NAMES,
+    "kindyn_6": KINDYN_6_NAMES,
+}
+# Body-22 source groups of the reduced joint sets (assemble_batch reduction).
+JOINT_SET_GROUPS = {
+    "extremities_4": EXTREMITY_4_GROUPS,
+    "kindyn_6": KINDYN_6_GROUPS,
 }
 
 # Joints an annotator can label in the manual test set (evaluation only). The
@@ -168,7 +186,17 @@ def reduce_body22_to_extremities(
     supervised: Tensor,
     confidence: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Reduce body-22 labels to four extremities with tri-state OR semantics.
+    """Reduce body-22 labels to the four extremities (:data:`EXTREMITY_4_GROUPS`)."""
+    return reduce_body22_to_groups(contact, supervised, confidence, EXTREMITY_4_GROUPS)
+
+
+def reduce_body22_to_groups(
+    contact: Tensor,
+    supervised: Tensor,
+    confidence: Tensor,
+    groups: Sequence[Sequence[int]],
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Reduce body-22 labels onto joint groups with tri-state OR semantics.
 
     ``contact``, ``supervised`` and ``confidence`` must have the same shape
     ``(..., 22)``. A group is a known positive when any *supervised* member is
@@ -177,8 +205,12 @@ def reduce_body22_to_extremities(
     Positive confidence is the maximum over supervised positive members, while
     known-free confidence is the mean over all group members. This matches the
     ClimbingVideos exporter convention used to fold fingers into each hand.
+    A single-member group (every hand, and every ``kindyn_6`` group) degenerates
+    to a passthrough of its joint's label, supervision and confidence.
 
-    :returns: ``(contact_4, supervised_4, confidence_4)`` as float tensors.
+    :param groups: Body-22 index groups, one output per group
+        (e.g. :data:`EXTREMITY_4_GROUPS` / :data:`KINDYN_6_GROUPS`).
+    :returns: ``(contact_G, supervised_G, confidence_G)`` as float tensors.
     """
     contact = torch.as_tensor(contact, dtype=torch.float32)
     supervised = torch.as_tensor(supervised, dtype=torch.float32, device=contact.device)
@@ -196,7 +228,7 @@ def reduce_body22_to_extremities(
     out_contact = []
     out_supervised = []
     out_confidence = []
-    for group in EXTREMITY_4_GROUPS:
+    for group in groups:
         indices = list(group)
         group_contact = is_contact[..., indices]
         group_supervised = is_supervised[..., indices]
@@ -230,10 +262,11 @@ def reduce_body22_to_extremities(
 
 def _joint_subset_mask(supervise_subset, joint_set: str) -> Tensor:
     """Return the output-space float supervision-subset mask."""
-    if joint_set == "extremities_4":
+    if joint_set in JOINT_SET_GROUPS:
         if supervise_subset is not None:
-            raise ValueError("joint.supervise_subset must be null for joint_set='extremities_4'")
-        return torch.ones(NUM_EXTREMITY_4, dtype=torch.float32)
+            raise ValueError(
+                f"joint.supervise_subset must be null for joint_set={joint_set!r}")
+        return torch.ones(len(JOINT_SET_NAMES[joint_set]), dtype=torch.float32)
 
     mask = torch.zeros(NUM_BODY_22, dtype=torch.float32)
     if supervise_subset is None:
@@ -259,7 +292,7 @@ class TargetSpec:
     :param vertex_dims: Vertex head output size (topology vertex count).
     :param joint_set: Semantic joint-contact output set.
     :param joint_names: Ordered semantic output names.
-    :param joint_dims: Joint head output size (22 or 4).
+    :param joint_dims: Joint head output size (22, 4 or 6).
     :param derive_from_vertex: Lift vertex labels to joint labels for image data.
     :param joint_subset_mask: Output-space mask restricting supervised joints.
     :param owner: ``(6890,)`` vertex->joint owner, present iff ``derive_from_vertex``.
@@ -365,13 +398,14 @@ class TargetSpec:
                         }
                         if missing:
                             raise ValueError(
-                                "joint_set='extremities_4' requires raw body-22 "
+                                f"joint_set={self.joint_set!r} requires raw body-22 "
                                 f"{sorted(missing)} in each video frame")
                         reduced_gt, reduced_supervised, reduced_confidence = (
-                            reduce_body22_to_extremities(
+                            reduce_body22_to_groups(
                                 frame["joint_contact"],
                                 frame["joint_supervised"],
                                 frame["joint_confidence"],
+                                JOINT_SET_GROUPS[self.joint_set],
                             )
                         )
                         gt[i] = reduced_gt
@@ -384,8 +418,9 @@ class TargetSpec:
                         gt[i] = body22
                         mask[i] = subset
                     else:
-                        gt[i], mask[i], _ = reduce_body22_to_extremities(
-                            body22, torch.ones_like(body22), torch.ones_like(body22))
+                        gt[i], mask[i], _ = reduce_body22_to_groups(
+                            body22, torch.ones_like(body22), torch.ones_like(body22),
+                            JOINT_SET_GROUPS[self.joint_set])
             out["joint"] = {"gt": gt, "mask": mask}
 
         return out

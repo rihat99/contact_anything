@@ -37,6 +37,11 @@ camera-0-derived direction, and ``load_forces=True`` adds per-frame GT forces:
 * ``force_contact`` ``[6]`` bool — the kindyn/contacts_2 contact mask the
   forces were solved under, folded per group (hands = wrist + 15 fingers).
   A zero force means *unlabeled*, not measured-zero.
+* ``force_lever`` ``[6, 3]`` float32 — root-frame lever arm (metres) of each
+  group's kindyn joint from the pelvis: ``R(q_xyzw)^T @ (joints_world[group_i]
+  - joints_world[pelvis])`` — the same world -> body-root rotation as
+  ``force_gt``. Consumed by the net-torque consistency loss; may be non-finite
+  on frames the solve did not cover (the loss skips those rows).
 * ``force_valid`` bool — frame valid and covered by the kindyn solve.
 """
 from __future__ import annotations
@@ -292,7 +297,7 @@ class ClimbingCorpusDataset(Dataset):
     :param require_labels: on ``test``, require the manual annotation (raise when
         missing; discovery skips unannotated scenes). Train labels are always loaded.
     :param load_forces: read ``kindyn_1.npz`` and emit ``force_gt`` /
-        ``force_contact`` / ``force_valid`` per frame.
+        ``force_contact`` / ``force_lever`` / ``force_valid`` per frame.
     :param load_images: read frame JPEGs + person masks in ``__getitem__``.
         ``False`` returns ``image``/``mask`` as ``None`` (metadata-only access;
         such items cannot go through the training collate).
@@ -538,12 +543,25 @@ class ClimbingCorpusDataset(Dataset):
             _rows_by_object_id(
                 np.asarray(kindyn["joint_contact"], bool),
                 kindyn_ids, object_ids, scene, "kindyn"))     # [P, N, 6]
+        joints_world = _rows_by_object_id(
+            np.asarray(kindyn["joints_world"], np.float32),
+            kindyn_ids, object_ids, scene, "kindyn")          # [P, N, J, 3] m, world
+        joint_names = [str(x) for x in kindyn["joint_names"]]
 
         n_people = len(object_ids)
         if forces_n.shape != (n_people, n, NUM_FORCE_GROUPS, 3):
             raise ValueError(
                 f"{scene}: contact_forces {forces_n.shape} does not match "
                 f"({n_people}, {n}, {NUM_FORCE_GROUPS}, 3)")
+        if joints_world.shape != (n_people, n, len(joint_names), 3):
+            raise ValueError(
+                f"{scene}: joints_world {joints_world.shape} does not match "
+                f"({n_people}, {n}, {len(joint_names)}, 3)")
+        missing_joints = [name for name in ("pelvis",) + KINDYN_FORCE_JOINTS
+                          if name not in joint_names]
+        if missing_joints:
+            raise ValueError(
+                f"{scene}: kindyn joint_names is missing {missing_joints}")
         if not np.isfinite(forces_n).all():
             raise ValueError(f"{scene}: contact_forces contain non-finite values")
         if (not np.isfinite(total_mass).all() or (total_mass <= 0).any()
@@ -562,9 +580,20 @@ class ClimbingCorpusDataset(Dataset):
         # against the stored axis-angle global_orient); rotate world -> root.
         rot = quat_xyzw_to_matrix(q[..., 3:7])                # [P, N, 3, 3]
         force_root = np.einsum("pnji,pnkj->pnki", rot, forces_bw).astype(np.float32)
+        # Lever arms for the net-torque consistency loss: the six group joints'
+        # world offsets from the pelvis, rotated world -> root with the same
+        # rotation as the forces. Resolved by NAME once per scene (the group
+        # names are validated against KINDYN_FORCE_JOINTS above). Not checked
+        # for finiteness — uncovered frames may hold garbage; the loss skips them.
+        pelvis = joint_names.index("pelvis")
+        group_joints = [joint_names.index(name) for name in KINDYN_FORCE_JOINTS]
+        lever_world = joints_world[:, :, group_joints] - joints_world[:, :, [pelvis]]
+        force_lever = np.einsum(
+            "pnji,pnkj->pnki", rot, lever_world).astype(np.float32)
         return {
             "force_gt": force_root,                          # [P, N, 6, 3] bw, root frame
             "force_contact": group_contact,                  # [P, N, 6] bool
+            "force_lever": force_lever,                      # [P, N, 6, 3] m, root frame
             "force_valid": force_valid,                      # [P, N] bool
         }
 
@@ -660,6 +689,8 @@ class ClimbingCorpusDataset(Dataset):
                 frame["force_gt"] = torch.from_numpy(data["force_gt"][person, pos])   # [6, 3]
                 frame["force_contact"] = torch.from_numpy(
                     data["force_contact"][person, pos])                               # [6] bool
+                frame["force_lever"] = torch.from_numpy(
+                    data["force_lever"][person, pos])                                 # [6, 3]
                 frame["force_valid"] = valid and bool(data["force_valid"][person, pos])
             clip.append(frame)
         return clip

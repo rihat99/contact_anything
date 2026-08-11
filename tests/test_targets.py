@@ -7,8 +7,11 @@ import torch
 from contact.targets import (
     EXTREMITY_4_GROUPS,
     EXTREMITY_4_NAMES,
+    KINDYN_6_GROUPS,
+    KINDYN_6_NAMES,
     NUM_BODY_22,
     NUM_EXTREMITY_4,
+    NUM_KINDYN_6,
     OBSERVABLE_14,
     SMPLX_BODY_22,
     TOPOLOGY_VERTS,
@@ -16,6 +19,7 @@ from contact.targets import (
     compute_vertex_joint_owner,
     derive_joint_contact,
     reduce_body22_to_extremities,
+    reduce_body22_to_groups,
     topology_num_vertices,
     validate_targets,
 )
@@ -43,6 +47,14 @@ def test_joint_set_names_and_observable():
     assert EXTREMITY_4_NAMES == ("left_hand", "right_hand", "left_foot", "right_foot")
     assert EXTREMITY_4_GROUPS == ((20,), (21,), (7, 10), (8, 11))
     assert NUM_EXTREMITY_4 == 4
+    # kindyn_6: the corpus force-group order, one body-22 source joint each.
+    assert KINDYN_6_NAMES == (
+        "left_hand", "right_hand", "left_foot", "right_foot", "left_ankle", "right_ankle")
+    assert KINDYN_6_GROUPS == ((20,), (21,), (10,), (11,), (7,), (8,))
+    assert NUM_KINDYN_6 == 6
+    # Every kindyn_6 source joint is observable in the manual test annotations,
+    # so the manual test split supervises all six groups.
+    assert all(idx in OBSERVABLE_14 for group in KINDYN_6_GROUPS for idx in group)
 
 
 def test_ownership_every_joint_owns_at_least_25_verts():
@@ -100,6 +112,12 @@ def test_target_spec_output_dims():
     assert spec_extremities.output_dims() == {"joint": 4}
     assert spec_extremities.joint_names == EXTREMITY_4_NAMES
 
+    cfg_kindyn = _base_cfg(vertex=False, joint=True)
+    cfg_kindyn["contact"]["targets"]["joint"]["joint_set"] = "kindyn_6"
+    spec_kindyn = TargetSpec.from_config(cfg_kindyn)
+    assert spec_kindyn.output_dims() == {"joint": 6}
+    assert spec_kindyn.joint_names == KINDYN_6_NAMES
+
 
 def test_reduce_body22_to_extremities_tri_state_and_confidence():
     # Eight rows cover the complete two-member foot truth table plus the
@@ -142,6 +160,73 @@ def test_reduce_body22_to_extremities_tri_state_and_confidence():
     assert torch.allclose(sup[:7, 2], torch.tensor([1, 1, 1, 1, 1, 0, 0]).float())
     assert torch.allclose(conf[:7, 2], torch.tensor([0.6, 0.3, 0.45, 0.9, 0.7, 0, 0]))
     assert gt[7, 0] == 1 and sup[7, 0] == 1 and conf[7, 0] == pytest.approx(0.65)
+
+
+def test_reduce_body22_to_kindyn6_single_source_passthrough():
+    """Every kindyn_6 group has one source joint: gt/supervision/confidence pass
+    straight through; the hand columns are byte-identical to extremities_4's."""
+    contact = torch.zeros(3, NUM_BODY_22)
+    supervised = torch.zeros_like(contact)
+    confidence = torch.zeros_like(contact)
+    # 0: distinct labels on all six sources (kindyn order 20,21,10,11,7,8).
+    supervised[0, [20, 21, 10, 11, 7, 8]] = 1
+    contact[0, [20, 10, 7]] = 1                        # LH, LF(toe), LA(heel) touch
+    confidence[0, [20, 21, 10, 11, 7, 8]] = torch.tensor(
+        [0.9, 0.8, 0.7, 0.6, 0.5, 0.4])
+    # 1: unsupervised sources stay unsupervised per group (no OR partner).
+    supervised[1, 10] = 1
+    contact[1, 10] = 1
+    confidence[1, 10] = 0.3
+    # 2: everything unknown -> fully ignored.
+
+    gt, sup, conf = reduce_body22_to_groups(
+        contact, supervised, confidence, KINDYN_6_GROUPS)
+    assert gt.shape == sup.shape == conf.shape == (3, NUM_KINDYN_6)
+    assert gt[0].tolist() == [1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+    assert sup[0].tolist() == [1.0] * 6
+    assert torch.allclose(conf[0], torch.tensor([0.9, 0.8, 0.7, 0.6, 0.5, 0.4]))
+    assert sup[1].tolist() == [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+    assert gt[1, 2] == 1.0 and conf[1, 2] == pytest.approx(0.3)
+    assert float(sup[2].sum()) == 0.0
+
+    # Hand semantics are the reduction applied to the same singleton groups, so
+    # the two hand columns match extremities_4's exactly on any input.
+    gt4, sup4, conf4 = reduce_body22_to_extremities(contact, supervised, confidence)
+    assert torch.equal(gt[:, :2], gt4[:, :2])
+    assert torch.equal(sup[:, :2], sup4[:, :2])
+    assert torch.equal(conf[:, :2], conf4[:, :2])
+
+
+def test_kindyn6_assemble_batch_uses_raw_supervision_and_confidence():
+    cfg = _base_cfg(vertex=False, joint=True)
+    jcfg = cfg["contact"]["targets"]["joint"]
+    jcfg["joint_set"] = "kindyn_6"
+    jcfg["use_confidence_weights"] = True
+    spec = TargetSpec.from_config(cfg)
+
+    contact = torch.zeros(NUM_BODY_22)
+    supervised = torch.zeros(NUM_BODY_22)
+    confidence = torch.zeros(NUM_BODY_22)
+    # Known left-hand contact; known-free left ankle; the left foot (toe) stays
+    # unknown — with single sources there is no OR partner to resolve it.
+    contact[20] = 1
+    supervised[20] = 1
+    confidence[20] = 0.75
+    supervised[7] = 1
+    confidence[7] = 0.2
+    frame = {
+        "joint_contact": contact,
+        "joint_supervised": supervised,
+        "joint_confidence": confidence,
+        "joint_mask": supervised * confidence,
+    }
+    target = spec.assemble_batch([frame])["joint"]
+    assert torch.allclose(target["gt"], torch.tensor([[1.0, 0, 0, 0, 0, 0]]))
+    assert torch.allclose(target["mask"], torch.tensor([[0.75, 0, 0, 0, 0.2, 0]]))
+
+    jcfg["use_confidence_weights"] = False
+    unweighted = TargetSpec.from_config(cfg).assemble_batch([frame])["joint"]
+    assert torch.allclose(unweighted["mask"], torch.tensor([[1.0, 0, 0, 0, 1.0, 0]]))
 
 
 def test_extremity_assemble_batch_uses_raw_supervision_and_confidence():

@@ -52,6 +52,14 @@ model:
     mlp_depth: 2
     mlp_channel_div_factor: 4
     dropout: 0.0
+    contact_gate:                     # gate the FINAL force output (post force_temporal) by the
+      enabled: false                  # DETACHED per-group contact logits: f = f_raw *
+                                      # sigmoid(sharpness * logit), identity map — the kindyn_6
+                                      # contact outputs match the six force groups 1:1 (heel force
+                                      # gated by ankle contact, toe by foot). Requires the per_token
+                                      # kindyn_6 joint target + 6 explicit force anchors; the
+                                      # ungated output stays as joint_forces_raw.
+      sharpness: 4.0                  # logit 1.0 -> p 0.73 -> gate 0.982 (nearly 1 in contact)
   force_temporal:                     # Step 05: temporal attention over force tokens (post_decoder)
     enabled: false                    # requires force_head.enabled; second ContactTemporalModule
     bottleneck_dim: 256               # lightweight 1024 -> 256 -> 1024 token adapter
@@ -137,6 +145,11 @@ force_supervision:
     huber_delta_bw: 0.5               # smooth-L1 quadratic->linear transition (bw)
     outlier_bw: 4.0                   # drop limb-frames with |gt| above this (solver blowups; 0 = off)
     noncontact: 1.0                   # L1 zero-force penalty on valid non-contact limb-frames
+    sum_force: 0.0                    # Huber on the six-group NET force vs GT, all groups regardless
+                                      # of contact; rows skipped when invalid or any group is an outlier
+    sum_torque: 0.0                   # Huber on the net torque sum(r x f) vs GT (bw*m; r = the loader's
+                                      # root-frame force_lever arms); additionally skips non-finite levers
+    huber_delta_bwm: 0.1              # sum_torque smooth-L1 transition (bw*m)
     group_weights: null               # per-group Huber weights (kindyn order), weighted-mean
                                       # semantics; null = uniform. Upweight the legs: hands
                                       # dominate contact rate AND GT magnitude, and with uniform
@@ -147,6 +160,8 @@ loss: {dice_eps: 1.0e-5, grad_clip: 1.0}
 train:                               # Phase 4: narrow the autograd graph (grad-asserted no-ops).
   detach_interm_preds: true          # interm MHR/camera preds -> torch.no_grad() + detached
   backbone_no_grad: true             # wrap ONLY the frozen backbone call in torch.no_grad()
+  compile_backbone: false            # torch.compile the frozen backbone: ~1.2x step time,
+                                     # ~44 s warmup, output delta ~1e-2 (bf16 noise order)
 
 optim: {lr: 1.0e-4, weight_decay: 1.0e-4, epochs: 20, warmup_epochs: 1, lr_min: 1.0e-5}
 

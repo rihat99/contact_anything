@@ -96,6 +96,7 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
     # not the model, so it is not mirrored here.
     fhcfg = cfg["model"].get("force_head", {}) or {}
     force_kp = fhcfg.get("force_keypoint_indices")
+    gate_cfg = fhcfg.get("contact_gate", {}) or {}
     model_cfg.MODEL.DECODER.DO_FORCE_TOKENS = bool(fhcfg.get("enabled", False))
     model_cfg.MODEL.FORCE_HEAD = CfgNode({
         # None = inherit the contact anchors (legacy); else the force tokens
@@ -104,6 +105,10 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
         "MLP_DEPTH":              int(fhcfg.get("mlp_depth", 2)),
         "MLP_CHANNEL_DIV_FACTOR": int(fhcfg.get("mlp_channel_div_factor", 4)),
         "DROPOUT":                float(fhcfg.get("dropout", 0.0)),
+        # Contact-gated final force output (sigmoid of the detached extremity
+        # contact logits, fixed 4->6 group map — see heads/force_head.py).
+        "CONTACT_GATE_ENABLED":   bool(gate_cfg.get("enabled", False)),
+        "CONTACT_GATE_SHARPNESS": float(gate_cfg.get("sharpness", 4.0)),
     })
 
     # Force temporal module (step 05). A second ContactTemporalModule over the
@@ -262,6 +267,11 @@ def build_model(cfg: dict, device: str = "cuda") -> Tuple[nn.Module, List[str]]:
         assert not trainable_backbone, (
             f"train.backbone_no_grad is set but the backbone has trainable params: "
             f"{trainable_backbone}")
+
+    # Optional torch.compile of the frozen backbone (no trainable params there,
+    # so checkpoints — trainable-only weights — never see the _orig_mod prefix).
+    if cfg["train"]["compile_backbone"]:
+        model.backbone = torch.compile(model.backbone)
 
     trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)

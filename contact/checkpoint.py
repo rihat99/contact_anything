@@ -149,6 +149,15 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
         force_kp = fhcfg.get("force_keypoint_indices")
         if force_kp is not None:
             force["force_keypoint_indices"] = [int(i) for i in force_kp]
+        # The contact gate changes what the head weights mean (they learn the
+        # pre-gate magnitude), so it is semantic too. Added only when enabled,
+        # for the same legacy-signature reason as the anchors above.
+        gate_cfg = fhcfg.get("contact_gate", {}) or {}
+        if gate_cfg.get("enabled", False):
+            force["contact_gate"] = {
+                "enabled": True,
+                "sharpness": float(gate_cfg.get("sharpness", 4.0)),
+            }
     else:
         force = {"enabled": False}
 

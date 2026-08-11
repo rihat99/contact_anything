@@ -72,6 +72,10 @@ DEFAULTS: dict[str, Any] = {
             "mlp_depth": 2,
             "mlp_channel_div_factor": 4,
             "dropout": 0.0,
+            "contact_gate": {               # gate the final force output by the (detached)
+                "enabled": False,           # kindyn_6 contact logits, one per force group
+                "sharpness": 4.0,           # gate = sigmoid(sharpness * contact logit)
+            },
         },
         "force_temporal": {                 # Step 05: temporal attention over force tokens
             "enabled": False,               # requires model.force_head.enabled
@@ -102,7 +106,7 @@ DEFAULTS: dict[str, Any] = {
             },
             "joint": {
                 "enabled": False,
-                "joint_set": "smplx_body_22",  # smplx_body_22 | extremities_4
+                "joint_set": "smplx_body_22",  # smplx_body_22 | extremities_4 | kindyn_6
                 "weight": 1.0,
                 "supervise_subset": None,       # None=all 22; 'observable_14'; or index list
                 "derive_from_vertex": False,    # OFF by default (semantics differ, see targets.py)
@@ -172,6 +176,9 @@ DEFAULTS: dict[str, Any] = {
             "huber_delta_bw": 0.5,      # smooth-L1 quadratic->linear transition (bw)
             "outlier_bw": 4.0,          # exclude limb-frames with |gt| above this (0 = off)
             "noncontact": 1.0,          # L1 zero-force penalty on non-contact limb-frames
+            "sum_force": 0.0,           # Huber on the six-group net force vs GT (all groups)
+            "sum_torque": 0.0,          # Huber on the net torque sum(r x f) vs GT (bw*m)
+            "huber_delta_bwm": 0.1,     # sum_torque smooth-L1 transition (bw*m)
             "group_weights": None,      # per-group Huber weights (kindyn order); null = uniform
         },
     },
@@ -179,6 +186,7 @@ DEFAULTS: dict[str, Any] = {
     "train": {                          # Phase 4 efficiency flags (grad-asserted no-ops)
         "detach_interm_preds": True,    # run interm MHR/camera preds under no_grad
         "backbone_no_grad": True,       # wrap only the frozen backbone call in no_grad
+        "compile_backbone": False,      # torch.compile the frozen backbone (~1.2x step)
         "freeze_contact": False,        # regime (a): freeze contact, train force branch only
     },
     "optim": {
@@ -433,13 +441,14 @@ def _validate_force_supervision(cfg: dict, force_head: dict) -> None:
     target_frame = str(fs["target_frame"])
     if target_frame not in ("all", "center"):
         raise ValueError("force_supervision.target_frame must be 'all' or 'center'")
-    for key in ("force", "noncontact", "outlier_bw"):
+    for key in ("force", "noncontact", "sum_force", "sum_torque", "outlier_bw"):
         value = float(fs["loss"][key])
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"force_supervision.loss.{key} must be finite and >= 0")
-    delta = float(fs["loss"]["huber_delta_bw"])
-    if not math.isfinite(delta) or delta <= 0:
-        raise ValueError("force_supervision.loss.huber_delta_bw must be finite and positive")
+    for key in ("huber_delta_bw", "huber_delta_bwm"):
+        delta = float(fs["loss"][key])
+        if not math.isfinite(delta) or delta <= 0:
+            raise ValueError(f"force_supervision.loss.{key} must be finite and positive")
     group_weights = fs["loss"]["group_weights"]
     if group_weights is not None:
         if not isinstance(group_weights, (list, tuple)) or not group_weights:
@@ -503,10 +512,10 @@ def _validate_semantics(cfg: dict) -> None:
         raise ValueError(
             f"contact.targets.joint.joint_set must be one of {sorted(_KNOWN_JOINT_SETS)}; "
             f"got {joint_set!r}")
-    if joint_set == "extremities_4" and joint_cfg["supervise_subset"] is not None:
+    if joint_set != "smplx_body_22" and joint_cfg["supervise_subset"] is not None:
         raise ValueError(
             "contact.targets.joint.supervise_subset must be null for "
-            "joint_set='extremities_4'")
+            f"joint_set={joint_set!r}")
 
     contact_head = cfg["model"]["contact_head"]
     pool_mode = str(contact_head["pool_mode"])
@@ -586,6 +595,33 @@ def _validate_semantics(cfg: dict) -> None:
                 "physics.enabled requires model.force_head.force_keypoint_indices=null "
                 "(the physics loss gates on the four extremity contact probabilities, "
                 "which is only sound when the force anchors are the contact anchors)")
+
+    contact_gate = force_head["contact_gate"]
+    sharpness = float(contact_gate["sharpness"])
+    if not math.isfinite(sharpness) or sharpness <= 0:
+        raise ValueError(
+            "model.force_head.contact_gate.sharpness must be finite and positive")
+    if contact_gate["enabled"]:
+        if not force_head["enabled"]:
+            raise ValueError(
+                "model.force_head.contact_gate.enabled requires "
+                "model.force_head.enabled=true (there is no force output to gate)")
+        if not (targets["joint"]["enabled"] and joint_set == "kindyn_6"
+                and pool_mode == "per_token"):
+            raise ValueError(
+                "model.force_head.contact_gate.enabled requires the joint contact "
+                "target enabled with joint_set='kindyn_6' and "
+                "model.contact_head.pool_mode='per_token' (each force group is "
+                "gated by its own aligned contact output)")
+        # The contact->force gate map is the identity over the six kindyn groups
+        # (FORCE_GATE_CONTACT_MAP in the force head; arity duplicated here so
+        # config validation stays torch-free).
+        if force_kp is None or len(force_kp) != 6:
+            raise ValueError(
+                "model.force_head.contact_gate.enabled requires explicit "
+                "model.force_head.force_keypoint_indices with 6 entries (the "
+                "contact->force gate map is the identity over the six kindyn "
+                f"groups); got {force_kp!r}")
 
     force_temporal = cfg["model"]["force_temporal"]
     if force_temporal["enabled"] and not force_head["enabled"]:

@@ -12,21 +12,26 @@ K = 6
 
 
 def make_cfg(**loss_overrides) -> dict:
-    loss = {"force": 1.0, "noncontact": 1.0, "huber_delta_bw": 0.5, "outlier_bw": 4.0,
+    loss = {"force": 1.0, "noncontact": 1.0, "sum_force": 0.0, "sum_torque": 0.0,
+            "huber_delta_bw": 0.5, "huber_delta_bwm": 0.1, "outlier_bw": 4.0,
             "group_weights": None}
     loss.update(loss_overrides)
     return {"force_supervision": {"target_frame": "all", "loss": loss}}
 
 
 def make_batch(n_rows: int, gt: torch.Tensor, contact: torch.Tensor,
-               valid: torch.Tensor | None = None, seq_len: int = 1) -> dict:
-    return {
+               valid: torch.Tensor | None = None, seq_len: int = 1,
+               lever: torch.Tensor | None = None) -> dict:
+    batch = {
         "force_gt": gt,
         "force_contact": contact,
         "force_valid": torch.ones(n_rows, dtype=torch.bool) if valid is None else valid,
         "frame_valid": torch.ones(n_rows, dtype=torch.bool),
         "seq_len": seq_len,
     }
+    if lever is not None:
+        batch["force_lever"] = lever
+    return batch
 
 
 def out_for(pred: torch.Tensor) -> dict:
@@ -164,3 +169,90 @@ def test_zero_weight_term_omitted():
     contact = torch.zeros(1, K, dtype=torch.bool)
     _, parts = loss_fn(out_for(torch.zeros(1, K, 3)), make_batch(1, gt, contact))
     assert set(parts["terms"]) == {"force"}
+
+
+def test_sum_force_exact_value():
+    """Hand-computed Huber on the six-group net force, all groups counted."""
+    loss_fn = ForceSupervisedLoss(make_cfg(sum_force=0.25), device="cpu")
+    pred = torch.zeros(1, K, 3)
+    gt = torch.zeros(1, K, 3)
+    gt[0, 0] = torch.tensor([0.2, 0.0, 0.0])
+    gt[0, 2] = torch.tensor([0.0, 0.6, 0.0])
+    contact = torch.zeros(1, K, dtype=torch.bool)
+    contact[0, [0, 2]] = True
+    _, parts = loss_fn(out_for(pred), make_batch(1, gt, contact))
+    # net error (0.2, 0.6, 0), beta 0.5: 0.5*0.2^2/0.5 + (0.6 - 0.25) = 0.39;
+    # the term's loss carries its 0.25 weight (mass 1 row).
+    assert parts["terms"]["sum_force"]["weight_mass"] == 1.0
+    assert math.isclose(parts["terms"]["sum_force"]["loss"], 0.25 * 0.39, rel_tol=1e-5)
+
+
+def test_sum_rows_skip_outliers_and_invalid_rows():
+    """A row with ANY outlier group leaves the sum terms entirely; so do invalid rows."""
+    loss_fn = ForceSupervisedLoss(make_cfg(sum_force=1.0), device="cpu")
+    pred = torch.zeros(3, K, 3)
+    gt = torch.zeros(3, K, 3)
+    gt[1, 0, 1] = -10.0                              # outlier group poisons row 1's sum
+    gt[1, 1, 0] = 0.5                                # would register if the row counted
+    contact = torch.zeros(3, K, dtype=torch.bool)
+    contact[1, [0, 1]] = True
+    valid = torch.tensor([True, True, False])        # row 2 is force-invalid
+    _, parts = loss_fn(out_for(pred), make_batch(3, gt, contact, valid=valid))
+    assert parts["terms"]["sum_force"]["weight_mass"] == 1.0   # row 0 only
+    assert parts["terms"]["sum_force"]["loss"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_sum_torque_exact_value_and_shared_levers():
+    """tau = sum(r x f) with the loader's levers on BOTH sides of the Huber."""
+    cfg = make_cfg(force=0.0, noncontact=0.0, sum_torque=1.0)
+    loss_fn = ForceSupervisedLoss(cfg, device="cpu")
+    pred = torch.zeros(1, K, 3)
+    pred[0, 0] = torch.tensor([1.0, 0.0, 0.0])
+    gt = torch.zeros(1, K, 3)
+    contact = torch.zeros(1, K, dtype=torch.bool)
+    contact[0, 0] = True
+    lever = torch.zeros(1, K, 3)
+    lever[0, 0] = torch.tensor([0.0, 0.0, 1.0])
+    _, parts = loss_fn(
+        out_for(pred), make_batch(1, gt, contact, lever=lever))
+    # tau_pred = (0,0,1) x (1,0,0) = (0,1,0); tau_gt = 0; beta 0.1 -> 1 - 0.05.
+    assert parts["terms"]["sum_torque"]["weight_mass"] == 1.0
+    assert math.isclose(parts["terms"]["sum_torque"]["loss"], 0.95, rel_tol=1e-5)
+    # Identical pred and gt forces give exactly zero torque residual: only the
+    # forces differ between the two sides, never the lever arms.
+    _, parts = loss_fn(
+        out_for(gt.clone()), make_batch(1, gt, contact, lever=torch.randn(1, K, 3)))
+    assert parts["terms"]["sum_torque"]["loss"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_sum_torque_skips_nonfinite_lever_rows():
+    """A NaN lever removes the row from sum_torque only — and must not leak NaN."""
+    loss_fn = ForceSupervisedLoss(
+        make_cfg(sum_force=1.0, sum_torque=1.0), device="cpu")
+    pred = torch.zeros(2, K, 3, requires_grad=True)
+    gt = torch.zeros(2, K, 3)
+    contact = torch.zeros(2, K, dtype=torch.bool)
+    lever = torch.zeros(2, K, 3)
+    lever[1, 3, 2] = float("nan")
+    total, parts = loss_fn(out_for(pred), make_batch(2, gt, contact, lever=lever))
+    assert parts["terms"]["sum_torque"]["weight_mass"] == 1.0
+    assert parts["terms"]["sum_force"]["weight_mass"] == 2.0
+    assert math.isfinite(float(total.detach()))
+    total.backward()
+    assert torch.isfinite(pred.grad).all()
+
+
+def test_center_selection_applies_to_levers():
+    """T=3 clips: only the middle row's lever/forces feed the sum terms."""
+    cfg = make_cfg(force=0.0, noncontact=0.0, sum_torque=1.0)
+    cfg["force_supervision"]["target_frame"] = "center"
+    loss_fn = ForceSupervisedLoss(cfg, device="cpu")
+    pred = torch.zeros(3, K, 3)
+    gt = torch.zeros(3, K, 3)
+    contact = torch.zeros(3, K, dtype=torch.bool)
+    lever = torch.full((3, K, 3), float("nan"))
+    lever[1] = 0.0                                   # only the center row is finite
+    _, parts = loss_fn(
+        out_for(pred), make_batch(3, gt, contact, seq_len=3, lever=lever))
+    assert parts["terms"]["sum_torque"]["weight_mass"] == 1.0
+    assert parts["terms"]["sum_torque"]["loss"] == pytest.approx(0.0, abs=1e-6)

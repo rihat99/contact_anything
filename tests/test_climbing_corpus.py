@@ -100,6 +100,16 @@ def _write_scene(
     forces[~group_contact] = 0.0
     q = np.zeros((n_people, N_FRAMES, 211), np.float32)
     q[..., 3:7] = QUAT_Z90
+    # World joints for the lever arms: everything at the pelvis except a known
+    # world offset for the left wrist (+0.5 x) and the left foot (+0.8 y).
+    joint_names = [f"joint_{j}" for j in range(52)]
+    joint_names[0] = "pelvis"
+    for name, jidx in zip(KINDYN_FORCE_JOINTS, (20, 21, 10, 11, 7, 8)):
+        joint_names[jidx] = name
+    joints_world = np.tile(
+        np.array([1.0, 2.0, 3.0], np.float32), (n_people, N_FRAMES, 52, 1))
+    joints_world[..., 20, 0] += 0.5                                     # left wrist
+    joints_world[..., 10, 1] += 0.8                                     # left foot (toe)
     order = list(range(n_people)) if kindyn_id_order is None else kindyn_id_order
     np.savez(
         human / "kindyn_1.npz",
@@ -107,6 +117,7 @@ def _write_scene(
         contact_force_joints=np.tile(np.array(KINDYN_FORCE_JOINTS, "<U16"), (n_people, 1)),
         contact_forces=forces[order], q=q[order], total_mass=masses[order],
         valid_mask=valid[order], joint_contact=jc52[order],
+        joint_names=np.array(joint_names), joints_world=joints_world[order],
         betas=np.zeros((n_people, 10), np.float32),
     )
 
@@ -209,7 +220,8 @@ def test_item_contract_and_dtypes(corpus):
         "image", "mask", "bbox", "cam_int", "cam_from_world", "gravity_world",
         "cam_jump_m", "joint_contact", "joint_mask", "joint_supervised",
         "joint_confidence", "frame_pos_sec", "frame_position", "frame_index",
-        "frame_valid", "key", "dataset", "force_gt", "force_contact", "force_valid",
+        "frame_valid", "key", "dataset", "force_gt", "force_contact",
+        "force_lever", "force_valid",
     }
     assert frame["image"].shape == (32, 24, 3) and frame["image"].dtype == np.uint8
     assert frame["mask"].shape == (32, 24)
@@ -221,6 +233,7 @@ def test_item_contract_and_dtypes(corpus):
         assert frame[key].shape == (22,) and frame[key].dtype == torch.float32
     assert frame["force_gt"].shape == (6, 3) and frame["force_gt"].dtype == torch.float32
     assert frame["force_contact"].shape == (6,) and frame["force_contact"].dtype == torch.bool
+    assert frame["force_lever"].shape == (6, 3) and frame["force_lever"].dtype == torch.float32
     assert frame["force_valid"] is True
     assert frame["key"] == "vidA_0000#0@0" and frame["dataset"] == "climbing_corpus"
     # cam centres move 0.1 m per source frame -> 0.2 m per stride-2 sampled step.
@@ -368,6 +381,47 @@ def test_force_rotation_units_and_contact_mask(corpus):
         "left_hand", "right_hand", "left_foot", "right_foot", "left_ankle", "right_ankle")
 
 
+def test_force_lever_rotates_pelvis_offsets_to_root(corpus):
+    """Lever arms = R(q)^T @ (group joint - pelvis), metres, root frame."""
+    ds = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="train", frames_per_clip=1,
+        frame_stride=1, jitter=False, load_forces=True)
+    lever = ds[0][0]["force_lever"]
+    # World offsets +0.5 x (left wrist) / +0.8 y (left foot) under Rz(90 deg)^T:
+    # x -> -y, y -> x (same rotation as the forces).
+    torch.testing.assert_close(
+        lever[0], torch.tensor([0.0, -0.5, 0.0]), atol=1e-6, rtol=0)
+    torch.testing.assert_close(
+        lever[2], torch.tensor([0.8, 0.0, 0.0]), atol=1e-6, rtol=0)
+    # The other four groups sit exactly at the pelvis in the fixture.
+    assert float(lever[[1, 3, 4, 5]].abs().max()) == 0.0
+
+
+def test_force_lever_group_resolution_is_by_name(corpus):
+    """Permuting the kindyn joint axis (pelvis away from row 0) changes nothing;
+    a missing group/pelvis name is a hard error."""
+    human = corpus / "features" / "human_optim" / "vi" / "dA" / "vidA_0000"
+    with np.load(human / "kindyn_1.npz", allow_pickle=True) as npz:
+        kindyn = dict(npz)
+    perm = np.roll(np.arange(52), 5)
+    kindyn["joint_names"] = np.asarray(kindyn["joint_names"])[perm]
+    kindyn["joints_world"] = np.asarray(kindyn["joints_world"])[:, :, perm]
+    np.savez(human / "kindyn_1.npz", **kindyn)
+    lever = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="train", frames_per_clip=1,
+        frame_stride=1, jitter=False, load_forces=True)[0][0]["force_lever"]
+    torch.testing.assert_close(
+        lever[0], torch.tensor([0.0, -0.5, 0.0]), atol=1e-6, rtol=0)
+
+    kindyn["joint_names"] = np.asarray(
+        ["nope" if str(n) == "pelvis" else str(n) for n in kindyn["joint_names"]])
+    np.savez(human / "kindyn_1.npz", **kindyn)
+    with pytest.raises(ValueError, match="missing \\['pelvis'\\]"):
+        ClimbingCorpusDataset(
+            corpus, scenes=["vidA_0000"], split="train", frames_per_clip=1,
+            frame_stride=1, jitter=False, load_forces=True)
+
+
 def test_force_valid_follows_kindyn_and_frame_validity(corpus):
     _write_scene(corpus, "vidB_0000", invalid_frames=(0,))
     ds = ClimbingCorpusDataset(
@@ -487,12 +541,29 @@ def test_clip_collates_into_training_batch(corpus):
     assert batch["seq_len"] == 2
     assert batch["cam_from_world"].shape == (2, 4, 4)
     assert bool(batch["cam_valid"].all())
+    assert batch["force_gt"].shape == (2, 6, 3)
+    assert batch["force_lever"].shape == (2, 6, 3)
     torch.testing.assert_close(
         batch["gravity_world"], torch.tensor([[0.0, 1.0, 0.0]] * 2))
     # extremities_4 reduction: left hand + left foot in contact, right side free.
     joint = batch["targets"]["joint"]
     assert joint["gt"].shape == (2, 4)
     assert joint["gt"][0].tolist() == [1.0, 0.0, 1.0, 0.0]
+    assert bool((joint["mask"] > 0).all())
+
+
+def test_clip_collates_kindyn6_targets(corpus):
+    """The gated experiment config reduces the same clip to six kindyn groups."""
+    ds = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
+        frame_stride=2, jitter=False, load_forces=True)
+    cfg = load_config(REPO / "configs" / "climbing_corpus_joint_force_gated.yaml")
+    collate = make_collate((256, 256), TargetSpec.from_config(cfg))
+    joint = collate([ds[0]])["targets"]["joint"]
+    assert joint["gt"].shape == (2, 6)
+    # kindyn order LH, RH, LF=toe, RF=toe, LA=heel, RA=heel: the folded left
+    # hand (finger 25) and the left big-toe joint touch; both heels are free.
+    assert joint["gt"][0].tolist() == [1.0, 0.0, 1.0, 0.0, 0.0, 0.0]
     assert bool((joint["mask"] > 0).all())
 
 

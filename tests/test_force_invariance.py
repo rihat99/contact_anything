@@ -318,3 +318,33 @@ def test_force_branch_within_noise_floor():
     finally:
         del model
         torch.cuda.empty_cache()
+
+
+def test_contact_gate_wires_final_force_output():
+    """Gated build (six kindyn_6 contact tokens matched 1:1 to the six force
+    groups): the forward's final force output equals raw * sigmoid(sharpness *
+    joint logits[gate map]), with the ungated tensor preserved under
+    ``joint_forces_raw``."""
+    from sam_3d_body.models.heads.force_head import FORCE_GATE_CONTACT_MAP
+
+    torch.manual_seed(0)
+    cfg = load_config(
+        os.path.join(REPO, "configs", "climbing_corpus_joint_force_gated.yaml"))
+    model, _ = build_model(cfg, "cuda")
+    model.eval()
+    try:
+        _randomize_force_head_final(model)          # nonzero raw forces
+        batch = _batch(cfg, model, _synth_frames(2))
+        with torch.no_grad():
+            out = forward_model(model, batch)
+        assert sorted(out["force"]) == ["joint_forces", "joint_forces_raw"]
+        raw = out["force"]["joint_forces_raw"].float()
+        assert float(raw.abs().max()) > 0
+        gate = torch.sigmoid(
+            4.0 * out["contact"]["joint_logits"].float()
+            [:, list(FORCE_GATE_CONTACT_MAP)])
+        torch.testing.assert_close(
+            out["force"]["joint_forces"].float(), raw * gate.unsqueeze(-1))
+    finally:
+        del model
+        torch.cuda.empty_cache()

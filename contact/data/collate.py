@@ -28,8 +28,6 @@ from torchvision.transforms import ToTensor
 from sam_3d_body.data.transforms import (
     Compose, GetBBoxCenterScale, TopdownAffine, VisionTransformWrapper,
 )
-from sam_3d_body.data.utils.prepare_batch import NoCollate
-
 from ..targets import TargetSpec, validate_targets
 from .climbing_corpus import (
     FORCE_GROUP_NAMES,
@@ -140,7 +138,6 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec):
 
         out["person_valid"] = torch.ones((len(frames), 1))
         out["cam_int"]      = cam_ints
-        out["img_ori"]      = [NoCollate(f["image"]) for f in frames]
         out["targets"]      = spec.assemble_batch(frames)
         out["seq_len"]      = seq_len
         out["frame_pos_sec"] = torch.tensor(
@@ -178,6 +175,12 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec):
             torch.as_tensor(f["force_contact"], dtype=torch.bool)
             if "force_contact" in f else torch.zeros(n_groups, dtype=torch.bool)
             for f in frames], dim=0)                                       # [B, 6]
+        # Root-frame lever arms (m) for the net-torque loss; the zeros fallback
+        # is inert because those frames also carry force_valid=False.
+        out["force_lever"] = torch.stack([
+            torch.as_tensor(f["force_lever"], dtype=torch.float32)
+            if "force_lever" in f else torch.zeros(n_groups, 3, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 6, 3]
         out["force_valid"] = torch.tensor(
             [bool(f.get("force_valid", False)) for f in frames],
             dtype=torch.bool)                                              # [B]
@@ -455,7 +458,7 @@ def make_loaders(
             dataset, batch_size=batch_size, shuffle=shuffle and sampler is None,
             sampler=sampler,
             num_workers=num_workers, drop_last=shuffle, collate_fn=collate,
-            pin_memory=False, persistent_workers=False)
+            pin_memory=True, persistent_workers=False)
 
     train_loader = InterleavedLoader([_loader(*p) for p in train_parts], seed=seed)
     eval_loader = InterleavedLoader([_loader(*p) for p in eval_parts], seed=seed)

@@ -20,6 +20,9 @@ from sam_3d_body.utils.logging import get_pylogger
 from ..backbones import create_backbone
 from ..decoders import build_decoder, build_keypoint_sampler, PromptEncoder
 from ..heads import build_head
+# --- force contact-gate hook (import) ---
+from ..heads.force_head import FORCE_GATE_CONTACT_MAP, contact_gate_forces
+# --- end force contact-gate hook ---
 from ..modules.camera_embed import CameraEncoder
 from ..modules.transformer import FFN, MLP
 
@@ -335,6 +338,28 @@ class SAM3DBody(BaseModel):
             self.force_feat_linear = nn.Linear(
                 self.backbone.embed_dims, self.cfg.MODEL.DECODER.DIM
             )
+
+            # --- force contact-gate hook (module construction) ---
+            # Contact-gated final force output (no params — a head-level product;
+            # config validation requires the six-token per_token kindyn_6 contact
+            # target, matched 1:1 to the six force groups, whenever the gate is on).
+            self.force_contact_gate = bool(
+                force_head_cfg.get("CONTACT_GATE_ENABLED", False)
+            )
+            self.force_contact_gate_sharpness = float(
+                force_head_cfg.get("CONTACT_GATE_SHARPNESS", 4.0)
+            )
+            if self.force_contact_gate:
+                assert self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False), (
+                    "FORCE_HEAD.CONTACT_GATE_ENABLED requires DO_CONTACT_TOKENS: "
+                    "the gate reads the per-group contact logits"
+                )
+                assert self.num_force_tokens == len(FORCE_GATE_CONTACT_MAP), (
+                    "FORCE_HEAD.CONTACT_GATE_ENABLED requires "
+                    f"{len(FORCE_GATE_CONTACT_MAP)} force tokens (kindyn groups); "
+                    f"got {self.num_force_tokens}"
+                )
+            # --- end force contact-gate hook ---
 
             # --- force temporal hook (module construction) ---
             # A second ContactTemporalModule instance over the force tokens
@@ -852,7 +877,24 @@ class SAM3DBody(BaseModel):
                 force_tokens = _ft(force_tokens, _sl, _pos, _valid)
             # --- end force temporal hook ---
             # Dimensionless per-extremity force vectors (units of body weight, D5).
-            force_output = {"joint_forces": self.head_force(force_tokens)}  # [B, K, 3]
+            joint_forces = self.head_force(force_tokens)                # [B, K, 3]
+            force_output = {"joint_forces": joint_forces}
+            # --- force contact-gate hook (final output) ---
+            # Gate the FINAL force output (post force_temporal) by the DETACHED
+            # per-group contact logits, so eval/inference/rendering all see gated
+            # forces unchanged; the ungated tensor stays for diagnostics. The
+            # detach keeps the force loss from rewriting the calibrated contact
+            # probabilities through this product (contact trains from its labels).
+            if getattr(self, "force_contact_gate", False):
+                force_output = {
+                    "joint_forces": contact_gate_forces(
+                        joint_forces,
+                        contact_output["joint_logits"],
+                        self.force_contact_gate_sharpness,
+                    ),
+                    "joint_forces_raw": joint_forces,
+                }
+            # --- end force contact-gate hook ---
         # --- end force hook ---
 
         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):

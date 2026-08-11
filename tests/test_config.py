@@ -347,8 +347,13 @@ def test_force_head_defaults_load():
         "mlp_depth": 2,
         "mlp_channel_div_factor": 4,
         "dropout": 0.0,
+        "contact_gate": {"enabled": False, "sharpness": 4.0},
     }
     assert cfg["train"]["freeze_contact"] is False
+    # New sum-consistency terms default OFF; deltas default to the shipped values.
+    assert cfg["force_supervision"]["loss"]["sum_force"] == 0.0
+    assert cfg["force_supervision"]["loss"]["sum_torque"] == 0.0
+    assert cfg["force_supervision"]["loss"]["huber_delta_bwm"] == pytest.approx(0.1)
 
 
 def test_force_head_on_extremities_per_token_is_accepted(tmp_path):
@@ -373,6 +378,139 @@ base: configs/base.yaml
 model:
   force_head: {frame: world}
 """))
+
+
+def test_contact_gate_requires_force_head_enabled(tmp_path):
+    with pytest.raises(ValueError, match="contact_gate.enabled requires model.force_head.enabled"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+model:
+  force_head: {contact_gate: {enabled: true}}
+"""))
+
+
+def test_contact_gate_requires_kindyn6_contact_target(tmp_path):
+    # A force-only build has no contact logits to gate on.
+    with pytest.raises(ValueError, match="joint_set='kindyn_6'"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+model:
+  force_head:
+    enabled: true
+    force_keypoint_indices: [62, 41, 15, 18, 17, 20]
+    contact_gate: {enabled: true}
+contact:
+  targets:
+    vertex: {enabled: false}
+    joint: {enabled: false}
+"""))
+    # The four-extremity set no longer aligns with the identity gate map.
+    with pytest.raises(ValueError, match="joint_set='kindyn_6'"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+model:
+  contact_head: {contact_keypoint_indices: [62, 41, 13, 14], num_global_tokens: 0,
+                 pool_mode: per_token}
+  force_head:
+    enabled: true
+    force_keypoint_indices: [62, 41, 15, 18, 17, 20]
+    contact_gate: {enabled: true}
+contact:
+  primary_target: joint
+  targets:
+    vertex: {enabled: false}
+    joint: {enabled: true, joint_set: extremities_4, supervise_subset: null}
+"""))
+
+
+def test_contact_gate_requires_six_force_groups(tmp_path):
+    # A wrong-arity explicit anchor list cannot feed the identity map's 6 groups.
+    with pytest.raises(ValueError, match="6 entries"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+model:
+  contact_head: {contact_keypoint_indices: [62, 41, 15, 18, 17, 20],
+                 num_global_tokens: 0, pool_mode: per_token}
+  force_head: {enabled: true, force_keypoint_indices: [62, 41, 15, 18],
+               contact_gate: {enabled: true}}
+contact:
+  primary_target: joint
+  targets:
+    vertex: {enabled: false}
+    joint: {enabled: true, joint_set: kindyn_6, supervise_subset: null}
+"""))
+
+
+def test_contact_gate_bad_sharpness_rejected(tmp_path):
+    with pytest.raises(ValueError, match="contact_gate.sharpness must be finite and positive"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+model:
+  force_head: {contact_gate: {sharpness: 0.0}}
+"""))
+
+
+def test_contact_gate_on_kindyn6_joint_build_is_accepted(tmp_path):
+    cfg = load_config(_write(tmp_path, """
+base: configs/base.yaml
+model:
+  contact_head: {contact_keypoint_indices: [62, 41, 15, 18, 17, 20],
+                 num_global_tokens: 0, pool_mode: per_token}
+  force_head:
+    enabled: true
+    force_keypoint_indices: [62, 41, 15, 18, 17, 20]
+    contact_gate: {enabled: true, sharpness: 2.0}
+contact:
+  primary_target: joint
+  targets:
+    vertex: {enabled: false}
+    joint: {enabled: true, joint_set: kindyn_6, supervise_subset: null}
+"""))
+    assert cfg["model"]["force_head"]["contact_gate"] == {
+        "enabled": True, "sharpness": 2.0}
+
+
+def test_joint_force_gated_launch_config():
+    cfg = load_config(REPO / "configs" / "climbing_corpus_joint_force_gated.yaml")
+    # Contact branch = the t5mid_v2 recipe on T=7 clips, but with SIX contact
+    # tokens anchored at the force anchors (kindyn_6, 1:1 with the force groups)
+    # and trained from scratch — no warm start.
+    source = load_config(
+        REPO / "configs" / "climbing_videos_joint_temporal_center_v2.yaml")
+    assert cfg["model"]["temporal"] == source["model"]["temporal"]
+    assert cfg["model"]["contact_head"] == {
+        **source["model"]["contact_head"],
+        "contact_keypoint_indices": [62, 41, 15, 18, 17, 20]}
+    assert cfg["contact"]["targets"]["joint"]["joint_set"] == "kindyn_6"
+    assert (cfg["contact"]["targets"]["joint"]["loss"]
+            == source["contact"]["targets"]["joint"]["loss"])
+    assert cfg["contact"]["targets"]["joint"]["use_confidence_weights"] is True
+    assert cfg["model"]["init_contact_checkpoint"] is None
+    assert cfg["train"]["freeze_contact"] is False       # contact trains (from scratch)
+    assert cfg["train"]["compile_backbone"] is True
+    # Force branch = the supervised v2 recipe, plus the contact gate.
+    force = load_config(REPO / "configs" / "climbing_corpus_force_supervised.yaml")
+    assert cfg["model"]["force_head"] == {
+        **force["model"]["force_head"],
+        "contact_gate": {"enabled": True, "sharpness": 4.0}}
+    assert cfg["model"]["force_temporal"] == force["model"]["force_temporal"]
+    assert cfg["force_supervision"]["enabled"] is True
+    assert cfg["force_supervision"]["loss"] == {
+        "force": 1.0, "huber_delta_bw": pytest.approx(0.1),
+        "outlier_bw": pytest.approx(4.0), "noncontact": 0.0,
+        "sum_force": pytest.approx(0.25), "sum_torque": pytest.approx(0.25),
+        "huber_delta_bwm": pytest.approx(0.1),
+        "group_weights": [1.0, 1.0, 2.0, 2.0, 2.0, 2.0]}
+    assert cfg["data"]["sequence"] == {
+        "frames_per_clip": 7, "frame_stride": 1, "jitter": True, "target_frame": "center"}
+    assert cfg["data"]["eval_split"] == "test"
+    assert [d["config"] for d in cfg["data"]["datasets"]] == [
+        "configs/datasets/climbing_corpus_forces.yaml"]
+    assert cfg["optim"] == {
+        "lr": pytest.approx(1.0e-4), "weight_decay": pytest.approx(1.0e-4),
+        "epochs": 30, "warmup_epochs": 1, "lr_min": pytest.approx(1.0e-6)}
+    assert cfg["output"]["exp_name"] == "corpus6_joint_force_gated_t7"
+    assert cfg["output"]["monitor"] == "test/force_mae"
 
 
 def test_force_temporal_defaults_load():
