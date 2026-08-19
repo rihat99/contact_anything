@@ -1,0 +1,10 @@
+name: climbing_corpus
+
+# climbing_corpus with the kindyn GT motion targets enabled — used by the motion
+# tokens v2 experiment. See climbing_corpus.yaml for the layout description.
+data:
+  root: /data3/rikhat.akizhanov/better/data/ClimbingVideos
+  contact_level: 1
+  load_motion: true       # kindyn_1.npz -> motion_gt / motion_valid / motion_outlier /
+                          # motion_rot per frame (central-difference vel+acc of the seven
+                          # motion joints over the FULL scene trajectory, root frame)

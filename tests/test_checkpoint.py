@@ -5,6 +5,7 @@ so the fingerprint / schema / RNG logic is exercised without a GPU or checkpoint
 """
 from __future__ import annotations
 
+import copy
 import random
 
 import numpy as np
@@ -40,6 +41,25 @@ class _TinyForce(_Tiny):
     def __init__(self, dim: int = 4):
         super().__init__(dim)
         self.head_force = nn.Linear(dim, dim)
+
+
+class _TinyCond(_TinyForce):
+    """``_TinyForce`` plus the zero-init input-conditioning projection."""
+
+    def __init__(self, dim: int = 4):
+        super().__init__(dim)
+        self.contact_cond_linear = nn.Linear(dim, dim, bias=False)
+
+
+def _cond_cfg(cfg: dict) -> dict:
+    """Add an enabled ``model.cond_input`` block to a config dict."""
+    cfg = copy.deepcopy(cfg)
+    cfg["model"]["cond_input"] = {
+        "enabled": True, "clip": 5.0,
+        "standardize": {"vel_mean": [0.0] * 3, "vel_std": [1.0] * 3,
+                        "acc_mean": [0.0] * 3, "acc_std": [1.0] * 3},
+    }
+    return cfg
 
 
 def _force_cfg(force_enabled: bool, grid_size: int = 5) -> dict:
@@ -262,6 +282,29 @@ def test_force_warm_start_loads_contact_leaves_force_fresh(tmp_path):
     assert state["warm_start_new_names"] == ["head_force.bias", "head_force.weight"]
     assert state["warm_start_loaded_names"] == [
         "contact_head.bias", "contact_head.weight"]
+
+
+def test_warm_start_allows_the_cond_input_projections(tmp_path):
+    # An unconditioned checkpoint warm-starting a CONDITIONED target: the
+    # cond_input signature key and the zero-init *_cond_linear params are
+    # exempted like the force branch, so the warm start succeeds and leaves the
+    # projections fresh (the reverse direction — conditioned source, plain target
+    # — is the same comparison with the key on the other side).
+    source = _Tiny()
+    path = tmp_path / "contact.pth"
+    opt, sched = _opt_sched(source)
+    ckpt_io.save(path, source, _trainable_names(source), opt, sched,
+                 epoch=0, global_step=1, best_metric=0.0, monitor="val/joint_f1",
+                 config=_force_cfg(force_enabled=False))
+
+    target = _TinyCond()
+    before = target.contact_cond_linear.weight.detach().clone()
+    state = ckpt_io.initialize_common_contact(
+        path, target, config=_cond_cfg(_force_cfg(force_enabled=True)))
+    assert torch.equal(target.contact_head.weight, source.contact_head.weight)
+    assert torch.equal(target.contact_cond_linear.weight, before)      # fresh
+    assert state["warm_start_new_names"] == [
+        "contact_cond_linear.weight", "head_force.bias", "head_force.weight"]
 
 
 def test_force_warm_start_rejects_other_arch_mismatch(tmp_path):

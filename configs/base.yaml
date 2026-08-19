@@ -70,6 +70,57 @@ model:
     causal: false                     # frame-level causal mask when true
     dropout: 0.0
     position_scale: 1.0               # multiply elapsed seconds before sinusoidal time encoding
+  motion_head:                        # Motion tokens v2: per-joint linear velocity + acceleration
+    enabled: false                    # motion-only builds are legal (no contact/force branch)
+    # Always explicit — motion tokens never inherit the contact anchors and there
+    # are no global motion tokens, so the token count IS this list's length.
+    # Default = the six kindyn force anchors + MHR70 9 (left hip) as the 7th,
+    # pelvis token: MHR70 has NO pelvis keypoint, and the model's own pelvis is
+    # mean(kp[9], kp[10]). The anchor only chooses where the token grid-samples
+    # image features; its TARGET is the true kindyn pelvis joint (52-joint 0).
+    motion_keypoint_indices: [62, 41, 15, 18, 17, 20, 9]
+    mlp_depth: 2
+    mlp_channel_div_factor: 4
+    dropout: 0.0
+  motion_temporal:                    # temporal attention over motion tokens (post_decoder)
+    enabled: false                    # requires motion_head.enabled; third ContactTemporalModule.
+                                      # Mandatory in practice: a per-frame head cannot represent
+                                      # a finite difference.
+    bottleneck_dim: 256               # lightweight 1024 -> 256 -> 1024 token adapter
+    num_layers: 1
+    num_heads: 4
+    mlp_ratio: 2.0
+    attend: per_token                 # per_token (T per token-slot) | joint (T*K tokens per clip)
+    causal: false                     # frame-level causal mask when true
+    dropout: 0.0
+    position_scale: 1.0               # multiply elapsed seconds before sinusoidal time encoding
+  cond_input:                         # feed smoothed pelvis vel/acc INTO the tokens
+    enabled: false                    # zero-init projections added to the INITIAL contact and
+                                      # force token embeddings (10-d feature per frame:
+                                      # standardized root-frame v, a, the gravity direction in
+                                      # root axes and a validity bit). No attention-mask change,
+                                      # so the frozen pose/MHR outputs stay bit-isolated; at init
+                                      # the projections are exactly zero, i.e. the conditioned
+                                      # model IS the unconditioned one.
+    features_path: null               # cond_features.npz (required when enabled): Gaussian-
+                                      # smoothed derivatives of the frozen model's own
+                                      # reconstructed pelvis lifted to world with the dataset
+                                      # extrinsics, keyed "<scene>__p<object_id>"
+    encoder_hidden: null              # null = bare zero-init linear per token block; an int H
+                                      # = small MLP Linear(10,H)+GELU+Linear(H,dim) whose OUTPUT
+                                      # layer is zero-init (still an exact no-op at init)
+    injection: pre_decoder            # pre_decoder = added to the INITIAL contact/force token
+                                      # embeddings (feature integrates with image evidence over
+                                      # all decoder layers); post_decoder = added to the
+                                      # decoder's token OUTPUTS, before a post_decoder-placement
+                                      # temporal module (between_layers temporal runs earlier)
+    clip: 5.0                         # clamp on the standardized v/a components (heavy tails
+                                      # survive smoothing: |a| reaches 183 m/s^2)
+    standardize:                      # pinned literals, root axes xyz; required when enabled
+      vel_mean: null                  # m/s
+      vel_std: null
+      acc_mean: null                  # m/s^2
+      acc_std: null
 
 contact:
   topology: smpl                      # smpl(6890) | smplx(10475) | mhr -> NotImplementedError
@@ -99,6 +150,8 @@ data:
   num_workers: 16
   # target_frame: all supervises every temporal row; center supervises only the
   # middle row (and therefore requires an odd frames_per_clip).
+  # frame_stride: an integer, or `auto` = per-scene max(1, round(fps / 25)) so a
+  # clip covers the same PHYSICAL span at every corpus frame rate.
   sequence: {frames_per_clip: 8, frame_stride: 2, jitter: true, target_frame: all}
 
 physics:                              # Step 06: RNEA root-wrench physics loss on the forces
@@ -154,6 +207,52 @@ force_supervision:
                                       # semantics; null = uniform. Upweight the legs: hands
                                       # dominate contact rate AND GT magnitude, and with uniform
                                       # weights the leg groups collapse to zero output.
+
+# Supervised kindyn velocity/acceleration loss (motion tokens v2). Targets are
+# derivatives of the kindyn fit over the FULL scene trajectory, in body-root
+# axes, in m/s and m/s^2. The head predicts STANDARDIZED values; the mean/std
+# table below is pinned in the experiment yaml so every checkpoint's stored
+# config reproduces the loss.
+motion_supervision:
+  enabled: false                      # requires motion_head.enabled + a climbing_corpus dataset
+                                      # with load_motion: true and frame_stride 1
+  target_frame: all                   # all | center (rows per clip contributing to the loss)
+  joint_names: null                   # null = all seven motion joints, in canonical order
+                                      # [left_wrist, right_wrist, left_foot, right_foot,
+                                      #  left_ankle, right_ankle, pelvis]; otherwise an
+                                      # ordered duplicate-free subset. K = len(this list)
+                                      # and it must match motion_keypoint_indices.
+  root_convention: twist              # how the `pelvis` slot is expressed:
+                                      #   twist          — BVR's own body twist,
+                                      #     d[t]=se3_log(T_t^-1 T_t+1), v=(d[t-1]+d[t])/2dt,
+                                      #     a=(d[t]-d[t-1])/dt^2 (linear parts). This is the
+                                      #     scheme BetterVideoReconstruction differentiated
+                                      #     the fit with, so the target matches the producer.
+                                      #   rotated_world  — R^T of the world central difference
+                                      #     (motion-tokens v1/v2); differs from the twist by
+                                      #     the Coriolis term omega x v (~7% of |a|).
+                                      # The six LIMB slots are always rotated_world: BVR
+                                      # defines no linear twist for non-root joints.
+  target_smooth_sec: 0.12             # Gaussian width in SECONDS applied to the root
+                                      # trajectory before differentiating (gap-aware,
+                                      # quaternions hemisphere-aligned then renormalized).
+                                      # A fixed PHYSICAL width makes the label bandwidth
+                                      # fps-independent: raw kindyn pelvis |a| RMS is
+                                      # 3.4 m/s^2 at 24 fps vs 13.3 at 60 fps for the same
+                                      # climbing, i.e. mostly sampling-rate artifact.
+                                      # 0 = differentiate the raw fit (v1/v2 target).
+                                      # Note motion_rot / motion_omega are re-derived from
+                                      # the smoothed trajectory too.
+  standardize:                        # per-joint per-component tables, [K][2][3]:
+    mean: null                        #   K rows (joint_names order), each
+    std: null                         #   [[vel_x,vel_y,vel_z],[acc_x,acc_y,acc_z]]
+  loss:
+    vel: 1.0                          # Huber weight on the standardized velocity
+    acc: 1.0                          # Huber weight on the standardized acceleration
+    huber_delta: 1.0                  # smooth-L1 quadratic->linear transition (standardized)
+    outlier_acc_ms2: 50.0             # TRAIN-only per-(frame, joint) cut on |acc_world|
+                                      # (kindyn 1/dt^2 jitter on 50/60-fps scenes); 0 = off.
+                                      # Eval is NEVER filtered.
 
 loss: {dice_eps: 1.0e-5, grad_clip: 1.0}
 

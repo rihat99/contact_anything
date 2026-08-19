@@ -13,10 +13,12 @@ REPO = Path(__file__).resolve().parents[1]
 
 from contact.config import load_config
 from contact.data.climbing_corpus import (
+    COND_FEATURE_DIM,
     ClimbingCorpusDataset,
     FORCE_GROUP_NAMES,
     GRAVITY_WORLD,
     KINDYN_FORCE_JOINTS,
+    cond_feature_rows,
     fold_force_group_contact,
     list_annotated_test_scenes,
     list_corpus_scenes,
@@ -565,6 +567,107 @@ def test_clip_collates_kindyn6_targets(corpus):
     # hand (finger 25) and the left big-toe joint touch; both heels are free.
     assert joint["gt"][0].tolist() == [1.0, 0.0, 1.0, 0.0, 0.0, 0.0]
     assert bool((joint["mask"] > 0).all())
+
+
+# ------------------------------------------------------------------ cond input
+
+#: Standardization literals for the synthetic conditioning artifact below.
+COND_STD = {"vel_mean": [0.0, 0.0, 0.0], "vel_std": [1.0, 1.0, 1.0],
+            "acc_mean": [0.0, 0.0, 0.0], "acc_std": [2.0, 2.0, 2.0]}
+
+
+def _write_cond_features(path: Path, entries: dict) -> Path:
+    """Write a synthetic ``cond_features.npz``: ``{entry: (frame_idx, valid)}``."""
+    arrays = {}
+    for name, (frame_idx, valid) in entries.items():
+        n = len(frame_idx)
+        arrays[f"{name}#frame_idx"] = np.asarray(frame_idx, np.int64)
+        arrays[f"{name}#feat_valid"] = np.asarray(valid, bool)
+        # Distinct per-frame values so a mis-join is visible, not averaged away.
+        arrays[f"{name}#vel_smooth_world"] = np.stack([
+            np.array([0.1 * f, 0.2 * f, 0.3 * f], np.float32) for f in frame_idx])
+        arrays[f"{name}#acc_smooth_world_alt"] = np.stack([
+            np.array([1.0 + f, 2.0 + f, 3.0 + f], np.float32) for f in frame_idx])
+        arrays[f"{name}#R_pred_world_from_root"] = np.tile(
+            quat_xyzw_to_matrix(QUAT_Z90).astype(np.float32), (n, 1, 1))
+    np.savez(path, **arrays)
+    return path
+
+
+def test_cond_feature_joins_on_frame_idx_and_zeroes_the_rest(corpus, tmp_path):
+    # Frames 0, 1 and 7 are absent from the artifact; frame 4 is present but
+    # marked invalid. Both cases must come back as exact zeros with bit 0.
+    path = _write_cond_features(
+        tmp_path / "cond.npz",
+        {"vidA_0000__p0": (np.arange(2, 7), np.array([1, 1, 0, 1, 1], bool))})
+    ds = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="train", frames_per_clip=N_FRAMES,
+        frame_stride=1, jitter=False, load_images=False,
+        cond_features_path=str(path), cond_standardize=COND_STD, cond_clip=5.0)
+    clip = ds[0]
+    assert [f["frame_index"] for f in clip] == list(range(N_FRAMES))
+    feats = torch.stack([f["cond_feat"] for f in clip])
+    assert feats.shape == (N_FRAMES, COND_FEATURE_DIM) and feats.dtype == torch.float32
+    for pos in (0, 1, 4, 7):
+        assert float(feats[pos].abs().sum()) == 0.0, pos
+    for pos in (2, 3, 5, 6):
+        assert float(feats[pos, 9]) == 1.0
+
+    expected = cond_feature_rows(
+        np.array([[0.1 * 2, 0.2 * 2, 0.3 * 2]], np.float32),
+        np.array([[1.0 + 2, 2.0 + 2, 3.0 + 2]], np.float32),
+        quat_xyzw_to_matrix(QUAT_Z90).astype(np.float32)[None],
+        np.array([True]), COND_STD, 5.0)
+    torch.testing.assert_close(feats[2], torch.from_numpy(expected[0]))
+
+
+def test_cond_feature_missing_entry_is_all_zeros(corpus, tmp_path):
+    path = _write_cond_features(
+        tmp_path / "cond.npz", {"someone_else__p0": (np.arange(4), np.ones(4, bool))})
+    ds = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
+        frame_stride=1, jitter=False, load_images=False,
+        cond_features_path=str(path), cond_standardize=COND_STD, cond_clip=5.0)
+    for frame in ds[0]:
+        assert float(frame["cond_feat"].abs().sum()) == 0.0
+
+
+def test_cond_features_require_standardization(corpus, tmp_path):
+    path = _write_cond_features(
+        tmp_path / "cond.npz", {"vidA_0000__p0": (np.arange(4), np.ones(4, bool))})
+    with pytest.raises(ValueError, match="cond_standardize entries"):
+        ClimbingCorpusDataset(
+            corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
+            frame_stride=1, jitter=False, load_images=False,
+            cond_features_path=str(path), cond_standardize={"vel_mean": [0.0] * 3})
+
+
+def test_cond_feat_collates_with_and_without_features(corpus, tmp_path):
+    cfg = load_config(REPO / "configs" / "climbing_corpus_joint_force_gated.yaml")
+    collate = make_collate((256, 256), TargetSpec.from_config(cfg))
+    common = dict(
+        scenes=["vidA_0000"], split="train", frames_per_clip=2, frame_stride=2,
+        jitter=False, load_forces=True)
+
+    # No features configured: the key is still emitted, as zeros (a still-image
+    # dataset in a mixed batch looks the same), so the model's zero-init
+    # projections are exercised on every step.
+    plain = collate([ClimbingCorpusDataset(corpus, **common)[0]])
+    assert plain["cond_feat"].shape == (2, COND_FEATURE_DIM)
+    assert plain["cond_feat"].dtype == torch.float32
+    assert float(plain["cond_feat"].abs().sum()) == 0.0
+
+    path = _write_cond_features(
+        tmp_path / "cond.npz",
+        {"vidA_0000__p0": (np.arange(N_FRAMES), np.ones(N_FRAMES, bool))})
+    ds = ClimbingCorpusDataset(
+        corpus, cond_features_path=str(path), cond_standardize=COND_STD,
+        cond_clip=5.0, **common)
+    clip = ds[0]
+    batch = collate([clip])
+    torch.testing.assert_close(
+        batch["cond_feat"], torch.stack([f["cond_feat"] for f in clip]))
+    assert float(batch["cond_feat"].abs().sum()) > 0.0
 
 
 # ------------------------------------------------------------------ real corpus

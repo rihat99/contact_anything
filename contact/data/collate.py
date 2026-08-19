@@ -30,7 +30,10 @@ from sam_3d_body.data.transforms import (
 )
 from ..targets import TargetSpec, validate_targets
 from .climbing_corpus import (
+    COND_FEATURE_DIM,
     FORCE_GROUP_NAMES,
+    MOTION_JOINT_NAMES,
+    NUM_MOTION_JOINTS,
     ClimbingCorpusDataset,
     list_annotated_test_scenes,
     list_corpus_scenes,
@@ -107,7 +110,14 @@ def _process_sample(frame: dict, transform):
 
 # -------------------------------------------------------------------- collate
 
-def make_collate(image_size: Tuple[int, int], spec: TargetSpec):
+def make_collate(image_size: Tuple[int, int], spec: TargetSpec,
+                 motion_joints: int = NUM_MOTION_JOINTS):
+    """Build the batch collate.
+
+    :param motion_joints: number of motion slots ``K`` the run's datasets emit
+        (``motion_supervision.joint_names``); only the zero fallback for frames
+        without motion targets depends on it.
+    """
     transform = _build_transform(image_size)
 
     def _collate(batch):
@@ -184,6 +194,43 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec):
         out["force_valid"] = torch.tensor(
             [bool(f.get("force_valid", False)) for f in frames],
             dtype=torch.bool)                                              # [B]
+
+        # Supervised GT motion (climbing_corpus with load_motion): root-frame
+        # linear vel|acc per motion slot (m/s, m/s^2), the per-slot outlier bit,
+        # the world-from-root rotation and the root body angular velocity. Frames
+        # without motion fall back to zeros / False / identity with
+        # motion_valid=False, so mixed batches collate.
+        n_motion = motion_joints
+        out["motion_gt"] = torch.stack([
+            torch.as_tensor(f["motion_gt"], dtype=torch.float32)
+            if "motion_gt" in f else torch.zeros(n_motion, 6, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, K, 6]
+        out["motion_outlier"] = torch.stack([
+            torch.as_tensor(f["motion_outlier"], dtype=torch.bool)
+            if "motion_outlier" in f else torch.zeros(n_motion, dtype=torch.bool)
+            for f in frames], dim=0)                                       # [B, K]
+        out["motion_rot"] = torch.stack([
+            torch.as_tensor(f["motion_rot"], dtype=torch.float32)
+            if "motion_rot" in f else torch.eye(3, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 3, 3]
+        out["motion_omega"] = torch.stack([
+            torch.as_tensor(f["motion_omega"], dtype=torch.float32)
+            if "motion_omega" in f else torch.zeros(3, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 3]
+        out["motion_valid"] = torch.tensor(
+            [bool(f.get("motion_valid", False)) for f in frames],
+            dtype=torch.bool)                                              # [B]
+
+        # Input-side conditioning feature (climbing_corpus with cond_features_path):
+        # standardized root-frame smoothed vel/acc + gravity direction + validity
+        # bit. ALWAYS emitted so the model's zero-init projections are used on
+        # every step (DDP rejects a param that some ranks leave unused); frames
+        # and datasets without features contribute exact zeros, which is what the
+        # bit-0 rows of the artifact itself look like.
+        out["cond_feat"] = torch.stack([
+            torch.as_tensor(f["cond_feat"], dtype=torch.float32)
+            if "cond_feat" in f else torch.zeros(COND_FEATURE_DIM, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 10]
         return out
 
     return _collate
@@ -338,7 +385,8 @@ def make_loaders(
     dcfg = cfg["data"]
     specs = list(dcfg["datasets"])
     spec_obj = TargetSpec.from_config(cfg)
-    collate = make_collate(image_size, spec_obj)
+    motion_names = tuple(cfg["motion_supervision"]["joint_names"] or MOTION_JOINT_NAMES)
+    collate = make_collate(image_size, spec_obj, motion_joints=len(motion_names))
 
     frames_per_batch = int(dcfg["frames_per_batch"])
     num_workers = int(dcfg["num_workers"])
@@ -376,15 +424,33 @@ def make_loaders(
 
     if corpus_specs:
         clips_per_batch = max(1, frames_per_batch // clip_len)
+        cond_cfg = cfg["model"]["cond_input"]
         for s in corpus_specs:
             ccfg = yaml.safe_load(Path(s["config"]).read_text())["data"]
             root = ccfg["root"]
             key = f"corpus:{s['config']}"
             common = dict(
-                frames_per_clip=clip_len, frame_stride=int(seq["frame_stride"]),
+                frames_per_clip=clip_len,
+                # "auto" = per-scene max(1, round(fps/25)); see scene_stride.
+                frame_stride=(seq["frame_stride"] if seq["frame_stride"] == "auto"
+                              else int(seq["frame_stride"])),
                 seed=seed, contact_level=int(ccfg.get("contact_level", 1)),
                 use_confidence_weights=use_conf,
-                load_forces=bool(ccfg.get("load_forces", False)))
+                load_forces=bool(ccfg.get("load_forces", False)),
+                load_motion=bool(ccfg.get("load_motion", False)),
+                motion_joint_names=motion_names,
+                motion_root_convention=str(
+                    cfg["motion_supervision"]["root_convention"]),
+                motion_target_smooth_sec=float(
+                    cfg["motion_supervision"]["target_smooth_sec"]),
+                motion_outlier_acc_ms2=float(
+                    cfg["motion_supervision"]["loss"]["outlier_acc_ms2"]),
+                # Input conditioning (model.cond_input): label-free, so it is a
+                # loader option rather than a target — null path = no cond_feat.
+                cond_features_path=(
+                    cond_cfg["features_path"] if cond_cfg["enabled"] else None),
+                cond_standardize=cond_cfg["standardize"],
+                cond_clip=float(cond_cfg["clip"]))
             all_train_scenes = list_corpus_scenes(root, "train")
             if eval_split == "test":
                 all_test_scenes = list_annotated_test_scenes(root)

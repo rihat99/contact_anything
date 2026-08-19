@@ -1,17 +1,18 @@
-"""Build a SAM-3D-Body model wired for contact- and force-head training.
+"""Build a SAM-3D-Body model wired for contact-, force- and motion-head training.
 
 We patch the checkpoint's ``model_config.yaml`` *before* constructing
 the model so the contact tokens, contact head(s), the optional force
-tokens / force head, and the mask conditioning the checkpoint shipped
-with are all created natively by ``SAM3DBody``. Checkpoint weights load
-with ``strict=False`` — everything in the upstream model (including the
-v2 mask conditioning) gets restored, and the new contact/force modules
-stay at random init.
+tokens / force head, the optional motion tokens / motion head, and the
+mask conditioning the checkpoint shipped with are all created natively by
+``SAM3DBody``. Checkpoint weights load with ``strict=False`` — everything
+in the upstream model (including the v2 mask conditioning) gets restored,
+and the new contact/force/motion modules stay at random init.
 
-After the load we freeze the whole network and unfreeze only the contact
-**and force** pipelines: any param whose name contains ``contact`` or
-``force`` (contact tokens/head/posemb/feat/temporal, and the force
-tokens, ``head_force``, ``force_temporal``). Backbone, decoder, prompt
+After the load we freeze the whole network and unfreeze only the contact,
+force **and motion** pipelines: any param whose name contains ``contact``,
+``force`` or ``motion`` (contact tokens/head/posemb/feat/temporal, the force
+tokens, ``head_force``, ``force_temporal``, and the motion tokens,
+``head_motion``, ``motion_temporal``). Backbone, decoder, prompt
 encoder, MHR/camera heads stay frozen. Regime (a) (``train.freeze_contact``)
 re-freezes the contact params after the unfreeze so only the force branch
 trains. Frozen modules are eval-pinned (:func:`pin_frozen_eval`).
@@ -30,6 +31,7 @@ from sam_3d_body.models.meta_arch import SAM3DBody
 from sam_3d_body.utils.checkpoint import load_state_dict
 from sam_3d_body.utils.config import get_config
 
+from .data.climbing_corpus import COND_FEATURE_DIM
 from .targets import TargetSpec
 
 
@@ -128,6 +130,49 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
         "POSITION_SCALE": float(ftcfg.get("position_scale", 1.0)),
     })
 
+    # Motion head + tokens (motion tokens v2). Patched even when disabled so the
+    # model config is self-describing; SAM3DBody only builds the motion stack
+    # when DO_MOTION_TOKENS. Anchors are always explicit (no contact inheritance,
+    # no global tokens), so the token count is the anchor-list length.
+    mhcfg = cfg["model"].get("motion_head", {}) or {}
+    motion_kp = mhcfg.get("motion_keypoint_indices") or []
+    model_cfg.MODEL.DECODER.DO_MOTION_TOKENS = bool(mhcfg.get("enabled", False))
+    model_cfg.MODEL.MOTION_HEAD = CfgNode({
+        "KEYPOINT_INDICES":       [int(i) for i in motion_kp],
+        "MLP_DEPTH":              int(mhcfg.get("mlp_depth", 2)),
+        "MLP_CHANNEL_DIV_FACTOR": int(mhcfg.get("mlp_channel_div_factor", 4)),
+        "DROPOUT":                float(mhcfg.get("dropout", 0.0)),
+    })
+
+    # Motion temporal module: a third ContactTemporalModule over the motion
+    # tokens, post_decoder only (no PLACEMENT key — it is fixed).
+    mtcfg = cfg["model"].get("motion_temporal", {}) or {}
+    model_cfg.MODEL.MOTION_TEMPORAL = CfgNode({
+        "ENABLED": bool(mtcfg.get("enabled", False)),
+        "BOTTLENECK_DIM": int(mtcfg.get("bottleneck_dim", 256)),
+        "NUM_LAYERS": int(mtcfg.get("num_layers", 1)),
+        "NUM_HEADS": int(mtcfg.get("num_heads", 4)),
+        "MLP_RATIO": float(mtcfg.get("mlp_ratio", 2.0)),
+        "ATTEND": str(mtcfg.get("attend", "per_token")),
+        "CAUSAL": bool(mtcfg.get("causal", False)),
+        "DROPOUT": float(mtcfg.get("dropout", 0.0)),
+        "POSITION_SCALE": float(mtcfg.get("position_scale", 1.0)),
+    })
+
+    # Input conditioning (model.cond_input). Only the switch and the feature width
+    # reach the model — the artifact path / standardization literals / clip are
+    # the LOADER's business (they define what `cond_feat` contains, not what the
+    # model does with it). Patched even when disabled so the config stays
+    # self-describing; SAM3DBody builds the projections only when ENABLED.
+    cond_cfg = cfg["model"].get("cond_input", {}) or {}
+    cond_hidden = cond_cfg.get("encoder_hidden", None)
+    model_cfg.MODEL.COND_INPUT = CfgNode({
+        "ENABLED":  bool(cond_cfg.get("enabled", False)),
+        "FEAT_DIM": COND_FEATURE_DIM,
+        "ENCODER_HIDDEN": None if cond_hidden is None else int(cond_hidden),
+        "INJECTION": str(cond_cfg.get("injection", "pre_decoder")),
+    })
+
     # Efficiency flags (Phase 4). Patched even when off so the model config is
     # self-describing; sam3d_body / promptable_decoder read them at their delimited
     # hooks and fall back to old (full-graph) behaviour when the key is absent.
@@ -153,11 +198,12 @@ def _load_checkpoint_weights(model: nn.Module, checkpoint_path: str) -> None:
 
 
 def _trainable_name_filter(name: str) -> bool:
-    """Train the contact and force pipelines only: their tokens, heads, and the
-    small posemb / feat projection layers that update the tokens between decoder
-    layers (all of which contain ``contact`` or ``force`` in the dotted name)."""
+    """Train the contact, force and motion pipelines only: their tokens, heads,
+    and the small posemb / feat projection layers that update the tokens between
+    decoder layers (all of which contain ``contact``, ``force`` or ``motion`` in
+    the dotted name)."""
     lname = name.lower()
-    return "contact" in lname or "force" in lname
+    return "contact" in lname or "force" in lname or "motion" in lname
 
 
 def _subtree_requires_grad(module: nn.Module) -> Tuple[bool, bool]:
@@ -236,7 +282,7 @@ def build_model(cfg: dict, device: str = "cuda") -> Tuple[nn.Module, List[str]]:
     model = SAM3DBody(model_cfg)
     _load_checkpoint_weights(model, ckpt_path)
 
-    # 3) Freeze everything; unfreeze the contact + force pipelines.
+    # 3) Freeze everything; unfreeze the contact + force + motion pipelines.
     for p in model.parameters():
         p.requires_grad = False
     for name, p in model.named_parameters():

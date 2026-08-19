@@ -88,6 +88,40 @@ DEFAULTS: dict[str, Any] = {
             "dropout": 0.0,
             "position_scale": 1.0,          # multiply elapsed seconds before sinusoidal time PE
         },
+        "motion_head": {                    # motion tokens v2: per-joint linear vel + acc
+            "enabled": False,
+            # Always explicit (no contact inheritance, no global tokens). Default =
+            # the six kindyn force anchors + MHR70 9 (left hip) for the pelvis token.
+            "motion_keypoint_indices": [62, 41, 15, 18, 17, 20, 9],
+            "mlp_depth": 2,
+            "mlp_channel_div_factor": 4,
+            "dropout": 0.0,
+        },
+        "motion_temporal": {                # temporal attention over motion tokens
+            "enabled": False,               # requires model.motion_head.enabled
+            "bottleneck_dim": 256,          # project 1024-d motion tokens before attention
+            "num_layers": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "attend": "per_token",          # joint (T*K tokens per clip) | per_token (T per slot)
+            "causal": False,
+            "dropout": 0.0,
+            "position_scale": 1.0,          # multiply elapsed seconds before sinusoidal time PE
+        },
+        "cond_input": {                     # smoothed pelvis vel/acc fed INTO the tokens
+            "enabled": False,               # zero-init projections; off = bit-identical model
+            "features_path": None,          # cond_features.npz (required when enabled)
+            "encoder_hidden": None,         # null = bare linear; int H = Linear(10,H)+GELU+
+                                            # zero-init Linear(H,dim) per token block
+            "injection": "pre_decoder",     # pre_decoder = added to the INITIAL token
+                                            # embeddings; post_decoder = added to the decoder's
+                                            # contact/force token OUTPUTS, before temporal
+            "clip": 5.0,                    # clamp on the standardized v/a components
+            "standardize": {                # root-axis literals over the corpus-train frames
+                "vel_mean": None, "vel_std": None,   # m/s, required when enabled
+                "acc_mean": None, "acc_std": None,   # m/s^2, required when enabled
+            },
+        },
     },
     "contact": {
         "topology": "smpl",             # smpl(6890) | smplx(10475) | mhr -> NotImplementedError
@@ -182,6 +216,23 @@ DEFAULTS: dict[str, Any] = {
             "group_weights": None,      # per-group Huber weights (kindyn order); null = uniform
         },
     },
+    "motion_supervision": {             # supervised kindyn vel/acc loss (motion tokens v2)
+        "enabled": False,               # requires model.motion_head.enabled
+        "target_frame": "all",          # all | center (rows per clip contributing to the loss)
+        "joint_names": None,            # null = all 7 motion joints; else an ordered subset
+        "root_convention": "twist",     # pelvis slot: twist (BVR body twist) | rotated_world
+        "target_smooth_sec": 0.12,      # Gaussian width (s) on the root trajectory; 0 = raw
+        "standardize": {                # per-joint per-component tables, [K][2][3] (vel; acc)
+            "mean": None,               # root axes, m/s and m/s^2; required when enabled
+            "std": None,
+        },
+        "loss": {
+            "vel": 1.0,                 # Huber weight on the standardized velocity
+            "acc": 1.0,                 # Huber weight on the standardized acceleration
+            "huber_delta": 1.0,         # smooth-L1 transition (standardized units)
+            "outlier_acc_ms2": 50.0,    # TRAIN-only per-(frame, joint) cut on |acc_world|; 0 = off
+        },
+    },
     "loss": {"dice_eps": 1.0e-5, "grad_clip": 1.0},
     "train": {                          # Phase 4 efficiency flags (grad-asserted no-ops)
         "detach_interm_preds": True,    # run interm MHR/camera preds under no_grad
@@ -274,11 +325,11 @@ def _validate_keys(node: dict, schema: dict, path: str = "") -> None:
 
 
 def _validate_temporal_common(node: dict, path: str) -> None:
-    """Validate the attend/shape/scale clauses shared by ``model.temporal`` and
-    ``model.force_temporal``.
+    """Validate the attend/shape/scale clauses shared by ``model.temporal``,
+    ``model.force_temporal`` and ``model.motion_temporal``.
 
-    Placement is validated separately (``force_temporal`` has no placement key —
-    it is fixed to ``post_decoder``).
+    Placement is validated separately (``force_temporal``/``motion_temporal``
+    have no placement key — it is fixed to ``post_decoder``).
     """
     if node["attend"] not in _TEMPORAL_ATTEND:
         raise ValueError(
@@ -311,6 +362,14 @@ _RESIDUAL_ROBUST_KINDS = frozenset({"square", "pseudo_huber"})
 _GATE_FRAMES = frozenset({"all", "residual"})
 
 _NONCONTACT_GATE_KINDS = frozenset({"soft_l2", "hinge_l1"})
+
+# The kindyn motion joints (contact.data.climbing_corpus.MOTION_JOINT_NAMES);
+# duplicated so config validation stays free of loader/torch imports.
+_MOTION_JOINT_NAMES = ("left_wrist", "right_wrist", "left_foot", "right_foot",
+                       "left_ankle", "right_ankle", "pelvis")
+_NUM_MOTION_JOINTS = len(_MOTION_JOINT_NAMES)
+
+_ROOT_CONVENTIONS = frozenset({"twist", "rotated_world"})
 
 
 def _validate_physics(cfg: dict, force_head: dict) -> None:
@@ -484,6 +543,172 @@ def _validate_force_supervision(cfg: dict, force_head: dict) -> None:
             "data.sequence.frames_per_clip")
 
 
+def _validate_motion(cfg: dict) -> None:
+    """Validate ``model.motion_head`` / ``model.motion_temporal`` /
+    ``motion_supervision`` (motion tokens v2)."""
+    motion_head = cfg["model"]["motion_head"]
+    motion_kp = motion_head["motion_keypoint_indices"]
+    if (not isinstance(motion_kp, list) or len(motion_kp) == 0
+            or not all(isinstance(i, int) and not isinstance(i, bool) for i in motion_kp)
+            or not all(0 <= i < 70 for i in motion_kp)):
+        raise ValueError(
+            "model.motion_head.motion_keypoint_indices must be a non-empty list of "
+            f"MHR70 indices in [0, 70); got {motion_kp!r}")
+
+    motion_temporal = cfg["model"]["motion_temporal"]
+    if motion_temporal["enabled"] and not motion_head["enabled"]:
+        raise ValueError(
+            "model.motion_temporal.enabled requires model.motion_head.enabled=true "
+            "(motion temporal attends the motion tokens)")
+    _validate_temporal_common(motion_temporal, "model.motion_temporal")
+
+    ms = cfg["motion_supervision"]
+    target_frame = str(ms["target_frame"])
+    if target_frame not in ("all", "center"):
+        raise ValueError("motion_supervision.target_frame must be 'all' or 'center'")
+    if ms["root_convention"] not in _ROOT_CONVENTIONS:
+        raise ValueError(
+            f"motion_supervision.root_convention must be one of "
+            f"{sorted(_ROOT_CONVENTIONS)}; got {ms['root_convention']!r}")
+    joint_names = ms["joint_names"]
+    if joint_names is not None and (
+            not isinstance(joint_names, list) or not joint_names
+            or any(name not in _MOTION_JOINT_NAMES for name in joint_names)
+            or len(set(joint_names)) != len(joint_names)):
+        raise ValueError(
+            "motion_supervision.joint_names must be null (all seven) or a "
+            f"duplicate-free subset of {list(_MOTION_JOINT_NAMES)}; got "
+            f"{joint_names!r}")
+    smooth = ms["target_smooth_sec"]
+    if (isinstance(smooth, bool) or not isinstance(smooth, (int, float))
+            or not math.isfinite(float(smooth)) or float(smooth) < 0):
+        raise ValueError(
+            "motion_supervision.target_smooth_sec must be a finite number >= 0 "
+            f"(seconds; 0 = raw kindyn derivatives); got {smooth!r}")
+    for key in ("vel", "acc", "outlier_acc_ms2"):
+        value = float(ms["loss"][key])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"motion_supervision.loss.{key} must be finite and >= 0")
+    delta = float(ms["loss"]["huber_delta"])
+    if not math.isfinite(delta) or delta <= 0:
+        raise ValueError("motion_supervision.loss.huber_delta must be finite and positive")
+
+    if not ms["enabled"]:
+        return
+    if not motion_head["enabled"]:
+        raise ValueError(
+            "motion_supervision.enabled requires model.motion_head.enabled=true "
+            "(the supervised loss reads the predicted motion)")
+    # Token k, joint_names[k] and standardize row k are matched purely by
+    # POSITION — nothing downstream can detect a reordered anchor list, so the
+    # arity is the only mechanical check available. The name list is duplicated
+    # here (as `_MOTION_JOINT_NAMES`) so config validation stays torch/loader-free.
+    names = list(joint_names or _MOTION_JOINT_NAMES)
+    if len(motion_kp) != len(names):
+        raise ValueError(
+            "motion_supervision.enabled requires exactly "
+            f"{len(names)} model.motion_head.motion_keypoint_indices (one per "
+            f"motion_supervision.joint_names entry: {', '.join(names)}); "
+            f"got {len(motion_kp)}")
+    if not any(entry["name"] == "climbing_corpus" for entry in cfg["data"]["datasets"]):
+        raise ValueError(
+            "motion_supervision.enabled requires a climbing_corpus dataset in "
+            "data.datasets (GT vel/acc come from the corpus kindyn_1.npz)")
+    # Targets are native-rate derivatives (dt = 1/fps). Stride 1 shows the model
+    # exactly that rate; 'auto' (max(1, round(fps/25)) per scene) shows a
+    # fixed PHYSICAL window instead, which only makes sense because
+    # `target_smooth_sec` makes the label a band-limited physical quantity rather
+    # than a per-sample difference. Any other fixed stride is a silent mismatch.
+    stride = cfg["data"]["sequence"]["frame_stride"]
+    if stride != "auto" and int(stride) != 1:
+        raise ValueError(
+            "motion_supervision.enabled requires data.sequence.frame_stride=1 or "
+            "'auto' (GT velocity/acceleration are native-rate derivatives)")
+    if target_frame == "center" and int(cfg["data"]["sequence"]["frames_per_clip"]) % 2 == 0:
+        raise ValueError(
+            "motion_supervision.target_frame='center' requires an odd "
+            "data.sequence.frames_per_clip")
+    # The standardization table is pinned in the config (never a buffer) so the
+    # loss stays reproducible from a checkpoint's stored config alone.
+    for key in ("mean", "std"):
+        table = ms["standardize"][key]
+        if (not isinstance(table, list) or len(table) != len(motion_kp)
+                or not all(isinstance(row, list) and len(row) == 2 for row in table)
+                or not all(isinstance(part, list) and len(part) == 3
+                           for row in table for part in row)
+                or not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                           and math.isfinite(float(v))
+                           for row in table for part in row for v in part)):
+            raise ValueError(
+                f"motion_supervision.standardize.{key} must be a finite "
+                f"[{len(motion_kp)}][2][3] nested list (one row per motion token, "
+                f"vel then acc, xyz)")
+    if any(float(v) <= 0 for row in ms["standardize"]["std"] for part in row for v in part):
+        raise ValueError("motion_supervision.standardize.std entries must be positive")
+    # Label smoothing is implemented for the ROOT trajectory only: the six limb
+    # slots keep raw central differences of `joints_world` while their `R^T` uses
+    # the SMOOTHED root rotation, so the pair would describe two different
+    # bandwidths. Fail rather than ship that silently.
+    limbs = [name for name in names if name != "pelvis"]
+    if float(ms["target_smooth_sec"]) > 0 and limbs:
+        raise ValueError(
+            "motion_supervision.target_smooth_sec > 0 is implemented for the "
+            f"pelvis slot only; joint_names also selects {limbs}. Limb-target "
+            "smoothing is unimplemented (their positions are not smoothed, only "
+            "the frame they are rotated into) — set target_smooth_sec: 0.0 or "
+            "restrict joint_names to ['pelvis']")
+
+
+def _validate_cond_input(cfg: dict, contact_enabled: bool) -> None:
+    """Validate ``model.cond_input`` (smoothed vel/acc token conditioning)."""
+    cond = cfg["model"]["cond_input"]
+    clip = cond["clip"]
+    if (isinstance(clip, bool) or not isinstance(clip, (int, float))
+            or not math.isfinite(float(clip)) or float(clip) <= 0):
+        raise ValueError(
+            "model.cond_input.clip must be a finite positive number (the clamp on "
+            f"the standardized components); got {clip!r}")
+    hidden = cond["encoder_hidden"]
+    if hidden is not None and (
+            isinstance(hidden, bool) or not isinstance(hidden, int) or hidden <= 0):
+        raise ValueError(
+            "model.cond_input.encoder_hidden must be null (bare linear projection) "
+            f"or a positive integer hidden width; got {hidden!r}")
+    injection = cond["injection"]
+    if injection not in ("pre_decoder", "post_decoder"):
+        raise ValueError(
+            "model.cond_input.injection must be 'pre_decoder' (added to the initial "
+            "token embeddings) or 'post_decoder' (added to the decoder's token "
+            f"outputs, before temporal attention); got {injection!r}")
+    if not cond["enabled"]:
+        return
+    if not (contact_enabled or cfg["model"]["force_head"]["enabled"]):
+        raise ValueError(
+            "model.cond_input.enabled requires a contact target or "
+            "model.force_head.enabled=true (there are no tokens to condition)")
+    if not isinstance(cond["features_path"], str) or not cond["features_path"]:
+        raise ValueError(
+            "model.cond_input.enabled requires model.cond_input.features_path "
+            "(the cond_features.npz built from the reconstructed pelvis trajectory)")
+    if not any(entry["name"] == "climbing_corpus" for entry in cfg["data"]["datasets"]):
+        raise ValueError(
+            "model.cond_input.enabled requires a climbing_corpus dataset in "
+            "data.datasets (the features are keyed by corpus scene + object id)")
+    # Pinned in the config (never a buffer) so the conditioning a checkpoint was
+    # trained under is reproducible from its stored config alone.
+    for key in ("vel_mean", "vel_std", "acc_mean", "acc_std"):
+        row = cond["standardize"][key]
+        if (not isinstance(row, list) or len(row) != 3
+                or not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                           and math.isfinite(float(v)) for v in row)):
+            raise ValueError(
+                f"model.cond_input.standardize.{key} must be a finite 3-list "
+                "(root-axis xyz)")
+    for key in ("vel_std", "acc_std"):
+        if any(float(v) <= 0 for v in cond["standardize"][key]):
+            raise ValueError(f"model.cond_input.standardize.{key} entries must be positive")
+
+
 def _validate_semantics(cfg: dict) -> None:
     """Cross-key checks that pure key validation cannot express."""
     topology = cfg["contact"]["topology"]
@@ -497,14 +722,18 @@ def _validate_semantics(cfg: dict) -> None:
     contact_enabled = any(targets[name]["enabled"] for name in _KNOWN_TARGETS)
     force_head = cfg["model"]["force_head"]
     force_kp = force_head["force_keypoint_indices"]
-    if not contact_enabled and not (force_head["enabled"] and force_kp is not None):
+    motion_head = cfg["model"]["motion_head"]
+    if (not contact_enabled and not (force_head["enabled"] and force_kp is not None)
+            and not motion_head["enabled"]):
         # Force-only builds (no contact tokens/head at all) are legal, but only
         # with the force branch on and its own explicit anchors — null anchors
-        # inherit from the contact tokens, which do not exist here.
+        # inherit from the contact tokens, which do not exist here. Motion-only
+        # builds are legal too (motion anchors are always explicit).
         raise ValueError(
             "no contact target is enabled — enable at least one of vertex/joint, "
             "or configure a force-only build (model.force_head.enabled=true with "
-            "explicit model.force_head.force_keypoint_indices)")
+            "explicit model.force_head.force_keypoint_indices), or a motion-only "
+            "build (model.motion_head.enabled=true)")
 
     joint_cfg = targets["joint"]
     joint_set = joint_cfg["joint_set"]
@@ -632,6 +861,8 @@ def _validate_semantics(cfg: dict) -> None:
 
     _validate_physics(cfg, force_head)
     _validate_force_supervision(cfg, force_head)
+    _validate_motion(cfg)
+    _validate_cond_input(cfg, contact_enabled)
 
     if cfg["train"]["freeze_contact"]:
         if not contact_enabled:
@@ -654,6 +885,21 @@ def _validate_semantics(cfg: dict) -> None:
     frames_per_clip = int(sequence["frames_per_clip"])
     if frames_per_clip <= 0:
         raise ValueError("data.sequence.frames_per_clip must be positive")
+    # `auto` = per-scene max(1, round(fps / 25)) (ClimbingCorpusDataset.scene_stride).
+    # Checked here rather than at the consumer: several scripts do int(frame_stride).
+    stride = sequence["frame_stride"]
+    if stride != "auto" and (isinstance(stride, bool)
+                             or not isinstance(stride, int) or stride <= 0):
+        raise ValueError(
+            f"data.sequence.frame_stride must be a positive int or 'auto'; got {stride!r}")
+    # Only the motion path resolves `auto` per scene. evaluate.py, demo.py,
+    # render_climbing_video_contacts.py, predict_reconstruction.py and the viewer
+    # all do int(frame_stride) and would die on it with an opaque ValueError.
+    if stride == "auto" and not cfg["motion_supervision"]["enabled"]:
+        raise ValueError(
+            "data.sequence.frame_stride: auto requires motion_supervision.enabled=true "
+            "(only the motion pipeline resolves the per-scene stride; the contact/"
+            "force CLIs read this key as a plain int)")
     if target_frame == "center" and frames_per_clip % 2 == 0:
         raise ValueError(
             "data.sequence.target_frame='center' requires an odd frames_per_clip")

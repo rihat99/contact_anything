@@ -136,12 +136,13 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
 
 ### Invariants (do not break)
 
-- **Freeze filter is name-based**: only params whose dotted name contains `"contact"` **or**
-  `"force"` train (tokens, heads, posemb/feat linears, `contact_temporal*`, `force_*`). Any new
-  trainable module must carry "contact" or "force" in its attribute path.
-- **Mask invariant**: no earlier token block attends a later one — original ⊥ {contact, force},
-  contact ⊥ force. Force tokens attend everything, so contact/MHR outputs have an exactly-zero
-  Jacobian w.r.t. every force param (D1); forward values agree only to the CUDA noise floor.
+- **Freeze filter is name-based**: only params whose dotted name contains `"contact"`, `"force"`
+  **or** `"motion"` train (tokens, heads, posemb/feat linears, `contact_temporal*`, `force_*`,
+  `motion_*`). Any new trainable module must carry one of those in its attribute path.
+- **Mask invariant**: no earlier token block attends a later one — original ⊥ {contact, force,
+  motion}, contact ⊥ {force, motion}, force ⊥ motion. Later blocks attend everything before them,
+  so contact/MHR outputs have an exactly-zero Jacobian w.r.t. every force **and motion** param
+  (D1); forward values agree only to the CUDA noise floor.
 - **Frozen modules are eval-pinned** (`contact/model.py::pin_frozen_eval`): `model.train(True)`
   re-pins backbone/decoder/MHR+camera heads to eval (the backbone has DROP_PATH_RATE 0.1 — train
   mode would make it stochastic). The toggled set is **requires_grad-derived** at call time (not a

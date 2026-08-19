@@ -43,6 +43,39 @@ camera-0-derived direction, and ``load_forces=True`` adds per-frame GT forces:
   ``force_gt``. Consumed by the net-torque consistency loss; may be non-finite
   on frames the solve did not cover (the loss skips those rows).
 * ``force_valid`` bool — frame valid and covered by the kindyn solve.
+
+``load_motion=True`` adds the per-frame kindyn motion targets (motion tokens v2):
+
+* ``motion_gt`` ``[K, 6]`` float32 — linear velocity (``[..., 0:3]``, m/s) and
+  linear acceleration (``[..., 3:6]``, m/s²) of the ``motion_joint_names`` slots
+  (default: all of :data:`MOTION_JOINT_NAMES`, pelvis LAST), in **body-root**
+  axes. The six limb slots are central differences of ``joints_world`` over the
+  FULL scene trajectory at the scene's stored (fractional) fps, rotated with the
+  same ``R(q_xyzw)^T`` as the forces. The ``pelvis`` slot follows
+  ``motion_root_convention``: ``"twist"`` (default) is BVR's own body twist,
+  :func:`root_body_twist`; ``"rotated_world"`` is the same ``R^T`` central
+  difference as the limbs (the motion-tokens-v1/v2 convention).
+* ``motion_valid`` bool — frame valid, central-difference support present, and
+  outside the 2-frame trims at each scene edge / around every validity gap.
+* ``motion_outlier`` ``[K]`` bool — per-joint ``|acc|`` above
+  ``motion_outlier_acc_ms2`` (kindyn ``1/dt²`` jitter on 50/60-fps scenes; a
+  threshold of ``0`` disables the flag). A train-only filter bit; eval never
+  applies it.
+* ``motion_rot`` ``[3, 3]`` float32 — ``R(q_xyzw)`` (world-from-root) at that
+  frame, so the metric can report world-vertical components.
+* ``motion_omega`` ``[3]`` float32 — body angular velocity of the root (the
+  angular part of the same twist). Under the ``twist`` convention the world
+  acceleration is ``R (a + omega x v)``, so the metric needs it to reach world
+  axes.
+
+``cond_features_path`` adds ``cond_feat`` ``[10]`` float32, the *input*-side
+conditioning feature (``model.cond_input``): standardized root-frame smoothed
+velocity (0:3) and acceleration (3:6), the gravity direction in root axes (6:9)
+and a validity bit (9). Unlike everything above it is **label-free** — it is
+derived from the frozen model's own reconstructed pelvis trajectory plus the
+dataset extrinsics (see :func:`cond_feature_rows`), so it is available at
+inference time. Frames outside the artifact (or outside its validity mask) get
+exact zeros with bit 0.
 """
 from __future__ import annotations
 
@@ -53,6 +86,7 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 from PIL import Image
+from scipy.ndimage import gaussian_filter1d
 from torch.utils.data import Dataset
 
 from ..targets import ALWAYS_NON_CONTACT_8, NUM_BODY_22, OBSERVABLE_14
@@ -90,6 +124,34 @@ KINDYN_FORCE_JOINTS = (
 )
 # 52-joint membership per force group (hands aggregate wrist + fingers).
 FORCE_GROUPS_52 = (LEFT_HAND_GROUP_52, RIGHT_HAND_GROUP_52, (10,), (11,), (7,), (8,))
+
+#: Motion-target joints (motion tokens v2): the six kindyn force joints — hands at
+#: the WRIST, exactly where kindyn attaches the wrench — plus the pelvis LAST.
+#: Resolved by name from ``kindyn["joint_names"]``; the 52-joint indices are
+#: ``(20, 21, 10, 11, 7, 8, 0)``.
+MOTION_JOINT_NAMES = KINDYN_FORCE_JOINTS + ("pelvis",)
+NUM_MOTION_JOINTS = len(MOTION_JOINT_NAMES)
+#: Frames trimmed at each scene edge and on both sides of every validity gap.
+#: Stricter than the 1 frame a central difference needs — kept at 2 so the eval
+#: rows stay identical to the v1 motion probe's.
+MOTION_EDGE_TRIM = 2
+#: Default per-(frame, joint) world-acceleration cut (m/s^2) flagged as an
+#: outlier; the run config (``motion_supervision.loss.outlier_acc_ms2``) is the
+#: authority and is threaded in by :func:`contact.data.collate.make_loaders`.
+MOTION_OUTLIER_ACC_MS2 = 50.0
+#: Default Gaussian width (SECONDS) applied to the root trajectory before
+#: differentiating, so the label bandwidth does not depend on the scene's fps.
+#: ``0`` reproduces the raw v1/v2 targets; the config knob
+#: ``motion_supervision.target_smooth_sec`` is the authority.
+MOTION_TARGET_SMOOTH_SEC = 0.12
+#: Reference frame rate (Hz) the ``auto`` clip stride normalises scenes to, so a
+#: T-frame clip spans the same physical time at every corpus fps.
+MOTION_REFERENCE_FPS = 25.0
+
+#: Width of the ``cond_feat`` input-conditioning vector (``model.cond_input``):
+#: standardized root-frame velocity (3) + acceleration (3) + the gravity
+#: direction in root axes (3) + a validity bit.
+COND_FEATURE_DIM = 10
 
 GRAVITY_MAG = 9.81
 # Exact scene-world down direction of every kindyn solve (world y is down). The
@@ -195,6 +257,220 @@ def quat_xyzw_to_matrix(quat: np.ndarray) -> np.ndarray:
     return rot
 
 
+def _quat_conjugate_xyzw(quat: np.ndarray) -> np.ndarray:
+    """Conjugate (= inverse, for unit quaternions) of an ``xyzw`` quaternion."""
+    return np.concatenate([-quat[..., :3], quat[..., 3:]], axis=-1)
+
+
+def _quat_mul_xyzw(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Hamilton product of two ``xyzw`` quaternions (``better_robot.lie.so3``)."""
+    ax, ay, az, aw = (a[..., i] for i in range(4))
+    bx, by, bz, bw = (b[..., i] for i in range(4))
+    return np.stack([
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ], axis=-1)
+
+
+def _quat_act_xyzw(quat: np.ndarray, point: np.ndarray) -> np.ndarray:
+    """Rotate ``point`` by the ``xyzw`` quaternion (``better_robot.lie.so3.act``)."""
+    qxyz, qw = quat[..., :3], quat[..., 3:]
+    return point + 2.0 * np.cross(qxyz, np.cross(qxyz, point) + qw * point)
+
+
+def _hat3(vec: np.ndarray) -> np.ndarray:
+    """Skew-symmetric ``(..., 3, 3)`` matrix of an ``(..., 3)`` vector."""
+    zero = np.zeros(vec.shape[:-1], vec.dtype)
+    x, y, z = vec[..., 0], vec[..., 1], vec[..., 2]
+    return np.stack([
+        np.stack([zero, -z, y], axis=-1),
+        np.stack([z, zero, -x], axis=-1),
+        np.stack([-y, x, zero], axis=-1),
+    ], axis=-2)
+
+
+#: Small-angle cutoff on ``theta**2`` for the float64 log lane, mirroring
+#: ``better_robot.lie.so3._TAYLOR_THETA2_FP64``.
+_TAYLOR_THETA2_FP64 = 1e-8
+
+
+def so3_log_xyzw(quat: np.ndarray) -> np.ndarray:
+    """Rotation vector of an ``xyzw`` unit quaternion. ``(..., 4) -> (..., 3)``.
+
+    float64 mirror of :func:`better_robot.lie.so3.log` — same hemisphere flip and
+    same small-angle Taylor branch — so the motion targets follow the exact
+    scheme BetterVideoReconstruction differentiated the kindyn trajectory with.
+    """
+    quat = np.asarray(quat, np.float64)
+    quat = np.where(quat[..., 3:4] < 0.0, -quat, quat)
+    qxyz, qw = quat[..., :3], quat[..., 3:4]
+    sin_half2 = (qxyz * qxyz).sum(axis=-1, keepdims=True)
+    taylor = sin_half2 < _TAYLOR_THETA2_FP64 / 4.0
+    sin_half = np.sqrt(np.where(taylor, 1.0, sin_half2))
+    theta = 2.0 * np.arctan2(sin_half, np.clip(qw, -1.0, 1.0))
+    factor = np.where(taylor, 2.0 + sin_half2 * (2.0 / 3.0),
+                      theta / np.maximum(sin_half, 1e-30))
+    return factor * qxyz
+
+
+def se3_log_xyzw(trans: np.ndarray, quat: np.ndarray) -> np.ndarray:
+    """``log`` of the SE3 element ``(trans, quat_xyzw)``. ``-> (..., 6)``.
+
+    float64 mirror of :func:`better_robot.lie.se3.log`: the returned linear part
+    carries the ``V^{-1}(omega) = I - W/2 + coeff * W^2`` correction (``W =
+    hat(omega)``), so it is a true manifold tangent rather than ``R^T dp``.
+    Layout is ``(linear, angular)``.
+    """
+    omega = so3_log_xyzw(quat)
+    theta2 = (omega * omega).sum(axis=-1, keepdims=True)
+    taylor = theta2 < _TAYLOR_THETA2_FP64
+    theta2_safe = np.where(taylor, 1.0, theta2)
+    theta = np.sqrt(theta2_safe)
+    cot_half = np.cos(theta / 2.0) / np.maximum(np.sin(theta / 2.0), 1e-30)
+    coeff = np.where(
+        taylor,
+        (1.0 / 12.0) + theta2 / 720.0,
+        1.0 / theta2_safe - cot_half / (2.0 * theta),
+    )
+    skew = _hat3(omega)
+    v_inv = np.eye(3) - 0.5 * skew + coeff[..., None] * (skew @ skew)
+    linear = np.einsum("...ij,...j->...i", v_inv, np.asarray(trans, np.float64))
+    return np.concatenate([linear, omega], axis=-1)
+
+
+def hemisphere_align(quat: np.ndarray) -> np.ndarray:
+    """Remove double-cover sign flips from a quaternion sequence. ``(N, 4)``.
+
+    ``q`` and ``-q`` are the same rotation, and the kindyn solve is free to
+    switch between them from frame to frame. Component-wise filtering would read
+    such a flip as a 180-degree excursion, so the sequence is first made
+    hemisphere-consistent (``dot(q_t, q_t+1) >= 0`` everywhere) by propagating a
+    cumulative sign.
+    """
+    dots = (quat[1:] * quat[:-1]).sum(axis=-1)
+    sign = np.concatenate([[1.0], np.cumprod(np.where(dots < 0.0, -1.0, 1.0))])
+    return quat * sign[:, None]
+
+
+def smooth_root_trajectory(
+    q_root: np.ndarray, valid: np.ndarray, sigma_samples: float,
+) -> np.ndarray:
+    """Gaussian-smooth a free-flyer trajectory. ``(N, 7) -> (N, 7)``.
+
+    Smoothing runs INSIDE each contiguous run of valid frames — filtering across
+    a tracking gap would invent motion — and invalid frames come back unchanged.
+    Positions are filtered component-wise; quaternions are hemisphere-aligned
+    (:func:`hemisphere_align`) first, then filtered component-wise and
+    renormalized.
+
+    The width is given in SAMPLES so the caller controls the physical bandwidth:
+    passing ``sigma_sec * fps`` makes the label spectrum fps-independent, which
+    is the point — raw kindyn pelvis ``|a|`` RMS runs 3.4 m/s^2 at 24 fps against
+    13.3 at 60 fps for the same activity, i.e. mostly sampling-rate artifact.
+
+    :param valid: ``(N,)`` per-frame kindyn validity.
+    :param sigma_samples: Gaussian width in frames; ``<= 0`` returns the input.
+    """
+    if sigma_samples <= 0.0:
+        return q_root
+    out = np.array(q_root, np.float64, copy=True)
+    breaks = np.flatnonzero(np.diff(valid.astype(np.int8)) != 0) + 1
+    for run in np.split(np.arange(len(q_root)), breaks):
+        if not valid[run[0]] or len(run) < 2:
+            continue
+        out[run, :3] = gaussian_filter1d(
+            out[run, :3], sigma=sigma_samples, axis=0, mode="nearest", truncate=4.0)
+        quat = gaussian_filter1d(
+            hemisphere_align(out[run, 3:7]), sigma=sigma_samples, axis=0,
+            mode="nearest", truncate=4.0)
+        out[run, 3:7] = quat / np.clip(
+            np.linalg.norm(quat, axis=-1, keepdims=True), 1e-8, None)
+    return out
+
+
+def root_body_twist(q_root: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """BVR's body-twist velocity/acceleration of the free-flyer root.
+
+    Mirrors ``BetterVideoReconstruction/tools/smplx_robot/dynamics.py::
+    velocity_acceleration_from_trajectory`` — the ONE place BVR derives v/a from
+    the fitted ``q`` — for the free-flyer (root) joint::
+
+        d[t] = se3_log(T_t^-1 T_t+1)        # BetterRobot's `difference`
+        v[t] = (d[t-1] + d[t]) / (2 dt)
+        a[t] = (d[t] - d[t-1]) / dt^2
+
+    The result therefore lives in the ROOT-LOCAL (body) frame as a proper twist:
+    its linear acceleration equals ``R^T p_ddot - omega x v_body``, ~7% away from
+    the plain ``R^T`` re-expression of the world acceleration.
+
+    :param q_root: ``(..., N, 7)`` kindyn root configuration — world position
+        ``[0:3]`` and world-from-root ``xyzw`` quaternion ``[3:7]``.
+    :param dt: frame interval in seconds (``1 / fps``).
+    :returns: ``(vel, acc, omega)``, each ``(..., N, 3)`` float64 — the LINEAR
+        parts of ``v``/``a`` and the ANGULAR part of ``v`` (body angular
+        velocity). Boundary frames are zero (they are never target-valid).
+    """
+    q_root = np.asarray(q_root, np.float64)
+    pos, quat = q_root[..., :3], q_root[..., 3:7]
+    quat = quat / np.clip(np.linalg.norm(quat, axis=-1, keepdims=True), 1e-8, None)
+    quat_inv = _quat_conjugate_xyzw(quat[..., :-1, :])
+    rel_trans = _quat_act_xyzw(quat_inv, pos[..., 1:, :] - pos[..., :-1, :])
+    rel_quat = _quat_mul_xyzw(quat_inv, quat[..., 1:, :])
+    diff = se3_log_xyzw(rel_trans, rel_quat)                     # (..., N-1, 6)
+
+    twist = np.zeros(q_root.shape[:-1] + (6,), np.float64)
+    acc = np.zeros_like(twist)
+    twist[..., 1:-1, :] = 0.5 * (diff[..., :-1, :] + diff[..., 1:, :]) / dt
+    acc[..., 1:-1, :] = (diff[..., 1:, :] - diff[..., :-1, :]) / (dt * dt)
+    return twist[..., :3], acc[..., :3], twist[..., 3:]
+
+
+def cond_feature_rows(
+    vel_world: np.ndarray,
+    acc_world: np.ndarray,
+    rot_world_from_root: np.ndarray,
+    valid: np.ndarray,
+    standardize: dict,
+    clip: float,
+) -> np.ndarray:
+    """Assemble the 10-d ``cond_feat`` rows from a ``cond_features.npz`` entry.
+
+    Everything is rotated into the PREDICTED root axes (``x_root = R^T x_world``,
+    the artifact's own ``root_frame_use`` recipe), velocity and acceleration are
+    standardized with the pinned literals and clamped to ``+-clip``, and invalid
+    rows are zeroed so an unusable frame is indistinguishable from a missing one.
+
+    :param vel_world: ``(F, 3)`` smoothed world velocity (m/s).
+    :param acc_world: ``(F, 3)`` smoothed world acceleration (m/s^2).
+    :param rot_world_from_root: ``(F, 3, 3)`` predicted world-from-root rotation.
+    :param valid: ``(F,)`` bool validity mask of the artifact.
+    :param standardize: ``vel_mean``/``vel_std``/``acc_mean``/``acc_std``, each 3.
+    :param clip: clamp on the standardized components.
+    :returns: ``(F, 10)`` float32 — standardized v (0:3), a (3:6), the gravity
+        direction in root axes (6:9), the validity bit (9).
+    """
+    rot = np.asarray(rot_world_from_root, np.float64)
+    valid = np.asarray(valid, bool)
+    vel_root = np.einsum("fji,fj->fi", rot, np.asarray(vel_world, np.float64))
+    acc_root = np.einsum("fji,fj->fi", rot, np.asarray(acc_world, np.float64))
+    grav_root = np.einsum("fji,j->fi", rot, GRAVITY_WORLD.astype(np.float64))
+
+    vel_z = (vel_root - np.asarray(standardize["vel_mean"], np.float64)) / np.asarray(
+        standardize["vel_std"], np.float64)
+    acc_z = (acc_root - np.asarray(standardize["acc_mean"], np.float64)) / np.asarray(
+        standardize["acc_std"], np.float64)
+    clip = float(clip)
+    feat = np.concatenate([
+        np.clip(vel_z, -clip, clip),
+        np.clip(acc_z, -clip, clip),
+        grav_root,
+        valid[:, None].astype(np.float64),
+    ], axis=-1)
+    return (feat * valid[:, None]).astype(np.float32)
+
+
 def fold_force_group_contact(jc52: np.ndarray) -> np.ndarray:
     """Fold 52-joint contact into per-force-group contact.
 
@@ -288,7 +564,10 @@ class ClimbingCorpusDataset(Dataset):
     :param split: ``"train"`` (jittered windows) | ``"val"`` (held-out source
         videos, fixed tiles) | ``"test"`` (DB test split, manual labels, fixed tiles).
     :param frames_per_clip: window length ``T``.
-    :param frame_stride: source-frame stride within a window.
+    :param frame_stride: source-frame stride within a window, or ``"auto"`` for
+        ``max(1, round(fps / 25))`` **per scene** — a clip then spans the same
+        physical time everywhere (0.20-0.26 s at T=7) instead of 2.9x more of it
+        at 24 fps than at 60. See :meth:`scene_stride`.
     :param jitter: stateless train-window jitter (train split only).
     :param seed: seed for both the grouped split and the window jitter.
     :param val_fraction: source-video fraction held out for ``val``.
@@ -298,6 +577,32 @@ class ClimbingCorpusDataset(Dataset):
         missing; discovery skips unannotated scenes). Train labels are always loaded.
     :param load_forces: read ``kindyn_1.npz`` and emit ``force_gt`` /
         ``force_contact`` / ``force_lever`` / ``force_valid`` per frame.
+    :param load_motion: read ``kindyn_1.npz`` and emit ``motion_gt`` /
+        ``motion_valid`` / ``motion_outlier`` / ``motion_rot`` / ``motion_omega``
+        per frame.
+    :param motion_joint_names: ordered subset of :data:`MOTION_JOINT_NAMES` to
+        emit (``None`` = all seven). The slot order IS this tuple's order.
+    :param motion_root_convention: how the ``pelvis`` slot is expressed —
+        ``"twist"`` (BVR's body twist, see :func:`root_body_twist`) or
+        ``"rotated_world"`` (``R^T`` of the world central difference, the
+        motion-tokens-v1/v2 convention). The six limb slots are always
+        ``rotated_world``: BVR defines no linear twist for non-root joints.
+    :param motion_target_smooth_sec: Gaussian width in SECONDS applied to the
+        root trajectory before differentiating (:func:`smooth_root_trajectory`),
+        so the label bandwidth is fps-independent. ``0`` differentiates the raw
+        kindyn fit (the v1/v2 target). Note this also re-derives ``motion_rot``
+        and ``motion_omega`` from the smoothed trajectory, so the limb slots'
+        ``R^T`` uses the smoothed rotation too.
+    :param motion_outlier_acc_ms2: acceleration magnitude above which a
+        ``(frame, joint)`` motion target is flagged as an outlier (train-only
+        filtering; the loss owns whether the bit is applied). ``0`` disables the
+        flag entirely.
+    :param cond_features_path: ``cond_features.npz`` to read the input-side
+        conditioning feature from (``None`` = no ``cond_feat`` emitted). Entries
+        are keyed ``"<scene>__p<object_id>"`` and joined per frame on ``frame_idx``.
+    :param cond_standardize: ``vel_mean``/``vel_std``/``acc_mean``/``acc_std``
+        literals (each 3), required with ``cond_features_path``.
+    :param cond_clip: clamp on the standardized conditioning components.
     :param load_images: read frame JPEGs + person masks in ``__getitem__``.
         ``False`` returns ``image``/``mask`` as ``None`` (metadata-only access;
         such items cannot go through the training collate).
@@ -313,7 +618,7 @@ class ClimbingCorpusDataset(Dataset):
         scenes: Optional[Sequence[str]] = None,
         split: str = "train",
         frames_per_clip: int = 8,
-        frame_stride: int = 2,
+        frame_stride: int | str = 2,
         jitter: bool = True,
         seed: int = 42,
         val_fraction: float = 0.15,
@@ -321,6 +626,14 @@ class ClimbingCorpusDataset(Dataset):
         use_confidence_weights: bool = False,
         require_labels: bool = True,
         load_forces: bool = False,
+        load_motion: bool = False,
+        motion_joint_names: Optional[Sequence[str]] = None,
+        motion_root_convention: str = "twist",
+        motion_target_smooth_sec: float = MOTION_TARGET_SMOOTH_SEC,
+        motion_outlier_acc_ms2: float = MOTION_OUTLIER_ACC_MS2,
+        cond_features_path: Optional[str] = None,
+        cond_standardize: Optional[dict] = None,
+        cond_clip: float = 5.0,
         load_images: bool = True,
     ):
         super().__init__()
@@ -332,7 +645,12 @@ class ClimbingCorpusDataset(Dataset):
         self.split = split
         self.mode = "train" if split == "train" else "val"
         self.T = int(frames_per_clip)
-        self.stride = int(frame_stride)
+        if frame_stride == "auto":
+            self.stride = "auto"
+        elif isinstance(frame_stride, str):
+            raise ValueError(f"frame_stride must be an int or 'auto'; got {frame_stride!r}")
+        else:
+            self.stride = int(frame_stride)
         self.jitter = bool(jitter) and split == "train"
         self.seed = int(seed)
         self.val_fraction = float(val_fraction)
@@ -340,6 +658,35 @@ class ClimbingCorpusDataset(Dataset):
         self.use_confidence_weights = bool(use_confidence_weights)
         self.require_labels = bool(require_labels)
         self.load_forces = bool(load_forces)
+        self.load_motion = bool(load_motion)
+        self.motion_joints = tuple(
+            MOTION_JOINT_NAMES if motion_joint_names is None else motion_joint_names)
+        unknown = [n for n in self.motion_joints if n not in MOTION_JOINT_NAMES]
+        if unknown or len(set(self.motion_joints)) != len(self.motion_joints):
+            raise ValueError(
+                f"motion_joint_names must be a duplicate-free subset of "
+                f"{list(MOTION_JOINT_NAMES)}; got {list(self.motion_joints)}")
+        if motion_root_convention not in ("twist", "rotated_world"):
+            raise ValueError(
+                "motion_root_convention must be 'twist' or 'rotated_world'; got "
+                f"{motion_root_convention!r}")
+        self.motion_root_convention = str(motion_root_convention)
+        self.motion_target_smooth_sec = float(motion_target_smooth_sec)
+        if not np.isfinite(self.motion_target_smooth_sec) or self.motion_target_smooth_sec < 0:
+            raise ValueError(
+                "motion_target_smooth_sec must be finite and >= 0; got "
+                f"{motion_target_smooth_sec!r}")
+        self.motion_outlier_acc_ms2 = float(motion_outlier_acc_ms2)
+        self.cond_features_path = (
+            None if cond_features_path is None else str(cond_features_path))
+        if self.cond_features_path is not None:
+            missing = [key for key in ("vel_mean", "vel_std", "acc_mean", "acc_std")
+                       if not (cond_standardize or {}).get(key)]
+            if missing:
+                raise ValueError(
+                    f"cond_features_path requires cond_standardize entries {missing}")
+        self.cond_standardize = dict(cond_standardize or {})
+        self.cond_clip = float(cond_clip)
         self.load_images = bool(load_images)
         self._epoch = 0
 
@@ -358,13 +705,19 @@ class ClimbingCorpusDataset(Dataset):
                 keep = train_videos if split == "train" else val_videos
                 scenes = [s for s in all_train if video_id_from_scene(s) in keep]
 
+        # Opened once for the whole scene loop (a zip member read per scene) and
+        # dropped before the loaders fork their workers.
+        self._cond_npz = (
+            None if self.cond_features_path is None
+            else np.load(self.cond_features_path, allow_pickle=True))
         self._scenes: dict[str, dict] = {}
         self._items: list[tuple[str, int, int, int]] = []   # (scene, person, base_start, jitter_range)
-        span = (self.T - 1) * self.stride
-        step = self.T * self.stride
         for scene in scenes:
             data = self._load_scene(scene)
             self._scenes[scene] = data
+            stride = self.scene_stride(scene)
+            span = (self.T - 1) * stride
+            step = self.T * stride
             num_frames = len(data["frame_indices"])
             valid_mask = data["valid_mask"]                 # [P, N] bool
             max_start = num_frames - 1 - span
@@ -378,11 +731,29 @@ class ClimbingCorpusDataset(Dataset):
                 if self.mode == "val" and bases and bases[-1] != max_start:
                     bases.append(max_start)
                 for base in bases:
-                    positions = base + np.arange(self.T) * self.stride
+                    positions = base + np.arange(self.T) * stride
                     if not valid_mask[person, positions].all():
                         continue  # every temporal row needs a real bbox/camera crop
                     jitter_range = max(1, min(step, max_start - base + 1))
                     self._items.append((scene, person, base, jitter_range))
+        if self._cond_npz is not None:
+            self._cond_npz.close()
+            self._cond_npz = None
+
+    def scene_stride(self, scene: str) -> int:
+        """Frame stride used inside this scene's clips.
+
+        A fixed integer stride is returned as-is; ``"auto"`` resolves to
+        ``max(1, round(fps / 25))``, which holds the clip's PHYSICAL span roughly
+        constant (T=7 spans 0.20-0.26 s at every corpus fps) instead of letting a
+        60-fps scene show 2.9x less time than a 24-fps one. Targets stay
+        native-rate derivatives — under fixed-seconds label smoothing they are a
+        physical quantity, not a per-sample difference, so the wider spacing is a
+        context choice, not a semantic mismatch.
+        """
+        if self.stride != "auto":
+            return self.stride
+        return max(1, int(round(float(self._scenes[scene]["fps"]) / MOTION_REFERENCE_FPS)))
 
     # ------------------------------------------------------------------ loading
 
@@ -481,6 +852,11 @@ class ClimbingCorpusDataset(Dataset):
         }
         if self.load_forces:
             data.update(self._load_forces(scene, human_dir, object_ids, n))
+        if self.load_motion:
+            data.update(self._load_motion(
+                scene, human_dir, object_ids, n, float(contacts["fps"])))
+        if self.cond_features_path is not None:
+            data.update(self._load_cond(scene, object_ids, n))
         return data
 
     def _load_test_labels(
@@ -513,6 +889,35 @@ class ClimbingCorpusDataset(Dataset):
         reviewed = annotated[..., OBSERVABLE_14].any(axis=-1)
         annotated[..., ALWAYS_NON_CONTACT_8] |= reviewed[..., None]
         return joint_contact, annotated
+
+    def _load_cond(
+        self, scene: str, object_ids: np.ndarray, n: int,
+    ) -> dict:
+        """Read the input-conditioning feature for this scene's tracked people.
+
+        The artifact is keyed by ``"<scene>__p<object_id>"`` and stores its own
+        ``frame_idx``, which may be shorter than the scene (bbox-degenerate
+        frames are skipped) or have internal holes. Rows are scattered back onto
+        the scene's frame axis; everything it does not cover stays exactly zero
+        (validity bit included), which is also what a wholly missing entry gives.
+        """
+        cond = np.zeros((len(object_ids), n, COND_FEATURE_DIM), np.float32)
+        for person, oid in enumerate(object_ids):
+            key = f"{scene}__p{int(oid)}"
+            if f"{key}#frame_idx" not in self._cond_npz.files:
+                continue
+            frame_idx = np.asarray(self._cond_npz[f"{key}#frame_idx"], np.int64)
+            rows = cond_feature_rows(
+                self._cond_npz[f"{key}#vel_smooth_world"],
+                self._cond_npz[f"{key}#acc_smooth_world_alt"],
+                self._cond_npz[f"{key}#R_pred_world_from_root"],
+                self._cond_npz[f"{key}#feat_valid"],
+                self.cond_standardize,
+                self.cond_clip,
+            )
+            keep = (frame_idx >= 0) & (frame_idx < n)
+            cond[person, frame_idx[keep]] = rows[keep]
+        return {"cond_feat": cond}                           # [P, N, 10] f32
 
     def _load_forces(
         self, scene: str, human_dir: Path, object_ids: np.ndarray, n: int,
@@ -597,6 +1002,127 @@ class ClimbingCorpusDataset(Dataset):
             "force_valid": force_valid,                      # [P, N] bool
         }
 
+    def _load_motion(
+        self, scene: str, human_dir: Path, object_ids: np.ndarray, n: int, fps: float,
+    ) -> dict:
+        """Linear vel/acc of the motion joints in body-root axes.
+
+        Computed once per scene over the FULL trajectory (never per clip) in
+        float64. The six limb slots are world central differences rotated with
+        the SAME einsum the forces use; the ``pelvis`` slot follows
+        ``motion_root_convention`` (see :func:`root_body_twist`). Only the derived
+        ``[N, K, 6]`` arrays are cached (~25 MB corpus-wide); the raw 52-joint
+        positions are not.
+        """
+        kindyn = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
+        kindyn_ids = np.asarray(kindyn["object_ids"])
+        joint_names = [str(x) for x in kindyn["joint_names"]]
+        missing = [name for name in MOTION_JOINT_NAMES if name not in joint_names]
+        if missing:
+            raise ValueError(f"{scene}: kindyn joint_names is missing {missing}")
+        if int(kindyn["num_frames"]) != n:
+            raise ValueError(
+                f"{scene}: kindyn has {int(kindyn['num_frames'])} frames, contacts "
+                f"has {n} — the derivative frame indexing would be misaligned")
+        kindyn_fps = float(np.asarray(kindyn["fps"]).item())
+        if not np.isfinite(kindyn_fps) or kindyn_fps <= 0:
+            raise ValueError(f"{scene}: bad kindyn fps {kindyn_fps}")
+        if abs(kindyn_fps - fps) > 1e-6:
+            raise ValueError(
+                f"{scene}: kindyn fps {kindyn_fps} != contacts fps {fps}")
+
+        cols = [joint_names.index(name) for name in MOTION_JOINT_NAMES]
+        joints_world = _rows_by_object_id(
+            np.asarray(kindyn["joints_world"], np.float32),
+            kindyn_ids, object_ids, scene, "kindyn")[:, :, cols]   # [P, N, 7, 3] m, world
+        q = _rows_by_object_id(
+            np.asarray(kindyn["q"], np.float32),
+            kindyn_ids, object_ids, scene, "kindyn")               # [P, N, 211]
+        kindyn_valid = _rows_by_object_id(
+            np.asarray(kindyn["valid_mask"], bool),
+            kindyn_ids, object_ids, scene, "kindyn")               # [P, N]
+        n_people = len(object_ids)
+        if joints_world.shape != (n_people, n, NUM_MOTION_JOINTS, 3):
+            raise ValueError(
+                f"{scene}: motion joints_world {joints_world.shape} does not match "
+                f"({n_people}, {n}, {NUM_MOTION_JOINTS}, 3)")
+        if not np.isfinite(joints_world[kindyn_valid]).all():
+            raise ValueError(
+                f"{scene}: non-finite motion joint position on a kindyn-valid frame")
+
+        dt = 1.0 / kindyn_fps
+        pos = joints_world.astype(np.float64)
+        vel = np.zeros_like(pos)
+        acc = np.zeros_like(pos)
+        vel[:, 1:-1] = (pos[:, 2:] - pos[:, :-2]) / (2.0 * dt)
+        acc[:, 1:-1] = (pos[:, 2:] - 2.0 * pos[:, 1:-1] + pos[:, :-2]) / (dt * dt)
+
+        # Fixed-PHYSICAL-width label smoothing (see `smooth_root_trajectory`):
+        # everything derived from the root — the twist, R and omega — comes from
+        # the smoothed trajectory, so the target, the frame it is expressed in
+        # and the world conversion all describe the same motion.
+        q_root = np.stack([
+            smooth_root_trajectory(
+                q[person, :, :7].astype(np.float64), kindyn_valid[person],
+                self.motion_target_smooth_sec * kindyn_fps)
+            for person in range(n_people)])                        # [P, N, 7]
+
+        rot = quat_xyzw_to_matrix(q_root[..., 3:7])                # [P, N, 3, 3] world-from-root
+        vel_out = np.einsum("pnji,pnkj->pnki", rot, vel)           # [P, N, 7, 3] root axes
+        acc_out = np.einsum("pnji,pnkj->pnki", rot, acc)
+        # Outlier magnitudes are the WORLD ones for the R^T slots (a rotation
+        # preserves the norm), and the twist's own for the root slot below.
+        acc_mag = np.linalg.norm(acc, axis=-1)                     # [P, N, 7]
+        # The root slot's BVR-exact body twist. Always computed: `motion_omega`
+        # (the body angular velocity) is what turns a root-frame linear vector
+        # back into world axes under either convention.
+        twist_vel, twist_acc, omega = root_body_twist(q_root, dt)
+        if self.motion_root_convention == "twist":
+            pelvis = MOTION_JOINT_NAMES.index("pelvis")
+            vel_out[:, :, pelvis] = twist_vel
+            acc_out[:, :, pelvis] = twist_acc
+            acc_mag[:, :, pelvis] = np.linalg.norm(twist_acc, axis=-1)
+
+        # Validity: v1's rule verbatim (build_targets.py) — the eval rows depend
+        # on it. Central-diff support (n-1, n, n+1 inside the scene AND
+        # kindyn-valid), then MOTION_EDGE_TRIM frames trimmed at each scene edge
+        # and on both sides of every validity gap.
+        target_valid = np.zeros((n_people, n), bool)
+        for person in range(n_people):
+            valid = kindyn_valid[person]
+            diff_ok = np.zeros(n, bool)
+            if n >= 3:
+                diff_ok[1:n - 1] = valid[2:] & valid[1:-1] & valid[:-2]
+            keep = np.zeros(n, bool)
+            keep[MOTION_EDGE_TRIM:n - MOTION_EDGE_TRIM] = True
+            gaps = np.flatnonzero(~valid)
+            for offset in range(-MOTION_EDGE_TRIM, MOTION_EDGE_TRIM + 1):
+                neighbours = gaps + offset
+                neighbours = neighbours[(neighbours >= 0) & (neighbours < n)]
+                keep[neighbours] = False
+            target_valid[person] = diff_ok & keep
+
+        # Per-(frame, joint) outlier bit on the WORLD acceleration magnitude
+        # (kindyn 1/dt^2 jitter on 50/60-fps scenes). A per-frame drop would
+        # discard 14.3% of train frames and hurt the pelvis token most.
+        # A threshold of 0 means OFF (the documented sentinel, mirroring
+        # ``force_supervision``'s ``outlier_bw``): without this guard every entry
+        # would compare ``> 0`` true, mask the whole train loss, and the run would
+        # take zero optimiser steps while looking healthy.
+        outlier = np.zeros(vel.shape[:3], bool)                       # [P, N, 7]
+        if self.motion_outlier_acc_ms2 > 0.0:
+            outlier = acc_mag > self.motion_outlier_acc_ms2
+        # Keep only the configured slots (default: all seven, in canonical order).
+        cols_out = [MOTION_JOINT_NAMES.index(name) for name in self.motion_joints]
+        motion_gt = np.concatenate([vel_out, acc_out], -1)[:, :, cols_out]
+        return {
+            "motion_gt": motion_gt.astype(np.float32),              # [P,N,K,6] root frame
+            "motion_valid": target_valid,                           # [P, N] bool
+            "motion_outlier": outlier[:, :, cols_out],              # [P, N, K] bool
+            "motion_rot": rot.astype(np.float32),                   # [P,N,3,3] world-from-root
+            "motion_omega": omega.astype(np.float32),               # [P,N,3] body angular vel
+        }
+
     # ------------------------------------------------------------------ epoch / jitter
 
     def set_epoch(self, epoch: int) -> None:
@@ -617,13 +1143,14 @@ class ClimbingCorpusDataset(Dataset):
     def __getitem__(self, index: int) -> list[dict]:
         scene, person, base, jitter_range = self._items[index]
         data = self._scenes[scene]
+        stride = self.scene_stride(scene)
         start = self._window_start(base, jitter_range, index)
-        positions = start + np.arange(self.T) * self.stride
+        positions = start + np.arange(self.T) * stride
         # The indexed base window is all-valid. If jitter crosses a tracking gap,
         # fall back deterministically so invalid-frame bboxes never reach the crop.
         if start != base and not data["valid_mask"][person, positions].all():
             start = base
-            positions = base + np.arange(self.T) * self.stride
+            positions = base + np.arange(self.T) * stride
 
         oid = int(data["object_ids"][person])
         frame_indices = data["frame_indices"]
@@ -692,5 +1219,17 @@ class ClimbingCorpusDataset(Dataset):
                 frame["force_lever"] = torch.from_numpy(
                     data["force_lever"][person, pos])                                 # [6, 3]
                 frame["force_valid"] = valid and bool(data["force_valid"][person, pos])
+            if self.load_motion:
+                frame["motion_gt"] = torch.from_numpy(
+                    data["motion_gt"][person, pos])                               # [K, 6]
+                frame["motion_outlier"] = torch.from_numpy(
+                    data["motion_outlier"][person, pos])                          # [K] bool
+                frame["motion_rot"] = torch.from_numpy(
+                    data["motion_rot"][person, pos])                              # [3, 3]
+                frame["motion_omega"] = torch.from_numpy(
+                    data["motion_omega"][person, pos])                            # [3]
+                frame["motion_valid"] = valid and bool(data["motion_valid"][person, pos])
+            if self.cond_features_path is not None:
+                frame["cond_feat"] = torch.from_numpy(data["cond_feat"][person, pos])  # [10]
             clip.append(frame)
         return clip

@@ -384,6 +384,128 @@ class SAM3DBody(BaseModel):
             # --- end force temporal hook ---
         # --- end force hook ---
 
+        # --- cond input hook (module construction) ---
+        # Per-frame conditioning feature (smoothed root velocity/acceleration
+        # derived from the model's OWN reconstructed pelvis; see
+        # contact/data/climbing_corpus.py::cond_feature_rows) projected into the
+        # decoder dim and ADDED to the contact/force token stream. INJECTION
+        # picks where: "pre_decoder" = the INITIAL token embeddings (the feature
+        # integrates with image evidence over all decoder layers); "post_decoder"
+        # = the decoder's token OUTPUTS, right before the post_decoder-placement
+        # temporal modules (a between_layers contact temporal runs inside the
+        # decoder, i.e. before this injection).
+        # Zero-init, so an enabled build starts bit-identical to the unconditioned
+        # one. Param names carry "contact"/"force" for the freeze/eval filters.
+        # No mask involvement: only token *values* change, so the frozen pose/MHR
+        # outputs keep their exactly-zero Jacobian w.r.t. these params.
+        self.cond_input_dim = 0
+        self.cond_input_injection = "pre_decoder"
+        cond_cfg = self.cfg.MODEL.get("COND_INPUT", None)
+        if cond_cfg is not None and cond_cfg.get("ENABLED", False):
+            self.cond_input_dim = int(cond_cfg.get("FEAT_DIM", 10))
+            self.cond_input_injection = str(cond_cfg.get("INJECTION", "pre_decoder"))
+            if self.cond_input_injection not in ("pre_decoder", "post_decoder"):
+                raise ValueError(
+                    f"COND_INPUT.INJECTION: {self.cond_input_injection!r}")
+            # `nn.Linear` draws its default init before we overwrite it with
+            # zeros, which would shift the global RNG stream and de-align every
+            # module built after this block. Forked so an enabled build gives
+            # every SHARED parameter exactly the weights the unconditioned build
+            # gets — the A/B pair then differs only by these two zero tensors.
+            # The OUTPUT layer is bias-free on purpose: a bias is a per-token-block
+            # CONSTANT that would receive gradient even on an all-zero (invalid)
+            # feature row, so a conditioned arm could drift from its baseline
+            # through a channel that carries no motion information — and the token
+            # embeddings already provide exactly that learnable constant. The MLP
+            # variant's HIDDEN layer keeps its bias deliberately (a useful GELU
+            # operating point; the constant it induces once the output layer is
+            # non-zero is redundant with the token embedding, not harmful).
+            # ENCODER_HIDDEN=None keeps the original bare linear; an int H swaps
+            # in a small MLP (Linear(feat,H) + GELU + Linear(H,dim)). Either way
+            # the OUTPUT layer is zero-init, so the projection is an exact no-op
+            # at initialisation and every invariant above still holds. The MLP
+            # variant keeps the *_cond_linear names: the freeze filter matches on
+            # "contact"/"force" and the warm-start exemption on "cond_linear".
+            hidden = self.cfg.MODEL.COND_INPUT.get("ENCODER_HIDDEN", None)
+
+            def _cond_projection() -> nn.Module:
+                if hidden is None:
+                    linear = nn.Linear(
+                        self.cond_input_dim, self.cfg.MODEL.DECODER.DIM, bias=False)
+                    nn.init.zeros_(linear.weight)
+                    return linear
+                out = nn.Linear(int(hidden), self.cfg.MODEL.DECODER.DIM, bias=False)
+                nn.init.zeros_(out.weight)
+                return nn.Sequential(
+                    nn.Linear(self.cond_input_dim, int(hidden)), nn.GELU(), out)
+
+            with torch.random.fork_rng(devices=[]):
+                if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
+                    self.contact_cond_linear = _cond_projection()
+                if self.cfg.MODEL.DECODER.get("DO_FORCE_TOKENS", False):
+                    self.force_cond_linear = _cond_projection()
+        # --- end cond input hook ---
+
+        # --- motion hook (module construction) ---
+        # Motion tokens/head mirror the force machinery: explicit keypoint
+        # anchors (no contact inheritance, no global tokens), an own embedding +
+        # posemb/feat linears, and a per-token vel/acc regression head. Every
+        # param carries "motion" in its name so the generalized freeze/eval
+        # filters ("contact" OR "force" OR "motion") pick it up.
+        if self.cfg.MODEL.DECODER.get("DO_MOTION_TOKENS", False):
+            motion_head_cfg = self.cfg.MODEL.get("MOTION_HEAD", dict())
+            motion_kp_indices = list(motion_head_cfg["KEYPOINT_INDICES"])
+            assert all(0 <= int(i) < 70 for i in motion_kp_indices), (
+                f"motion keypoint indices must be MHR70 indices in [0, 70); "
+                f"got {motion_kp_indices}"
+            )
+            self.motion_keypoint_indices = [int(i) for i in motion_kp_indices]
+            self.num_motion_tokens = len(self.motion_keypoint_indices)
+            if not hasattr(self, "contact_grid_size"):
+                # Motion-only build: the anchored update's grid-sampling params
+                # are normally set by the contact (or force-only) block above.
+                contact_head_cfg = self.cfg.MODEL.get("CONTACT_HEAD", dict())
+                self.contact_grid_size   = contact_head_cfg.get("GRID_SIZE", 1)
+                self.contact_grid_radius = contact_head_cfg.get("GRID_RADIUS", 0.1)
+            self.motion_embedding = nn.Embedding(
+                self.num_motion_tokens, self.cfg.MODEL.DECODER.DIM
+            )
+            self.head_motion = build_head(self.cfg, "motion")
+            self.motion_posemb_linear = FFN(
+                embed_dims=2,
+                feedforward_channels=self.cfg.MODEL.DECODER.DIM,
+                output_dims=self.cfg.MODEL.DECODER.DIM,
+                num_fcs=2,
+                add_identity=False,
+            )
+            self.motion_feat_linear = nn.Linear(
+                self.backbone.embed_dims, self.cfg.MODEL.DECODER.DIM
+            )
+
+            # --- motion temporal hook (module construction) ---
+            # A third ContactTemporalModule instance, over the motion tokens
+            # (post_decoder only, like force). A per-frame head cannot represent
+            # a derivative, so this is mandatory for the motion experiment.
+            # Attribute absent when disabled. No image_dim: pre_decoder is not
+            # supported here.
+            mtcfg = self.cfg.MODEL.get("MOTION_TEMPORAL", None)
+            if mtcfg is not None and mtcfg.get("ENABLED", False):
+                from ..modules.temporal import ContactTemporalModule
+                self.motion_temporal = ContactTemporalModule(
+                    dim=self.cfg.MODEL.DECODER.DIM,
+                    num_layers=mtcfg.get("NUM_LAYERS", 1),
+                    num_heads=mtcfg.get("NUM_HEADS", 4),
+                    mlp_ratio=mtcfg.get("MLP_RATIO", 2.0),
+                    attend=mtcfg.get("ATTEND", "per_token"),
+                    causal=mtcfg.get("CAUSAL", False),
+                    dropout=mtcfg.get("DROPOUT", 0.0),
+                    placement="post_decoder",
+                    bottleneck_dim=mtcfg.get("BOTTLENECK_DIM", 256),
+                    position_scale=mtcfg.get("POSITION_SCALE", 1.0),
+                )
+            # --- end motion temporal hook ---
+        # --- end motion hook ---
+
         self.keypoint_posemb_linear = FFN(
             embed_dims=2,
             feedforward_channels=self.cfg.MODEL.DECODER.DIM,
@@ -496,6 +618,25 @@ class SAM3DBody(BaseModel):
             if valid is not None:
                 valid = valid[idx]
         return seq_len, pos, valid
+
+    def _cond_input_feature(self, batch, batch_size, ref):
+        """Per-body-row conditioning feature (cond input hook).
+
+        Returns ``[batch_size, cond_input_dim]`` on ``ref``'s device/dtype,
+        indexed by ``self.body_batch_idx`` so it lines up row-for-row with the
+        contact/force tokens. Batches without the key (still-image collates that
+        predate it, or a bare inference batch) contribute exact zeros rather than
+        skipping the projection, so its params are used on every step — DDP
+        rejects a parameter some ranks leave unused.
+        """
+        feat = None if batch is None else batch.get("cond_feat")
+        if feat is None:
+            return torch.zeros(
+                batch_size, self.cond_input_dim, dtype=ref.dtype, device=ref.device)
+        idx = self.body_batch_idx
+        if idx is not None and len(idx):
+            feat = feat[idx]
+        return feat.to(dtype=ref.dtype, device=ref.device)
 
     def forward_decoder(
         self,
@@ -675,14 +816,32 @@ class SAM3DBody(BaseModel):
             # Add contact tokens if enabled
             do_contact_tokens = self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False)
             do_force_tokens = self.cfg.MODEL.DECODER.get("DO_FORCE_TOKENS", False)
+            do_motion_tokens = self.cfg.MODEL.DECODER.get("DO_MOTION_TOKENS", False)
+            # --- cond input hook (per-frame token conditioning) ---
+            # One 10-d feature row per frame, projected (zero-init) and added to
+            # both extra token blocks below.
+            cond_feature = (
+                self._cond_input_feature(batch, batch_size, token_embeddings)
+                if self.cond_input_dim else None
+            )
+            # --- end cond input hook ---
+
             if do_contact_tokens:
                 contact_emb_start_idx = token_embeddings.shape[1]
+                contact_emb = self.contact_embedding.weight[None, :, :].repeat(
+                    batch_size, 1, 1
+                )
+                # --- cond input hook (contact tokens, pre_decoder) ---
+                if (cond_feature is not None
+                        and self.cond_input_injection == "pre_decoder"
+                        and hasattr(self, "contact_cond_linear")):
+                    contact_emb = contact_emb + self.contact_cond_linear(
+                        cond_feature).unsqueeze(1)
+                # --- end cond input hook ---
                 token_embeddings = torch.cat(
                     [
                         token_embeddings,
-                        self.contact_embedding.weight[None, :, :].repeat(
-                            batch_size, 1, 1
-                        ),
+                        contact_emb,
                     ],
                     dim=1,
                 )
@@ -703,12 +862,20 @@ class SAM3DBody(BaseModel):
             # once the sequence is complete so N_total is correct.
             if do_force_tokens:
                 force_emb_start_idx = token_embeddings.shape[1]
+                force_emb = self.force_embedding.weight[None, :, :].repeat(
+                    batch_size, 1, 1
+                )
+                # --- cond input hook (force tokens, pre_decoder) ---
+                if (cond_feature is not None
+                        and self.cond_input_injection == "pre_decoder"
+                        and hasattr(self, "force_cond_linear")):
+                    force_emb = force_emb + self.force_cond_linear(
+                        cond_feature).unsqueeze(1)
+                # --- end cond input hook ---
                 token_embeddings = torch.cat(
                     [
                         token_embeddings,
-                        self.force_embedding.weight[None, :, :].repeat(
-                            batch_size, 1, 1
-                        ),
+                        force_emb,
                     ],
                     dim=1,
                 )
@@ -724,17 +891,45 @@ class SAM3DBody(BaseModel):
                 )
             # --- end force hook ---
 
-            if do_contact_tokens or do_force_tokens:
+            # --- motion hook (append tokens last) ---
+            # Motion tokens live after every other appended block, so the mask
+            # below gives original/contact/force ⊥ motion for free.
+            if do_motion_tokens:
+                motion_emb_start_idx = token_embeddings.shape[1]
+                token_embeddings = torch.cat(
+                    [
+                        token_embeddings,
+                        self.motion_embedding.weight[None, :, :].repeat(
+                            batch_size, 1, 1
+                        ),
+                    ],
+                    dim=1,
+                )
+                # No positional embeddings for motion tokens
+                token_augment = torch.cat(
+                    [
+                        token_augment,
+                        torch.zeros_like(
+                            token_embeddings[:, token_augment.shape[1] :, :]
+                        ),
+                    ],
+                    dim=1,
+                )
+            # --- end motion hook ---
+
+            if do_contact_tokens or do_force_tokens or do_motion_tokens:
                 # Asymmetric attention mask: no earlier token block may attend a
-                # later one (True=allowed). Original tokens never attend contact
-                # or force tokens; contact tokens never attend force tokens; each
+                # later one (True=allowed). Original tokens never attend contact,
+                # force or motion tokens; contact tokens never attend force or
+                # motion tokens; force tokens never attend motion tokens; each
                 # extra block can still attend everything before it to learn from
                 # it. Built after all extra blocks so N_total is final.
                 token_mask = self._build_block_token_mask(
                     batch_size,
                     token_embeddings.shape[1],
                     ([contact_emb_start_idx] if do_contact_tokens else [])
-                    + ([force_emb_start_idx] if do_force_tokens else []),
+                    + ([force_emb_start_idx] if do_force_tokens else [])
+                    + ([motion_emb_start_idx] if do_motion_tokens else []),
                     token_embeddings.device,
                 )
 
@@ -802,6 +997,14 @@ class SAM3DBody(BaseModel):
         )
         # --- end force hook ---
 
+        # --- motion hook (per-layer anchored update) ---
+        mt_token_update_fn = (
+            self.motion_token_update_fn
+            if self.cfg.MODEL.DECODER.get("DO_MOTION_TOKENS", False)
+            else None
+        )
+        # --- end motion hook ---
+
         # --- contact temporal hook (pre_decoder) ---
         # Image tensor the contact tokens grid-sample from: a PRIVATE zero-gated
         # temporal copy for pre_decoder, otherwise the shared decoder tensor. The
@@ -832,6 +1035,12 @@ class SAM3DBody(BaseModel):
                 args = ft_token_update_fn(
                     force_emb_start_idx, image_embeddings, self.decoder.layers, *args
                 )
+            # --- motion hook: motion tokens sample the shared decoder image
+            # tensor, anchored at their own MHR70 keypoints ---
+            if mt_token_update_fn is not None:
+                args = mt_token_update_fn(
+                    motion_emb_start_idx, image_embeddings, self.decoder.layers, *args
+                )
             return args
 
         pose_token, pose_output = self.decoder(
@@ -851,6 +1060,17 @@ class SAM3DBody(BaseModel):
             contact_tokens = pose_token[
                 :, contact_emb_start_idx : contact_emb_start_idx + self.total_contact_tokens
             ]
+            # --- cond input hook (contact tokens, post_decoder) ---
+            # Added out-of-place to the decoder's contact-token outputs (the
+            # returned pose_token stays unconditioned), before a post_decoder
+            # temporal module. Same zero-init projection as pre_decoder — only
+            # the injection site moves.
+            if (cond_feature is not None
+                    and self.cond_input_injection == "post_decoder"
+                    and hasattr(self, "contact_cond_linear")):
+                contact_tokens = contact_tokens + self.contact_cond_linear(
+                    cond_feature).unsqueeze(1)
+            # --- end cond input hook ---
             # --- contact temporal hook (post_decoder) ---
             _tm = getattr(self, "contact_temporal", None)
             if _tm is not None and _tm.placement == "post_decoder":
@@ -870,6 +1090,13 @@ class SAM3DBody(BaseModel):
             force_tokens = pose_token[
                 :, force_emb_start_idx : force_emb_start_idx + self.num_force_tokens
             ]
+            # --- cond input hook (force tokens, post_decoder) ---
+            if (cond_feature is not None
+                    and self.cond_input_injection == "post_decoder"
+                    and hasattr(self, "force_cond_linear")):
+                force_tokens = force_tokens + self.force_cond_linear(
+                    cond_feature).unsqueeze(1)
+            # --- end cond input hook ---
             # --- force temporal hook (post_decoder) ---
             _ft = getattr(self, "force_temporal", None)
             if _ft is not None:
@@ -897,15 +1124,38 @@ class SAM3DBody(BaseModel):
             # --- end force contact-gate hook ---
         # --- end force hook ---
 
+        # --- motion hook (process motion tokens) ---
+        motion_output = None
+        if self.cfg.MODEL.DECODER.get("DO_MOTION_TOKENS", False):
+            motion_tokens = pose_token[
+                :, motion_emb_start_idx : motion_emb_start_idx + self.num_motion_tokens
+            ]
+            # --- motion temporal hook (post_decoder) ---
+            _mt = getattr(self, "motion_temporal", None)
+            if _mt is not None:
+                _sl, _pos, _valid = self._contact_temporal_fields(batch)
+                motion_tokens = _mt(motion_tokens, _sl, _pos, _valid)
+            # --- end motion temporal hook ---
+            # Standardized root-frame linear velocity + acceleration per token;
+            # the supervised loss owns the mean/std table.
+            motion = self.head_motion(motion_tokens)                # [B, K, 6]
+            motion_output = {
+                "joint_vel": motion[..., :3],
+                "joint_acc": motion[..., 3:],
+                "joint_motion": motion,
+            }
+        # --- end motion hook ---
+
         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
             return (
                 pose_token[:, hand_det_emb_start_idx : hand_det_emb_start_idx + 2],
                 pose_output,
                 contact_output,
                 force_output,
+                motion_output,
             )
         else:
-            return pose_token, pose_output, contact_output, force_output
+            return pose_token, pose_output, contact_output, force_output, motion_output
 
     def forward_decoder_hand(
         self,
@@ -1261,8 +1511,10 @@ class SAM3DBody(BaseModel):
         pose_output, pose_output_hand = None, None
         contact_output = None
         force_output = None
+        motion_output = None
         if len(self.body_batch_idx):
-            tokens_output, pose_output, contact_output, force_output = self.forward_decoder(
+            (tokens_output, pose_output, contact_output, force_output,
+             motion_output) = self.forward_decoder(
                 image_embeddings[self.body_batch_idx],
                 init_estimate=None,  # not recurring previous estimate
                 keypoints=cur_keypoint_prompt[self.body_batch_idx],
@@ -1280,6 +1532,7 @@ class SAM3DBody(BaseModel):
                 "mhr_hand": pose_output_hand,
                 "contact": contact_output,
                 "force": force_output,
+                "motion": motion_output,
             }
         )
 
@@ -1565,8 +1818,10 @@ class SAM3DBody(BaseModel):
         pose_output, pose_output_hand = None, None
         contact_output = None
         force_output = None
+        motion_output = None
         if len(self.body_batch_idx):
-            tokens_output, pose_output, contact_output, force_output = self.forward_decoder(
+            (tokens_output, pose_output, contact_output, force_output,
+             motion_output) = self.forward_decoder(
                 image_embeddings[self.body_batch_idx],
                 init_estimate=None,
                 keypoints=keypoints_prompt[self.body_batch_idx],
@@ -1592,6 +1847,7 @@ class SAM3DBody(BaseModel):
             "mhr_hand": pose_output_hand,  # mhr prediction output
             "contact": contact_output,  # contact prediction output (body decoder only)
             "force": force_output,  # per-extremity force output (body decoder only)
+            "motion": motion_output,  # per-joint vel/acc output (body decoder only)
             "condition_info": condition_info,
             "image_embeddings": image_embeddings,
         }
@@ -2114,7 +2370,8 @@ class SAM3DBody(BaseModel):
                 dim=-1,
             )
 
-        tokens_output, pose_output, contact_output, force_output = self.forward_decoder(
+        (tokens_output, pose_output, contact_output, force_output,
+         motion_output) = self.forward_decoder(
             image_embeddings,
             init_estimate=None,  # not recurring previous estimate
             keypoints=keypoint_prompt,
@@ -2125,7 +2382,7 @@ class SAM3DBody(BaseModel):
         pose_output = pose_output[-1]
 
         output.update({"mhr": pose_output, "contact": contact_output,
-                       "force": force_output})
+                       "force": force_output, "motion": motion_output})
         return output, keypoint_prompt
 
     def _get_hand_box(self, pose_output, batch):
@@ -2342,13 +2599,14 @@ class SAM3DBody(BaseModel):
     def _build_block_token_mask(batch_size, num_total, block_starts, device):
         """Asymmetric token-token attention mask for the appended token blocks.
 
-        ``block_starts`` lists the start index of every appended block (contact
-        and/or force) in ascending order. For each start ``s``, every token
-        before ``s`` is barred from attending any token at ``>= s`` — so no
+        ``block_starts`` lists the start index of every appended block (contact,
+        force and/or motion) in ascending order. For each start ``s``, every
+        token before ``s`` is barred from attending any token at ``>= s`` — so no
         earlier token block may attend a later one (True=allowed): original
-        tokens never attend contact or force tokens, contact tokens never attend
-        force tokens, while each appended block still attends everything before
-        it. Returns a bool mask of shape ``(batch_size, num_total, num_total)``.
+        tokens never attend contact, force or motion tokens, contact tokens never
+        attend force or motion tokens, force tokens never attend motion tokens,
+        while each appended block still attends everything before it. Returns a
+        bool mask of shape ``(batch_size, num_total, num_total)``.
         """
         token_mask = torch.ones(
             batch_size, num_total, num_total, dtype=torch.bool, device=device,
@@ -2555,6 +2813,36 @@ class SAM3DBody(BaseModel):
             force_emb_start_idx, self.num_force_tokens,
             self.force_keypoint_indices,
             self.force_posemb_linear, self.force_feat_linear,
+            image_embeddings, pose_output, token_embeddings, token_augment,
+        )
+        return token_embeddings, token_augment, pose_output, layer_idx
+
+    def motion_token_update_fn(
+        self,
+        motion_emb_start_idx,
+        image_embeddings,
+        decoder_layers,
+        token_embeddings,
+        token_augment,
+        pose_output,
+        layer_idx,
+    ):
+        """Update motion tokens after each intermediate decoder layer.
+
+        Same anchored update as :meth:`force_token_update_fn` (2D-keypoint posemb
+        + grid-sampled features at ``motion_keypoint_indices``), applied to the
+        motion-token slice with the motion linears. Every motion token is
+        anchored (no global tokens). No temporal hook — motion temporal is
+        post_decoder only.
+        """
+        # Skip after the last layer (same pattern as force_token_update_fn)
+        if layer_idx == len(decoder_layers) - 1:
+            return token_embeddings, token_augment, pose_output, layer_idx
+
+        token_embeddings, token_augment = self._anchored_token_update(
+            motion_emb_start_idx, self.num_motion_tokens,
+            self.motion_keypoint_indices,
+            self.motion_posemb_linear, self.motion_feat_linear,
             image_embeddings, pose_output, token_embeddings, token_augment,
         )
         return token_embeddings, token_augment, pose_output, layer_idx

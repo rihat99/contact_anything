@@ -5,6 +5,7 @@ from .camera_head import PerspectiveHead
 from .contact_head import ContactHead
 from .force_head import ForceHead
 from .mhr_head import MHRHead
+from .motion_head import MotionHead
 
 
 def build_head(cfg, head_type="mhr", enable_hand_model=False, default_scale_factor=1.0,
@@ -59,6 +60,17 @@ def build_head(cfg, head_type="mhr", enable_hand_model=False, default_scale_fact
             mlp_depth=force_cfg.get("MLP_DEPTH", 2),
             mlp_channel_div_factor=force_cfg.get("MLP_CHANNEL_DIV_FACTOR", 4),
             dropout=force_cfg.get("DROPOUT", 0.0),
+        )
+    elif head_type == "motion":
+        motion_cfg = cfg.MODEL.get("MOTION_HEAD", dict())
+        # Motion anchors are always explicit (no contact inheritance, no global
+        # tokens), so the token count is exactly the anchor-list length.
+        return MotionHead(
+            input_dim=cfg.MODEL.DECODER.DIM,
+            num_motion_tokens=len(motion_cfg["KEYPOINT_INDICES"]),
+            mlp_depth=motion_cfg.get("MLP_DEPTH", 2),
+            mlp_channel_div_factor=motion_cfg.get("MLP_CHANNEL_DIV_FACTOR", 4),
+            dropout=motion_cfg.get("DROPOUT", 0.0),
         )
     else:
         raise ValueError("Invalid head type: ", head_type)

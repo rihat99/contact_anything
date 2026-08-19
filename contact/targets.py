@@ -440,8 +440,10 @@ def validate_targets(cfg: dict, datasets: Sequence) -> None:
     Every enabled target must be supervised by at least one dataset, **and every
     configured dataset must supervise at least one enabled target** (natively or
     via enabled ``joint.derive_from_vertex``) — otherwise that dataset's batches
-    are all-masked yet still take optimiser steps. Every dataset that supplies
-    vertex labels must also match ``contact.topology``.
+    are all-masked yet still take optimiser steps. A dataset supplying GT forces
+    (``force_supervision``) or GT motion (``motion_supervision``) counts as
+    supervising: those builds have no contact target at all. Every dataset that
+    supplies vertex labels must also match ``contact.topology``.
 
     :param cfg: Resolved run config.
     :param datasets: Built dataset objects exposing ``supervised_targets``
@@ -457,12 +459,16 @@ def validate_targets(cfg: dict, datasets: Sequence) -> None:
     # supplies GT forces as supervising — force-only configs have no contact
     # target at all, and mixed configs may include a forces-only dataset.
     force_supervised = bool((cfg.get("force_supervision") or {}).get("enabled", False))
+    # Same exemption for a supervised-motion run (motion-only configs have no
+    # contact target either; their supervision is the kindyn vel/acc targets).
+    motion_supervised = bool((cfg.get("motion_supervision") or {}).get("enabled", False))
 
     supplied: set[str] = set()
     for ds in datasets:
         native = set(getattr(ds, "supervised_targets", set()))
         ds_supervised = _dataset_supervised(native, enabled, derive)
         ds_forces = force_supervised and bool(getattr(ds, "load_forces", False))
+        ds_motion = motion_supervised and bool(getattr(ds, "load_motion", False))
         supplied |= ds_supervised
         if "vertex" in native:
             ds_topology = getattr(ds, "topology", None)
@@ -470,13 +476,13 @@ def validate_targets(cfg: dict, datasets: Sequence) -> None:
                 raise ValueError(
                     f"dataset {getattr(ds, 'name', ds)!r} supplies vertex labels in "
                     f"topology {ds_topology!r} but contact.topology is {topology!r}")
-        if not ds_supervised and not ds_forces:
+        if not ds_supervised and not ds_forces and not ds_motion:
             raise ValueError(
                 f"dataset {getattr(ds, 'name', ds)!r} supervises none of the enabled "
                 f"target(s) {sorted(enabled)} (it supplies {sorted(native)}); every "
                 f"configured dataset must supervise ≥1 enabled target (or supply GT "
-                f"forces under force_supervision) or it only contributes all-masked "
-                f"batches")
+                f"forces under force_supervision / GT motion under motion_supervision) "
+                f"or it only contributes all-masked batches")
 
     missing = enabled - supplied
     if missing:

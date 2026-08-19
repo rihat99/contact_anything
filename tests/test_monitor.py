@@ -120,6 +120,39 @@ def test_resume_diff_flags_loss_grad_clip():
     assert any(d.strip().startswith("loss") for d in diffs)
 
 
+@pytest.mark.parametrize("section,change", [
+    ("motion_supervision", {"target_smooth_sec": 0.0}),
+    ("motion_supervision", {"root_convention": "rotated_world"}),
+    ("motion_supervision", {"joint_names": ["pelvis"]}),
+    ("force_supervision", {"target_frame": "all"}),
+])
+def test_resume_diff_flags_a_changed_supervision_target(section, change):
+    # These sections define what the run FITS (motion target convention, label
+    # smoothing, slot list, standardize affine; force term weights). Swapping one
+    # mid-run would continue a different task into the same curve.
+    tm = _train_module()
+    base = _resume_base()
+    diffs = tm._resume_config_diffs(base, {**base, section: change})
+    assert any(section in d for d in diffs)
+
+
+def test_resume_diff_normalizes_historical_supervision_sections():
+    # A checkpoint written before these sections (or before a key inside one)
+    # must still compare equal to a current resolution holding the defaults.
+    import copy
+
+    from contact.config import DEFAULTS
+
+    tm = _train_module()
+    current = _resume_base()
+    for section in ("motion_supervision", "force_supervision"):
+        current[section] = copy.deepcopy(DEFAULTS[section])
+    saved = copy.deepcopy(current)
+    del saved["motion_supervision"]["target_smooth_sec"]
+    del saved["force_supervision"]
+    assert tm._resume_config_diffs(saved, current) == []
+
+
 def test_resume_diff_normalizes_historical_physics_configs():
     # A historical saved config that predates residual_robust / max_cam_jump_m (or
     # the whole disabled physics section) must compare equal to a current

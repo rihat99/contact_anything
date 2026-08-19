@@ -67,8 +67,11 @@ from contact.engine import forward_model
 from contact.model import build_model
 from contact.targets import (
     EXTREMITY_4_NAMES,
+    JOINT_SET_GROUPS,
+    KINDYN_6_NAMES,
     TargetSpec,
-    reduce_body22_to_extremities,
+    joint_set_names,
+    reduce_body22_to_groups,
 )
 
 
@@ -228,8 +231,10 @@ def _frame_index_map(ds: ClimbingCorpusDataset, scene: str) -> dict[tuple[int, i
     return result
 
 
-def _scene_ground_truth(data: dict) -> tuple[np.ndarray, np.ndarray]:
-    """Return four-extremity labels and known-label mask as ``[P,N,4]`` arrays."""
+def _scene_ground_truth(
+    data: dict, groups: tuple[tuple[int, ...], ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-group labels and known-label mask as ``[P,N,K]`` arrays."""
     raw_contact = data.get("joint_contact")
     if raw_contact is None:
         raise ValueError("dataset labels were not loaded for this scene")
@@ -247,8 +252,8 @@ def _scene_ground_truth(data: dict) -> tuple[np.ndarray, np.ndarray]:
         if raw_confidence is None
         else torch.as_tensor(raw_confidence, dtype=torch.float32)
     )
-    reduced_contact, reduced_supervised, _ = reduce_body22_to_extremities(
-        contact, supervised, confidence)
+    reduced_contact, reduced_supervised, _ = reduce_body22_to_groups(
+        contact, supervised, confidence, groups)
     return (
         (reduced_contact > 0.5).cpu().numpy(),
         (reduced_supervised > 0).cpu().numpy(),
@@ -378,6 +383,12 @@ def _predict_scene(
     A model without a contact head (force-only build) leaves ``probs`` NaN —
     no disks are drawn — and anchors at its ``force_keypoint_indices``.
     """
+    # A conditioned checkpoint (model.cond_input) needs the real per-frame
+    # cond_feat rows — the collate zero-fills missing ones, which is out of
+    # distribution for a trained conditioning path (and with an MLP encoder a
+    # zero row is a learned constant, not a no-op).
+    cond_cfg = cfg["model"].get("cond_input", {}) or {}
+    cond_enabled = bool(cond_cfg.get("enabled", False))
     ds = ClimbingCorpusDataset(
         root,
         scenes=[scene],
@@ -390,19 +401,23 @@ def _predict_scene(
         use_confidence_weights=False,
         require_labels=require_labels,
         load_forces=collect_force and force_frame == "root",
+        cond_features_path=cond_cfg.get("features_path") if cond_enabled else None,
+        cond_standardize=cond_cfg.get("standardize") if cond_enabled else None,
+        cond_clip=float(cond_cfg.get("clip", 5.0)),
     )
     data = ds._scenes[scene]
     n_people, n_frames = data["valid_mask"].shape
     has_contact = getattr(model, "num_contact_tokens", 0) > 0
     if has_contact:
         spec = TargetSpec.from_config(cfg)
-        if spec.joint_names != EXTREMITY_4_NAMES:
+        if spec.joint_names not in (EXTREMITY_4_NAMES, KINDYN_6_NAMES):
             raise ValueError(
-                f"video renderer requires extremities_4; got {spec.joint_set}: "
-                f"{spec.joint_names}")
+                f"video renderer requires extremities_4 or kindyn_6; got "
+                f"{spec.joint_set}: {spec.joint_names}")
         anchor_indices = list(model.contact_keypoint_indices)
-        if len(anchor_indices) != 4:
-            raise ValueError(f"expected four MHR anchors; got {anchor_indices}")
+        if len(anchor_indices) != len(spec.joint_names):
+            raise ValueError(
+                f"expected {len(spec.joint_names)} MHR anchors; got {anchor_indices}")
     else:
         if not collect_force:
             raise ValueError(
@@ -739,6 +754,8 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = load_config(args.config)
+    joint_cfg = cfg["contact"]["targets"]["joint"]
+    label_joint_set = joint_cfg["joint_set"] if joint_cfg["enabled"] else "extremities_4"
     root, contact_level = _dataset_options(cfg)
     scenes = (
         list_annotated_test_scenes(root)
@@ -782,7 +799,7 @@ def main() -> int:
             force_frame=force_frame,
         )
         labels, label_mask = (
-            _scene_ground_truth(ds._scenes[scene])
+            _scene_ground_truth(ds._scenes[scene], JOINT_SET_GROUPS[label_joint_set])
             if args.overlay_labels else (None, None)
         )
         suffix = "gtpred" if args.overlay_labels else "contacts"
@@ -822,7 +839,7 @@ def main() -> int:
             "frames_per_clip": seq_len,
             "frame_stride": stride,
             "world_size": world_size,
-            "joint_names": list(EXTREMITY_4_NAMES),
+            "joint_names": list(joint_set_names(label_joint_set)),
             "circle_colors": {"contact": "red", "non_contact": "green"},
             "circle_encoding": (
                 {"inner_disk": "dataset label", "outer_ring": "model prediction"}

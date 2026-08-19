@@ -82,6 +82,10 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
     so a same-shape but different-architecture checkpoint is rejected on load.
     Returns ``None`` when ``config`` is ``None`` (signature comparison skipped).
 
+    The ``motion``/``motion_temporal`` and ``cond_input`` keys appear only when
+    their branch is enabled: checkpoints written before they existed store
+    signatures without them, and this comparison is an exact dict equality.
+
     Known, deliberate gap: the ``temporal``/``force_temporal`` sub-signatures omit
     ``dropout``. Every shipped artifact uses ``0.0``, and adding the key now would
     orphan existing checkpoints whose stored signatures lack it (their comparison
@@ -178,7 +182,64 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
     else:
         force_temporal = {"enabled": False}
 
+    # Motion head + motion temporal (motion tokens v2). Added to the returned
+    # signature ONLY when the motion branch is enabled, so every checkpoint
+    # written before it existed keeps a byte-identical stored signature (the
+    # comparison in `_check_schema` is an exact dict equality).
+    sig_extra: dict = {}
+    mhcfg = model_cfg.get("motion_head", {}) or {}
+    if mhcfg.get("enabled", False):
+        sig_extra["motion"] = {
+            "enabled": True,
+            "motion_keypoint_indices": [
+                int(i) for i in (mhcfg.get("motion_keypoint_indices") or [])],
+            "mlp_depth": int(mhcfg.get("mlp_depth", 2)),
+            "mlp_channel_div_factor": int(mhcfg.get("mlp_channel_div_factor", 4)),
+            "dropout": float(mhcfg.get("dropout", 0.0)),
+        }
+        mtcfg = model_cfg.get("motion_temporal", {}) or {}
+        if mtcfg.get("enabled", False):
+            sig_extra["motion_temporal"] = {
+                "enabled": True,
+                "attend": str(mtcfg.get("attend", "per_token")),
+                "causal": bool(mtcfg.get("causal", False)),
+                "bottleneck_dim": int(mtcfg.get("bottleneck_dim", 256)),
+                "num_layers": int(mtcfg.get("num_layers", 1)),
+                "num_heads": int(mtcfg.get("num_heads", 4)),
+                "mlp_ratio": float(mtcfg.get("mlp_ratio", 2.0)),
+                "position_scale": float(mtcfg.get("position_scale", 1.0)),
+            }
+        else:
+            sig_extra["motion_temporal"] = {"enabled": False}
+
+    # Input conditioning (model.cond_input). Same enabled-only rule as `motion`:
+    # every checkpoint written before it existed keeps a byte-identical stored
+    # signature. The standardization literals and the clip ARE captured — they
+    # define what the projections' learned weights mean, so a checkpoint trained
+    # under different literals is a different model, not a rescaled one.
+    ccfg = model_cfg.get("cond_input", {}) or {}
+    if ccfg.get("enabled", False):
+        std = ccfg.get("standardize", {}) or {}
+        sig_extra["cond_input"] = {
+            "enabled": True,
+            "clip": float(ccfg.get("clip", 5.0)),
+            "standardize": {
+                key: [float(v) for v in (std.get(key) or [])]
+                for key in ("vel_mean", "vel_std", "acc_mean", "acc_std")
+            },
+        }
+        # Added only when set: every bare-linear checkpoint written before the
+        # MLP encoder existed keeps a byte-identical stored signature.
+        if ccfg.get("encoder_hidden", None) is not None:
+            sig_extra["cond_input"]["encoder_hidden"] = int(ccfg["encoder_hidden"])
+        # Added only when non-default (same stability rule): the injection site
+        # changes what the learned projections mean, so a post_decoder run must
+        # never silently load a pre_decoder checkpoint or vice versa.
+        if str(ccfg.get("injection", "pre_decoder")) != "pre_decoder":
+            sig_extra["cond_input"]["injection"] = str(ccfg["injection"])
+
     return {
+        **sig_extra,
         "anchor_indices": [int(i) for i in kp],
         "num_global_tokens": int(chead.get("num_global_tokens", 3)),
         "pool_mode": str(chead.get("pool_mode", "concat")),
@@ -511,11 +572,12 @@ def initialize_common_contact(
     This is deliberately narrower than :func:`load`: it does not restore the
     optimiser, scheduler, epoch, or RNG. The only trainable parameters that may be
     absent from the source checkpoint are ``contact_temporal.*`` (temporal
-    fine-tuning from a per-frame checkpoint) and any param whose name contains
+    fine-tuning from a per-frame checkpoint), any param whose name contains
     ``"force"`` (the force branch — force tokens/linears, ``head_force``,
-    ``force_temporal``). Everything else must match exactly: the force keys are
-    exempted from the arch-signature comparison symmetrically (like ``temporal``),
-    and the precondition is that the target enables the temporal module OR the force
+    ``force_temporal``) or ``"motion"``, and the ``*_cond_linear`` input-conditioning
+    projections. Everything else must match exactly: those keys are exempted from
+    the arch-signature comparison symmetrically (like ``temporal``), and the
+    precondition is that the target enables the temporal module OR the force
     branch. It starts a temporal fine-tune, or a regime-(a) force warm-start, from a
     per-frame contact checkpoint without weakening the strict resume checks.
 
@@ -545,6 +607,26 @@ def initialize_common_contact(
     source_sig.pop("force_temporal", None)
     target_force = target_sig.pop("force", {"enabled": False})
     target_sig.pop("force_temporal", None)
+    # Same treatment for the two later branches a warm start may introduce (or
+    # drop): the motion tokens and the input conditioning. Both are absent from
+    # every earlier checkpoint's signature, and their params are allowed-missing
+    # below, so comparing them here would reject warm starts the loader supports.
+    # One asymmetry survives the pop: a source that TRAINED cond projections must
+    # not have them transplanted across a different injection site — pre_decoder
+    # weights steer the decoder's inputs, post_decoder ones offset its outputs.
+    # The tensors are shape-identical, so only this check separates them.
+    src_injection = (source_sig.get("cond_input") or {}).get("injection", "pre_decoder")
+    tgt_injection = (target_sig.get("cond_input") or {}).get("injection", "pre_decoder")
+    if src_injection != tgt_injection and any(
+            "cond_linear" in name for name in ckpt["trainable_state_dict"]):
+        raise RuntimeError(
+            f"{path}: warm-start source carries cond projections trained with "
+            f"injection={src_injection!r} but the target uses "
+            f"injection={tgt_injection!r}; the weights are shape-compatible yet "
+            "semantically different")
+    for key in ("motion", "motion_temporal", "cond_input"):
+        source_sig.pop(key, None)
+        target_sig.pop(key, None)
     if source_sig != target_sig:
         diffs = [
             f"  {key}: checkpoint={source_sig.get(key, 'ABSENT')!r} "
@@ -553,8 +635,8 @@ def initialize_common_contact(
             if source_sig.get(key) != target_sig.get(key)
         ]
         raise RuntimeError(
-            f"{path}: warm-start architecture mismatch outside the temporal/force "
-            f"modules:\n" + "\n".join(diffs))
+            f"{path}: warm-start architecture mismatch outside the temporal/force/"
+            f"motion/cond_input modules:\n" + "\n".join(diffs))
     # A temporal source is allowed IFF the target's temporal architecture is
     # identical: then its ``contact_temporal.*`` params simply load like any other
     # contact param. A differing (or disabled) target temporal still raises — the
@@ -586,12 +668,15 @@ def initialize_common_contact(
     missing = sorted(current_trainable - set(source_state))
     invalid_missing = [
         name for name in missing
-        if not name.startswith("contact_temporal.") and "force" not in name.lower()
+        if not name.startswith("contact_temporal.")
+        and "force" not in name.lower()
+        and "motion" not in name.lower()
+        and "cond_linear" not in name
     ]
     if invalid_missing:
         raise RuntimeError(
-            f"{path}: warm start is missing non-temporal/non-force trainable parameters: "
-            f"{invalid_missing}")
+            f"{path}: warm start is missing trainable parameters outside the "
+            f"temporal/force/motion/cond_input modules: {invalid_missing}")
 
     model.load_state_dict(source_state, strict=False)
     ckpt["warm_start_loaded_names"] = sorted(source_state)

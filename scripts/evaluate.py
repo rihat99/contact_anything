@@ -379,6 +379,10 @@ def _manual_test_loader(cfg: dict, image_size: tuple[int, int], spec: TargetSpec
         raise ValueError("--split test requires a climbing_corpus-only data config")
     dataset_cfg = (yaml.safe_load(Path(corpus_entries[0]["config"]).read_text()) or {})["data"]
     sequence = cfg["data"]["sequence"]
+    # Input conditioning is a model INPUT: a conditioned checkpoint scored with
+    # zeroed features is scored out of distribution, so it is threaded here the
+    # same way make_loaders threads it for training/epoch-end eval.
+    cond_cfg = cfg["model"]["cond_input"]
     ds = ClimbingCorpusDataset(
         dataset_cfg["root"],
         split="test",
@@ -390,6 +394,10 @@ def _manual_test_loader(cfg: dict, image_size: tuple[int, int], spec: TargetSpec
         use_confidence_weights=bool(
             cfg["contact"]["targets"]["joint"]["use_confidence_weights"]),
         load_forces=bool(dataset_cfg.get("load_forces", False)),
+        cond_features_path=(
+            cond_cfg["features_path"] if cond_cfg["enabled"] else None),
+        cond_standardize=cond_cfg["standardize"],
+        cond_clip=float(cond_cfg["clip"]),
     )
     clips_per_batch = max(
         1, int(cfg["data"]["frames_per_batch"]) // int(sequence["frames_per_clip"]))
