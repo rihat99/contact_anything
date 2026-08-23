@@ -319,6 +319,9 @@ def test_motion_defaults_load():
     }
     assert cfg["model"]["motion_temporal"] == {
         "enabled": False,
+        "placement": "post_decoder",
+        "layers": None,
+        "kind": "attention",
         "bottleneck_dim": 256,
         "num_layers": 1,
         "num_heads": 4,
@@ -333,9 +336,11 @@ def test_motion_defaults_load():
         "target_frame": "all",
         "joint_names": None,
         "root_convention": "twist",
+        "angular": False,
         "target_smooth_sec": 0.12,
         "standardize": {"mean": None, "std": None},
-        "loss": {"vel": 1.0, "acc": 1.0, "huber_delta": 1.0, "outlier_acc_ms2": 50.0},
+        "loss": {"vel": 1.0, "acc": 1.0, "ang_vel": 1.0, "ang_acc": 1.0,
+                 "huber_delta": 1.0, "outlier_acc_ms2": 50.0},
     }
 
 
@@ -604,3 +609,151 @@ def test_arch_signature_carries_motion_keys_when_enabled():
     assert sig["motion_temporal"]["attend"] == "joint"
     assert sig["motion_temporal"]["num_layers"] == 2
     assert sig["motion_temporal"]["position_scale"] == pytest.approx(30.0)
+
+
+# ---------------------------------------------------------------- angular (12-dim)
+
+_ANGULAR_TABLE = """
+    mean: [[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]
+    std: [[[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]]
+"""
+
+_ANGULAR_BASE = """
+base: configs/base.yaml
+model:
+  motion_head:
+    enabled: true
+    motion_keypoint_indices: [9]
+contact:
+  targets:
+    vertex: {enabled: false}
+    joint: {enabled: false}
+data:
+  datasets:
+  - {name: climbing_corpus, config: configs/datasets/climbing_corpus_motion.yaml}
+  sequence: {frames_per_clip: 7, frame_stride: auto}
+motion_supervision:
+  enabled: true
+  joint_names: [pelvis]
+  angular: true
+  standardize:
+"""
+
+
+def test_angular_config_accepted_and_widens_the_head(tmp_path):
+    from contact.model import _patch_model_cfg
+
+    cfg = load_config(_write(tmp_path, _ANGULAR_BASE + _ANGULAR_TABLE))
+    assert cfg["motion_supervision"]["angular"] is True
+    model_cfg = _patch_model_cfg(_min_model_cfg(), cfg, "mhr.pt")
+    assert model_cfg.MODEL.MOTION_HEAD.OUTPUT_DIMS == 12
+    # Non-angular configs keep the 6-wide head.
+    base = load_config(REPO / "configs" / "base.yaml")
+    assert _patch_model_cfg(
+        _min_model_cfg(), base, "mhr.pt").MODEL.MOTION_HEAD.OUTPUT_DIMS == 6
+
+
+def test_angular_requires_twist_convention(tmp_path):
+    with pytest.raises(ValueError, match="angular requires root_convention"):
+        load_config(_write(tmp_path, _ANGULAR_BASE.replace(
+            "  angular: true", "  angular: true\n  root_convention: rotated_world",
+        ) + _ANGULAR_TABLE))
+
+
+def test_angular_requires_pelvis_only(tmp_path):
+    with pytest.raises(ValueError, match="angular requires joint_names"):
+        load_config(_write(tmp_path, _ANGULAR_BASE.replace(
+            "joint_names: [pelvis]", "joint_names: [left_wrist, pelvis]",
+        ).replace("motion_keypoint_indices: [9]",
+                  "motion_keypoint_indices: [62, 9]") + _ANGULAR_TABLE))
+
+
+def test_angular_standardize_needs_four_groups(tmp_path):
+    with pytest.raises(ValueError, match=r"\[1\]\[4\]\[3\]"):
+        load_config(_write(tmp_path, _ANGULAR_BASE + """
+    mean: [[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]
+    std: [[[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]]
+"""))
+
+
+def test_motion_head_supports_twelve_outputs():
+    cfg = _motion_head_cfg([9])
+    cfg.MODEL.MOTION_HEAD.OUTPUT_DIMS = 12
+    head = build_head(cfg, "motion")
+    out = head(torch.randn(2, 1, 16))
+    assert out.shape == (2, 1, 12)
+    assert torch.equal(out, torch.zeros_like(out))
+
+
+# ------------------------------------------------- in-decoder temporal placements
+
+def test_motion_temporal_placement_validation(tmp_path):
+    ok = load_config(_write(tmp_path, _MOTION_ONLY.replace(
+        "motion_temporal: {enabled: true}",
+        "motion_temporal: {enabled: true, placement: between_layers_cross, layers: [3, 4]}")))
+    assert ok["model"]["motion_temporal"]["placement"] == "between_layers_cross"
+    assert ok["model"]["motion_temporal"]["layers"] == [3, 4]
+
+    with pytest.raises(ValueError, match="motion_temporal.placement"):
+        load_config(_write(tmp_path, _MOTION_ONLY.replace(
+            "motion_temporal: {enabled: true}",
+            "motion_temporal: {enabled: true, placement: pre_decoder}")))
+    with pytest.raises(ValueError, match="layers only applies"):
+        load_config(_write(tmp_path, _MOTION_ONLY.replace(
+            "motion_temporal: {enabled: true}",
+            "motion_temporal: {enabled: true, layers: [3]}")))
+    for bad in ("[]", "[5]", "[-1]", "[3, 3]", "[true]"):
+        with pytest.raises(ValueError, match="motion_temporal.layers"):
+            load_config(_write(tmp_path, _MOTION_ONLY.replace(
+                "motion_temporal: {enabled: true}",
+                f"motion_temporal: {{enabled: true, placement: between_layers, layers: {bad}}}")))
+
+
+def test_motion_temporal_placement_in_signature_only_when_nondefault(tmp_path):
+    cfg = load_config(_write(tmp_path, _MOTION_ONLY))
+    sig = ckpt_io._arch_signature(cfg)
+    # Default placement: byte-stable signature (no placement/layers keys).
+    assert "placement" not in sig["motion_temporal"]
+    assert "layers" not in sig["motion_temporal"]
+
+    cfg2 = load_config(_write(tmp_path, _MOTION_ONLY.replace(
+        "motion_temporal: {enabled: true}",
+        "motion_temporal: {enabled: true, placement: between_layers, layers: [3, 4]}")))
+    sig2 = ckpt_io._arch_signature(cfg2)
+    assert sig2["motion_temporal"]["placement"] == "between_layers"
+    assert sig2["motion_temporal"]["layers"] == [3, 4]
+    assert sig != sig2
+
+
+def test_motion_temporal_combined_placement(tmp_path):
+    ok = load_config(_write(tmp_path, _MOTION_ONLY.replace(
+        "motion_temporal: {enabled: true}",
+        "motion_temporal: {enabled: true, placement: between_layers_cross+post_decoder,"
+        " layers: [3, 4]}")))
+    assert ok["model"]["motion_temporal"]["placement"] == "between_layers_cross+post_decoder"
+    for bad in ("post_decoder+post_decoder", "between_layers+between_layers_cross",
+                "between_layers_cross+nope"):
+        with pytest.raises(ValueError, match="motion_temporal.placement"):
+            load_config(_write(tmp_path, _MOTION_ONLY.replace(
+                "motion_temporal: {enabled: true}",
+                f"motion_temporal: {{enabled: true, placement: {bad}}}")))
+
+
+def test_motion_temporal_conv_kind(tmp_path):
+    ok = load_config(_write(tmp_path, _MOTION_ONLY.replace(
+        "motion_temporal: {enabled: true}",
+        "motion_temporal: {enabled: true, kind: conv}")))
+    assert ok["model"]["motion_temporal"]["kind"] == "conv"
+    sig = ckpt_io._arch_signature(ok)
+    assert sig["motion_temporal"]["kind"] == "conv"
+    # Default kind stays OUT of the signature (byte-stability).
+    base = load_config(_write(tmp_path, _MOTION_ONLY))
+    assert "kind" not in ckpt_io._arch_signature(base)["motion_temporal"]
+    with pytest.raises(ValueError, match="kind='conv'"):
+        load_config(_write(tmp_path, _MOTION_ONLY.replace(
+            "motion_temporal: {enabled: true}",
+            "motion_temporal: {enabled: true, kind: conv, placement: between_layers}")))
+    with pytest.raises(ValueError, match="motion_temporal.kind"):
+        load_config(_write(tmp_path, _MOTION_ONLY.replace(
+            "motion_temporal: {enabled: true}",
+            "motion_temporal: {enabled: true, kind: nope}")))

@@ -46,7 +46,7 @@ camera-0-derived direction, and ``load_forces=True`` adds per-frame GT forces:
 
 ``load_motion=True`` adds the per-frame kindyn motion targets (motion tokens v2):
 
-* ``motion_gt`` ``[K, 6]`` float32 — linear velocity (``[..., 0:3]``, m/s) and
+* ``motion_gt`` ``[K, 6|12]`` float32 — linear velocity (``[..., 0:3]``, m/s) and
   linear acceleration (``[..., 3:6]``, m/s²) of the ``motion_joint_names`` slots
   (default: all of :data:`MOTION_JOINT_NAMES`, pelvis LAST), in **body-root**
   axes. The six limb slots are central differences of ``joints_world`` over the
@@ -408,9 +408,10 @@ def root_body_twist(q_root: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarr
     :param q_root: ``(..., N, 7)`` kindyn root configuration — world position
         ``[0:3]`` and world-from-root ``xyzw`` quaternion ``[3:7]``.
     :param dt: frame interval in seconds (``1 / fps``).
-    :returns: ``(vel, acc, omega)``, each ``(..., N, 3)`` float64 — the LINEAR
-        parts of ``v``/``a`` and the ANGULAR part of ``v`` (body angular
-        velocity). Boundary frames are zero (they are never target-valid).
+    :returns: ``(vel, acc, omega, ang_acc)``, each ``(..., N, 3)`` float64 — the
+        LINEAR parts of ``v``/``a``, then the ANGULAR parts: body angular
+        velocity and its derivative. Boundary frames are zero (they are never
+        target-valid).
     """
     q_root = np.asarray(q_root, np.float64)
     pos, quat = q_root[..., :3], q_root[..., 3:7]
@@ -424,7 +425,7 @@ def root_body_twist(q_root: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarr
     acc = np.zeros_like(twist)
     twist[..., 1:-1, :] = 0.5 * (diff[..., :-1, :] + diff[..., 1:, :]) / dt
     acc[..., 1:-1, :] = (diff[..., 1:, :] - diff[..., :-1, :]) / (dt * dt)
-    return twist[..., :3], acc[..., :3], twist[..., 3:]
+    return twist[..., :3], acc[..., :3], twist[..., 3:], acc[..., 3:]
 
 
 def cond_feature_rows(
@@ -597,6 +598,9 @@ class ClimbingCorpusDataset(Dataset):
         ``(frame, joint)`` motion target is flagged as an outlier (train-only
         filtering; the loss owns whether the bit is applied). ``0`` disables the
         flag entirely.
+    :param motion_angular: append the root slot's body angular velocity and
+        acceleration to ``motion_gt`` (``[K, 12]``). Requires the ``twist``
+        convention and a pelvis-only joint list.
     :param cond_features_path: ``cond_features.npz`` to read the input-side
         conditioning feature from (``None`` = no ``cond_feat`` emitted). Entries
         are keyed ``"<scene>__p<object_id>"`` and joined per frame on ``frame_idx``.
@@ -631,6 +635,8 @@ class ClimbingCorpusDataset(Dataset):
         motion_root_convention: str = "twist",
         motion_target_smooth_sec: float = MOTION_TARGET_SMOOTH_SEC,
         motion_outlier_acc_ms2: float = MOTION_OUTLIER_ACC_MS2,
+        motion_angular: bool = False,
+        load_pose: bool = False,
         cond_features_path: Optional[str] = None,
         cond_standardize: Optional[dict] = None,
         cond_clip: float = 5.0,
@@ -677,6 +683,17 @@ class ClimbingCorpusDataset(Dataset):
                 "motion_target_smooth_sec must be finite and >= 0; got "
                 f"{motion_target_smooth_sec!r}")
         self.motion_outlier_acc_ms2 = float(motion_outlier_acc_ms2)
+        self.motion_angular = bool(motion_angular)
+        self.load_pose = bool(load_pose)
+        # Angular twist targets exist for the root slot only; mirroring the
+        # config validator keeps the class safe for direct construction.
+        if self.motion_angular and (
+                self.motion_root_convention != "twist"
+                or self.motion_joints != ("pelvis",)):
+            raise ValueError(
+                "motion_angular requires motion_root_convention='twist' and "
+                f"motion_joint_names=['pelvis']; got {self.motion_root_convention!r}, "
+                f"{list(self.motion_joints)}")
         self.cond_features_path = (
             None if cond_features_path is None else str(cond_features_path))
         if self.cond_features_path is not None:
@@ -855,9 +872,37 @@ class ClimbingCorpusDataset(Dataset):
         if self.load_motion:
             data.update(self._load_motion(
                 scene, human_dir, object_ids, n, float(contacts["fps"])))
+        if self.load_pose:
+            data.update(self._load_pose(scene, human_dir, object_ids, n))
         if self.cond_features_path is not None:
             data.update(self._load_cond(scene, object_ids, n))
         return data
+
+    def _load_pose(
+        self, scene: str, human_dir: Path, object_ids: np.ndarray, n: int,
+    ) -> dict:
+        """Kindyn-MHR pseudo-GT pose targets from ``mhr_1.npz`` (E2).
+
+        Written by ``scripts/convert_kindyn_to_mhr.py``: a world-frame MHR ``q``
+        trajectory fitted to the kindyn joints. Only ``valid_mask`` rows were
+        fitted (the rest carry the raw per-frame init) — the loss masks on it.
+        """
+        path = human_dir / "mhr_1.npz"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"{scene}: {path} missing — run scripts/convert_kindyn_to_mhr.py")
+        mhr = np.load(path, allow_pickle=True)
+        if int(mhr["num_frames"]) != n:
+            raise ValueError(
+                f"{scene}: mhr_1 has {int(mhr['num_frames'])} frames, contacts has {n}")
+        mhr_ids = np.asarray(mhr["object_ids"])
+        q_world = _rows_by_object_id(
+            np.asarray(mhr["q_world"], np.float32), mhr_ids, object_ids,
+            scene, "mhr_1")                                     # [P, N, 132]
+        pose_valid = _rows_by_object_id(
+            np.asarray(mhr["valid_mask"], bool), mhr_ids, object_ids,
+            scene, "mhr_1")                                     # [P, N]
+        return {"pose_gt_q": q_world, "pose_valid_mask": pose_valid}
 
     def _load_test_labels(
         self, scene: str, object_ids: np.ndarray, n: int,
@@ -1010,9 +1055,10 @@ class ClimbingCorpusDataset(Dataset):
         Computed once per scene over the FULL trajectory (never per clip) in
         float64. The six limb slots are world central differences rotated with
         the SAME einsum the forces use; the ``pelvis`` slot follows
-        ``motion_root_convention`` (see :func:`root_body_twist`). Only the derived
-        ``[N, K, 6]`` arrays are cached (~25 MB corpus-wide); the raw 52-joint
-        positions are not.
+        ``motion_root_convention`` (see :func:`root_body_twist`). With
+        ``motion_angular`` the root slot appends the body angular velocity and
+        acceleration (``[..., 6:12]``). Only the derived ``[N, K, 6|12]`` arrays
+        are cached (~25 MB corpus-wide); the raw 52-joint positions are not.
         """
         kindyn = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
         kindyn_ids = np.asarray(kindyn["object_ids"])
@@ -1076,9 +1122,9 @@ class ClimbingCorpusDataset(Dataset):
         # The root slot's BVR-exact body twist. Always computed: `motion_omega`
         # (the body angular velocity) is what turns a root-frame linear vector
         # back into world axes under either convention.
-        twist_vel, twist_acc, omega = root_body_twist(q_root, dt)
+        twist_vel, twist_acc, omega, ang_acc = root_body_twist(q_root, dt)
+        pelvis = MOTION_JOINT_NAMES.index("pelvis")
         if self.motion_root_convention == "twist":
-            pelvis = MOTION_JOINT_NAMES.index("pelvis")
             vel_out[:, :, pelvis] = twist_vel
             acc_out[:, :, pelvis] = twist_acc
             acc_mag[:, :, pelvis] = np.linalg.norm(twist_acc, axis=-1)
@@ -1114,9 +1160,18 @@ class ClimbingCorpusDataset(Dataset):
             outlier = acc_mag > self.motion_outlier_acc_ms2
         # Keep only the configured slots (default: all seven, in canonical order).
         cols_out = [MOTION_JOINT_NAMES.index(name) for name in self.motion_joints]
-        motion_gt = np.concatenate([vel_out, acc_out], -1)[:, :, cols_out]
+        parts = [vel_out, acc_out]
+        if self.motion_angular:
+            # Angular twist components exist for the root slot only; __init__
+            # already restricted angular targets to pelvis-only joint lists.
+            ang_vel_out = np.zeros_like(vel_out)
+            ang_acc_out = np.zeros_like(acc_out)
+            ang_vel_out[:, :, pelvis] = omega
+            ang_acc_out[:, :, pelvis] = ang_acc
+            parts += [ang_vel_out, ang_acc_out]
+        motion_gt = np.concatenate(parts, -1)[:, :, cols_out]
         return {
-            "motion_gt": motion_gt.astype(np.float32),              # [P,N,K,6] root frame
+            "motion_gt": motion_gt.astype(np.float32),              # [P,N,K,6|12] root frame
             "motion_valid": target_valid,                           # [P, N] bool
             "motion_outlier": outlier[:, :, cols_out],              # [P, N, K] bool
             "motion_rot": rot.astype(np.float32),                   # [P,N,3,3] world-from-root
@@ -1221,7 +1276,7 @@ class ClimbingCorpusDataset(Dataset):
                 frame["force_valid"] = valid and bool(data["force_valid"][person, pos])
             if self.load_motion:
                 frame["motion_gt"] = torch.from_numpy(
-                    data["motion_gt"][person, pos])                               # [K, 6]
+                    data["motion_gt"][person, pos])                               # [K, 6|12]
                 frame["motion_outlier"] = torch.from_numpy(
                     data["motion_outlier"][person, pos])                          # [K] bool
                 frame["motion_rot"] = torch.from_numpy(
@@ -1229,6 +1284,11 @@ class ClimbingCorpusDataset(Dataset):
                 frame["motion_omega"] = torch.from_numpy(
                     data["motion_omega"][person, pos])                            # [3]
                 frame["motion_valid"] = valid and bool(data["motion_valid"][person, pos])
+            if self.load_pose:
+                frame["pose_gt_q"] = torch.from_numpy(
+                    data["pose_gt_q"][person, pos])                           # [132]
+                frame["pose_valid"] = valid and bool(
+                    data["pose_valid_mask"][person, pos])
             if self.cond_features_path is not None:
                 frame["cond_feat"] = torch.from_numpy(data["cond_feat"][person, pos])  # [10]
             clip.append(frame)

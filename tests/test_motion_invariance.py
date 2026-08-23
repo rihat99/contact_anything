@@ -121,22 +121,32 @@ def _motion_disabled(model):
 
 @contextlib.contextmanager
 def _motion_temporal_disabled(model):
-    """Drop the ``motion_temporal`` submodule so the post-decoder hook takes its
-    ``getattr(..., None)`` skip path — the exact code path of a disabled build."""
+    """Drop the ``motion_temporal`` submodule(s) so the hooks take their
+    ``getattr(..., None)`` skip paths — the exact code path of a disabled build."""
     mt = model.motion_temporal
     del model.motion_temporal
+    post = getattr(model, "motion_temporal_post", None)
+    if post is not None:
+        del model.motion_temporal_post
     try:
         yield
     finally:
         model.motion_temporal = mt
+        if post is not None:
+            model.motion_temporal_post = post
 
 
 def _randomize_motion_temporal_gammas(model, seed=13):
     gen = torch.Generator(device="cuda").manual_seed(seed)
+    modules = [model.motion_temporal]
+    post = getattr(model, "motion_temporal_post", None)
+    if post is not None:
+        modules.append(post)
     with torch.no_grad():
-        for name, p in model.motion_temporal.named_parameters():
-            if "gamma" in name:
-                p.copy_(torch.randn(p.shape, generator=gen, device="cuda"))
+        for module in modules:
+            for name, p in module.named_parameters():
+                if "gamma" in name:
+                    p.copy_(torch.randn(p.shape, generator=gen, device="cuda"))
 
 
 def _motion_params(model):
@@ -330,6 +340,87 @@ def test_motion_branch_within_noise_floor():
             assert diff <= limit, (
                 f"MHR output {key!r} moved {diff:.2e} > {limit:.2e} "
                 f"(base noise {floor[key]:.2e}) — motion leaked into a frozen output")
+    finally:
+        del model
+        torch.cuda.empty_cache()
+
+
+# ------------------------------------------- in-decoder placements (E1a / E1b)
+
+def _build_placement(placement, layers=(3, 4)):
+    torch.manual_seed(0)
+    cfg = load_config(PELVIS_CFG)
+    cfg["model"]["motion_temporal"]["placement"] = placement
+    cfg["model"]["motion_temporal"]["layers"] = list(layers)
+    model, trainable = build_model(cfg, "cuda")
+    model.eval()
+    return model, trainable, cfg
+
+
+@pytest.mark.parametrize("placement", [
+    "between_layers", "between_layers_cross",
+    "between_layers_cross+post_decoder"])
+def test_in_decoder_placement_zero_init_within_noise_floor(placement):
+    """Zero gammas: the in-decoder hooks are exact identities, so every MHR
+    output matches a motion-disabled run to within the CUDA noise floor."""
+    model, _, cfg = _build_placement(placement)
+    try:
+        batch = _batch(cfg, model, _synth_frames(4), seq_len=4)
+        base, floor = _noise_floor(model, batch)
+        live = _mhr_outputs(model, batch)
+        for key, val in live.items():
+            bound = _NOISE_MARGIN * floor[key] + _NOISE_FLOOR_EPS
+            assert _max_abs(val, base[key]) <= bound, (
+                f"{placement}: MHR output {key!r} off by "
+                f"{_max_abs(val, base[key]):.2e} (bound {bound:.2e})")
+    finally:
+        del model
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("placement", [
+    "between_layers", "between_layers_cross",
+    "between_layers_cross+post_decoder"])
+def test_in_decoder_placement_moves_motion_and_isolates_mhr(placement):
+    """Live gammas move the motion outputs (cross-frame mixing / frozen-block
+    reads happened) while every MHR output keeps an exactly-zero Jacobian
+    w.r.t. every motion param — the mask invariant survives the new hooks."""
+    model, _, cfg = _build_placement(placement)
+    try:
+        _randomize_motion_head_final(model)
+        batch = _batch(cfg, model, _synth_frames(4), seq_len=4)
+
+        with _motion_temporal_disabled(model):
+            m_base = forward_model(model, batch)["motion"]["joint_motion"]
+            m_base = m_base.detach().float().clone()
+
+        _randomize_motion_temporal_gammas(model)
+        out = forward_model(model, batch)
+        m_live = out["motion"]["joint_motion"]
+        moved = _max_abs(m_live.detach().float(), m_base)
+        assert moved > _MOTION_SIGNAL, (
+            f"{placement} barely moved the motion outputs ({moved:.2e})")
+
+        mparams = [p for _, p in _motion_params(model)]
+        mt_params = [p for n, p in _motion_params(model) if "motion_temporal" in n]
+        assert mt_params, "no motion_temporal params picked up by the filter"
+        gmt = torch.autograd.grad(m_live.float().sum(), mt_params,
+                                  allow_unused=True, retain_graph=True)
+        assert any(g is not None and float(g.abs().sum()) > 0 for g in gmt)
+
+        checked = 0
+        for key, val in out["mhr"].items():
+            if not (torch.is_tensor(val) and val.is_floating_point()):
+                continue
+            checked += 1
+            if not val.requires_grad:
+                continue
+            grads = torch.autograd.grad(val.float().sum(), mparams,
+                                        allow_unused=True, retain_graph=True)
+            for g in grads:
+                assert g is None or float(g.abs().sum()) == 0.0, (
+                    f"{placement}: MHR output {key!r} has a nonzero motion Jacobian")
+        assert checked > 0
     finally:
         del model
         torch.cuda.empty_cache()

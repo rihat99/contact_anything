@@ -1,0 +1,77 @@
+# Pose E2 — corpus_pose_temporal_t7. The DELIBERATE exception to the frozen-pose
+# rule: a zero-gated temporal-attention module on the POSE token (sequence index
+# 0) mixes it across the T=7 clip frames after the decoder, and the FINAL MHR
+# output is recomputed from the updated token. Supervised by the kindyn-MHR
+# pseudo-GT (`scripts/convert_kindyn_to_mhr.py`: the physics-optimized SMPL-X
+# trajectory refit as MHR q, ~0.5 cm joint residual), compared in q space (125
+# local pose channels; the free-flyer root is NOT supervised).
+#
+# Goal: temporally smoother AND closer-to-kindyn pose — sam3d body as a temporal
+# model. At init (zero gates) the model is exactly the frozen per-frame one, so
+# epoch-0 test metrics ARE the frozen baseline: pose MAE ~0.058 rad and a pose
+# acceleration RMS ~30x the kindyn target's (measured on a probe scene). The
+# monitor minimises test/pose_mae; test/pose_acc_ratio (pred/GT acceleration
+# RMS, 1.0 = kindyn-smooth) is the smoothness readout — watch it against the
+# "smooth but wrong" failure mode (mae must not rise while it falls).
+#
+# Everything else about the base stays frozen: contact/force/motion branches are
+# absent, intermediate predictions and the keypoint-token updates see the
+# untouched token, and only params named `pose_temporal` train (the freeze
+# filter's one sanctioned exception).
+base: configs/base.yaml
+
+model:
+  pose_temporal:
+    enabled: true
+    num_layers: 2
+    num_heads: 4
+    mlp_ratio: 2.0
+    attend: per_token                 # one pose token: per_token == joint
+    bottleneck_dim: 256
+    position_scale: 30.0              # 30-fps seconds -> well-separated frame offsets
+
+contact:
+  targets:
+    vertex: {enabled: false}
+    joint: {enabled: false}           # pose-temporal-only build
+
+data:
+  datasets:
+    - {name: climbing_corpus, config: configs/datasets/climbing_corpus_pose.yaml}
+  eval_split: test                    # no val split: train on all 331 scenes
+  frames_per_batch: 35                # per GPU -> 5 clips x T=7
+  # stride 1 (not auto): the auto stride is a motion_supervision-only feature;
+  # pose targets are per-frame so the native rate is correct here.
+  sequence: {frames_per_clip: 7, frame_stride: 1, jitter: true, target_frame: all}
+
+pose_supervision:
+  enabled: true
+  loss:
+    pose: 1.0
+    huber_delta: 0.1                  # radians
+
+optim:
+  lr: 1.0e-4
+  warmup_epochs: 1
+  lr_min: 1.0e-6
+  epochs: 10
+
+logging:
+  tensorboard_metrics:
+  - train/loss
+  - train/lr
+  - train/grad_norm
+  - train/grad_norm_raw
+  - train/frames_per_sec
+  - train/pose/loss
+  - train/pose/mae
+  - test/loss
+  - test/pose/mae
+  - test/pose/acc_rms_pred
+  - test/pose/acc_rms_gt
+  - test/pose/acc_ratio
+  - test/pose/n_rows
+
+output:
+  exp_name: corpus_pose_temporal_t7
+  monitor: test/pose_mae              # minimised; acc_ratio is the smoothness readout

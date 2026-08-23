@@ -111,12 +111,14 @@ def _process_sample(frame: dict, transform):
 # -------------------------------------------------------------------- collate
 
 def make_collate(image_size: Tuple[int, int], spec: TargetSpec,
-                 motion_joints: int = NUM_MOTION_JOINTS):
+                 motion_joints: int = NUM_MOTION_JOINTS, motion_dim: int = 6):
     """Build the batch collate.
 
     :param motion_joints: number of motion slots ``K`` the run's datasets emit
         (``motion_supervision.joint_names``); only the zero fallback for frames
         without motion targets depends on it.
+    :param motion_dim: per-slot ``motion_gt`` width — ``6`` (vel|acc) or ``12``
+        when ``motion_supervision.angular`` adds the root angular pair.
     """
     transform = _build_transform(image_size)
 
@@ -203,8 +205,9 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec,
         n_motion = motion_joints
         out["motion_gt"] = torch.stack([
             torch.as_tensor(f["motion_gt"], dtype=torch.float32)
-            if "motion_gt" in f else torch.zeros(n_motion, 6, dtype=torch.float32)
-            for f in frames], dim=0)                                       # [B, K, 6]
+            if "motion_gt" in f else torch.zeros(n_motion, motion_dim,
+                                                 dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, K, 6|12]
         out["motion_outlier"] = torch.stack([
             torch.as_tensor(f["motion_outlier"], dtype=torch.bool)
             if "motion_outlier" in f else torch.zeros(n_motion, dtype=torch.bool)
@@ -219,6 +222,17 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec,
             for f in frames], dim=0)                                       # [B, 3]
         out["motion_valid"] = torch.tensor(
             [bool(f.get("motion_valid", False)) for f in frames],
+            dtype=torch.bool)                                              # [B]
+
+        # Kindyn-MHR pseudo-GT pose (climbing_corpus with load_pose): the fitted
+        # world-frame MHR q per frame. Frames without targets fall back to zeros
+        # with pose_valid=False, so mixed batches collate.
+        out["pose_gt_q"] = torch.stack([
+            torch.as_tensor(f["pose_gt_q"], dtype=torch.float32)
+            if "pose_gt_q" in f else torch.zeros(132, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 132]
+        out["pose_valid"] = torch.tensor(
+            [bool(f.get("pose_valid", False)) for f in frames],
             dtype=torch.bool)                                              # [B]
 
         # Input-side conditioning feature (climbing_corpus with cond_features_path):
@@ -386,7 +400,9 @@ def make_loaders(
     specs = list(dcfg["datasets"])
     spec_obj = TargetSpec.from_config(cfg)
     motion_names = tuple(cfg["motion_supervision"]["joint_names"] or MOTION_JOINT_NAMES)
-    collate = make_collate(image_size, spec_obj, motion_joints=len(motion_names))
+    motion_angular = bool(cfg["motion_supervision"].get("angular", False))
+    collate = make_collate(image_size, spec_obj, motion_joints=len(motion_names),
+                           motion_dim=12 if motion_angular else 6)
 
     frames_per_batch = int(dcfg["frames_per_batch"])
     num_workers = int(dcfg["num_workers"])
@@ -445,6 +461,8 @@ def make_loaders(
                     cfg["motion_supervision"]["target_smooth_sec"]),
                 motion_outlier_acc_ms2=float(
                     cfg["motion_supervision"]["loss"]["outlier_acc_ms2"]),
+                motion_angular=motion_angular,
+                load_pose=bool(cfg["pose_supervision"]["enabled"]),
                 # Input conditioning (model.cond_input): label-free, so it is a
                 # loader option rather than a target — null path = no cond_feat.
                 cond_features_path=(

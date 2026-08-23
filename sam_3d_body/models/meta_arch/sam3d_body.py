@@ -483,28 +483,108 @@ class SAM3DBody(BaseModel):
             )
 
             # --- motion temporal hook (module construction) ---
-            # A third ContactTemporalModule instance, over the motion tokens
-            # (post_decoder only, like force). A per-frame head cannot represent
-            # a derivative, so this is mandatory for the motion experiment.
-            # Attribute absent when disabled. No image_dim: pre_decoder is not
-            # supported here.
+            # A per-frame head cannot represent a derivative, so a temporal
+            # module is mandatory for the motion experiment. Placements:
+            # `post_decoder` (self-attention over the motion tokens after the
+            # decoder, the v3 default), `between_layers` (the same module run
+            # inside the decoder loop at `LAYERS`, shared weights),
+            # `between_layers_cross` (a TemporalCrossModule whose motion-token
+            # queries read the FROZEN sam3d token block of every clip frame at
+            # `LAYERS`), or a COMBINATION "<in_decoder>+post_decoder" building
+            # one in-decoder module (kept under `motion_temporal`, the
+            # single-placement checkpoint name) plus a separate post-decoder
+            # module `motion_temporal_post` (TRAM-style pairing: patch-token
+            # temporal + pose-level temporal). Attributes absent when disabled.
+            # No image_dim: pre_decoder is not supported here.
             mtcfg = self.cfg.MODEL.get("MOTION_TEMPORAL", None)
             if mtcfg is not None and mtcfg.get("ENABLED", False):
-                from ..modules.temporal import ContactTemporalModule
-                self.motion_temporal = ContactTemporalModule(
+                placement = str(mtcfg.get("PLACEMENT", "post_decoder"))
+                placements = placement.split("+")
+                layers_cfg = mtcfg.get("LAYERS", None)
+                self.motion_temporal_placement = placement
+                self.motion_temporal_layers = (
+                    None if layers_cfg is None else [int(i) for i in layers_cfg])
+                if self.motion_temporal_layers is not None:
+                    # The hook fires after layers 0..DEPTH-2 only; a layer index
+                    # beyond that would silently never run (dead adapter, DDP
+                    # unused-param crash), so fail at build time.
+                    last_hook = int(self.cfg.MODEL.DECODER.get("DEPTH", 6)) - 2
+                    bad = [i for i in self.motion_temporal_layers if i > last_hook]
+                    if bad:
+                        raise ValueError(
+                            f"motion_temporal LAYERS {bad} exceed the last "
+                            f"intermediate decoder layer {last_hook} "
+                            f"(DEPTH={self.cfg.MODEL.DECODER.get('DEPTH', 6)})")
+                common = dict(
                     dim=self.cfg.MODEL.DECODER.DIM,
                     num_layers=mtcfg.get("NUM_LAYERS", 1),
                     num_heads=mtcfg.get("NUM_HEADS", 4),
                     mlp_ratio=mtcfg.get("MLP_RATIO", 2.0),
-                    attend=mtcfg.get("ATTEND", "per_token"),
                     causal=mtcfg.get("CAUSAL", False),
                     dropout=mtcfg.get("DROPOUT", 0.0),
-                    placement="post_decoder",
                     bottleneck_dim=mtcfg.get("BOTTLENECK_DIM", 256),
                     position_scale=mtcfg.get("POSITION_SCALE", 1.0),
                 )
+
+                def _build_motion_temporal(kind):
+                    if kind == "between_layers_cross":
+                        from ..modules.temporal import TemporalCrossModule
+                        return TemporalCrossModule(**common)
+                    if (kind == "post_decoder"
+                            and mtcfg.get("KIND", "attention") == "conv"):
+                        # 3-tap depthwise temporal conv (derivative-friendly
+                        # stencil; config-validated to post_decoder only).
+                        from ..modules.temporal import TemporalConvModule
+                        return TemporalConvModule(
+                            dim=common["dim"],
+                            num_layers=common["num_layers"],
+                            mlp_ratio=common["mlp_ratio"],
+                            causal=common["causal"],
+                            dropout=common["dropout"],
+                            bottleneck_dim=common["bottleneck_dim"],
+                        )
+                    from ..modules.temporal import ContactTemporalModule
+                    return ContactTemporalModule(
+                        attend=mtcfg.get("ATTEND", "per_token"),
+                        placement=kind,
+                        **common,
+                    )
+
+                in_decoder = [p for p in placements if p != "post_decoder"]
+                if in_decoder:
+                    # The in-decoder module keeps the single-placement attribute
+                    # name so lone between-layers checkpoints stay loadable.
+                    self.motion_temporal = _build_motion_temporal(in_decoder[0])
+                    if "post_decoder" in placements:
+                        self.motion_temporal_post = _build_motion_temporal(
+                            "post_decoder")
+                else:
+                    self.motion_temporal = _build_motion_temporal("post_decoder")
             # --- end motion temporal hook ---
         # --- end motion hook ---
+
+        # --- pose temporal hook (module construction) ---
+        # E2: temporal attention over the POSE token (sequence index 0), the ONE
+        # deliberate exception to the frozen-pose rule. The module runs after
+        # the decoder and the FINAL pose output is recomputed from the updated
+        # token; zero-init gates make init behavior exactly frozen. Every param
+        # carries "pose_temporal" in its name (freeze-filter exception).
+        ptcfg = self.cfg.MODEL.get("POSE_TEMPORAL", None)
+        if ptcfg is not None and ptcfg.get("ENABLED", False):
+            from ..modules.temporal import ContactTemporalModule
+            self.pose_temporal = ContactTemporalModule(
+                dim=self.cfg.MODEL.DECODER.DIM,
+                num_layers=ptcfg.get("NUM_LAYERS", 2),
+                num_heads=ptcfg.get("NUM_HEADS", 4),
+                mlp_ratio=ptcfg.get("MLP_RATIO", 2.0),
+                attend=ptcfg.get("ATTEND", "per_token"),
+                causal=ptcfg.get("CAUSAL", False),
+                dropout=ptcfg.get("DROPOUT", 0.0),
+                placement="post_decoder",
+                bottleneck_dim=ptcfg.get("BOTTLENECK_DIM", 256),
+                position_scale=ptcfg.get("POSITION_SCALE", 30.0),
+            )
+        # --- end pose temporal hook ---
 
         self.keypoint_posemb_linear = FFN(
             embed_dims=2,
@@ -1039,7 +1119,8 @@ class SAM3DBody(BaseModel):
             # tensor, anchored at their own MHR70 keypoints ---
             if mt_token_update_fn is not None:
                 args = mt_token_update_fn(
-                    motion_emb_start_idx, image_embeddings, self.decoder.layers, *args
+                    motion_emb_start_idx, image_embeddings, self.decoder.layers,
+                    batch, *args
                 )
             return args
 
@@ -1053,6 +1134,28 @@ class SAM3DBody(BaseModel):
             keypoint_token_update_fn=keypoint_token_update_fn_comb,
             token_context_gate=token_context_gate,
         )
+
+        # --- pose temporal hook (post_decoder) ---
+        # E2, the DELIBERATE exception to the frozen-pose rule: mix the pose
+        # token (index 0 of the decoder's norm_final output) across the clip's
+        # frames and recompute the FINAL pose output from the updated token.
+        # Intermediate predictions, the keypoint-token updates and every other
+        # token block saw the untouched token — contact/force/motion outputs
+        # cannot move. Zero-init gates keep init behavior exactly frozen.
+        _pt = getattr(self, "pose_temporal", None)
+        if _pt is not None:
+            _sl, _pos, _valid = self._contact_temporal_fields(batch)
+            _updated = _pt(pose_token[:, 0:1], _sl, _pos, _valid)
+            pose_token = torch.cat([_updated, pose_token[:, 1:]], dim=1)
+            _final = token_to_pose_output_fn(
+                pose_token, None, len(self.decoder.layers) - 1)
+            # The decoder returns the interm list with the final output last —
+            # only the final one is recomputed.
+            if isinstance(pose_output, (list, tuple)):
+                pose_output = list(pose_output[:-1]) + [_final]
+            else:
+                pose_output = _final
+        # --- end pose temporal hook ---
 
         # Process contact tokens if enabled
         contact_output = None
@@ -1131,19 +1234,29 @@ class SAM3DBody(BaseModel):
                 :, motion_emb_start_idx : motion_emb_start_idx + self.num_motion_tokens
             ]
             # --- motion temporal hook (post_decoder) ---
-            _mt = getattr(self, "motion_temporal", None)
-            if _mt is not None:
+            # Single post_decoder placement uses `motion_temporal`; a combined
+            # placement keeps its post module under `motion_temporal_post`.
+            _post = getattr(self, "motion_temporal_post", None)
+            if _post is None and getattr(
+                    self, "motion_temporal_placement", "post_decoder"
+            ) == "post_decoder":
+                _post = getattr(self, "motion_temporal", None)
+            if _post is not None:
                 _sl, _pos, _valid = self._contact_temporal_fields(batch)
-                motion_tokens = _mt(motion_tokens, _sl, _pos, _valid)
+                motion_tokens = _post(motion_tokens, _sl, _pos, _valid)
             # --- end motion temporal hook ---
-            # Standardized root-frame linear velocity + acceleration per token;
-            # the supervised loss owns the mean/std table.
-            motion = self.head_motion(motion_tokens)                # [B, K, 6]
+            # Standardized root-frame linear velocity + acceleration per token
+            # (+ the root angular pair on 12-wide heads); the supervised loss
+            # owns the mean/std table.
+            motion = self.head_motion(motion_tokens)                # [B, K, 6|12]
             motion_output = {
-                "joint_vel": motion[..., :3],
-                "joint_acc": motion[..., 3:],
+                "joint_vel": motion[..., 0:3],
+                "joint_acc": motion[..., 3:6],
                 "joint_motion": motion,
             }
+            if motion.shape[-1] == 12:
+                motion_output["joint_ang_vel"] = motion[..., 6:9]
+                motion_output["joint_ang_acc"] = motion[..., 9:12]
         # --- end motion hook ---
 
         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
@@ -2822,6 +2935,7 @@ class SAM3DBody(BaseModel):
         motion_emb_start_idx,
         image_embeddings,
         decoder_layers,
+        batch,
         token_embeddings,
         token_augment,
         pose_output,
@@ -2832,8 +2946,12 @@ class SAM3DBody(BaseModel):
         Same anchored update as :meth:`force_token_update_fn` (2D-keypoint posemb
         + grid-sampled features at ``motion_keypoint_indices``), applied to the
         motion-token slice with the motion linears. Every motion token is
-        anchored (no global tokens). No temporal hook — motion temporal is
-        post_decoder only.
+        anchored (no global tokens). The in-decoder temporal placements run
+        here after the anchored update (see the construction hook): both write
+        ONLY the motion slice back — `between_layers_cross` additionally READS
+        the frozen sam3d token block across the clip's frames, which the block
+        mask permits (motion is the last block) and which cannot move any frozen
+        output.
         """
         # Skip after the last layer (same pattern as force_token_update_fn)
         if layer_idx == len(decoder_layers) - 1:
@@ -2845,6 +2963,40 @@ class SAM3DBody(BaseModel):
             self.motion_posemb_linear, self.motion_feat_linear,
             image_embeddings, pose_output, token_embeddings, token_augment,
         )
+
+        # --- motion temporal hook (between_layers / between_layers_cross) ---
+        # Shared weights across the configured LAYERS (None = all intermediate
+        # layers 0..N-2). Rebuilt via cat (no in-place on graph tensors). Under
+        # a combined "<in_decoder>+post_decoder" placement the in-decoder module
+        # still lives at `motion_temporal`.
+        _mt = getattr(self, "motion_temporal", None)
+        _placements = getattr(
+            self, "motion_temporal_placement", "post_decoder").split("+")
+        _in_dec = [p for p in _placements if p != "post_decoder"]
+        if _mt is not None and _in_dec:
+            _placement = _in_dec[0]
+            _layers = getattr(self, "motion_temporal_layers", None)
+            if _layers is None or layer_idx in _layers:
+                _sl, _pos, _valid = self._contact_temporal_fields(batch)
+                _lo = motion_emb_start_idx
+                _hi = motion_emb_start_idx + self.num_motion_tokens
+                if _placement == "between_layers_cross":
+                    # KV = the ORIGINAL sam3d block only (everything before the
+                    # first appended extra block).
+                    _base_end = motion_emb_start_idx
+                    if self.cfg.MODEL.DECODER.get("DO_FORCE_TOKENS", False):
+                        _base_end -= self.num_force_tokens
+                    if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
+                        _base_end -= self.total_contact_tokens
+                    _updated = _mt(
+                        token_embeddings[:, _lo:_hi],
+                        token_embeddings[:, :_base_end], _sl, _pos, _valid)
+                else:
+                    _updated = _mt(token_embeddings[:, _lo:_hi], _sl, _pos, _valid)
+                token_embeddings = torch.cat(
+                    [token_embeddings[:, :_lo], _updated,
+                     token_embeddings[:, _hi:]], dim=1)
+        # --- end motion temporal hook ---
         return token_embeddings, token_augment, pose_output, layer_idx
 
     def keypoint_token_update_fn_hand(

@@ -122,7 +122,7 @@ def _resume_config_diffs(saved: dict, current: dict) -> list[str]:
     """Identity-defining config diffs for a resume candidate.
 
     Compared: ``model``, ``contact``, ``physics``, ``force_supervision``,
-    ``motion_supervision`` (whole sections), top-level ``loss`` (carries
+    ``motion_supervision``, ``pose_supervision`` (whole sections), top-level ``loss`` (carries
     ``grad_clip``), ``data.datasets``, ``data.sequence``, ``data.eval_split``,
     ``optim`` (minus ``epochs``) and ``output.monitor``. The two supervision
     sections define what the run is FITTING — the motion target convention,
@@ -143,7 +143,7 @@ def _resume_config_diffs(saved: dict, current: dict) -> list[str]:
 
     diffs: list[str] = []
     for section in ("model", "contact", "physics", "force_supervision",
-                    "motion_supervision", "loss"):
+                    "motion_supervision", "pose_supervision", "loss"):
         if _normalized(saved, section) != _normalized(current, section):
             diffs.append(f"  {section}: differs")
     for key in ("datasets", "sequence", "eval_split"):
@@ -362,6 +362,9 @@ class Trainer:
         self.motion_supervised = bool(self.cfg["motion_supervision"]["enabled"])
         self.motion_joint_names = tuple(
             self.cfg["motion_supervision"]["joint_names"] or MOTION_JOINT_NAMES)
+        self.motion_terms = ("vel", "acc") + (
+            ("ang_vel", "ang_acc")
+            if self.cfg["motion_supervision"].get("angular", False) else ())
         # Headline slot for the console line: the pelvis carries the pre-registered
         # bars, but a limb-only build must still print something.
         self.motion_headline_joint = (
@@ -379,6 +382,18 @@ class Trainer:
                 "model.motion_head.enabled requires motion_supervision.enabled=true "
                 "for training: without a motion objective the motion params never "
                 "receive gradients")
+
+        # Kindyn-MHR pseudo-GT pose objective (model.pose_temporal, E2).
+        self.pose_supervised = bool(self.cfg["pose_supervision"]["enabled"])
+        self.pose_loss = None
+        if self.pose_supervised:
+            from contact.pose_supervision import PoseSupervisedLoss
+            self.pose_loss = PoseSupervisedLoss(self.cfg, device=device)
+        elif self.cfg["model"]["pose_temporal"]["enabled"]:
+            raise ValueError(
+                "model.pose_temporal.enabled requires pose_supervision.enabled=true "
+                "for training: without a pose objective the pose_temporal params "
+                "never receive gradients")
 
         # Regime-(b) physics-gradient leak guard: the documented physics/contact
         # gradient isolation holds only in regime (a) (contact frozen). When physics
@@ -434,7 +449,8 @@ class Trainer:
         # RMSEs are minimised; the classification metrics (f1/iou/...) and the
         # motion vertical correlations are maximised.
         self.monitor_mode = (
-            "min" if (self.monitor.endswith(("/loss", "/physics_residual", "/force_mae"))
+            "min" if (self.monitor.endswith(("/loss", "/physics_residual",
+                                             "/force_mae", "/pose_mae"))
                       or "_rmse_" in self.monitor)
             else "max")
 
@@ -527,10 +543,13 @@ class Trainer:
         if getattr(self, "motion_supervised", False):
             valid |= {
                 f"{self.eval_split}/motion_{quantity}_{stat}_{suffix}"
-                for quantity in ("vel", "acc")
+                for quantity in getattr(self, "motion_terms", ("vel", "acc"))
                 for stat in ("vert_r", "r3d", "rmse")
                 for suffix in ("mean",) + tuple(self.motion_joint_names)
             }
+        if getattr(self, "pose_supervised", False):
+            valid |= {f"{self.eval_split}/pose_mae",
+                      f"{self.eval_split}/pose_acc_ratio"}
         if self.monitor not in valid:
             raise ValueError(
                 f"output.monitor {self.monitor!r} is not a valid metric; choose one of "
@@ -715,28 +734,38 @@ class Trainer:
         for name, term in motion_parts["terms"].items():
             scalars[f"{prefix}/motion/{name}"] = term["loss"]
             scalars[f"{prefix}/motion/{name}_mass"] = term["weight_mass"]
-        scalars[f"{prefix}/motion/vel_rmse"] = motion_parts["vel_rmse"]
-        scalars[f"{prefix}/motion/acc_rmse"] = motion_parts["acc_rmse"]
+            scalars[f"{prefix}/motion/{name}_rmse"] = motion_parts[f"{name}_rmse"]
         scalars[f"{prefix}/motion/n_outliers"] = motion_parts["n_outlier_excluded"]
         return scalars
 
     @staticmethod
-    def _motion_eval_metrics(stats: torch.Tensor, names: tuple[str, ...]) -> dict:
+    def _pose_scalars(prefix: str, pose_parts: dict) -> dict:
+        """Flatten PoseSupervisedLoss parts into ``{prefix}/pose/*`` scalars."""
+        scalars = {f"{prefix}/pose/loss": pose_parts["loss"],
+                   f"{prefix}/pose/mae": pose_parts["pose_mae"]}
+        for name, term in pose_parts["terms"].items():
+            scalars[f"{prefix}/pose/{name}"] = term["loss"]
+            scalars[f"{prefix}/pose/{name}_mass"] = term["weight_mass"]
+        return scalars
+
+    @staticmethod
+    def _motion_eval_metrics(stats: torch.Tensor, names: tuple[str, ...],
+                             terms: tuple[str, ...] = ("vel", "acc")) -> dict:
         """Global Pearson r + 3-D RMSE from all-reduced sufficient stats.
 
-        ``stats`` is the ``[2, K, 12]`` float64 accumulator (rows: vel, acc).
-        Entries are per-slot, carrying the ``names`` suffix — ``pelvis`` is the
-        one the pre-registered v1 bars are stated on. The pooled entries are
-        named ``*_mean`` precisely so a multi-joint average is never read against
-        a pelvis-only bar (the limb targets are 2-3x noisier). ``r3d`` is the
-        Pearson r pooled over the 3 target-axis components, ``vert_r`` the
-        world-vertical one.
+        ``stats`` is the ``[G, K, 12]`` float64 accumulator (rows: ``terms``,
+        the loss's term order). Entries are per-slot, carrying the ``names``
+        suffix — ``pelvis`` is the one the pre-registered v1 bars are stated on.
+        The pooled entries are named ``*_mean`` precisely so a multi-joint
+        average is never read against a pelvis-only bar (the limb targets are
+        2-3x noisier). ``r3d`` is the Pearson r pooled over the 3 target-axis
+        components, ``vert_r`` the world-vertical one.
         """
-        r = pearson_from_stats(stats)                     # [2, K]
-        r3d = pearson3d_from_stats(stats)                 # [2, K]
-        rmse = rmse_from_stats(stats)                     # [2, K]
+        r = pearson_from_stats(stats)                     # [G, K]
+        r3d = pearson3d_from_stats(stats)                 # [G, K]
+        rmse = rmse_from_stats(stats)                     # [G, K]
         out: dict[str, float] = {}
-        for i, quantity in enumerate(("vel", "acc")):
+        for i, quantity in enumerate(terms):
             out[f"{quantity}_vert_r_mean"] = float(torch.nanmean(r[i]))
             out[f"{quantity}_r3d_mean"] = float(torch.nanmean(r3d[i]))
             out[f"{quantity}_rmse_mean"] = float(
@@ -802,7 +831,8 @@ class Trainer:
             phys_parts = None
             force_parts = None
             motion_parts = None
-            physics_active = force_active = motion_active = False
+            pose_parts = None
+            physics_active = force_active = motion_active = pose_active = False
             total = (None if (self.freeze_contact or contact_loss is None)
                      else contact_loss)
             if self.physics_loss is not None:
@@ -823,17 +853,24 @@ class Trainer:
                 motion_scaled, motion_active = self._ddp_physics_loss(
                     motion_total, motion_parts)
                 total = motion_scaled if total is None else total + motion_scaled
+            if self.pose_loss is not None:
+                # Same (numerator, mass) term contract again.
+                pose_total, pose_parts = self.pose_loss(out, batch)
+                pose_scaled, pose_active = self._ddp_physics_loss(
+                    pose_total, pose_parts)
+                total = pose_scaled if total is None else total + pose_scaled
             if total is None:
                 raise RuntimeError(
                     "no training objective: the contact loss is frozen/absent and "
-                    "none of physics / force_supervision / motion_supervision is "
-                    "enabled")
+                    "none of physics / force_supervision / motion_supervision / "
+                    "pose_supervision is enabled")
 
             # A batch with zero active supervision (an all-invalid video window, or a
             # fully physics-ineligible clip) has zero gradient — but AdamW weight
             # decay would still nudge the weights. Skip the optimiser step for those.
             active = ((contact_active and not self.freeze_contact)
-                      or physics_active or force_active or motion_active)
+                      or physics_active or force_active or motion_active
+                      or pose_active)
             loss = total
             finite = torch.tensor(
                 int(bool(torch.isfinite(loss).item())), device=self.device,
@@ -907,6 +944,8 @@ class Trainer:
                     scalars.update(self._force_scalars("train", force_parts))
                 if motion_parts is not None:
                     scalars.update(self._motion_scalars("train", motion_parts))
+                if pose_parts is not None:
+                    scalars.update(self._pose_scalars("train", pose_parts))
                 self.logger.log(scalars, self.global_step)
 
             if self.is_main:
@@ -917,6 +956,8 @@ class Trainer:
                     postfix["fmae"] = f"{force_parts['force_mae']['loss']:.3f}"
                 elif motion_parts is not None:
                     postfix["arms"] = f"{motion_parts['acc_rmse']:.2f}"
+                elif pose_parts is not None:
+                    postfix["pmae"] = f"{pose_parts['pose_mae']:.4f}"
                 pbar.set_postfix(**postfix)
             self.global_step += 1
 
@@ -978,6 +1019,7 @@ class Trainer:
         # Motion: per-(quantity, joint) Pearson/RMSE sufficient statistics summed
         # in float64 over the split, then all-reduced once (exact global values).
         motion_stats = None
+        pose_stats = None
         for batch in tqdm(
             self.eval_loader, desc=self.eval_split, disable=not self.is_main,
         ):
@@ -1012,6 +1054,12 @@ class Trainer:
                 motion_stats = stats.clone() if motion_stats is None else motion_stats + stats
                 if self.loss_fn is None:
                     running_loss += motion_parts["loss"]
+            if self.pose_loss is not None:
+                _, pose_parts = self.pose_loss(out, batch)
+                stats = pose_parts["stats"]
+                pose_stats = stats.clone() if pose_stats is None else pose_stats + stats
+                if self.loss_fn is None:
+                    running_loss += pose_parts["loss"]
             for t in self.targets:
                 tgt = targets[t]
                 add_counts(counts[t], contact_counts(logits[t], tgt["gt"], tgt["mask"]))
@@ -1051,7 +1099,12 @@ class Trainer:
             if self.distributed:
                 dist.all_reduce(motion_stats, op=dist.ReduceOp.SUM)
             metrics["motion"] = self._motion_eval_metrics(
-                motion_stats, self.motion_joint_names)
+                motion_stats, self.motion_joint_names, self.motion_terms)
+        if pose_stats is not None:
+            from contact.pose_supervision import metrics_from_stats
+            if self.distributed:
+                dist.all_reduce(pose_stats, op=dist.ReduceOp.SUM)
+            metrics["pose"] = metrics_from_stats(pose_stats)
         return {"loss": running_loss / max(n, 1),
                 "metrics": metrics,
                 "per_output": {
@@ -1094,12 +1147,23 @@ class Trainer:
                     phys_note = f"  physics_residual {v['metrics']['physics']['residual']:.4f}"
                 if "force" in v["metrics"]:
                     phys_note += f"  force_mae {v['metrics']['force']['mae']:.4f}"
+                if "pose" in v["metrics"]:
+                    p = v["metrics"]["pose"]
+                    phys_note += (
+                        f"  pose[mae {p['mae']:.4f} rad  acc_rms "
+                        f"{p['acc_rms_pred']:.4f}/{p['acc_rms_gt']:.4f} "
+                        f"(x{p['acc_ratio']:.1f})  rows {int(p['n_rows'])}]")
                 if "motion" in v["metrics"]:
                     m = v["metrics"]["motion"]
                     j = self.motion_headline_joint
+                    ang_note = (
+                        f"wvel_r3d {m[f'ang_vel_r3d_{j}']:+.3f} "
+                        f"wacc_r3d {m[f'ang_acc_r3d_{j}']:+.3f} "
+                        if f"ang_vel_r3d_{j}" in m else "")
                     phys_note += (
                         f"  motion[{j} vel_r3d {m[f'vel_r3d_{j}']:+.3f} "
                         f"acc_r3d {m[f'acc_r3d_{j}']:+.3f} "
+                        f"{ang_note}"
                         f"acc_vert_r {m[f'acc_vert_r_{j}']:+.3f} | mean "
                         f"vel_rmse {m['vel_rmse_mean']:.3f} "
                         f"acc_rmse {m['acc_rmse_mean']:.2f} "

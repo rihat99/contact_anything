@@ -67,7 +67,7 @@ from contact.data.climbing_corpus import (
 from contact.data.collate import batch_to_device, make_collate
 from contact.engine import forward_model
 from contact.model import build_model
-from contact.motion_supervision import to_world_linear
+from contact.motion_supervision import to_world_angular, to_world_linear
 from contact.targets import TargetSpec
 
 #: Context radius of the v1 canonical row definition (T = 25 probe window).
@@ -108,6 +108,7 @@ def motion_supervision_source(cfg: dict, checkpoint: str | None) -> tuple[dict, 
     stored.setdefault("joint_names", None)
     stored.setdefault("root_convention", "rotated_world")
     stored.setdefault("target_smooth_sec", 0.0)
+    stored.setdefault("angular", False)
     # `loss` only supplies the outlier threshold, and evaluation never filters
     # outliers — but a checkpoint predating the sub-schema must not KeyError.
     stored["loss"] = {**cfg["motion_supervision"]["loss"], **(stored.get("loss") or {})}
@@ -144,6 +145,7 @@ def build_test_dataset(cfg: dict, ms: dict) -> ClimbingCorpusDataset:
         motion_root_convention=ms["root_convention"],
         motion_target_smooth_sec=float(ms["target_smooth_sec"]),
         motion_outlier_acc_ms2=float(ms["loss"]["outlier_acc_ms2"]),
+        motion_angular=bool(ms.get("angular", False)),
     )
 
 
@@ -217,7 +219,7 @@ def predict(model, loader, rows, seq_len, device: str) -> torch.Tensor:
         keys = batch.pop("keys")
         batch = batch_to_device(batch, device)
         out = forward_model(model, batch)
-        motion = out["motion"]["joint_motion"].float()                 # [B, K, 6]
+        motion = out["motion"]["joint_motion"].float()                 # [B, K, 6|12]
         n_clips = motion.shape[0] // seq_len
         rows_here = rows[cursor:cursor + n_clips]
         for i, (scene, person, frame) in enumerate(rows_here):
@@ -235,9 +237,15 @@ def predict(model, loader, rows, seq_len, device: str) -> torch.Tensor:
 
 
 def destandardize(pred: torch.Tensor, std_cfg: dict) -> torch.Tensor:
-    """Standardized head output ``(R, K, 6)`` -> physical target-frame units."""
-    mean = torch.tensor(std_cfg["mean"], dtype=torch.float32).reshape(1, -1, 6)
-    std = torch.tensor(std_cfg["std"], dtype=torch.float32).reshape(1, -1, 6)
+    """Standardized head output ``(R, K, 6|12)`` -> physical target-frame units.
+
+    The width follows the table: ``[K][2][3]`` (vel|acc) or ``[K][4][3]`` when
+    the checkpoint trained with ``motion_supervision.angular``.
+    """
+    mean = torch.tensor(std_cfg["mean"], dtype=torch.float32)
+    std = torch.tensor(std_cfg["std"], dtype=torch.float32)
+    mean = mean.reshape(1, mean.shape[0], -1)
+    std = std.reshape(1, std.shape[0], -1)
     return pred * std + mean
 
 
@@ -273,24 +281,33 @@ def score(
 ) -> dict:
     """Per-slot RMSE3D / GT RMS / pooled-3D r / world-vertical r / medians / slope.
 
-    ``pred``/``gt`` are physical, in target axes. The world-vertical statistics go
-    through :func:`to_world_linear` on BOTH sides, so a twist slot picks up its
-    ``omega x v`` term consistently.
+    ``pred``/``gt`` are physical, in target axes (6- or 12-wide; the angular
+    pair adds ``ang_vel``/``ang_acc`` sections). The world-vertical statistics
+    go through :func:`to_world_linear` on BOTH sides, so a twist slot picks up
+    its ``omega x v`` term; the angular pair converts with the plain rotation
+    (:func:`to_world_angular` — no Coriolis).
     """
-    pred_world = to_world_linear(pred[..., :3], pred[..., 3:], rot, omega, twist_slots)
-    gt_world = to_world_linear(gt[..., :3], gt[..., 3:], rot, omega, twist_slots)
+    pred_lin = to_world_linear(pred[..., 0:3], pred[..., 3:6], rot, omega, twist_slots)
+    gt_lin = to_world_linear(gt[..., 0:3], gt[..., 3:6], rot, omega, twist_slots)
+    terms = ("vel", "acc") if pred.shape[-1] == 6 else ("vel", "acc",
+                                                        "ang_vel", "ang_acc")
+    world = {"vel": (pred_lin[0], gt_lin[0]), "acc": (pred_lin[1], gt_lin[1])}
+    for j, name in enumerate(terms[2:]):
+        sl = slice(6 + 3 * j, 9 + 3 * j)
+        world[name] = (to_world_angular(pred[..., sl], rot),
+                       to_world_angular(gt[..., sl], rot))
     pred_np = pred.numpy().astype(np.float64)
     gt_np = gt.numpy().astype(np.float64)
     scenes = np.array([row[0] for row in rows])
     report: dict = {"n_rows": len(rows), "n_scenes": int(len(set(scenes)))}
-    for q, quantity in enumerate(("vel", "acc")):
-        sl = slice(0, 3) if quantity == "vel" else slice(3, 6)
+    for q, quantity in enumerate(terms):
+        sl = slice(3 * q, 3 * q + 3)
         per_joint = {}
         for k, name in enumerate(names):
             p = pred_np[:, k, sl]
             g = gt_np[:, k, sl]
-            p_vert = pred_world[q].numpy().astype(np.float64)[:, k, 1]
-            g_vert = gt_world[q].numpy().astype(np.float64)[:, k, 1]
+            p_vert = world[quantity][0].numpy().astype(np.float64)[:, k, 1]
+            g_vert = world[quantity][1].numpy().astype(np.float64)[:, k, 1]
             per_scene_vert, per_scene_3d = [], []
             for s in sorted(set(scenes)):
                 sel = scenes == s
@@ -317,7 +334,8 @@ def _median_finite(values: list[float]) -> float:
 
 
 def print_report(report: dict, names: tuple[str, ...], label: str = "") -> None:
-    for quantity in ("vel", "acc"):
+    for quantity in [q for q in ("vel", "acc", "ang_vel", "ang_acc")
+                     if q in report]:
         print(f"\n{quantity}{'  ' + label if label else ''}:")
         print(f"  {'slot':>12s}  {'rmse3d':>8s}  {'gt_rms':>8s}  {'r3d':>7s}  "
               f"{'r3d_med':>7s}  {'vert_r':>7s}  {'vr_med':>7s}  {'slope':>7s}")
@@ -448,10 +466,11 @@ def run_baselines(dataset, rows, gt, rot, omega, ms: dict, oracle: bool) -> dict
     # likewise nonzero rather than nan: a CONSTANT ROOT-FRAME vector still has a
     # varying world-vertical projection once the per-frame rotation is applied.
     # The same constant is scored against both target definitions.
+    width = gt_p.shape[-1]
     mean_row = torch.tensor(
-        ms["standardize"]["mean"], dtype=torch.float32).reshape(-1, 6)[k]
+        ms["standardize"]["mean"], dtype=torch.float32).reshape(-1, width)[k]
     out["rows"]["mean_prior"] = score(
-        mean_row.view(1, 1, 6).expand(len(rows), 1, 6).contiguous(),
+        mean_row.view(1, 1, width).expand(len(rows), 1, width).contiguous(),
         gt_p, rot, omega, twist_slots, ("pelvis",), rows)
     print_report(out["rows"]["mean_prior"], ("pelvis",), "mean_prior")
     sources = [("smooth", "pred_pelvis_world")]
@@ -459,11 +478,13 @@ def run_baselines(dataset, rows, gt, rot, omega, ms: dict, oracle: bool) -> dict
         sources.append(("gtsmooth", "pelvis_world"))
     for prefix, source in sources:
         for sigma in BASELINE_SIGMAS:
+            # Trajectory baselines are linear-only (the store has no root quats):
+            # score them against the linear half of an angular target.
             pred = trajectory_baselines(
                 dataset, rows, rot, omega, twist, source, sigma)
             key = f"{prefix}_sigma{sigma:g}"
             out["rows"][key] = score(
-                pred, gt_p, rot, omega, twist_slots, ("pelvis",), rows)
+                pred, gt_p[..., :6], rot, omega, twist_slots, ("pelvis",), rows)
             acc = out["rows"][key]["acc"]["pelvis"]
             vel = out["rows"][key]["vel"]["pelvis"]
             print(f"{key:<20s} acc r3d {acc['r3d']:+.4f} vert_r {acc['vert_r']:+.4f} "
@@ -541,7 +562,8 @@ def main() -> int:
         dataset._items = centered_items(dataset, rows)
         base_collate = make_collate(
             tuple(model.cfg.MODEL.IMAGE_SIZE), TargetSpec.from_config(cfg),
-            motion_joints=len(names))
+            motion_joints=len(names),
+            motion_dim=12 if ms.get("angular", False) else 6)
 
         def collate(items):
             out = base_collate(items)

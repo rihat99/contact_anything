@@ -209,8 +209,45 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
                 "mlp_ratio": float(mtcfg.get("mlp_ratio", 2.0)),
                 "position_scale": float(mtcfg.get("position_scale", 1.0)),
             }
+            # Added only when non-default (byte-stable signatures for every
+            # checkpoint written before the knob existed).
+            if str(mtcfg.get("kind", "attention")) != "attention":
+                sig_extra["motion_temporal"]["kind"] = str(mtcfg["kind"])
+            # Same rule for the in-decoder placements.
+            # The placement changes what the temporal weights mean — a
+            # post_decoder module must never silently load into a between-layers
+            # run — and for the in-decoder placements the layer set is part of
+            # that meaning too.
+            if str(mtcfg.get("placement", "post_decoder")) != "post_decoder":
+                sig_extra["motion_temporal"]["placement"] = str(mtcfg["placement"])
+                # Normalised: `layers: null` means all intermediate layers, so
+                # it must equal the explicit [0..4] spelling; sorted so order
+                # never splits identical architectures.
+                layers = mtcfg.get("layers", None)
+                sig_extra["motion_temporal"]["layers"] = (
+                    sorted(int(i) for i in layers) if layers is not None
+                    else [0, 1, 2, 3, 4])
+                # NOTE `attend` stays recorded even for between_layers_cross
+                # (where the module ignores it): the first xattn run's
+                # checkpoints already store it, and dropping it now would
+                # spuriously reject them. Keep cross configs at the default.
         else:
             sig_extra["motion_temporal"] = {"enabled": False}
+
+    # Pose-token temporal module (E2). Enabled-only, like `motion`: absent from
+    # every checkpoint written before it existed.
+    ptcfg = model_cfg.get("pose_temporal", {}) or {}
+    if ptcfg.get("enabled", False):
+        sig_extra["pose_temporal"] = {
+            "enabled": True,
+            "attend": str(ptcfg.get("attend", "per_token")),
+            "causal": bool(ptcfg.get("causal", False)),
+            "bottleneck_dim": int(ptcfg.get("bottleneck_dim", 256)),
+            "num_layers": int(ptcfg.get("num_layers", 2)),
+            "num_heads": int(ptcfg.get("num_heads", 4)),
+            "mlp_ratio": float(ptcfg.get("mlp_ratio", 2.0)),
+            "position_scale": float(ptcfg.get("position_scale", 30.0)),
+        }
 
     # Input conditioning (model.cond_input). Same enabled-only rule as `motion`:
     # every checkpoint written before it existed keeps a byte-identical stored
@@ -624,7 +661,7 @@ def initialize_common_contact(
             f"injection={src_injection!r} but the target uses "
             f"injection={tgt_injection!r}; the weights are shape-compatible yet "
             "semantically different")
-    for key in ("motion", "motion_temporal", "cond_input"):
+    for key in ("motion", "motion_temporal", "cond_input", "pose_temporal"):
         source_sig.pop(key, None)
         target_sig.pop(key, None)
     if source_sig != target_sig:

@@ -1,0 +1,106 @@
+# Motion E1c/d — corpus_motion_pelvis12_xattn_post. The COMBINED placement: the in-decoder
+# module of `climbing_corpus_motion_pelvis12_xattn.yaml` (layers 3-4, shared
+# weights) PLUS a separate post-decoder self-attention module
+# (`motion_temporal_post`, same hyperparameters). The single-placement runs
+# showed post_decoder > either in-decoder REPLACEMENT (canonical acc r3d
+# 0.343 vs 0.298/0.299; ang_vel 0.675 vs 0.432/0.236) — this run asks TRAM's
+# question instead: does in-decoder temporal ADD anything on top of the post
+# block (their patch-token + pose-level pairing was additive)?
+base: configs/base.yaml
+
+model:
+  motion_head:
+    enabled: true
+    motion_keypoint_indices: [9]      # one token: pelvis (left-hip anchor)
+  motion_temporal:
+    enabled: true
+    placement: between_layers_cross+post_decoder   # in-decoder reads + post self-attn
+    layers: [3, 4]                    # late hook sites (adapter-literature vote)
+    num_layers: 1                     # per hook call; 2 sites ~ the baseline's depth 2
+    num_heads: 4
+    mlp_ratio: 2.0
+    bottleneck_dim: 256
+    position_scale: 30.0              # 30-fps seconds -> well-separated frame offsets
+
+contact:
+  targets:
+    vertex: {enabled: false}
+    joint: {enabled: false}           # motion-only: no contact branch at all
+
+data:
+  datasets:
+    - {name: climbing_corpus, config: configs/datasets/climbing_corpus_motion.yaml}
+  eval_split: test                    # no val split: train on all 331 scenes
+  frames_per_batch: 35                # per GPU -> 5 clips x T=7
+  sequence: {frames_per_clip: 7, frame_stride: auto, jitter: true, target_frame: all}
+
+motion_supervision:
+  enabled: true
+  target_frame: all
+  joint_names: [pelvis]               # one slot; must match motion_keypoint_indices
+  root_convention: twist              # BVR body twist (see the v3 header)
+  angular: true                       # + body angular vel/acc -> 12-wide head/target
+  target_smooth_sec: 0.12             # fixed-SECONDS label bandwidth
+  loss:
+    vel: 1.0
+    acc: 1.0
+    ang_vel: 1.0
+    ang_acc: 1.0
+    huber_delta: 1.0
+    outlier_acc_ms2: 50.0             # unchanged: the cut stays on the LINEAR |acc|
+  # Measured on the 331 curated corpus-TRAIN scenes under THIS target definition
+  # (twist, smoothed 0.12 s, angular): target-valid frames minus the per-frame
+  # outlier bit (106,603 of 106,621 kept), float64 — same protocol as v3; the
+  # vel/acc rows reproduce v3's table exactly. Row = [[vel], [acc], [ang_vel],
+  # [ang_acc]] in root axes: m/s, m/s^2, rad/s, rad/s^2. The head is zero-init,
+  # so it starts by predicting exactly this mean.
+  standardize:
+    mean:
+      - [[-0.01741,  0.04905,  0.03804], [-0.00093, -0.03626, -0.01106],
+         [-0.01308,  0.00722, -0.00187], [-0.00788,  0.01342,  0.00159]]  # pelvis
+    std:
+      - [[ 0.29957,  0.35708,  0.30839], [ 1.24717,  1.34592,  1.23255],
+         [ 0.48509,  0.67971,  0.45959], [ 2.45224,  4.00013,  2.27487]]  # pelvis
+
+optim:
+  lr: 1.0e-4
+  warmup_epochs: 1
+  lr_min: 1.0e-6
+  epochs: 10
+
+logging:
+  tensorboard_metrics:
+  - train/loss
+  - train/lr
+  - train/grad_norm
+  - train/grad_norm_raw
+  - train/frames_per_sec
+  - train/motion/loss
+  - train/motion/vel
+  - train/motion/acc
+  - train/motion/ang_vel
+  - train/motion/ang_acc
+  - train/motion/vel_rmse
+  - train/motion/acc_rmse
+  - train/motion/ang_vel_rmse
+  - train/motion/ang_acc_rmse
+  - train/motion/n_outliers
+  - test/loss
+  - test/motion/vel_r3d_pelvis
+  - test/motion/acc_r3d_pelvis
+  - test/motion/ang_vel_r3d_pelvis
+  - test/motion/ang_acc_r3d_pelvis
+  - test/motion/vel_vert_r_pelvis
+  - test/motion/acc_vert_r_pelvis
+  - test/motion/vel_rmse_pelvis
+  - test/motion/acc_rmse_pelvis
+  - test/motion/ang_vel_rmse_pelvis
+  - test/motion/ang_acc_rmse_pelvis
+  - test/motion/n_rows
+
+output:
+  exp_name: corpus_motion_pelvis12_xattn_post
+  # Same monitor as v3: the LINEAR acceleration r3d, so checkpoint selection is
+  # comparable across the v3 -> v4 -> in-decoder ladder. Angular r3d is logged
+  # alongside and reported by the probe.
+  monitor: test/motion_acc_r3d_pelvis

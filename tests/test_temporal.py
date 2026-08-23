@@ -440,3 +440,85 @@ def test_bridge_carries_window_frames_to_yacs():
     mc.MODEL.MHR_HEAD = CN()
     _patch_model_cfg(mc, cfg, mhr_path="unused.pt")
     assert mc.MODEL.TEMPORAL.WINDOW_FRAMES == 5
+
+
+# ------------------------------------------------------------ TemporalCrossModule
+
+def _cross(dim=32, bottleneck=16, **kw):
+    from sam_3d_body.models.modules.temporal import TemporalCrossModule
+
+    return TemporalCrossModule(
+        dim=dim, num_layers=2, num_heads=4, mlp_ratio=2.0,
+        bottleneck_dim=bottleneck, **kw)
+
+
+def _cross_inputs(n_clips=2, seq_len=4, num_q=3, num_s=5, dim=32, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    b = n_clips * seq_len
+    tok = torch.randn(b, num_q, dim, generator=g)
+    src = torch.randn(b, num_s, dim, generator=g)
+    pos = (torch.arange(b, dtype=torch.float32) % seq_len) * 0.1
+    return tok, src, pos
+
+
+def test_cross_zero_gamma_is_exact_identity():
+    tok, src, pos = _cross_inputs()
+    for bottleneck in (16, None):
+        m = _cross(bottleneck=bottleneck)
+        out = m(tok, src, 4, pos, torch.ones(8, dtype=torch.bool))
+        assert torch.equal(out, tok)
+
+
+def test_cross_never_writes_the_source_and_reads_it():
+    """Randomized gammas: the output depends on the source (a read happened),
+    while the source tensor itself is untouched."""
+    m = _cross()
+    for p in m.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    tok, src, pos = _cross_inputs()
+    src_before = src.clone()
+    out_a = m(tok, src, 4, pos)
+    out_b = m(tok, src + 1.0, 4, pos)
+    assert torch.equal(src, src_before)
+    assert (out_a - out_b).abs().max() > 1e-4
+
+
+def test_cross_causal_blocks_future_source_frames():
+    """With causal=True, changing a LATER frame's source cannot change an
+    EARLIER frame's query output."""
+    m = _cross(causal=True)
+    for p in m.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    tok, src, pos = _cross_inputs(n_clips=1)
+    out = m(tok, src, 4, pos)
+    src2 = src.clone()
+    src2[3] += 10.0                                  # last frame's source only
+    out2 = m(tok, src2, 4, pos)
+    assert torch.allclose(out[:3], out2[:3], atol=1e-6)
+    assert (out[3] - out2[3]).abs().max() > 1e-4
+
+
+def test_cross_invalid_frame_keys_are_blocked():
+    """An invalid frame's source tokens must not influence any VALID frame's
+    query (the invalid frame itself keeps its self-diagonal — the NaN guard —
+    but its rows are excluded from every loss/metric anyway)."""
+    m = _cross()
+    for p in m.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    tok, src, pos = _cross_inputs(n_clips=1)
+    valid = torch.tensor([True, True, False, True])
+    out = m(tok, src, 4, pos, valid)
+    src2 = src.clone()
+    src2[2] += 10.0                                  # the invalid frame's source
+    out2 = m(tok, src2, 4, pos, valid)
+    keep = [0, 1, 3]
+    assert torch.allclose(out[keep], out2[keep], atol=1e-6)
+    assert (out[2] - out2[2]).abs().max() > 1e-4     # self-diagonal read
+
+
+def test_cross_t1_matches_single_frame():
+    """T=1 clips degrade to per-frame cross-attention with zero time PE."""
+    m = _cross()
+    tok, src, _ = _cross_inputs(n_clips=8, seq_len=1)
+    out = m(tok, src, 1, None, None)
+    assert torch.equal(out, tok)

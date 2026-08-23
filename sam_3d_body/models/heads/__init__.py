@@ -71,6 +71,7 @@ def build_head(cfg, head_type="mhr", enable_hand_model=False, default_scale_fact
             mlp_depth=motion_cfg.get("MLP_DEPTH", 2),
             mlp_channel_div_factor=motion_cfg.get("MLP_CHANNEL_DIV_FACTOR", 4),
             dropout=motion_cfg.get("DROPOUT", 0.0),
+            output_dims=motion_cfg.get("OUTPUT_DIMS", 6),
         )
     else:
         raise ValueError("Invalid head type: ", head_type)

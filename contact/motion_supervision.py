@@ -1,8 +1,10 @@
 """Supervised per-joint velocity/acceleration loss against kindyn ground truth.
 
-Reads ``out["motion"]["joint_motion"] (B, K, 6)`` — **standardized** root-frame
-linear velocity (``[..., 0:3]``) and acceleration (``[..., 3:6]``) — and the
-collated ``motion_gt (B, K, 6)`` / ``motion_valid (B)`` / ``motion_outlier
+Reads ``out["motion"]["joint_motion"] (B, K, 6|12)`` — **standardized**
+root-frame linear velocity (``[..., 0:3]``) and acceleration (``[..., 3:6]``),
+plus the root body angular velocity/acceleration (``[..., 6:12]``) when
+``motion_supervision.angular`` is on — and the
+collated ``motion_gt (B, K, 6|12)`` / ``motion_valid (B)`` / ``motion_outlier
 (B, K)`` / ``motion_rot (B, 3, 3)`` / ``motion_omega (B, 3)`` batch keys, whose
 slot order is ``motion_supervision.joint_names`` (default: all of
 :data:`~contact.data.climbing_corpus.MOTION_JOINT_NAMES` — ``left_wrist,
@@ -20,6 +22,8 @@ mean under DDP):
 - ``vel`` — smooth-L1 (Huber) between prediction and standardized GT, summed
   over the 3 components, on valid ``(frame, joint)`` entries.
 - ``acc`` — the same on the acceleration triple.
+- ``ang_vel`` / ``ang_acc`` — the same on the angular triples (``angular`` runs
+  only; pelvis-only twist targets).
 
 Per-joint standardization is what makes the two scales comparable: the wrists'
 root-frame acceleration std is ~2.5× the pelvis's, so a single global scaler
@@ -50,8 +54,13 @@ from torch import Tensor
 from .data.climbing_corpus import MOTION_JOINT_NAMES
 
 _TERM_NAMES = ("vel", "acc")
+#: Extra terms appended when ``motion_supervision.angular`` is on: the root
+#: slot's body angular velocity (``[..., 6:9]``, rad/s) and angular acceleration
+#: (``[..., 9:12]``, rad/s²), both straight from the SE3-log twist.
+_ANGULAR_TERM_NAMES = ("ang_vel", "ang_acc")
 
-#: Columns of the per-(quantity, joint) statistics tensor ``[2, K, 12]``. The
+#: Columns of the per-(quantity, joint) statistics tensor ``[G, K, 12]`` (rows
+#: follow the loss's ``term_names``: vel, acc[, ang_vel, ang_acc]). The
 #: ``*_vert`` block feeds the world-vertical Pearson r, the ``*_3d`` block the
 #: pooled 3-component Pearson r in target axes (its sample count is ``3 * n``).
 STAT_COLUMNS = ("n", "sum_pred_vert", "sum_gt_vert", "sum_pred_vert_sq",
@@ -80,6 +89,17 @@ def to_world_linear(
             torch.einsum("rij,rkj->rki", rot, acc))
 
 
+def to_world_angular(vec: Tensor, rot: Tensor) -> Tensor:
+    """Root-axis angular vel/acc ``(rows, K, 3)`` -> world axes.
+
+    Both are plain re-expressions: ``ω_world = R ω_body`` and, because
+    ``ω × ω = 0``, ``α_world = d/dt(R ω_body) = R α_body`` — no Coriolis term.
+
+    :param rot: ``(rows, 3, 3)`` world-from-root rotation.
+    """
+    return torch.einsum("rij,rkj->rki", rot, vec)
+
+
 class MotionSupervisedLoss:
     """GT vel/acc supervision for the motion-token branch.
 
@@ -102,17 +122,21 @@ class MotionSupervisedLoss:
         self.twist_slots = torch.tensor(
             [twist and name == "pelvis" for name in self.joint_names],
             dtype=torch.bool, device=device)
+        self.angular = bool(ms.get("angular", False))
+        self.term_names = _TERM_NAMES + (
+            _ANGULAR_TERM_NAMES if self.angular else ())
         loss_cfg = ms["loss"]
-        self.weights = {name: float(loss_cfg[name]) for name in _TERM_NAMES}
+        self.weights = {name: float(loss_cfg[name]) for name in self.term_names}
         self.huber_delta = float(loss_cfg["huber_delta"])
         self.device = torch.device(device)
         self.dtype = dtype
-        # [K, 2, 3] -> [1, K, 6] so it broadcasts over the row axis and lines up
-        # with the head's (vel | acc) output layout.
+        # [K, G, 3] -> [1, K, 3G] so it broadcasts over the row axis and lines up
+        # with the head's (vel | acc[ | ang_vel | ang_acc]) output layout.
+        width = 3 * len(self.term_names)
         mean = torch.tensor(ms["standardize"]["mean"], dtype=dtype)
         std = torch.tensor(ms["standardize"]["std"], dtype=dtype)
-        self.mean = mean.reshape(1, mean.shape[0], 6).to(self.device)
-        self.std = std.reshape(1, std.shape[0], 6).to(self.device)
+        self.mean = mean.reshape(1, mean.shape[0], width).to(self.device)
+        self.std = std.reshape(1, std.shape[0], width).to(self.device)
 
     def __call__(
         self, out: dict, batch: dict, exclude_outliers: bool = True,
@@ -125,28 +149,33 @@ class MotionSupervisedLoss:
         """Return ``(total, parts)``.
 
         :param out: forward output — reads ``out["motion"]["joint_motion"]
-            (B, K, 6)`` in standardized units (grads live).
-        :param batch: reads ``motion_gt (B, K, 6)`` (physical units),
+            (B, K, 6|12)`` in standardized units (grads live).
+        :param batch: reads ``motion_gt (B, K, 6|12)`` (physical units),
             ``motion_valid (B)``, ``motion_outlier (B, K)``,
             ``motion_rot (B, 3, 3)``, ``frame_valid (B)`` and ``seq_len``.
         :param exclude_outliers: apply the per-``(frame, joint)`` outlier bit.
             ``True`` in training, ``False`` at evaluation.
         :returns: ``(total, parts)`` where ``parts["terms"][name]`` carries
             ``weighted_numerator_tensor`` + ``weight_mass`` for exact DDP
-            reduction and ``parts["stats"]`` is the ``[2, K, 7]`` float64 tensor
-            of Pearson/RMSE sufficient statistics (rows: vel, acc).
+            reduction and ``parts["stats"]`` is the ``[G, K, 12]`` float64
+            tensor of Pearson/RMSE sufficient statistics (rows: ``term_names``).
         """
-        pred = out["motion"]["joint_motion"].to(self.device, self.dtype)   # (B, K, 6)
+        pred = out["motion"]["joint_motion"].to(self.device, self.dtype)   # (B, K, 6|12)
         # Graph-connected zero touching every motion param (DDP: they must stay
         # on the backward graph even when a batch has no supervised frames).
         zero_touch = pred.sum() * 0.0
 
-        gt = batch["motion_gt"].to(self.device, self.dtype)                # (B, K, 6)
+        gt = batch["motion_gt"].to(self.device, self.dtype)                # (B, K, 6|12)
         if pred.shape != gt.shape:
             raise ValueError(
                 f"motion prediction {tuple(pred.shape)} does not match GT "
                 f"{tuple(gt.shape)} — motion_keypoint_indices and the dataset's "
                 f"motion joints must agree")
+        if pred.shape[-1] != 3 * len(self.term_names):
+            raise ValueError(
+                f"motion prediction is {pred.shape[-1]}-wide but the loss has "
+                f"terms {self.term_names} — model.motion_head width and "
+                f"motion_supervision.angular must agree")
         if self.mean.shape[1] != pred.shape[1]:
             raise ValueError(
                 f"motion_supervision.standardize has {self.mean.shape[1]} joint "
@@ -181,11 +210,11 @@ class MotionSupervisedLoss:
 
         gt_std = (gt - self.mean) / self.std
         huber = F.smooth_l1_loss(
-            pred, gt_std, reduction="none", beta=self.huber_delta)        # (rows, K, 6)
+            pred, gt_std, reduction="none", beta=self.huber_delta)        # (rows, K, 6|12)
         mass = float(mask.sum())
         terms: dict[str, tuple[Tensor, float]] = {
-            "vel": ((huber[..., :3].sum(dim=-1) * mask).sum(), mass),
-            "acc": ((huber[..., 3:].sum(dim=-1) * mask).sum(), mass),
+            name: ((huber[..., 3 * i:3 * i + 3].sum(dim=-1) * mask).sum(), mass)
+            for i, name in enumerate(self.term_names)
         }
 
         diagnostics = self._diagnostics(
@@ -211,23 +240,28 @@ class MotionSupervisedLoss:
         its Coriolis term). Both predictions and GT go through the same
         conversion, so the comparison stays like-for-like.
         """
-        pred_phys = pred * self.std + self.mean                           # (rows, K, 6)
+        pred_phys = pred * self.std + self.mean                           # (rows, K, 6|12)
         weight = mask.to(torch.float64)                                   # (rows, K)
-        pred_world = to_world_linear(
-            pred_phys[..., :3], pred_phys[..., 3:], rot, omega, self.twist_slots)
-        gt_world = to_world_linear(
-            gt[..., :3], gt[..., 3:], rot, omega, self.twist_slots)
+        pred_lin = to_world_linear(
+            pred_phys[..., 0:3], pred_phys[..., 3:6], rot, omega, self.twist_slots)
+        gt_lin = to_world_linear(
+            gt[..., 0:3], gt[..., 3:6], rot, omega, self.twist_slots)
+        world = {"vel": (pred_lin[0], gt_lin[0]), "acc": (pred_lin[1], gt_lin[1])}
+        for j, name in enumerate(_ANGULAR_TERM_NAMES if self.angular else ()):
+            sl = slice(6 + 3 * j, 9 + 3 * j)
+            world[name] = (to_world_angular(pred_phys[..., sl], rot),
+                           to_world_angular(gt[..., sl], rot))
 
-        stats = torch.zeros(2, pred.shape[1], len(STAT_COLUMNS),
+        stats = torch.zeros(len(self.term_names), pred.shape[1], len(STAT_COLUMNS),
                             dtype=torch.float64, device=pred.device)
         rmse = {}
-        for i, name in enumerate(_TERM_NAMES):
-            sl = slice(0, 3) if name == "vel" else slice(3, 6)
+        for i, name in enumerate(self.term_names):
+            sl = slice(3 * i, 3 * i + 3)
             p = pred_phys[..., sl].to(torch.float64)                      # (rows, K, 3)
             g = gt[..., sl].to(torch.float64)
             # World y (down-positive) of the converted vectors.
-            p_vert = pred_world[i][..., 1].to(torch.float64)               # (rows, K)
-            g_vert = gt_world[i][..., 1].to(torch.float64)
+            p_vert = world[name][0][..., 1].to(torch.float64)              # (rows, K)
+            g_vert = world[name][1][..., 1].to(torch.float64)
             sq_err = ((p - g) ** 2).sum(dim=-1)                            # (rows, K)
             stats[i, :, 0] = weight.sum(dim=0)
             stats[i, :, 1] = (p_vert * weight).sum(dim=0)
@@ -268,7 +302,7 @@ class MotionSupervisedLoss:
         """
         parts_terms: dict[str, dict[str, Any]] = {}
         total: Tensor | None = None
-        for name in _TERM_NAMES:
+        for name in self.term_names:
             if self.weights[name] == 0.0:
                 continue
             raw, mass = terms[name]
@@ -335,6 +369,6 @@ def gt_rms3d_from_stats(stats: Tensor) -> Tensor:
         torch.full_like(n, float("nan")))
 
 
-__all__ = ["MotionSupervisedLoss", "to_world_linear", "pearson_from_stats",
-           "pearson3d_from_stats", "rmse_from_stats", "gt_rms3d_from_stats",
-           "STAT_COLUMNS"]
+__all__ = ["MotionSupervisedLoss", "to_world_linear", "to_world_angular",
+           "pearson_from_stats", "pearson3d_from_stats", "rmse_from_stats",
+           "gt_rms3d_from_stats", "STAT_COLUMNS"]

@@ -117,7 +117,7 @@ def test_root_body_twist_matches_better_robot_on_a_random_trajectory():
         dtype=torch.float64)).numpy()
     q_root = np.concatenate([pos, quat], -1)
 
-    vel, acc, omega = root_body_twist(q_root, dt)
+    vel, acc, omega, ang_acc = root_body_twist(q_root, dt)
     tensor_q = torch.tensor(q_root, dtype=torch.float64)
     diff = se3.log(se3.compose(se3.inverse(tensor_q[:-1]), tensor_q[1:])).numpy()
     vel_ref = np.zeros((n_frames, 6))
@@ -128,6 +128,7 @@ def test_root_body_twist_matches_better_robot_on_a_random_trajectory():
     assert np.abs(vel - vel_ref[:, :3]).max() < 1e-12
     assert np.abs(acc - acc_ref[:, :3]).max() < 1e-10
     assert np.abs(omega - vel_ref[:, 3:]).max() < 1e-12
+    assert np.abs(ang_acc - acc_ref[:, 3:]).max() < 1e-10
 
 
 @requires_corpus
@@ -139,7 +140,7 @@ def test_root_body_twist_matches_better_robot_on_a_real_scene():
     q_root, fps = _scene_q(scene)
     dt = 1.0 / fps
 
-    vel, acc, omega = root_body_twist(q_root, dt)
+    vel, acc, omega, ang_acc = root_body_twist(q_root, dt)
     tensor_q = torch.tensor(q_root, dtype=torch.float64)
     tensor_q[:, 3:] /= tensor_q[:, 3:].norm(dim=-1, keepdim=True)
     diff = se3.log(se3.compose(se3.inverse(tensor_q[:-1]), tensor_q[1:])).numpy()
@@ -151,6 +152,7 @@ def test_root_body_twist_matches_better_robot_on_a_real_scene():
     assert np.abs(vel - vel_ref[:, :3]).max() < 1e-9
     assert np.abs(acc - acc_ref[:, :3]).max() < 1e-6
     assert np.abs(omega - vel_ref[:, 3:]).max() < 1e-9
+    assert np.abs(ang_acc - acc_ref[:, 3:]).max() < 1e-6
 
 
 # ------------------------------------------------------------- convention behaviour
@@ -379,3 +381,47 @@ def test_bad_root_convention_rejected():
     with pytest.raises(ValueError, match="motion_root_convention must be"):
         ClimbingCorpusDataset(_CORPUS, scenes=[], split="train", load_motion=True,
                               motion_root_convention="world")
+
+
+# ------------------------------------------------------------------ angular loader
+
+@requires_corpus
+def test_angular_loader_appends_the_twist_angular_pair():
+    """``motion_angular`` widens ``motion_gt`` to 12 and fills the pelvis slot
+    with the twist's own angular components; the linear half is untouched."""
+    from contact.data.climbing_corpus import list_corpus_scenes
+
+    scene = list_corpus_scenes(_CORPUS, "train")[0]
+    kwargs = dict(
+        scenes=[scene], split="train", frames_per_clip=7, frame_stride=1,
+        jitter=False, load_motion=True, load_images=False,
+        motion_joint_names=("pelvis",), motion_root_convention="twist",
+        motion_target_smooth_sec=0.12)
+    ang = ClimbingCorpusDataset(_CORPUS, motion_angular=True, **kwargs)
+    lin = ClimbingCorpusDataset(_CORPUS, **kwargs)
+
+    data = ang._scenes[scene]
+    gt = data["motion_gt"]
+    assert gt.shape[-2:] == (1, 12)
+    valid = data["motion_valid"]
+    assert valid.any()
+    # Linear half identical to the 6-wide loader's output.
+    np.testing.assert_array_equal(gt[..., :6], lin._scenes[scene]["motion_gt"])
+    # The ang_vel slice IS the emitted body angular velocity, and the ang_acc
+    # slice carries real signal on valid frames.
+    np.testing.assert_allclose(
+        gt[..., 0, 6:9][valid], data["motion_omega"][valid], atol=1e-6)
+    assert np.abs(gt[..., 0, 9:12][valid]).max() > 0.0
+
+
+def test_angular_requires_twist_and_pelvis_only():
+    with pytest.raises(ValueError, match="motion_angular requires"):
+        ClimbingCorpusDataset(
+            _CORPUS, scenes=[], split="train", frames_per_clip=7, frame_stride=1,
+            load_motion=True, motion_joint_names=("pelvis",),
+            motion_root_convention="rotated_world", motion_angular=True)
+    with pytest.raises(ValueError, match="motion_angular requires"):
+        ClimbingCorpusDataset(
+            _CORPUS, scenes=[], split="train", frames_per_clip=7, frame_stride=1,
+            load_motion=True, motion_joint_names=("left_wrist", "pelvis"),
+            motion_root_convention="twist", motion_angular=True)

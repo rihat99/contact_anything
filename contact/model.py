@@ -92,6 +92,22 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
         "WINDOW_FRAMES": tcfg.get("window_frames", None),
     })
 
+    # Pose-token temporal module (E2). The DELIBERATE exception to the
+    # frozen-pose rule: when enabled, the final MHR output is recomputed from a
+    # temporally-mixed pose token (zero-init gates = frozen behavior at init).
+    ptcfg = cfg["model"].get("pose_temporal", {}) or {}
+    model_cfg.MODEL.POSE_TEMPORAL = CfgNode({
+        "ENABLED": bool(ptcfg.get("enabled", False)),
+        "BOTTLENECK_DIM": int(ptcfg.get("bottleneck_dim", 256)),
+        "NUM_LAYERS": int(ptcfg.get("num_layers", 2)),
+        "NUM_HEADS": int(ptcfg.get("num_heads", 4)),
+        "MLP_RATIO": float(ptcfg.get("mlp_ratio", 2.0)),
+        "ATTEND": str(ptcfg.get("attend", "per_token")),
+        "CAUSAL": bool(ptcfg.get("causal", False)),
+        "DROPOUT": float(ptcfg.get("dropout", 0.0)),
+        "POSITION_SCALE": float(ptcfg.get("position_scale", 30.0)),
+    })
+
     # Force head + tokens (steps 04+). Patched even when disabled so the model
     # config is self-describing; SAM3DBody only builds the force stack when
     # DO_FORCE_TOKENS. The `frame` key is consumed by the physics loss (step 06),
@@ -137,18 +153,29 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
     mhcfg = cfg["model"].get("motion_head", {}) or {}
     motion_kp = mhcfg.get("motion_keypoint_indices") or []
     model_cfg.MODEL.DECODER.DO_MOTION_TOKENS = bool(mhcfg.get("enabled", False))
+    # Head width follows the supervision target: 12 when the angular pair is on.
+    motion_angular = bool(
+        cfg.get("motion_supervision", {}).get("angular", False))
     model_cfg.MODEL.MOTION_HEAD = CfgNode({
         "KEYPOINT_INDICES":       [int(i) for i in motion_kp],
         "MLP_DEPTH":              int(mhcfg.get("mlp_depth", 2)),
         "MLP_CHANNEL_DIV_FACTOR": int(mhcfg.get("mlp_channel_div_factor", 4)),
         "DROPOUT":                float(mhcfg.get("dropout", 0.0)),
+        "OUTPUT_DIMS":            12 if motion_angular else 6,
     })
 
-    # Motion temporal module: a third ContactTemporalModule over the motion
-    # tokens, post_decoder only (no PLACEMENT key — it is fixed).
+    # Motion temporal module over the motion tokens. PLACEMENT: post_decoder
+    # (v3 default), between_layers (same self-attention inside the decoder loop)
+    # or between_layers_cross (motion queries read the frozen sam3d block across
+    # the clip's frames). LAYERS restricts the in-decoder placements to a subset
+    # of the intermediate layers (null = all of 0..4).
     mtcfg = cfg["model"].get("motion_temporal", {}) or {}
+    mt_layers = mtcfg.get("layers", None)
     model_cfg.MODEL.MOTION_TEMPORAL = CfgNode({
         "ENABLED": bool(mtcfg.get("enabled", False)),
+        "PLACEMENT": str(mtcfg.get("placement", "post_decoder")),
+        "LAYERS": None if mt_layers is None else [int(i) for i in mt_layers],
+        "KIND": str(mtcfg.get("kind", "attention")),
         "BOTTLENECK_DIM": int(mtcfg.get("bottleneck_dim", 256)),
         "NUM_LAYERS": int(mtcfg.get("num_layers", 1)),
         "NUM_HEADS": int(mtcfg.get("num_heads", 4)),
@@ -201,9 +228,12 @@ def _trainable_name_filter(name: str) -> bool:
     """Train the contact, force and motion pipelines only: their tokens, heads,
     and the small posemb / feat projection layers that update the tokens between
     decoder layers (all of which contain ``contact``, ``force`` or ``motion`` in
-    the dotted name)."""
+    the dotted name) — plus ``pose_temporal``, the ONE deliberate exception that
+    is allowed to move the frozen pose outputs (E2; ``head_pose`` itself never
+    matches, the substring check is on the full module name)."""
     lname = name.lower()
-    return "contact" in lname or "force" in lname or "motion" in lname
+    return ("contact" in lname or "force" in lname or "motion" in lname
+            or "pose_temporal" in lname)
 
 
 def _subtree_requires_grad(module: nn.Module) -> Tuple[bool, bool]:

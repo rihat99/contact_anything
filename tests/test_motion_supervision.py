@@ -258,3 +258,82 @@ def test_twist_slot_gets_the_coriolis_term():
     assert float(rotated["stats"][1, 2, 2]) == pytest.approx(0.0)
     # The objective itself is frame-free, so the loss is identical either way.
     assert twist["loss"] == pytest.approx(rotated["loss"])
+
+
+# ------------------------------------------------------------------ angular (12-dim)
+
+
+def make_angular_cfg(**loss_overrides) -> dict:
+    """Pelvis-only twist config with the angular pair enabled (K=1, G=4)."""
+    cfg = make_cfg(**loss_overrides)
+    ms = cfg["motion_supervision"]
+    ms["joint_names"] = ["pelvis"]
+    ms["angular"] = True
+    ms["standardize"] = {"mean": [[[0.0] * 3] * 4], "std": [[[1.0] * 3] * 4]}
+    ms["loss"].setdefault("ang_vel", 1.0)
+    ms["loss"].setdefault("ang_acc", 1.0)
+    return cfg
+
+
+def make_angular_batch(n_rows: int, gt: torch.Tensor, omega=None) -> dict:
+    return {
+        "motion_gt": gt,
+        "motion_valid": torch.ones(n_rows, dtype=torch.bool),
+        "motion_outlier": torch.zeros(n_rows, 1, dtype=torch.bool),
+        "motion_rot": torch.eye(3).expand(n_rows, 3, 3).contiguous(),
+        "motion_omega": torch.zeros(n_rows, 3) if omega is None else omega,
+        "frame_valid": torch.ones(n_rows, dtype=torch.bool),
+        "seq_len": 1,
+    }
+
+
+def test_angular_terms_and_exact_values():
+    """Four terms in twist order, [4, 1, 12] stats, hand-computed Huber."""
+    loss_fn = MotionSupervisedLoss(make_angular_cfg(), device="cpu")
+    assert loss_fn.term_names == ("vel", "acc", "ang_vel", "ang_acc")
+    pred = torch.zeros(2, 1, 12)
+    pred[0, 0, 6] = 0.5                              # ang_vel error (quadratic branch)
+    pred[1, 0, 11] = 3.0                             # ang_acc error (linear branch)
+    total, parts = loss_fn(
+        out_for(pred), make_angular_batch(2, torch.zeros(2, 1, 12)))
+    assert tuple(parts["terms"]) == ("vel", "acc", "ang_vel", "ang_acc")
+    assert parts["stats"].shape == (4, 1, 12)
+    # smooth_l1 beta=1: 0.5*0.5^2 = 0.125; 3.0 - 0.5 = 2.5. Mass = 2 rows x 1 slot.
+    assert math.isclose(parts["terms"]["ang_vel"]["loss"], 0.125 / 2.0, rel_tol=1e-6)
+    assert math.isclose(parts["terms"]["ang_acc"]["loss"], 2.5 / 2.0, rel_tol=1e-6)
+    assert math.isclose(float(total), (0.125 + 2.5) / 2.0, rel_tol=1e-6)
+    for name in ("vel", "acc", "ang_vel", "ang_acc"):
+        assert f"{name}_rmse" in parts
+
+
+def test_angular_world_stats_have_no_coriolis():
+    """ω/α convert with a plain rotation while the linear acc keeps its Coriolis.
+
+    Identity rotation, ``omega = e_z``, linear vel ``e_x``: the LINEAR world
+    acceleration picks up ``ω × v = e_y`` (vertical +1). ``ang_vel = 2 e_x``
+    would leak ``ω × ang_vel = 2 e_y`` into a wrongly-Coriolis'd angular
+    acceleration; the correct plain rotation leaves its vertical at exactly 3.
+    """
+    loss_fn = MotionSupervisedLoss(make_angular_cfg(), device="cpu")
+    gt = torch.zeros(1, 1, 12)
+    gt[0, 0, 0] = 1.0                                # lin vel root-x
+    gt[0, 0, 6] = 2.0                                # ang vel root-x
+    gt[0, 0, 10] = 3.0                               # ang acc root-y (vertical)
+    omega = torch.tensor([[0.0, 0.0, 1.0]])
+    _, parts = loss_fn(
+        out_for(torch.zeros(1, 1, 12)), make_angular_batch(1, gt, omega=omega))
+    stats = parts["stats"]                           # [4, 1, 12]
+    assert float(stats[1, 0, 2]) == pytest.approx(1.0)   # lin acc vert: Coriolis
+    assert float(stats[2, 0, 2]) == pytest.approx(0.0)   # ang vel vert: plain R
+    assert float(stats[3, 0, 2]) == pytest.approx(3.0)   # ang acc vert: plain R
+    # Pooled 3-component sums see the raw target axes either way.
+    assert float(stats[2, 0, 8]) == pytest.approx(2.0)
+    assert float(stats[3, 0, 8]) == pytest.approx(3.0)
+
+
+def test_angular_width_mismatch_raises():
+    """A 6-wide prediction against the 4-term loss is a config drift, not a crash."""
+    loss_fn = MotionSupervisedLoss(make_angular_cfg(), device="cpu")
+    with pytest.raises(ValueError, match="angular"):
+        loss_fn(out_for(torch.zeros(1, 1, 6)),
+                make_angular_batch(1, torch.zeros(1, 1, 6)))

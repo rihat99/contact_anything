@@ -133,12 +133,30 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
      `contact/force_supervision.py` trains against the corpus `kindyn_1.npz` GT forces —
      body-weight units, body-root frame, no extrinsics anywhere in the objective.
    Full formulation, frames, and conventions: `docs/forces.md`.
+6. **Motion head** (`model.motion_head`, optional) — anchored motion tokens regressing
+   standardized root-frame vel/acc per slot, `out["motion"]["joint_motion"] [B,K,6|12]`
+   (12 with `motion_supervision.angular`: + the root twist's angular vel/acc). The
+   `model.motion_temporal` module has three placements: `post_decoder` (default),
+   `between_layers` (in-decoder self-attn at `layers`, shared weights) and
+   `between_layers_cross` (a `TemporalCrossModule`: motion queries read the FROZEN sam3d
+   token block of every clip frame inside the decoder loop — writes only the motion slice,
+   invariance test-enforced). Supervision: `motion_supervision` (kindyn twist targets,
+   σ0.12 s label smoothing, pelvis-only for angular).
+7. **Pose temporal** (`model.pose_temporal`, optional; E2) — the ONE deliberate exception to
+   the frozen-pose rule: a zero-gated temporal module on the pose token (index 0) after the
+   decoder; the FINAL MHR output is recomputed from the updated token (interm preds and all
+   other token blocks see the untouched one). Supervised by `pose_supervision` against
+   kindyn-MHR pseudo-GT (`scripts/convert_kindyn_to_mhr.py` writes `mhr_1.npz` per scene —
+   the kindyn SMPL-X trajectory refit as a world-frame MHR `q`, ~0.5 cm joint residual),
+   compared in q space (125 local channels; the free-flyer root is never supervised).
 
 ### Invariants (do not break)
 
-- **Freeze filter is name-based**: only params whose dotted name contains `"contact"`, `"force"`
-  **or** `"motion"` train (tokens, heads, posemb/feat linears, `contact_temporal*`, `force_*`,
-  `motion_*`). Any new trainable module must carry one of those in its attribute path.
+- **Freeze filter is name-based**: only params whose dotted name contains `"contact"`, `"force"`,
+  `"motion"` **or** `"pose_temporal"` train (tokens, heads, posemb/feat linears,
+  `contact_temporal*`, `force_*`, `motion_*`, `pose_temporal`). Any new trainable module must
+  carry one of those in its attribute path. `pose_temporal` is the ONE name allowed to move the
+  frozen pose outputs (`head_pose` itself never matches the substring).
 - **Mask invariant**: no earlier token block attends a later one — original ⊥ {contact, force,
   motion}, contact ⊥ {force, motion}, force ⊥ motion. Later blocks attend everything before them,
   so contact/MHR outputs have an exactly-zero Jacobian w.r.t. every force **and motion** param
@@ -175,6 +193,9 @@ Key sections (see `configs/base.yaml` for full commented defaults):
 | `model.force_head` / `model.force_temporal` | force branch: enabled, `frame: local_world_aligned|local|root`, `force_keypoint_indices` (null = inherit contact anchors; explicit list enables force-only builds), MLP; force temporal (post_decoder only) |
 | `physics` | RNEA loss: enabled, MHR `model_path`/`lod`, `gravity`, `min_frames`, `smoothing_kernel`, per-term `loss.*` weights (all dimensionless) |
 | `force_supervision` | supervised kindyn GT-force loss (exclusive with `physics`): `target_frame`, Huber `force`/`huber_delta_bw`, `outlier_bw` cut, `noncontact` L1 |
+| `model.motion_head` / `model.motion_temporal` | motion tokens: explicit anchors; temporal `placement: post_decoder|between_layers|between_layers_cross` + `layers` (in-decoder hook sites) |
+| `motion_supervision` | kindyn twist vel/acc loss: `joint_names`, `root_convention`, `angular` (12-dim root target), `target_smooth_sec`, standardize `[K][2|4][3]` |
+| `model.pose_temporal` / `pose_supervision` | E2 pose branch: zero-gated pose-token temporal module + kindyn-MHR pseudo-GT q-space Huber (`mhr_1.npz` via `scripts/convert_kindyn_to_mhr.py`) |
 | `train.freeze_contact` | regime (a): freeze contact, train force only (requires `model.init_contact_checkpoint`) |
 | `contact.topology` | `smpl` / `smplx` (`mhr` → NotImplementedError) |
 | `contact.targets.vertex/joint` | enabled, weight, loss params, `joint_set`, subset masking, `derive_from_vertex`, confidence weights |

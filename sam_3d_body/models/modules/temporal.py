@@ -37,6 +37,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def sinusoidal_time_encoding(
@@ -459,3 +460,305 @@ class ContactTemporalModule(nn.Module):
         delta = (self.img_gamma * delta).transpose(1, 2).view(
             b_flat, Cimg, H, W)
         return image_embeddings + delta
+
+
+class _TemporalCrossBlock(nn.Module):
+    """Pre-LN CROSS-attention block with zero-initialised residual gates.
+
+    ``x -> x + gamma_attn * MHA(q=LN(x)+pe_q, k=LN(kv)+pe_k, v=LN(kv));
+    x -> x + gamma_ffn * FFN(LN(x))``. Both gammas start at zero, so the block
+    is an exact identity at init; ``kv`` is read, never written.
+    """
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float):
+        super().__init__()
+        self.norm_attn = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.gamma_attn = nn.Parameter(torch.zeros(dim))
+
+        hidden = int(dim * mlp_ratio)
+        self.norm_ffn = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim),
+            nn.Dropout(dropout),
+        )
+        self.gamma_ffn = nn.Parameter(torch.zeros(dim))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv: torch.Tensor,
+        pe_q: torch.Tensor,
+        pe_k: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        normed_kv = self.norm_kv(kv)
+        attn_out, _ = self.attn(
+            self.norm_attn(x) + pe_q, normed_kv + pe_k, normed_kv,
+            attn_mask=attn_mask, need_weights=False,
+        )
+        x = x + self.gamma_attn * attn_out
+        x = x + self.gamma_ffn * self.ffn(self.norm_ffn(x))
+        return x
+
+
+class TemporalCrossModule(nn.Module):
+    """Cross-frame CROSS-attention: a token stream reads a source block over time.
+
+    Queries are an auxiliary stream's tokens per frame (``[B_flat, K, C]``,
+    clip-major/frame-minor like :class:`ContactTemporalModule`); keys/values are
+    a SOURCE token slice ``[B_flat, S, C]`` — e.g. the frozen sam3d block —
+    reshaped so each query sees the source tokens of ALL visible frames of its
+    clip (``T*S`` keys). Only the query slice is returned; the source is never
+    written, so the decoder's block-mask invariant holds by construction and the
+    frozen outputs keep an exactly-zero Jacobian w.r.t. every parameter here.
+
+    Zero-init per-channel gates plus the bias-free adapter out-projection make
+    the module an exact identity at init. The sinusoidal encoding of real
+    elapsed seconds (``frame_pos_sec`` × ``position_scale``, on q/k only) keeps
+    it order-aware; signed differences across frames are representable because
+    the per-channel gates and the head out-projection carry signs.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_layers: int = 1,
+        num_heads: int = 4,
+        mlp_ratio: float = 2.0,
+        causal: bool = False,
+        dropout: float = 0.0,
+        bottleneck_dim: Optional[int] = 256,
+        position_scale: float = 1.0,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = int(num_heads)
+        self.causal = bool(causal)
+        self.position_scale = float(position_scale)
+        if not math.isfinite(self.position_scale) or self.position_scale <= 0:
+            raise ValueError("position_scale must be finite and positive")
+
+        self.bottleneck_dim = int(dim if bottleneck_dim is None else bottleneck_dim)
+        block_dim = self.bottleneck_dim
+        if block_dim != dim:
+            self.token_in_proj = nn.Linear(dim, block_dim)
+            self.source_in_proj = nn.Linear(dim, block_dim)
+            # Bias-free so a zero temporal delta maps to an exact zero and the
+            # complete adapter remains bitwise identity at initialization.
+            self.token_out_proj = nn.Linear(block_dim, dim, bias=False)
+
+        self.blocks = nn.ModuleList(
+            _TemporalCrossBlock(block_dim, num_heads, mlp_ratio, dropout)
+            for _ in range(num_layers)
+        )
+
+    def _attn_mask(
+        self,
+        seq_len: int,
+        frame_valid: Optional[torch.Tensor],
+        n_clips: int,
+        per_query: int,
+        per_key: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Frame visibility expanded to the asymmetric ``[T*K, T*S]`` grid.
+
+        :returns: bool mask ``[n_clips * num_heads, T*K, T*S]`` (``True`` =
+            blocked) or ``None`` when non-causal and every frame is valid.
+        """
+        if frame_valid is None:
+            valid = torch.ones(n_clips, seq_len, dtype=torch.bool, device=device)
+        else:
+            valid = frame_valid.to(device=device, dtype=torch.bool).view(
+                n_clips, seq_len)
+        if not self.causal and bool(valid.all()):
+            return None
+        allowed = torch.stack(
+            [frame_visibility(seq_len, valid[c], self.causal)
+             for c in range(n_clips)], dim=0)             # [n_clips, T, T]
+        allowed = allowed.repeat_interleave(per_query, dim=1).repeat_interleave(
+            per_key, dim=2)                               # [n_clips, T*K, T*S]
+        return (~allowed).repeat_interleave(self.num_heads, dim=0)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        source: torch.Tensor,
+        seq_len: int,
+        frame_pos_sec: Optional[torch.Tensor] = None,
+        frame_valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return the updated query slice ``[B_flat, K, C]``.
+
+        :param tokens: query stream ``[B_flat, K, C]``, clip-major/frame-minor.
+        :param source: read-only source slice ``[B_flat, S, C]``.
+        :param seq_len: frames per clip ``T``; ``B_flat % T == 0``.
+        :param frame_pos_sec: elapsed seconds per flattened frame ``[B_flat]``.
+        :param frame_valid: per-frame validity ``[B_flat]``.
+        """
+        b_flat, num_q, dim = tokens.shape
+        assert dim == self.dim, f"token dim {dim} != configured {self.dim}"
+        assert source.shape[0] == b_flat and source.shape[2] == dim, (
+            f"source {tuple(source.shape)} does not match tokens "
+            f"{tuple(tokens.shape)}")
+        assert b_flat % seq_len == 0, (
+            f"flat batch {b_flat} not divisible by seq_len {seq_len}")
+        n_clips = b_flat // seq_len
+        num_k = source.shape[1]
+
+        if hasattr(self, "token_in_proj"):
+            working_q = self.token_in_proj(tokens)
+            working_kv = self.source_in_proj(source)
+        else:
+            working_q, working_kv = tokens, source
+        block_dim = working_q.shape[-1]
+
+        # reshape, not view: in the decoder hook the inputs are narrow slices of
+        # the full token sequence, whose strides make the frame/token merge
+        # non-viewable when no bottleneck projection re-materialised them.
+        q = working_q.reshape(n_clips, seq_len * num_q, block_dim)
+        kv = working_kv.reshape(n_clips, seq_len * num_k, block_dim)
+        frame_pe = self._pos_emb(
+            frame_pos_sec, seq_len, n_clips, block_dim, tokens.device, q.dtype)
+        pe_q = frame_pe.unsqueeze(2).expand(-1, -1, num_q, -1).reshape(
+            n_clips, seq_len * num_q, block_dim)
+        pe_k = frame_pe.unsqueeze(2).expand(-1, -1, num_k, -1).reshape(
+            n_clips, seq_len * num_k, block_dim)
+        mask = self._attn_mask(
+            seq_len, frame_valid, n_clips, num_q, num_k, tokens.device)
+
+        out = q
+        for block in self.blocks:
+            out = block(out, kv, pe_q, pe_k, mask)
+        out = out.reshape(b_flat, num_q, block_dim)
+
+        if hasattr(self, "token_out_proj"):
+            # The blocks are exact identities while their gammas are zero.
+            # Project only their delta, not the token itself.
+            return tokens + self.token_out_proj(out - working_q)
+        return out
+
+    # Reuse the sibling module's per-frame time encoding (identical semantics).
+    _pos_emb = ContactTemporalModule._pos_emb
+
+
+class _TemporalConvBlock(nn.Module):
+    """Pre-LN depthwise temporal-conv block with zero-initialised gates.
+
+    ``x -> x + gamma_conv * PW(GELU(DWConv_time(LN(x))));
+    x -> x + gamma_ffn * FFN(LN(x))``. The depthwise kernel spans ``kernel``
+    frames, so a signed finite-difference stencil is directly representable —
+    the capability softmax attention lacks (convex combinations only).
+    """
+
+    def __init__(self, dim: int, kernel: int, mlp_ratio: float, dropout: float,
+                 causal: bool):
+        super().__init__()
+        self.kernel = int(kernel)
+        self.causal = bool(causal)
+        self.norm_conv = nn.LayerNorm(dim)
+        self.conv = nn.Conv1d(dim, dim, self.kernel, groups=dim)
+        self.pw = nn.Linear(dim, dim)
+        self.gamma_conv = nn.Parameter(torch.zeros(dim))
+
+        hidden = int(dim * mlp_ratio)
+        self.norm_ffn = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim),
+            nn.Dropout(dropout),
+        )
+        self.gamma_ffn = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``x [rows, T, C]`` (rows = clip x slot sequences)."""
+        h = self.norm_conv(x).transpose(1, 2)             # [rows, C, T]
+        pad = (self.kernel - 1, 0) if self.causal else (
+            self.kernel // 2, self.kernel - 1 - self.kernel // 2)
+        h = self.conv(F.pad(h, pad)).transpose(1, 2)      # [rows, T, C]
+        x = x + self.gamma_conv * self.pw(F.gelu(h))
+        x = x + self.gamma_ffn * self.ffn(self.norm_ffn(x))
+        return x
+
+
+class TemporalConvModule(nn.Module):
+    """Temporal 3-tap convolution over a token stream (post_decoder only).
+
+    The derivative-friendly alternative to temporal attention: each token slot
+    is convolved along the clip's TIME axis (depthwise, kernel 3 — sufficient
+    for short clips per the ZeroI2V ablation), so signed cross-frame stencils
+    are in the hypothesis class. Zero-init per-channel gates (plus the
+    bias-free adapter out-projection) keep init behavior exactly frozen.
+
+    Index-based taps deliberately carry no time encoding: the stride-auto
+    loader already normalises the physical frame spacing. Zero padding at the
+    clip edges; invalid frames' features are zeroed before the conv (corpus
+    windows never contain one — this is a guard, not a modelled case).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_layers: int = 1,
+        kernel: int = 3,
+        mlp_ratio: float = 2.0,
+        causal: bool = False,
+        dropout: float = 0.0,
+        bottleneck_dim: Optional[int] = 256,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.bottleneck_dim = int(dim if bottleneck_dim is None else bottleneck_dim)
+        block_dim = self.bottleneck_dim
+        if block_dim != dim:
+            self.token_in_proj = nn.Linear(dim, block_dim)
+            # Bias-free so a zero temporal delta maps to an exact zero.
+            self.token_out_proj = nn.Linear(block_dim, dim, bias=False)
+        self.blocks = nn.ModuleList(
+            _TemporalConvBlock(block_dim, kernel, mlp_ratio, dropout, causal)
+            for _ in range(num_layers)
+        )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        seq_len: int,
+        frame_pos_sec: Optional[torch.Tensor] = None,
+        frame_valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """``tokens [B_flat, K, C]`` clip-major/frame-minor -> same shape.
+
+        ``frame_pos_sec`` is accepted for hook-signature parity and unused.
+        """
+        b_flat, num_k, dim = tokens.shape
+        assert dim == self.dim, f"token dim {dim} != configured {self.dim}"
+        assert b_flat % seq_len == 0, (
+            f"flat batch {b_flat} not divisible by seq_len {seq_len}")
+        n_clips = b_flat // seq_len
+
+        working = (self.token_in_proj(tokens)
+                   if hasattr(self, "token_in_proj") else tokens)
+        block_dim = working.shape[-1]
+        if frame_valid is not None and not bool(frame_valid.all()):
+            keep = frame_valid.to(working.dtype).view(b_flat, 1, 1)
+            working = working * keep
+        x = working.reshape(n_clips, seq_len, num_k, block_dim)
+        x = x.permute(0, 2, 1, 3).reshape(n_clips * num_k, seq_len, block_dim)
+        for block in self.blocks:
+            x = block(x)
+        x = x.reshape(n_clips, num_k, seq_len, block_dim).permute(0, 2, 1, 3)
+        x = x.reshape(b_flat, num_k, block_dim)
+
+        if hasattr(self, "token_out_proj"):
+            # Blocks are exact identities at zero gammas; project the delta only.
+            return tokens + self.token_out_proj(x - working)
+        return x
