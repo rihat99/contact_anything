@@ -52,7 +52,7 @@ contact:
 
 
 def test_pose_supervision_requires_pose_temporal(tmp_path):
-    with pytest.raises(ValueError, match="requires model.pose_temporal.enabled"):
+    with pytest.raises(ValueError, match="requires a trainable pose path"):
         load_config(_write(tmp_path, """
 base: configs/base.yaml
 pose_supervision: {enabled: true}

@@ -329,7 +329,7 @@ def test_contact_gate_wires_final_force_output():
 
     torch.manual_seed(0)
     cfg = load_config(
-        os.path.join(REPO, "configs", "climbing_corpus_joint_force_gated.yaml"))
+        os.path.join(REPO, "configs", "climbing_corpus_joint_force_cond_sum1_postdec.yaml"))
     model, _ = build_model(cfg, "cuda")
     model.eval()
     try:

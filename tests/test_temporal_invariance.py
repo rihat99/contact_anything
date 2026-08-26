@@ -14,7 +14,7 @@ it (two disabled passes), then require that
 * non-zero-gamma contact logits move by **orders of magnitude** more than the floor.
 
 The asymmetric token mask (pose rows never attend to contact tokens) plus the
-private image copy for ``pre_decoder`` make pose isolation exact *mathematically*;
+make pose isolation exact *mathematically*;
 the residual we observe is pure CUDA noise.
 
 Disabling is done by dropping the ``contact_temporal`` submodule so the hooks hit
@@ -54,9 +54,8 @@ pytestmark = [
 
 # ---------------------------------------------------------------- helpers
 
-def _cfg(placement: str, attend: str = "joint") -> dict:
+def _cfg(placement: str = "post_decoder", attend: str = "joint") -> dict:
     cfg = load_config(TEMPORAL_CFG)
-    cfg["model"]["temporal"]["placement"] = placement
     cfg["model"]["temporal"]["attend"] = attend
     return cfg
 
@@ -153,8 +152,8 @@ def _assert_within_floor(enabled, disabled, floor, keys, tag):
 
 # ---------------------------------------------------------------- (a) zero-gamma == disabled
 
-@pytest.mark.parametrize("placement", ["post_decoder", "between_layers", "pre_decoder"])
-def test_zero_gamma_matches_disabled(placement):
+def test_zero_gamma_matches_disabled():
+    placement = "post_decoder"
     model, cfg = _build(placement)
     try:
         batch = _batch(cfg, model, _synth_frames(8), seq_len=4)
@@ -169,8 +168,8 @@ def test_zero_gamma_matches_disabled(placement):
 
 # -------------------------------------------------------- (a') exact pose isolation
 
-@pytest.mark.parametrize("placement", ["post_decoder", "between_layers", "pre_decoder"])
-def test_temporal_params_have_no_pose_jacobian(placement):
+def test_temporal_params_have_no_pose_jacobian():
+    placement = "post_decoder"
     """Exact (noise-free) proof: pose/MHR outputs have a zero temporal Jacobian.
 
     With non-zero temporal gates, differentiate every frozen pose/MHR output w.r.t.
@@ -215,8 +214,8 @@ def test_temporal_params_have_no_pose_jacobian(placement):
 
 # ---------------------------------------------------------------- (b) nonzero-gamma pose isolation
 
-@pytest.mark.parametrize("placement", ["post_decoder", "between_layers", "pre_decoder"])
-def test_nonzero_gamma_isolates_pose(placement):
+def test_nonzero_gamma_isolates_pose():
+    placement = "post_decoder"
     model, cfg = _build(placement)
     try:
         batch = _batch(cfg, model, _synth_frames(8), seq_len=4)

@@ -123,6 +123,9 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
     if tcfg.get("enabled", False):
         temporal = {
             "enabled": True,
+            # The placement key left the config (post_decoder is the only
+            # placement now) but stays in the signature: stored signatures of
+            # existing checkpoints contain it, and the comparison is exact.
             "placement": str(tcfg.get("placement", "post_decoder")),
             "attend": str(tcfg.get("attend", "joint")),
             "causal": bool(tcfg.get("causal", False)),
@@ -209,30 +212,51 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
                 "mlp_ratio": float(mtcfg.get("mlp_ratio", 2.0)),
                 "position_scale": float(mtcfg.get("position_scale", 1.0)),
             }
-            # Added only when non-default (byte-stable signatures for every
-            # checkpoint written before the knob existed).
-            if str(mtcfg.get("kind", "attention")) != "attention":
-                sig_extra["motion_temporal"]["kind"] = str(mtcfg["kind"])
-            # Same rule for the in-decoder placements.
-            # The placement changes what the temporal weights mean — a
-            # post_decoder module must never silently load into a between-layers
-            # run — and for the in-decoder placements the layer set is part of
-            # that meaning too.
-            if str(mtcfg.get("placement", "post_decoder")) != "post_decoder":
-                sig_extra["motion_temporal"]["placement"] = str(mtcfg["placement"])
-                # Normalised: `layers: null` means all intermediate layers, so
-                # it must equal the explicit [0..4] spelling; sorted so order
-                # never splits identical architectures.
-                layers = mtcfg.get("layers", None)
-                sig_extra["motion_temporal"]["layers"] = (
-                    sorted(int(i) for i in layers) if layers is not None
-                    else [0, 1, 2, 3, 4])
-                # NOTE `attend` stays recorded even for between_layers_cross
-                # (where the module ignores it): the first xattn run's
-                # checkpoints already store it, and dropping it now would
-                # spuriously reject them. Keep cross configs at the default.
         else:
             sig_extra["motion_temporal"] = {"enabled": False}
+
+    # Cross-modal temporal / per-frame attention bricks. Enabled-only, like
+    # `motion`: absent from every checkpoint written before they existed. The
+    # modality list changes which token slices the weights were trained on, so
+    # it is semantic.
+    xmcfg = model_cfg.get("cross_modal_temporal", {}) or {}
+    if xmcfg.get("enabled", False):
+        sig_extra["cross_modal_temporal"] = {
+            "enabled": True,
+            "modalities": sorted(str(m) for m in (xmcfg.get("modalities") or [])),
+            "causal": bool(xmcfg.get("causal", False)),
+            "bottleneck_dim": int(xmcfg.get("bottleneck_dim", 256)),
+            "num_layers": int(xmcfg.get("num_layers", 1)),
+            "num_heads": int(xmcfg.get("num_heads", 4)),
+            "mlp_ratio": float(xmcfg.get("mlp_ratio", 2.0)),
+            "position_scale": float(xmcfg.get("position_scale", 1.0)),
+        }
+    # The mutual decoder mask changes what every appended token was trained to
+    # read (contact attends force/motion and vice versa) — semantic. Emitted
+    # only when set, so pre-existing causal signatures stay byte-identical.
+    if model_cfg.get("extra_token_attention", "causal") == "mutual":
+        sig_extra["extra_token_attention"] = "mutual"
+
+    facfg = model_cfg.get("frame_attn", {}) or {}
+    if facfg.get("enabled", False):
+        sig_extra["frame_attn"] = {
+            "enabled": True,
+            "modalities": sorted(str(m) for m in (facfg.get("modalities") or [])),
+            # frame_attn always spans every modality's tokens now; the config
+            # key was removed, but stored signatures compare by exact equality,
+            # so keep emitting the constant every attend_all checkpoint carries.
+            "attend_all": True,
+            "bottleneck_dim": int(facfg.get("bottleneck_dim", 256)),
+            "num_layers": int(facfg.get("num_layers", 1)),
+            "num_heads": int(facfg.get("num_heads", 4)),
+            "mlp_ratio": float(facfg.get("mlp_ratio", 2.0)),
+        }
+
+    # Pose-head fine-tune (train.finetune_pose_head). Enabled-only: the
+    # checkpoint then carries head_pose.proj weights, which must never load
+    # into (or be expected by) a frozen-pose run.
+    if (config.get("train", {}) or {}).get("finetune_pose_head", False):
+        sig_extra["pose_head_finetune"] = {"enabled": True}
 
     # Pose-token temporal module (E2). Enabled-only, like `motion`: absent from
     # every checkpoint written before it existed.

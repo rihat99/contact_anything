@@ -32,9 +32,30 @@ from contact.model import build_model
 from contact.targets import NUM_BODY_22, TargetSpec
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_BASE_CFG = os.path.join(REPO, "configs", "climbing_corpus_joint_force_valless_base.yaml")
-_COND_CFG = os.path.join(REPO, "configs", "climbing_corpus_joint_force_cond.yaml")
+_POSTDEC_CFG = os.path.join(
+    REPO, "configs", "climbing_corpus_joint_force_cond_sum1_postdec.yaml")
 _CKPT = load_config(os.path.join(REPO, "configs", "base.yaml"))["model"]["checkpoint_path"]
+
+# The retired shipped A/B ladder is reconstructed from the kept production
+# config: the bare-linear pre_decoder cond arm, and the same build with the
+# conditioning stripped back to its defaults.
+_COND_TEXT = """
+base: configs/climbing_corpus_joint_force_cond_sum1_postdec.yaml
+model:
+  cond_input:
+    encoder_hidden: null
+    injection: pre_decoder
+"""
+_UNCOND_TEXT = """
+base: configs/climbing_corpus_joint_force_cond_sum1_postdec.yaml
+model:
+  cond_input:
+    enabled: false
+    features_path: null
+    encoder_hidden: null
+    injection: pre_decoder
+    standardize: {vel_mean: null, vel_std: null, acc_mean: null, acc_std: null}
+"""
 
 _NOISE_MARGIN = 8.0
 _NOISE_FLOOR_EPS = 1e-6
@@ -49,9 +70,20 @@ _SEQ_LEN = 7
 
 
 @pytest.fixture(scope="module")
-def built():
+def cfg_pair(tmp_path_factory):
+    """(unconditioned, bare-linear pre_decoder cond) config paths."""
+    d = tmp_path_factory.mktemp("cond_pair")
+    uncond = d / "uncond.yaml"
+    uncond.write_text(_UNCOND_TEXT)
+    cond = d / "cond.yaml"
+    cond.write_text(_COND_TEXT)
+    return str(uncond), str(cond)
+
+
+@pytest.fixture(scope="module")
+def built(cfg_pair):
     torch.manual_seed(0)
-    cfg = load_config(_COND_CFG)
+    cfg = load_config(cfg_pair[1])
     model, trainable = build_model(cfg, "cuda")
     model.eval()
     return model, cfg, trainable
@@ -168,7 +200,7 @@ def test_projections_exist_zero_init_and_train(built):
         assert dict(model.named_parameters())[f"{name}.weight"].requires_grad
 
 
-def test_experiment_pair_shares_every_other_weight():
+def test_experiment_pair_shares_every_other_weight(cfg_pair):
     """Under one seed the two arms differ by the two zero projections and nothing else.
 
     The trainer seeds the global RNG from ``data.seed`` before building, and the
@@ -176,8 +208,9 @@ def test_experiment_pair_shares_every_other_weight():
     conditioned build must reproduce the baseline's random init parameter for
     parameter — the A/B pair's only difference is the conditioning itself.
     """
-    seed = load_config(_BASE_CFG)["data"]["seed"]
-    assert seed == load_config(_COND_CFG)["data"]["seed"]
+    base_cfg, cond_cfg = cfg_pair
+    seed = load_config(base_cfg)["data"]["seed"]
+    assert seed == load_config(cond_cfg)["data"]["seed"]
 
     def _trainable(cfg_path):
         torch.manual_seed(seed)
@@ -186,8 +219,8 @@ def test_experiment_pair_shares_every_other_weight():
         params = dict(model.named_parameters())
         return {n: params[n].detach().clone() for n in names}
 
-    base = _trainable(_BASE_CFG)
-    cond = _trainable(_COND_CFG)
+    base = _trainable(base_cfg)
+    cond = _trainable(cond_cfg)
     assert set(cond) - set(base) == {
         "contact_cond_linear.weight", "force_cond_linear.weight"}
     assert set(base) - set(cond) == set()
@@ -287,14 +320,13 @@ def test_frozen_mhr_is_unaffected_by_the_projections(built):
 
 
 # ---------------------------------------------------------------- MLP encoder
-
-_SUM1_CFG = os.path.join(REPO, "configs", "climbing_corpus_joint_force_cond_sum1.yaml")
+# (the kept postdec production config IS the MLP-encoder arm)
 
 
 @pytest.fixture(scope="module")
 def built_mlp():
     torch.manual_seed(0)
-    cfg = load_config(_SUM1_CFG)
+    cfg = load_config(_POSTDEC_CFG)
     model, trainable = build_model(cfg, "cuda")
     model.eval()
     return model, cfg, trainable
@@ -431,10 +463,6 @@ def test_conditioning_params_have_gradients_from_the_force_output(built):
 
 
 # ---------------------------------------------------------------- post_decoder injection
-
-_POSTDEC_CFG = os.path.join(
-    REPO, "configs", "climbing_corpus_joint_force_cond_sum1_postdec.yaml")
-
 
 @pytest.fixture(scope="module")
 def built_postdec():

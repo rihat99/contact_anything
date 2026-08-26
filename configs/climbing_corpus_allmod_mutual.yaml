@@ -1,0 +1,44 @@
+# All-modality v2 — corpus_allmod_mutual. `climbing_corpus_allmod.yaml` plus
+# three changes:
+#
+#   1. `model.extra_token_attention: mutual` — inside the frozen decoder the
+#      contact, force and motion token blocks fully inter-attend across all six
+#      layers (the original/pose tokens still attend none of them, so the
+#      frozen MHR readout keeps its exactly-zero Jacobian w.r.t. every added
+#      param). Post-decoder wiring unchanged: ONE cross-modal temporal block
+#      over [pose, contact, force, motion], frame attention on all four
+#      modalities, pose-head fine-tune, NO per-modality/pose temporal blocks.
+#   2. `force_supervision.loss.noncontact: 0.2` — the explicit zero-force L1 on
+#      kindyn non-contact limb-frames returns (v2-proven weight) on top of the
+#      contact gate.
+#   3. `motion_consistency` — the PREDICTED pose is lifted to the world with the
+#      dataset extrinsics, differentiated with the kindyn body-twist scheme, and
+#      the resulting pelvis vel/acc is pulled toward the kindyn GT (grad -> pose
+#      path; attacks depth wobble) and toward the motion head's own estimate
+#      (grad -> BOTH; pose and motion must agree). Standardized with the
+#      motion_supervision table; boundary clip frames are never supervised.
+#
+# Comparison partner: corpus_allmod (same data, per-modality objectives,
+# schedule, seed, monitor).
+#
+# Launch:
+#   CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
+#     scripts/train.py --config configs/climbing_corpus_allmod_mutual.yaml
+base: configs/climbing_corpus_allmod.yaml
+
+model:
+  extra_token_attention: mutual       # change 1 — see header
+
+force_supervision:
+  loss:
+    noncontact: 0.2                   # change 2: explicit zero-force pull on free limbs
+
+motion_consistency:                   # change 3: pose-derived twist vs GT + motion head
+  enabled: true
+  loss:
+    gt: 1.0                           # anchor the pose-derived motion to kindyn GT
+    head: 0.5                         # pose <-> motion-head agreement (softer)
+    huber_delta: 1.0                  # standardized units
+
+output:
+  exp_name: corpus_allmod_mutual

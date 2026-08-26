@@ -40,6 +40,11 @@ DEFAULTS: dict[str, Any] = {
         "mhr_model_path": f"{_CKPT_DIR}/assets/mhr_model.pt",
         "init_contact_checkpoint": None,   # optional contact-only warm start (not optimiser resume)
         "mask_embed_type": "v2",
+        "extra_token_attention": "causal",  # decoder mask over the appended token blocks:
+                                            # causal = no earlier block attends a later one
+                                            # (original ⊥ contact ⊥ force ⊥ motion); mutual =
+                                            # contact/force/motion fully inter-attend (original
+                                            # tokens still attend none of them)
         "contact_head": {
             "contact_keypoint_indices": None,   # None = list(range(21))
             "num_global_tokens": 3,
@@ -51,9 +56,8 @@ DEFAULTS: dict[str, Any] = {
             "grid_radius": 0.1,
             "blind_to_image": False,        # ablation: no image path into contact tokens
         },
-        "temporal": {                       # Phase 3: ContactTemporalModule
+        "temporal": {                       # Phase 3: ContactTemporalModule (post_decoder)
             "enabled": False,
-            "placement": "post_decoder",    # post_decoder | between_layers | pre_decoder
             "bottleneck_dim": 256,           # project 1024-d contact tokens before attention
             "num_layers": 1,
             "num_heads": 4,
@@ -111,24 +115,46 @@ DEFAULTS: dict[str, Any] = {
             "dropout": 0.0,
             "position_scale": 30.0,
         },
-        "motion_temporal": {                # temporal attention over motion tokens
+        "motion_temporal": {                # temporal attention over motion tokens (post_decoder)
             "enabled": False,               # requires model.motion_head.enabled
-            "placement": "post_decoder",    # post_decoder | between_layers (in-decoder
-                                            # self-attn) | between_layers_cross (motion
-                                            # queries read the frozen sam3d block per frame)
-            "layers": None,                 # in-decoder placements: which intermediate
-                                            # decoder layers run the hook (null = all 0..4)
-            "kind": "attention",            # attention | conv (post_decoder only: 3-tap
-                                            # depthwise temporal conv, derivative-friendly)
             "bottleneck_dim": 256,          # project 1024-d motion tokens before attention
             "num_layers": 1,
             "num_heads": 4,
             "mlp_ratio": 2.0,
-            "attend": "per_token",          # joint (T*K tokens per clip) | per_token (T per
-                                            # slot); ignored by between_layers_cross
+            "attend": "per_token",          # joint (T*K tokens per clip) | per_token (T per slot)
             "causal": False,
             "dropout": 0.0,
             "position_scale": 1.0,          # multiply elapsed seconds before sinusoidal time PE
+        },
+        "cross_modal_temporal": {           # ONE temporal block over ALL chosen modality blocks
+            "enabled": False,               # attend='joint' over the concatenation, so e.g.
+                                            # force tokens see the pose token across the clip
+                                            # and vice versa (alternative to the per-modality
+                                            # temporal blocks above)
+            "modalities": ["contact", "force"],  # >= 2 of pose|contact|force|motion; each needs
+                                            # its branch enabled. 'pose' WRITES the pose token:
+                                            # the final MHR output is recomputed from it
+                                            # (needs pose_supervision for training)
+            "bottleneck_dim": 256,
+            "num_layers": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "causal": False,
+            "dropout": 0.0,
+            "position_scale": 1.0,          # multiply elapsed seconds before sinusoidal time PE
+        },
+        "frame_attn": {                     # per-frame attention AFTER the temporal blocks
+            "enabled": False,               # NO temporal mixing: tokens attend within their
+                                            # own frame only (works for clips and stills alike)
+            "modalities": ["contact"],      # one own-weights block per listed modality;
+                                            # keys/values always span EVERY enabled modality's
+                                            # post-temporal tokens of the frame (pose included);
+                                            # 'pose' WRITES the pose token (same rule as above)
+            "bottleneck_dim": 256,
+            "num_layers": 1,
+            "num_heads": 4,
+            "mlp_ratio": 2.0,
+            "dropout": 0.0,
         },
         "cond_input": {                     # smoothed pelvis vel/acc fed INTO the tokens
             "enabled": False,               # zero-init projections; off = bit-identical model
@@ -259,6 +285,43 @@ DEFAULTS: dict[str, Any] = {
             "outlier_acc_ms2": 50.0,    # TRAIN-only per-(frame, joint) cut on |acc_world|; 0 = off
         },
     },
+    "motion_consistency": {             # differentiate the PREDICTED pose (world root via
+        "enabled": False,               # extrinsics, BVR body-twist) and compare the pelvis
+                                        # vel/acc with kindyn GT and with the motion head,
+                                        # plus ABSOLUTE root-pose anchors (pos/rot/cam_rail)
+                                        # that close the constant-camera null space the
+                                        # derivative terms leave open (corpus_allmod_mutual
+                                        # collapse). Requires motion_supervision.enabled, a
+                                        # trainable pose path and frames_per_clip >= 3.
+        "hip_offset_root": [-0.009, -0.060, -0.065],
+                                        # mean-hips minus kindyn root origin, GT-root frame,
+                                        # metres — measured on the motion-probe artifact
+                                        # (363 scenes); GT pos target = p_gt + R_gt @ offset.
+        "angular": True,                # include the angular twist rows in the gt/head
+                                        # comparison (only when motion_supervision.angular).
+                                        # false = linear-only: the angular residuals are
+                                        # differentiated orientation wobble and reward a
+                                        # constant world orientation (the v3 rot collapse).
+        "loss": {
+            "gt": 1.0,                  # pose-derived twist vs kindyn GT (grad -> pose path)
+            "head": 0.5,                # pose-derived twist vs DETACHED motion head
+                                        # (grad -> pose path only; the head is never
+                                        # dragged toward a degenerate pose trajectory)
+            "huber_delta": 1.0,         # smooth-L1 transition (standardized units)
+            "pos": 0.0,                 # ABSOLUTE world root position vs kindyn (per-frame,
+                                        # boundaries included; 0 = off)
+            "pos_huber_m": 0.1,         # smooth-L1 transition for pos (metres)
+            "rot": 0.0,                 # absolute root orientation: so3_log(R_pred^T R_gt)
+            "rot_huber_rad": 0.1,       # smooth-L1 transition for rot (radians)
+            "cam_rail": 0.0,            # camera trust region vs the FROZEN model's own
+                                        # pred_cam_t: relu(|delta| - margin), zero inside
+            "cam_rail_margin_m": 0.5,   # rail margin (metres) — wide; wobble is cm-scale
+            "rot_rail": 0.0,            # orientation trust region vs the frozen model's own
+                                        # global_rot: relu(geodesic - margin), zero inside
+            "rot_rail_margin_rad": 0.2, # rail margin (radians, ~11.5°) — the frozen model's
+                                        # per-frame orientation error is ~7°
+        },
+    },
     "pose_supervision": {               # kindyn-MHR pseudo-GT pose loss (E2)
         "enabled": False,               # requires model.pose_temporal.enabled + corpus
                                         # mhr_1.npz files (scripts/convert_kindyn_to_mhr.py)
@@ -279,6 +342,10 @@ DEFAULTS: dict[str, Any] = {
         "backbone_no_grad": True,       # wrap only the frozen backbone call in no_grad
         "compile_backbone": False,      # torch.compile the frozen backbone (~1.2x step)
         "freeze_contact": False,        # regime (a): freeze contact, train force branch only
+        "finetune_pose_head": False,    # unfreeze head_pose.proj (the MHR head's FFN; its
+                                        # constant tables stay frozen). Deliberate exception
+                                        # to the frozen-pose rule; needs pose_supervision
+        "pose_head_lr_scale": 0.1,      # lr multiplier for the head_pose param group
     },
     "optim": {
         "lr": 1.0e-4,
@@ -310,8 +377,8 @@ DEFAULTS: dict[str, Any] = {
 
 _KNOWN_DATASETS = frozenset({"damon", "climbing", "climbing_corpus"})
 _KNOWN_TARGETS = frozenset({"vertex", "joint"})
-_TEMPORAL_PLACEMENTS = frozenset({"post_decoder", "between_layers", "pre_decoder"})
 _TEMPORAL_ATTEND = frozenset({"joint", "per_token"})
+_MODALITIES = ("pose", "contact", "force", "motion")
 _KNOWN_JOINT_SETS = frozenset(JOINT_SET_NAMES)
 _CONTACT_POOL_MODES = frozenset({"attention", "concat", "per_token"})
 _FORCE_FRAMES = frozenset({"local_world_aligned", "local", "root"})
@@ -365,13 +432,12 @@ def _validate_keys(node: dict, schema: dict, path: str = "") -> None:
 
 
 def _validate_temporal_common(node: dict, path: str) -> None:
-    """Validate the attend/shape/scale clauses shared by ``model.temporal``,
-    ``model.force_temporal`` and ``model.motion_temporal``.
-
-    Placement is validated separately (``force_temporal``/``motion_temporal``
-    have no placement key — it is fixed to ``post_decoder``).
+    """Validate the attend/shape/scale clauses shared by every temporal /
+    frame-attention section. A clause is checked only when its key exists in
+    the section (``cross_modal_temporal`` has no ``attend`` — it is fixed to
+    ``'joint'``; ``frame_attn`` has neither ``attend`` nor the time keys).
     """
-    if node["attend"] not in _TEMPORAL_ATTEND:
+    if "attend" in node and node["attend"] not in _TEMPORAL_ATTEND:
         raise ValueError(
             f"{path}.attend must be one of {sorted(_TEMPORAL_ATTEND)}; "
             f"got {node['attend']!r}")
@@ -387,9 +453,39 @@ def _validate_temporal_common(node: dict, path: str) -> None:
         raise ValueError(f"{path}.num_layers must be positive")
     if float(node["mlp_ratio"]) <= 0:
         raise ValueError(f"{path}.mlp_ratio must be positive")
-    position_scale = float(node["position_scale"])
-    if not math.isfinite(position_scale) or position_scale <= 0:
-        raise ValueError(f"{path}.position_scale must be finite and positive")
+    if "position_scale" in node:
+        position_scale = float(node["position_scale"])
+        if not math.isfinite(position_scale) or position_scale <= 0:
+            raise ValueError(f"{path}.position_scale must be finite and positive")
+
+
+def _enabled_modalities(cfg: dict) -> dict:
+    """Which modality token blocks the configured build creates."""
+    contact_enabled = any(
+        cfg["contact"]["targets"][name]["enabled"] for name in _KNOWN_TARGETS)
+    return {
+        "pose": True,
+        "contact": contact_enabled,
+        "force": bool(cfg["model"]["force_head"]["enabled"]),
+        "motion": bool(cfg["model"]["motion_head"]["enabled"]),
+    }
+
+
+def _validate_modalities(cfg: dict, node: dict, path: str, min_count: int) -> None:
+    """Validate a ``modalities`` list against the build's enabled branches."""
+    mods = node["modalities"]
+    if (not isinstance(mods, list) or len(mods) < min_count
+            or len(set(mods)) != len(mods)
+            or any(m not in _MODALITIES for m in mods)):
+        raise ValueError(
+            f"{path}.modalities must be a duplicate-free list of >= {min_count} "
+            f"of {list(_MODALITIES)}; got {mods!r}")
+    available = _enabled_modalities(cfg)
+    missing = [m for m in mods if not available[m]]
+    if missing:
+        raise ValueError(
+            f"{path}.modalities {missing} have no token block in this build "
+            "(enable the corresponding contact target / force_head / motion_head)")
 
 
 _PHYSICS_WEIGHT_KEYS = frozenset({
@@ -583,6 +679,20 @@ def _validate_force_supervision(cfg: dict, force_head: dict) -> None:
             "data.sequence.frames_per_clip")
 
 
+def _pose_trainable_paths(cfg: dict) -> list:
+    """Names of the enabled config paths that move the frozen pose outputs."""
+    paths = []
+    if cfg["model"]["pose_temporal"]["enabled"]:
+        paths.append("model.pose_temporal")
+    if cfg["train"]["finetune_pose_head"]:
+        paths.append("train.finetune_pose_head")
+    for section in ("cross_modal_temporal", "frame_attn"):
+        node = cfg["model"][section]
+        if node["enabled"] and "pose" in node["modalities"]:
+            paths.append(f"model.{section} (pose modality)")
+    return paths
+
+
 def _validate_motion(cfg: dict) -> None:
     """Validate ``model.motion_head`` / ``model.motion_temporal`` /
     ``motion_supervision`` (motion tokens v2)."""
@@ -612,48 +722,16 @@ def _validate_motion(cfg: dict) -> None:
     if not math.isfinite(ps_delta) or ps_delta <= 0:
         raise ValueError("pose_supervision.loss.huber_delta must be finite and positive")
     if ps["enabled"]:
-        if not cfg["model"]["pose_temporal"]["enabled"]:
+        if not _pose_trainable_paths(cfg):
             raise ValueError(
-                "pose_supervision.enabled requires model.pose_temporal.enabled=true "
-                "(the loss trains the pose-token temporal module)")
+                "pose_supervision.enabled requires a trainable pose path: "
+                "model.pose_temporal.enabled, train.finetune_pose_head, or the "
+                "'pose' modality in model.cross_modal_temporal / model.frame_attn")
         if not any(entry["name"] == "climbing_corpus"
                    for entry in cfg["data"]["datasets"]):
             raise ValueError(
                 "pose_supervision.enabled requires a climbing_corpus dataset in "
                 "data.datasets (pose pseudo-GT comes from the corpus mhr_1.npz)")
-    mt_placement = motion_temporal.get("placement", "post_decoder")
-    mt_members = str(mt_placement).split("+")
-    if (any(p not in ("post_decoder", "between_layers", "between_layers_cross")
-            for p in mt_members)
-            or len(set(mt_members)) != len(mt_members)
-            or sum(p != "post_decoder" for p in mt_members) > 1):
-        raise ValueError(
-            "model.motion_temporal.placement must be 'post_decoder', "
-            "'between_layers', 'between_layers_cross' or an in-decoder one "
-            "combined with post_decoder ('between_layers_cross+post_decoder'); "
-            f"got {mt_placement!r}")
-    mt_kind = motion_temporal.get("kind", "attention")
-    if mt_kind not in ("attention", "conv"):
-        raise ValueError(
-            f"model.motion_temporal.kind must be 'attention' or 'conv'; got {mt_kind!r}")
-    if mt_kind == "conv" and mt_placement != "post_decoder":
-        raise ValueError(
-            "model.motion_temporal.kind='conv' is implemented for "
-            f"placement='post_decoder' only; got {mt_placement!r}")
-    mt_layers = motion_temporal.get("layers", None)
-    if mt_layers is not None:
-        if all(p == "post_decoder" for p in mt_members):
-            raise ValueError(
-                "model.motion_temporal.layers only applies to the in-decoder "
-                "placements; remove it or set placement to between_layers[_cross]")
-        if (not isinstance(mt_layers, list) or not mt_layers
-                or any(isinstance(i, bool) or not isinstance(i, int)
-                       or not 0 <= i <= 4 for i in mt_layers)
-                or len(set(mt_layers)) != len(mt_layers)):
-            raise ValueError(
-                "model.motion_temporal.layers must be a non-empty duplicate-free "
-                f"list of intermediate decoder layer indices in [0, 4]; got "
-                f"{mt_layers!r}")
 
     ms = cfg["motion_supervision"]
     target_frame = str(ms["target_frame"])
@@ -767,6 +845,53 @@ def _validate_motion(cfg: dict) -> None:
             "smoothing is unimplemented (their positions are not smoothed, only "
             "the frame they are rotated into) — set target_smooth_sec: 0.0 or "
             "restrict joint_names to ['pelvis']")
+
+
+def _validate_motion_consistency(cfg: dict) -> None:
+    """Validate ``motion_consistency`` (pose-derived twist vs GT / motion head)."""
+    mc = cfg["motion_consistency"]
+    weight_keys = ("gt", "head", "pos", "rot", "cam_rail", "rot_rail")
+    for key in weight_keys:
+        value = float(mc["loss"][key])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"motion_consistency.loss.{key} must be finite and >= 0")
+    for key in ("huber_delta", "pos_huber_m", "rot_huber_rad", "cam_rail_margin_m",
+                "rot_rail_margin_rad"):
+        value = float(mc["loss"][key])
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"motion_consistency.loss.{key} must be finite and positive")
+    if not isinstance(mc["angular"], bool):
+        raise ValueError("motion_consistency.angular must be a boolean")
+    offset = mc["hip_offset_root"]
+    if (not isinstance(offset, (list, tuple)) or len(offset) != 3
+            or not all(math.isfinite(float(v)) for v in offset)):
+        raise ValueError(
+            "motion_consistency.hip_offset_root must be a finite 3-vector (metres)")
+    if not mc["enabled"]:
+        return
+    if all(float(mc["loss"][key]) == 0.0 for key in weight_keys):
+        raise ValueError(
+            "motion_consistency.enabled with every loss weight at 0 does nothing")
+    if not cfg["motion_supervision"]["enabled"]:
+        raise ValueError(
+            "motion_consistency.enabled requires motion_supervision.enabled=true "
+            "(it standardizes with its table and compares against its GT and head)")
+    names = cfg["motion_supervision"]["joint_names"] or list(_MOTION_JOINT_NAMES)
+    if "pelvis" not in names:
+        raise ValueError(
+            "motion_consistency.enabled requires the 'pelvis' slot in "
+            "motion_supervision.joint_names (the pose-derived twist is the root's)")
+    if not _pose_trainable_paths(cfg):
+        raise ValueError(
+            "motion_consistency.enabled requires a trainable pose path "
+            "(model.pose_temporal, train.finetune_pose_head, or the 'pose' "
+            "modality of model.cross_modal_temporal / model.frame_attn) — "
+            "otherwise the pose-derived side carries no gradient")
+    if int(cfg["data"]["sequence"]["frames_per_clip"]) < 3:
+        raise ValueError(
+            "motion_consistency.enabled requires data.sequence.frames_per_clip >= 3 "
+            "(the twist stencil reads frames t-1, t, t+1)")
 
 
 def _validate_cond_input(cfg: dict, contact_enabled: bool) -> None:
@@ -892,23 +1017,43 @@ def _validate_semantics(cfg: dict) -> None:
             "model.temporal.enabled requires an enabled contact target (the contact "
             "temporal module attends the contact tokens, which a force-only build "
             "does not create — use model.force_temporal for the force tokens)")
-    if temporal["placement"] not in _TEMPORAL_PLACEMENTS:
-        raise ValueError(
-            f"model.temporal.placement must be one of {sorted(_TEMPORAL_PLACEMENTS)}; "
-            f"got {temporal['placement']!r}")
-    if (contact_head["blind_to_image"] and temporal["enabled"]
-            and temporal["placement"] == "pre_decoder"):
-        raise ValueError(
-            "model.contact_head.blind_to_image with model.temporal.placement="
-            "'pre_decoder' is a no-op: the pre_decoder branch exists only to build "
-            "the image tensor the anchored update samples, and blind_to_image "
-            "removes that update")
     _validate_temporal_common(temporal, "model.temporal")
     window_frames = temporal["window_frames"]
     if window_frames is not None and (int(window_frames) < 3 or int(window_frames) % 2 == 0):
         raise ValueError(
             f"model.temporal.window_frames must be null or an odd int >= 3; "
             f"got {window_frames!r}")
+
+    cross_modal = cfg["model"]["cross_modal_temporal"]
+    _validate_temporal_common(cross_modal, "model.cross_modal_temporal")
+    if cross_modal["enabled"]:
+        _validate_modalities(
+            cfg, cross_modal, "model.cross_modal_temporal", min_count=2)
+
+    frame_attn = cfg["model"]["frame_attn"]
+    _validate_temporal_common(frame_attn, "model.frame_attn")
+    if frame_attn["enabled"]:
+        _validate_modalities(cfg, frame_attn, "model.frame_attn", min_count=1)
+        if not any(v for m, v in _enabled_modalities(cfg).items() if m != "pose"):
+            raise ValueError(
+                "model.frame_attn.enabled requires at least one of the contact/"
+                "force/motion branches: with only the pose token in the build "
+                "there is no frame context to attend")
+
+    eta = cfg["model"]["extra_token_attention"]
+    if eta not in ("causal", "mutual"):
+        raise ValueError(
+            f"model.extra_token_attention must be 'causal' or 'mutual'; got {eta!r}")
+    if eta == "mutual" and sum(
+            v for m, v in _enabled_modalities(cfg).items() if m != "pose") < 2:
+        raise ValueError(
+            "model.extra_token_attention='mutual' requires >= 2 of the contact/"
+            "force/motion branches enabled (with fewer appended blocks there is "
+            "no cross-block attention to open up)")
+
+    lr_scale = float(cfg["train"]["pose_head_lr_scale"])
+    if not math.isfinite(lr_scale) or lr_scale <= 0:
+        raise ValueError("train.pose_head_lr_scale must be finite and positive")
 
     if force_head["frame"] not in _FORCE_FRAMES:
         raise ValueError(
@@ -974,6 +1119,7 @@ def _validate_semantics(cfg: dict) -> None:
     _validate_physics(cfg, force_head)
     _validate_force_supervision(cfg, force_head)
     _validate_motion(cfg)
+    _validate_motion_consistency(cfg)
     _validate_cond_input(cfg, contact_enabled)
 
     if cfg["train"]["freeze_contact"]:
@@ -989,6 +1135,19 @@ def _validate_semantics(cfg: dict) -> None:
             raise ValueError(
                 "train.freeze_contact=true requires model.init_contact_checkpoint "
                 "(warm-start the frozen contact branch)")
+        xm = cfg["model"]["cross_modal_temporal"]
+        if xm["enabled"] and "contact" in xm["modalities"]:
+            raise ValueError(
+                "train.freeze_contact=true is incompatible with 'contact' in "
+                "model.cross_modal_temporal.modalities: the block's params do not "
+                "carry 'contact' in their names, so they would stay trainable and "
+                "move the frozen contact outputs")
+        if cfg["model"]["extra_token_attention"] == "mutual":
+            raise ValueError(
+                "train.freeze_contact=true is incompatible with "
+                "model.extra_token_attention='mutual': the frozen contact tokens "
+                "would attend the trainable force/motion tokens, so the frozen "
+                "contact outputs would move during force training")
 
     sequence = cfg["data"]["sequence"]
     target_frame = str(sequence["target_frame"])

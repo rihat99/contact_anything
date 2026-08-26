@@ -1,28 +1,21 @@
-# Post-decoder conditioning arm — corpus6_jf_cond_sum1_postdec.
+# Joint contact+force production baseline — corpus6_jf_cond_sum1_postdec (the
+# best force run; the retired cond/cond_sum1 A/B ladder's winning arm).
 #
-# `climbing_corpus_joint_force_cond_sum1.yaml` with ONE change:
-# `model.cond_input.injection: pre_decoder -> post_decoder` (test-enforced in
-# tests/test_cond_input.py — only that key and `output.exp_name` may differ).
-# Same seed, same 331 train scenes, same 20-epoch two-GPU schedule, same
-# `test/force_mae` monitor.
-#
-# What moves: the zero-init vel/acc projections are no longer added to the
-# INITIAL contact/force token embeddings (where the feature has to survive six
-# decoder layers of image cross-attention to reach the heads) but to the
-# decoder's contact/force token OUTPUTS, right before the temporal-attention
-# modules. The heads then read image evidence (decoder output) + motion feature
-# (direct) as an additive late fusion. Hypothesis: the late injection preserves
-# the vel/acc signal better; risk: the feature can no longer shape WHERE the
-# tokens look in the image.
-#
-# Same zero-init MLP encoder (Linear(10,64)+GELU+zero-init Linear(64,1024)) per
-# token block, so at initialisation this build is still bit-identical to the
+# Six kindyn_6 contact tokens matched 1:1 to the six supervised force groups
+# (shared anchors, per_token heads, contact gate on the final force output),
+# per-modality temporal blocks, and post_decoder vel/acc conditioning: a
+# zero-init MLP encoder (Linear(10,64)+GELU+zero-init Linear(64,1024)) per
+# token block adds the smoothed pelvis vel/acc feature to the decoder's
+# contact/force token OUTPUTS, right before the temporal modules — the heads
+# read image evidence (decoder output) + motion feature (direct) as an
+# additive late fusion. At initialisation the build is bit-identical to the
 # unconditioned one, and the frozen pose/MHR outputs keep their exactly-zero
-# Jacobian w.r.t. every cond param (the injection is entirely outside the
-# decoder now — it cannot even touch the shared attention graph).
+# Jacobian w.r.t. every cond param (the injection never touches the decoder's
+# attention graph).
 #
-# Conditioning feature, contact/force branches, data, losses: see the
-# cond_sum1 / A/B-pair headers.
+# Losses: focal contact (kindyn_6, confidence-weighted) + supervised kindyn
+# forces (Huber 0.1 bw, sum_force 1.0, sum_torque 0.25, legs x2) on the center
+# row of T=7 stride-1 clips. See docs/forces.md.
 #
 # Launch:
 #   CUDA_VISIBLE_DEVICES=2,6 torchrun --standalone --nproc-per-node=2 \
@@ -37,7 +30,6 @@ model:
     pool_mode: per_token
   temporal:
     enabled: true
-    placement: post_decoder
     bottleneck_dim: 256
     num_layers: 1
     num_heads: 4

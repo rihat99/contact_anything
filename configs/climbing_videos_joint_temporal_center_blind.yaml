@@ -24,7 +24,6 @@ model:
   init_contact_checkpoint: null       # train the complete contact stack from scratch
   temporal:
     enabled: true
-    placement: post_decoder
     bottleneck_dim: 256
     num_layers: 1
     num_heads: 4

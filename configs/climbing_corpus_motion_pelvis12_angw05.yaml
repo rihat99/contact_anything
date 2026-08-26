@@ -1,6 +1,6 @@
-# Motion E0b — corpus_motion_pelvis12_angw05. Identical to the 12-dim baseline
-# (`climbing_corpus_motion_pelvis12_t7.yaml`) except the ANGULAR loss weights
-# drop to 0.5: the 4-way equal split cost the linear velocity ~0.03 r3d vs the
+# Motion E0b — corpus_motion_pelvis12_angw05, the PRODUCTION motion model.
+# Identical to the retired 12-dim equal-weight baseline (E0) except the ANGULAR
+# loss weights drop to 0.5: the 4-way equal split cost the linear velocity ~0.03 r3d vs the
 # 6-dim v3 (0.448 vs 0.475 canonical) — this asks whether down-weighting the
 # angular pair recovers it without giving back the angular gains (ang_vel 0.675
 # / ang_acc 0.254 at weight 1.0).

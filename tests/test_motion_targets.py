@@ -155,6 +155,37 @@ def test_root_body_twist_matches_better_robot_on_a_real_scene():
     assert np.abs(ang_acc - acc_ref[:, 3:]).max() < 1e-6
 
 
+@requires_corpus
+def test_root_pose_keys_regenerate_the_pelvis_twist():
+    """``motion_root_pos`` + ``motion_rot`` are the ABSOLUTE root poses the
+    twist targets were differentiated from: running the consistency loss's
+    :func:`clip_body_twist` over them must reproduce ``motion_gt``'s pelvis
+    slot on every valid row. Pins the new keys to the existing targets."""
+    from contact.motion_consistency import clip_body_twist
+
+    scene = "MuVpoovQl2M_0001"
+    ds = _dataset({scene})
+    data = ds._scenes[scene]
+    _, fps = _scene_q(scene)
+
+    valid = data["motion_valid"][0]
+    root_valid = data["motion_root_valid"][0]
+    # Absolute-pose validity is the raw kindyn coverage: a superset of the
+    # stencil-trimmed target validity, and finite wherever it holds.
+    assert (root_valid | ~valid).all()
+    assert np.isfinite(data["motion_root_pos"][0][root_valid]).all()
+
+    pos = torch.tensor(data["motion_root_pos"][0], dtype=torch.float64)[None]
+    rot = torch.tensor(data["motion_rot"][0], dtype=torch.float64)[None]
+    vel, acc, _, _ = clip_body_twist(
+        pos, rot, torch.tensor([1.0 / fps], dtype=torch.float64))
+    pelvis_gt = data["motion_gt"][0][:, PELVIS]                # [N, 6] vel|acc
+    assert np.allclose(
+        vel[0].numpy()[valid], pelvis_gt[valid, 0:3], rtol=1e-4, atol=1e-3)
+    assert np.allclose(
+        acc[0].numpy()[valid], pelvis_gt[valid, 3:6], rtol=1e-4, atol=1e-3)
+
+
 # ------------------------------------------------------------- convention behaviour
 
 @requires_corpus

@@ -79,7 +79,6 @@ def test_ported_baselines_keep_semantics():
     v2 = load_config(REPO / "configs" / "climbing_videos_joint_temporal_center_v2.yaml")
     assert v2["model"]["temporal"] == {
         "enabled": True,
-        "placement": "post_decoder",
         "bottleneck_dim": 256,
         "num_layers": 1,
         "num_heads": 4,
@@ -468,49 +467,6 @@ contact:
 """))
     assert cfg["model"]["force_head"]["contact_gate"] == {
         "enabled": True, "sharpness": 2.0}
-
-
-def test_joint_force_gated_launch_config():
-    cfg = load_config(REPO / "configs" / "climbing_corpus_joint_force_gated.yaml")
-    # Contact branch = the t5mid_v2 recipe on T=7 clips, but with SIX contact
-    # tokens anchored at the force anchors (kindyn_6, 1:1 with the force groups)
-    # and trained from scratch — no warm start.
-    source = load_config(
-        REPO / "configs" / "climbing_videos_joint_temporal_center_v2.yaml")
-    assert cfg["model"]["temporal"] == source["model"]["temporal"]
-    assert cfg["model"]["contact_head"] == {
-        **source["model"]["contact_head"],
-        "contact_keypoint_indices": [62, 41, 15, 18, 17, 20]}
-    assert cfg["contact"]["targets"]["joint"]["joint_set"] == "kindyn_6"
-    assert (cfg["contact"]["targets"]["joint"]["loss"]
-            == source["contact"]["targets"]["joint"]["loss"])
-    assert cfg["contact"]["targets"]["joint"]["use_confidence_weights"] is True
-    assert cfg["model"]["init_contact_checkpoint"] is None
-    assert cfg["train"]["freeze_contact"] is False       # contact trains (from scratch)
-    assert cfg["train"]["compile_backbone"] is True
-    # Force branch = the supervised v2 recipe, plus the contact gate.
-    force = load_config(REPO / "configs" / "climbing_corpus_force_supervised.yaml")
-    assert cfg["model"]["force_head"] == {
-        **force["model"]["force_head"],
-        "contact_gate": {"enabled": True, "sharpness": 4.0}}
-    assert cfg["model"]["force_temporal"] == force["model"]["force_temporal"]
-    assert cfg["force_supervision"]["enabled"] is True
-    assert cfg["force_supervision"]["loss"] == {
-        "force": 1.0, "huber_delta_bw": pytest.approx(0.1),
-        "outlier_bw": pytest.approx(4.0), "noncontact": 0.0,
-        "sum_force": pytest.approx(0.25), "sum_torque": pytest.approx(0.25),
-        "huber_delta_bwm": pytest.approx(0.1),
-        "group_weights": [1.0, 1.0, 2.0, 2.0, 2.0, 2.0]}
-    assert cfg["data"]["sequence"] == {
-        "frames_per_clip": 7, "frame_stride": 1, "jitter": True, "target_frame": "center"}
-    assert cfg["data"]["eval_split"] == "test"
-    assert [d["config"] for d in cfg["data"]["datasets"]] == [
-        "configs/datasets/climbing_corpus_forces.yaml"]
-    assert cfg["optim"] == {
-        "lr": pytest.approx(1.0e-4), "weight_decay": pytest.approx(1.0e-4),
-        "epochs": 30, "warmup_epochs": 1, "lr_min": pytest.approx(1.0e-6)}
-    assert cfg["output"]["exp_name"] == "corpus6_joint_force_gated_t7"
-    assert cfg["output"]["monitor"] == "test/force_mae"
 
 
 def test_force_temporal_defaults_load():

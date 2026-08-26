@@ -4,9 +4,11 @@ Fast CPU coverage for feeding the frozen model's own smoothed pelvis velocity /
 acceleration into the contact and force tokens — the config accept/reject matrix,
 ``_patch_model_cfg`` plumbing, freeze-filter coverage of the new projections,
 arch-signature stability (the new key must stay out of every signature written
-before conditioning existed), the matched-pair invariant of the two experiment
-configs, and :func:`cond_feature_rows` against a hand computation on the real
-artifact.
+before conditioning existed), and :func:`cond_feature_rows` against a hand
+computation on the real artifact. The retired cond A/B ladder's configs are
+gone; the kept production arm (`cond_sum1_postdec`) anchors the enabled-path
+assertions and a minimal inline fixture covers the bare-linear pre_decoder
+variant.
 
 The init-equivalence proof (a conditioned build IS the unconditioned one at
 initialisation, because both projections are zero-init) needs the real
@@ -26,8 +28,7 @@ from contact.config import load_config
 from contact.data.climbing_corpus import COND_FEATURE_DIM, cond_feature_rows
 
 REPO = Path(__file__).resolve().parents[1]
-_BASE_CFG = REPO / "configs" / "climbing_corpus_joint_force_valless_base.yaml"
-_COND_CFG = REPO / "configs" / "climbing_corpus_joint_force_cond.yaml"
+_POSTDEC_CFG = REPO / "configs" / "climbing_corpus_joint_force_cond_sum1_postdec.yaml"
 _T7HINGE_CFG = REPO / "configs" / "climbing_videos_force_warmstart_t7hinge.yaml"
 _FEATURES = REPO / "output" / "motion_probe_geom" / "cond_features.npz"
 
@@ -42,8 +43,10 @@ _STD = """
       acc_std: [2.0, 2.0, 2.0]
 """
 
+# Bare-linear pre_decoder conditioning on the kept force-only corpus config
+# (no cond in the base, so the removal-based reject tests below stay honest).
 _COND_ON = """
-base: configs/climbing_corpus_joint_force_valless_base.yaml
+base: configs/climbing_corpus_force_supervised.yaml
 model:
   cond_input:
     enabled: true
@@ -128,44 +131,11 @@ model:
         load_config(_write(tmp_path, text))
 
 
-# ---------------------------------------------------------------- experiment pair
-
-def _flatten(node: dict, prefix: str = "") -> dict:
-    out: dict = {}
-    for key, value in node.items():
-        dotted = f"{prefix}.{key}" if prefix else key
-        if isinstance(value, dict):
-            out.update(_flatten(value, dotted))
-        else:
-            out[dotted] = value
-    return out
-
-
-def test_experiment_pair_differs_only_by_conditioning():
-    """The A/B arms must be matched: same seed, data, schedule and monitor."""
-    base = _flatten(load_config(_BASE_CFG))
-    cond = _flatten(load_config(_COND_CFG))
-    moved = {
-        key for key in set(base) | set(cond)
-        if base.get(key, "<absent>") != cond.get(key, "<absent>")
-    }
-    assert moved == {
-        "model.cond_input.enabled",
-        "model.cond_input.features_path",
-        "model.cond_input.standardize.vel_mean",
-        "model.cond_input.standardize.vel_std",
-        "model.cond_input.standardize.acc_mean",
-        "model.cond_input.standardize.acc_std",
-        "output.exp_name",
-    }
-    assert base["optim.epochs"] == cond["optim.epochs"] == 10
-    assert base["output.monitor"] == cond["output.monitor"] == "test/force_mae"
-    assert base["data.eval_split"] == cond["data.eval_split"] == "test"
-
+# ------------------------------------------------------------- pinned literals
 
 def test_pinned_standardization_is_the_artifact_scale():
     """Sanity-bound the pinned literals (recomputing them needs the artifact)."""
-    std = load_config(_COND_CFG)["model"]["cond_input"]["standardize"]
+    std = load_config(_POSTDEC_CFG)["model"]["cond_input"]["standardize"]
     assert all(0.3 < v < 0.5 for v in std["vel_std"])
     assert all(1.5 < v < 2.0 for v in std["acc_std"])
     assert all(abs(v) < 0.1 for v in std["vel_mean"] + std["acc_mean"])
@@ -190,7 +160,7 @@ def test_patch_model_cfg_disabled_is_still_self_describing():
     from contact.model import _patch_model_cfg
 
     model_cfg = _patch_model_cfg(
-        _min_model_cfg(), load_config(_BASE_CFG), "mhr.pt")
+        _min_model_cfg(), load_config(REPO / "configs" / "base.yaml"), "mhr.pt")
     assert model_cfg.MODEL.COND_INPUT.ENABLED is False
     assert model_cfg.MODEL.COND_INPUT.FEAT_DIM == COND_FEATURE_DIM
 
@@ -247,13 +217,11 @@ def test_cond_projections_pass_the_trainable_filter():
 
 # ---------------------------------------------------------------- MLP encoder
 
-_SUM1_CFG = REPO / "configs" / "climbing_corpus_joint_force_cond_sum1.yaml"
-
-
-def test_encoder_hidden_defaults_to_bare_linear():
+def test_encoder_hidden_defaults_to_bare_linear(tmp_path):
     assert load_config(REPO / "configs" / "base.yaml")["model"]["cond_input"][
         "encoder_hidden"] is None
-    assert load_config(_COND_CFG)["model"]["cond_input"]["encoder_hidden"] is None
+    assert load_config(_write(tmp_path, _COND_ON))["model"]["cond_input"][
+        "encoder_hidden"] is None
 
 
 @pytest.mark.parametrize("bad", ["0", "-4", "true", "2.5"])
@@ -271,7 +239,7 @@ def test_patch_model_cfg_carries_encoder_hidden(tmp_path):
         _min_model_cfg(), load_config(_write(tmp_path, text)), "mhr.pt")
     assert model_cfg.MODEL.COND_INPUT.ENCODER_HIDDEN == 64
     model_cfg = _patch_model_cfg(
-        _min_model_cfg(), load_config(_COND_CFG), "mhr.pt")
+        _min_model_cfg(), load_config(_write(tmp_path, _COND_ON)), "mhr.pt")
     assert model_cfg.MODEL.COND_INPUT.ENCODER_HIDDEN is None
 
 
@@ -299,54 +267,36 @@ def test_mlp_encoder_params_pass_filter_and_warmstart_exemption():
         assert "cond_linear" in name
 
 
-def test_sum1_config_is_the_cond_arm_with_three_deliberate_changes():
-    cond = _flatten(load_config(_COND_CFG))
-    sum1 = _flatten(load_config(_SUM1_CFG))
-    moved = {
-        key for key in set(cond) | set(sum1)
-        if cond.get(key, "<absent>") != sum1.get(key, "<absent>")
-    }
-    assert moved == {
-        "model.cond_input.encoder_hidden",
-        "force_supervision.loss.sum_force",
-        "optim.epochs",
-        "output.exp_name",
-    }
-    assert sum1["model.cond_input.encoder_hidden"] == 64
-    assert sum1["force_supervision.loss.sum_force"] == 1.0
-    assert sum1["optim.epochs"] == 20
-    assert sum1["output.monitor"] == "test/force_mae"
-    assert sum1["data.eval_split"] == "test"
-
-
 # ---------------------------------------------------------------- signature stability
 
 def test_arch_signature_omits_cond_key_when_disabled():
     # Checkpoints written before conditioning existed store signatures without
     # this key, and the comparison in `_check_schema` is an exact dict equality.
     assert "cond_input" not in ckpt_io._arch_signature(load_config(_T7HINGE_CFG))
-    assert "cond_input" not in ckpt_io._arch_signature(load_config(_BASE_CFG))
+    assert "cond_input" not in ckpt_io._arch_signature(
+        load_config(REPO / "configs" / "base.yaml"))
 
 
 def test_arch_signature_carries_cond_key_when_enabled():
-    sig = ckpt_io._arch_signature(load_config(_COND_CFG))
+    sig = ckpt_io._arch_signature(load_config(_POSTDEC_CFG))
     assert sig["cond_input"]["enabled"] is True
     assert sig["cond_input"]["clip"] == 5.0
     assert sig["cond_input"]["standardize"]["vel_std"] == [0.37997, 0.38611, 0.40752]
 
 
 def test_arch_signature_separates_different_standardizations(tmp_path):
-    other = load_config(_COND_CFG)
+    other = load_config(_POSTDEC_CFG)
     other["model"]["cond_input"]["standardize"]["acc_std"] = [1.0, 1.0, 1.0]
-    assert ckpt_io._arch_signature(other) != ckpt_io._arch_signature(load_config(_COND_CFG))
+    assert ckpt_io._arch_signature(other) != ckpt_io._arch_signature(
+        load_config(_POSTDEC_CFG))
 
 
-def test_arch_signature_encoder_key_only_when_set():
-    # Bare-linear checkpoints (the whole A/B pair) keep byte-identical stored
+def test_arch_signature_encoder_key_only_when_set(tmp_path):
+    # Bare-linear checkpoints (the retired A/B pair) keep byte-identical stored
     # signatures; an MLP-encoder run is a different architecture.
-    bare = ckpt_io._arch_signature(load_config(_COND_CFG))
+    bare = ckpt_io._arch_signature(load_config(_write(tmp_path, _COND_ON)))
     assert "encoder_hidden" not in bare["cond_input"]
-    mlp = ckpt_io._arch_signature(load_config(_SUM1_CFG))
+    mlp = ckpt_io._arch_signature(load_config(_POSTDEC_CFG))
     assert mlp["cond_input"]["encoder_hidden"] == 64
 
 
@@ -387,7 +337,7 @@ def test_cond_feature_rows_matches_hand_computation_on_a_real_entry():
     artifact = np.load(_FEATURES, allow_pickle=True)
     meta = json.loads(str(artifact["__meta__"]))
     name = meta["entries"][0]["name"]
-    std = load_config(_COND_CFG)["model"]["cond_input"]["standardize"]
+    std = load_config(_POSTDEC_CFG)["model"]["cond_input"]["standardize"]
 
     rot = artifact[f"{name}#R_pred_world_from_root"]
     vel = artifact[f"{name}#vel_smooth_world"]
@@ -441,13 +391,11 @@ def test_real_artifact_covers_every_corpus_scene_person():
 
 # ---------------------------------------------------------------- injection site
 
-_POSTDEC_CFG = REPO / "configs" / "climbing_corpus_joint_force_cond_sum1_postdec.yaml"
-
-
-def test_injection_defaults_to_pre_decoder():
+def test_injection_defaults_to_pre_decoder(tmp_path):
     assert load_config(REPO / "configs" / "base.yaml")["model"]["cond_input"][
         "injection"] == "pre_decoder"
-    assert load_config(_COND_CFG)["model"]["cond_input"]["injection"] == "pre_decoder"
+    assert load_config(_write(tmp_path, _COND_ON))["model"]["cond_input"][
+        "injection"] == "pre_decoder"
 
 
 def test_injection_rejects_unknown_values(tmp_path):
@@ -464,29 +412,14 @@ def test_patch_model_cfg_carries_injection(tmp_path):
         _min_model_cfg(), load_config(_write(tmp_path, text)), "mhr.pt")
     assert model_cfg.MODEL.COND_INPUT.INJECTION == "post_decoder"
     model_cfg = _patch_model_cfg(
-        _min_model_cfg(), load_config(_COND_CFG), "mhr.pt")
+        _min_model_cfg(), load_config(_write(tmp_path, _COND_ON)), "mhr.pt")
     assert model_cfg.MODEL.COND_INPUT.INJECTION == "pre_decoder"
 
 
-def test_postdec_config_is_sum1_with_the_injection_moved():
-    """The postdec arm must stay a clean A/B against cond_sum1."""
-    sum1 = _flatten(load_config(_SUM1_CFG))
-    postdec = _flatten(load_config(_POSTDEC_CFG))
-    moved = {
-        key for key in set(sum1) | set(postdec)
-        if sum1.get(key, "<absent>") != postdec.get(key, "<absent>")
-    }
-    assert moved == {"model.cond_input.injection", "output.exp_name"}
-    assert postdec["model.cond_input.injection"] == "post_decoder"
-    assert postdec["optim.epochs"] == 20
-    assert postdec["output.monitor"] == "test/force_mae"
-
-
-def test_arch_signature_injection_key_only_when_post_decoder():
+def test_arch_signature_injection_key_only_when_post_decoder(tmp_path):
     # Every pre_decoder checkpoint written before the key existed keeps a
     # byte-identical stored signature.
-    for cfg_path in (_COND_CFG, _SUM1_CFG):
-        sig = ckpt_io._arch_signature(load_config(cfg_path))
-        assert "injection" not in sig["cond_input"], cfg_path
+    sig = ckpt_io._arch_signature(load_config(_write(tmp_path, _COND_ON)))
+    assert "injection" not in sig["cond_input"]
     sig = ckpt_io._arch_signature(load_config(_POSTDEC_CFG))
     assert sig["cond_input"]["injection"] == "post_decoder"

@@ -62,7 +62,6 @@ model:
   # attention-window choice, like frames_per_clip).
   temporal:
     enabled: true
-    placement: post_decoder
     bottleneck_dim: 256
     num_layers: 1
     num_heads: 4

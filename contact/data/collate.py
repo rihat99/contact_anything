@@ -223,6 +223,13 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec,
         out["motion_valid"] = torch.tensor(
             [bool(f.get("motion_valid", False)) for f in frames],
             dtype=torch.bool)                                              # [B]
+        out["motion_root_pos"] = torch.stack([
+            torch.as_tensor(f["motion_root_pos"], dtype=torch.float32)
+            if "motion_root_pos" in f else torch.zeros(3, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 3] world
+        out["motion_root_valid"] = torch.tensor(
+            [bool(f.get("motion_root_valid", False)) for f in frames],
+            dtype=torch.bool)                                              # [B]
 
         # Kindyn-MHR pseudo-GT pose (climbing_corpus with load_pose): the fitted
         # world-frame MHR q per frame. Frames without targets fall back to zeros

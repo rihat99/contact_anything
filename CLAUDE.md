@@ -83,7 +83,7 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
 
 | Path | Purpose |
 |---|---|
-| `sam_3d_body/` | Vendored SAM 3D Body fork. Upstream code untouched; our additions are the contact head/tokens, `models/modules/temporal.py`, and hooks delimited by `# --- contact temporal hook ---` / efficiency-flag comments. |
+| `sam_3d_body/` | Vendored SAM 3D Body fork. Upstream code untouched; our additions are the contact head/tokens, `models/modules/temporal.py`, `models/modules/frame_attention.py`, and hooks delimited by `# --- contact temporal hook ---` / efficiency-flag comments. |
 | `contact/` | Our library: `config.py` (yaml + `base:` include + strict validation), `model.py` (build/freeze/eval-pin), `targets.py`, `losses.py`, `metrics.py`, `engine.py` (shared forward), `checkpoint.py` (schema v2), `tracking.py` (wandb+TB), `data/` (loaders, collate, splits), `physics/` (`adapter.py` MHR bridge + `loss.py` RNEA residual). |
 | `scripts/` | Thin CLIs: train, evaluate, demo, build_climbing_images, precompute_*, render_results_table. |
 | `configs/` | `base.yaml` (all defaults, commented) + the kept experiment overrides (self-contained, one per `output/` run + the supervised-force experiment); `configs/datasets/*.yaml` = dataset paths/options. Retired experiment yamls live in `legacy/configs/`. |
@@ -105,17 +105,19 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
    pose/keypoint outputs are unaffected by anything contact-side. The optional **force tokens**
    (`model.force_head`; four inheriting the contact anchors, or an explicit
    `force_keypoint_indices` list — force-only builds with no contact tokens/head at all are legal)
-   are appended *after* the contact tokens and the mask is extended so no earlier token block
-   attends a later one.
+   are appended *after* the contact tokens. Among the appended blocks
+   `model.extra_token_attention` picks the regime: `causal` (default) extends the mask so no
+   earlier block attends a later one; `mutual` lets contact/force/motion fully inter-attend
+   (original tokens still attend none of them, so pose/MHR stay isolated either way).
 3. **Per-target contact heads** — `head_contact` is an `nn.ModuleDict`: pooled modes support
    `vertex` → `[B, 6890|10475]` or body-22 joint logits. `pool_mode: per_token` applies one
    shared classifier independently to each token; ClimbingVideos uses four tokens → `[B,4]`.
    Output: `out["contact"]["<target>_logits"]`.
 4. **Temporal module** (`model.temporal`, optional) — zero-init-gated pre-LN attention blocks over
    the frames of a clip, order-aware via sinusoidal encoding of real elapsed seconds
-   (`frame_pos_sec`), optional frame-level causal mask. Placements: `post_decoder` (default),
-   `between_layers` (runs at decoder layers 0–4, shared weights), `pre_decoder` (experimental,
-   contact-private bottlenecked feature branch). Batches are homogeneous-T flattened clips
+   (`frame_pos_sec`), optional frame-level causal mask. Post-decoder only (the in-decoder
+   placements — between_layers, between_layers_cross, temporal conv, pre_decoder — were
+   controlled negatives and are retired). Batches are homogeneous-T flattened clips
    (`[B_clips*T, ...]` + `seq_len`/`frame_pos_sec`/`frame_valid`); single images are T=1.
 5. **Force head** (`model.force_head`, optional) — K force tokens → `head_force` (zero-init)
    regressing `out["force"]["joint_forces"] [B,K,3]`, dimensionless (units of body weight); an
@@ -136,31 +138,79 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
 6. **Motion head** (`model.motion_head`, optional) — anchored motion tokens regressing
    standardized root-frame vel/acc per slot, `out["motion"]["joint_motion"] [B,K,6|12]`
    (12 with `motion_supervision.angular`: + the root twist's angular vel/acc). The
-   `model.motion_temporal` module has three placements: `post_decoder` (default),
-   `between_layers` (in-decoder self-attn at `layers`, shared weights) and
-   `between_layers_cross` (a `TemporalCrossModule`: motion queries read the FROZEN sam3d
-   token block of every clip frame inside the decoder loop — writes only the motion slice,
-   invariance test-enforced). Supervision: `motion_supervision` (kindyn twist targets,
-   σ0.12 s label smoothing, pelvis-only for angular).
-7. **Pose temporal** (`model.pose_temporal`, optional; E2) — the ONE deliberate exception to
-   the frozen-pose rule: a zero-gated temporal module on the pose token (index 0) after the
-   decoder; the FINAL MHR output is recomputed from the updated token (interm preds and all
-   other token blocks see the untouched one). Supervised by `pose_supervision` against
+   `model.motion_temporal` module is post-decoder self-attention over the motion tokens
+   (mandatory in practice — a per-frame head cannot represent a derivative). Supervision:
+   `motion_supervision` (kindyn twist targets, σ0.12 s label smoothing, pelvis-only for
+   angular).
+7. **Pose temporal** (`model.pose_temporal`, optional; E2) — a deliberate exception to
+   the frozen-pose rule: the pose modality's per-modality temporal block — a zero-gated
+   temporal module on the pose token (index 0), run with the contact/force/motion temporal
+   blocks (after `cross_modal_temporal`); the FINAL MHR output is recomputed from the updated
+   token (interm preds and all other token blocks see the untouched one). Supervised by `pose_supervision` against
    kindyn-MHR pseudo-GT (`scripts/convert_kindyn_to_mhr.py` writes `mhr_1.npz` per scene —
    the kindyn SMPL-X trajectory refit as a world-frame MHR `q`, ~0.5 cm joint residual),
    compared in q space (125 local channels; the free-flyer root is never supervised).
+8. **Cross-modal temporal** (`model.cross_modal_temporal`, optional) — ONE zero-gated temporal
+   block (attend=joint) over the CONCATENATION of the chosen modality token blocks
+   (`modalities` ⊆ {pose, contact, force, motion}, ≥ 2, canonical sequence order), run
+   post-decoder BEFORE the per-modality temporal blocks: every participating token attends
+   every other across the clip's frames. Deliberately relaxes D1 among the participants;
+   listing `pose` writes the pose token (final MHR recomputed — needs `pose_supervision`).
+9. **Frame attention** (`model.frame_attn`, optional) — per-frame (NO temporal mixing)
+   zero-gated attention run AFTER every temporal block, one own-weights module per listed
+   modality (`sam_3d_body/models/modules/frame_attention.py`). Each module's keys/values
+   always span every enabled modality's post-temporal tokens of that frame (pose token
+   included, read-only unless `pose` is listed). All updates come from one consistent
+   snapshot, then apply — order-independent.
+10. **Pose-head fine-tune** (`train.finetune_pose_head`) — unfreezes `head_pose.proj` (the MHR
+   head's FFN; its constant tables and `head_pose_hand` stay frozen) as its own optimizer
+   param group at `optim.lr × train.pose_head_lr_scale`. Requires `pose_supervision`; the
+   checkpoint then carries the head weights (`pose_head_finetune` in the arch signature).
+11. **Pose→motion consistency** (`motion_consistency`, optional; no parameters — a pure loss,
+   `contact/motion_consistency.py`) — lifts the PREDICTED per-frame body placement to the
+   metric world with the dataset extrinsics (`p_w = R_ext^T((mean(kp[9,10]) + pred_cam_t) −
+   t_ext)`, `R_w = R_ext^T · diag(1,−1,−1) · euler("xyz", global_rot)` — the composition
+   verified against the motion-probe artifact), differentiates it with the kindyn BVR
+   body-twist stencil, standardizes with the `motion_supervision` pelvis table, and applies
+   Huber terms: vs the kindyn GT twist (`loss.gt`, gradient → pose path; attacks depth
+   wobble) and vs the motion head's **detached** prediction (`loss.head`, gradient → pose
+   path ONLY — the head is never dragged toward a degenerate pose trajectory). Twist rows
+   need stencil support (t−1, t, t+1), so clip boundaries are never twist-supervised.
+   Derivative terms alone leave the ABSOLUTE root placement in a null space (a constant
+   `pred_cam_t` is invisible under a static camera — the corpus_allmod_mutual collapse:
+   camera at a constant 9 cm depth, kp2d ~12k px off-person, motion head dragged down).
+   Three anchor terms close it: `loss.pos` (world mean-hips vs kindyn root +
+   `hip_offset_root`, the measured ≈9 cm constant; Huber metres, every valid row incl.
+   boundaries), `loss.rot` (`so3_log(R_pred^T R_gt)`, Huber radians; probe: no constant
+   frame offset), and `loss.cam_rail` (trust region vs the frozen model's own `pred_cam_t`,
+   stashed by the recompute hook as `out["mhr"]["pred_cam_t_frozen"]`: zero inside
+   `cam_rail_margin_m`, linear beyond — inert for a healthy model). v4 adds
+   `loss.rot_rail` (the same trust region on `global_rot` vs the stashed
+   `global_rot_frozen`, geodesic radians — v3 proved the unrailed orientation is
+   the next escape channel: pinned near-constant, ~55° from GT) and
+   `angular: false` (the gt/head twist comparison drops the angular rows — pure
+   differentiated orientation wobble, the signal that rewards constancy). GT root poses ship as
+   `motion_root_pos`/`motion_root_valid` (+ existing `motion_rot`) with `load_motion`.
 
 ### Invariants (do not break)
 
 - **Freeze filter is name-based**: only params whose dotted name contains `"contact"`, `"force"`,
-  `"motion"` **or** `"pose_temporal"` train (tokens, heads, posemb/feat linears,
-  `contact_temporal*`, `force_*`, `motion_*`, `pose_temporal`). Any new trainable module must
-  carry one of those in its attribute path. `pose_temporal` is the ONE name allowed to move the
-  frozen pose outputs (`head_pose` itself never matches the substring).
-- **Mask invariant**: no earlier token block attends a later one — original ⊥ {contact, force,
-  motion}, contact ⊥ {force, motion}, force ⊥ motion. Later blocks attend everything before them,
-  so contact/MHR outputs have an exactly-zero Jacobian w.r.t. every force **and motion** param
-  (D1); forward values agree only to the CUDA noise floor.
+  `"motion"`, `"cross_modal"`, `"frame_attn"` **or** `"pose_temporal"` train (tokens, heads,
+  posemb/feat linears, `contact_temporal*`, `force_*`, `motion_*`, `cross_modal_temporal`,
+  `frame_attn.*`, `pose_temporal`). Any new trainable module must carry one of those in its
+  attribute path. The pose outputs move only via `pose_temporal`, the `pose` modality of the
+  cross-modal bricks, or the explicit `train.finetune_pose_head` flag (which unfreezes
+  `head_pose.proj` outside the name filter — train.py adds it to the saved-name set).
+- **Mask invariant**: inside the decoder the original tokens NEVER attend the appended blocks —
+  pose/MHR outputs have an exactly-zero Jacobian w.r.t. every contact/force/motion param under
+  either mask regime. Under `extra_token_attention: causal` (default) additionally no earlier
+  appended block attends a later one (contact ⊥ {force, motion}, force ⊥ motion), so contact
+  outputs have an exactly-zero Jacobian w.r.t. every force **and motion** param (D1); `mutual`
+  deliberately opens full inter-attention among the appended blocks (D1 gone between them —
+  incompatible with `train.freeze_contact`, and captured in the arch signature). The
+  POST-decoder bricks `cross_modal_temporal` and `frame_attn` relax D1 the same way **among
+  their listed modalities**; the frozen pose/MHR outputs remain isolated unless `pose` is a
+  listed (written) modality.
 - **Frozen modules are eval-pinned** (`contact/model.py::pin_frozen_eval`): `model.train(True)`
   re-pins backbone/decoder/MHR+camera heads to eval (the backbone has DROP_PATH_RATE 0.1 — train
   mode would make it stochastic). The toggled set is **requires_grad-derived** at call time (not a
@@ -193,10 +243,15 @@ Key sections (see `configs/base.yaml` for full commented defaults):
 | `model.force_head` / `model.force_temporal` | force branch: enabled, `frame: local_world_aligned|local|root`, `force_keypoint_indices` (null = inherit contact anchors; explicit list enables force-only builds), MLP; force temporal (post_decoder only) |
 | `physics` | RNEA loss: enabled, MHR `model_path`/`lod`, `gravity`, `min_frames`, `smoothing_kernel`, per-term `loss.*` weights (all dimensionless) |
 | `force_supervision` | supervised kindyn GT-force loss (exclusive with `physics`): `target_frame`, Huber `force`/`huber_delta_bw`, `outlier_bw` cut, `noncontact` L1 |
-| `model.motion_head` / `model.motion_temporal` | motion tokens: explicit anchors; temporal `placement: post_decoder|between_layers|between_layers_cross` + `layers` (in-decoder hook sites) |
+| `model.motion_head` / `model.motion_temporal` | motion tokens: explicit anchors + post-decoder temporal self-attention |
+| `model.cross_modal_temporal` | ONE temporal block over the chosen modality blocks (`modalities` ≥ 2 of pose/contact/force/motion) — cross-modality mixing across frames |
+| `model.frame_attn` | per-frame attention after the temporal blocks: per-modality own-weights blocks whose keys/values span every modality's tokens of the frame |
+| `model.extra_token_attention` | decoder mask among the appended blocks: `causal` (block-triangular, default) \| `mutual` (contact/force/motion inter-attend) |
 | `motion_supervision` | kindyn twist vel/acc loss: `joint_names`, `root_convention`, `angular` (12-dim root target), `target_smooth_sec`, standardize `[K][2|4][3]` |
+| `motion_consistency` | pose→motion consistency + absolute anchors: the PREDICTED pose lifted to world (extrinsics) and differentiated (BVR body twist) — pelvis vel/acc Huber vs kindyn GT (`loss.gt`) and vs the DETACHED motion head (`loss.head`), both grad → pose path only; plus `loss.pos`/`loss.rot` (absolute world root pose vs kindyn + `hip_offset_root`), `loss.cam_rail`/`loss.rot_rail` (trust regions vs the frozen `pred_cam_t`/`global_rot`) closing the constant-camera/-orientation null spaces, and `angular: false` restricting the twist comparison to the linear rows; requires `motion_supervision` + a trainable pose path + T ≥ 3 |
 | `model.pose_temporal` / `pose_supervision` | E2 pose branch: zero-gated pose-token temporal module + kindyn-MHR pseudo-GT q-space Huber (`mhr_1.npz` via `scripts/convert_kindyn_to_mhr.py`) |
 | `train.freeze_contact` | regime (a): freeze contact, train force only (requires `model.init_contact_checkpoint`) |
+| `train.finetune_pose_head` | unfreeze `head_pose.proj` at `lr × pose_head_lr_scale` (requires `pose_supervision`) |
 | `contact.topology` | `smpl` / `smplx` (`mhr` → NotImplementedError) |
 | `contact.targets.vertex/joint` | enabled, weight, loss params, `joint_set`, subset masking, `derive_from_vertex`, confidence weights |
 | `data.datasets` | list of `{name, config, split}`; `frames_per_batch` (memory-flat batch budget), `sequence.{frames_per_clip,frame_stride,jitter}` |

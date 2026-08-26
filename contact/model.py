@@ -59,6 +59,10 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
     # still patched below (self-describing config; the force branch reads the
     # shared GRID_SIZE / GRID_RADIUS from it).
     model_cfg.MODEL.DECODER.DO_CONTACT_TOKENS = bool(out_dims)
+    # Decoder mask over the appended token blocks: causal (block-triangular) or
+    # mutual (contact/force/motion inter-attend; original tokens still blind).
+    model_cfg.MODEL.EXTRA_TOKEN_ATTENTION = str(
+        cfg["model"].get("extra_token_attention", "causal"))
     if "CONTACT_HEAD" not in model_cfg.MODEL:
         model_cfg.MODEL.CONTACT_HEAD = CfgNode()
     ch = model_cfg.MODEL.CONTACT_HEAD
@@ -79,7 +83,6 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
     tcfg = cfg["model"].get("temporal", {}) or {}
     model_cfg.MODEL.TEMPORAL = CfgNode({
         "ENABLED": bool(tcfg.get("enabled", False)),
-        "PLACEMENT": str(tcfg.get("placement", "post_decoder")),
         "BOTTLENECK_DIM": int(tcfg.get("bottleneck_dim", 256)),
         "NUM_LAYERS": int(tcfg.get("num_layers", 1)),
         "NUM_HEADS": int(tcfg.get("num_heads", 4)),
@@ -164,18 +167,10 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
         "OUTPUT_DIMS":            12 if motion_angular else 6,
     })
 
-    # Motion temporal module over the motion tokens. PLACEMENT: post_decoder
-    # (v3 default), between_layers (same self-attention inside the decoder loop)
-    # or between_layers_cross (motion queries read the frozen sam3d block across
-    # the clip's frames). LAYERS restricts the in-decoder placements to a subset
-    # of the intermediate layers (null = all of 0..4).
+    # Motion temporal module over the motion tokens (post_decoder).
     mtcfg = cfg["model"].get("motion_temporal", {}) or {}
-    mt_layers = mtcfg.get("layers", None)
     model_cfg.MODEL.MOTION_TEMPORAL = CfgNode({
         "ENABLED": bool(mtcfg.get("enabled", False)),
-        "PLACEMENT": str(mtcfg.get("placement", "post_decoder")),
-        "LAYERS": None if mt_layers is None else [int(i) for i in mt_layers],
-        "KIND": str(mtcfg.get("kind", "attention")),
         "BOTTLENECK_DIM": int(mtcfg.get("bottleneck_dim", 256)),
         "NUM_LAYERS": int(mtcfg.get("num_layers", 1)),
         "NUM_HEADS": int(mtcfg.get("num_heads", 4)),
@@ -184,6 +179,37 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
         "CAUSAL": bool(mtcfg.get("causal", False)),
         "DROPOUT": float(mtcfg.get("dropout", 0.0)),
         "POSITION_SCALE": float(mtcfg.get("position_scale", 1.0)),
+    })
+
+    # Cross-modal temporal module: ONE temporal block (attend fixed to 'joint')
+    # over the concatenation of the listed modality token blocks. Patched even
+    # when disabled so the model config is self-describing; SAM3DBody only
+    # builds cross_modal_temporal when ENABLED.
+    xmcfg = cfg["model"].get("cross_modal_temporal", {}) or {}
+    model_cfg.MODEL.CROSS_MODAL_TEMPORAL = CfgNode({
+        "ENABLED": bool(xmcfg.get("enabled", False)),
+        "MODALITIES": [str(m) for m in (xmcfg.get("modalities") or [])],
+        "BOTTLENECK_DIM": int(xmcfg.get("bottleneck_dim", 256)),
+        "NUM_LAYERS": int(xmcfg.get("num_layers", 1)),
+        "NUM_HEADS": int(xmcfg.get("num_heads", 4)),
+        "MLP_RATIO": float(xmcfg.get("mlp_ratio", 2.0)),
+        "CAUSAL": bool(xmcfg.get("causal", False)),
+        "DROPOUT": float(xmcfg.get("dropout", 0.0)),
+        "POSITION_SCALE": float(xmcfg.get("position_scale", 1.0)),
+    })
+
+    # Per-frame attention (no temporal mixing) after the temporal blocks: one
+    # own-weights module per listed modality; keys/values span every modality's
+    # tokens of the frame. Same patched-even-when-disabled rule.
+    facfg = cfg["model"].get("frame_attn", {}) or {}
+    model_cfg.MODEL.FRAME_ATTN = CfgNode({
+        "ENABLED": bool(facfg.get("enabled", False)),
+        "MODALITIES": [str(m) for m in (facfg.get("modalities") or [])],
+        "BOTTLENECK_DIM": int(facfg.get("bottleneck_dim", 256)),
+        "NUM_LAYERS": int(facfg.get("num_layers", 1)),
+        "NUM_HEADS": int(facfg.get("num_heads", 4)),
+        "MLP_RATIO": float(facfg.get("mlp_ratio", 2.0)),
+        "DROPOUT": float(facfg.get("dropout", 0.0)),
     })
 
     # Input conditioning (model.cond_input). Only the switch and the feature width
@@ -228,11 +254,15 @@ def _trainable_name_filter(name: str) -> bool:
     """Train the contact, force and motion pipelines only: their tokens, heads,
     and the small posemb / feat projection layers that update the tokens between
     decoder layers (all of which contain ``contact``, ``force`` or ``motion`` in
-    the dotted name) — plus ``pose_temporal``, the ONE deliberate exception that
-    is allowed to move the frozen pose outputs (E2; ``head_pose`` itself never
-    matches, the substring check is on the full module name)."""
+    the dotted name) — plus the shared post-decoder bricks ``cross_modal``
+    (cross-modal temporal) and ``frame_attn`` (per-frame attention), and
+    ``pose_temporal``, the deliberate exception that is allowed to move the
+    frozen pose outputs (E2; ``head_pose`` itself never matches, the substring
+    check is on the full module name — its optional fine-tune is a separate
+    explicit flag in :func:`build_model`)."""
     lname = name.lower()
     return ("contact" in lname or "force" in lname or "motion" in lname
+            or "cross_modal" in lname or "frame_attn" in lname
             or "pose_temporal" in lname)
 
 
@@ -317,6 +347,19 @@ def build_model(cfg: dict, device: str = "cuda") -> Tuple[nn.Module, List[str]]:
         p.requires_grad = False
     for name, p in model.named_parameters():
         if _trainable_name_filter(name):
+            p.requires_grad = True
+
+    # Optional pose-head fine-tune: unfreeze ONLY the MHR head's projection FFN
+    # (everything else in MHRHead is a frozen constant table, and
+    # head_pose_hand must not match). Deliberate exception to the frozen-pose
+    # rule; train.py enforces a pose objective and gives these params their own
+    # lr-scaled optimizer group.
+    if cfg.get("train", {}).get("finetune_pose_head", False):
+        head_pose_params = [
+            (name, p) for name, p in model.named_parameters()
+            if name.startswith("head_pose.proj.")]
+        assert head_pose_params, "head_pose.proj not found on the model"
+        for _, p in head_pose_params:
             p.requires_grad = True
 
     # Regime (a): warm-start from a contact checkpoint and train the force branch

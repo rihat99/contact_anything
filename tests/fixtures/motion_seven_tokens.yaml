@@ -1,41 +1,7 @@
-# Motion tokens v2 — corpus7_motion_t7. Dedicated motion tokens that cross-attend
-# the image features inside the frozen decoder, regressing per-joint LINEAR
-# velocity + acceleration (no angular, no forces, no contacts).
-#
-# Why: the v1 probe read the frozen decoder's EXISTING output tokens (pose token +
-# 70 kp2D + 70 kp3D) through a temporal transformer and found they carry nothing
-# about motion beyond the pose readout (token-0-only beat all 141; trajectory-only
-# beat trajectory+tokens). The one untested escalation is a NEW information channel:
-# tokens with their own image cross-attention and anchored local feature sampling
-# (blur, background flow, scale change) that the pose-trained tokens had no
-# incentive to keep.
-#
-# Motion-ONLY build: both contact targets disabled and force disabled -> no contact
-# tokens, no contact head, no force tokens. The seven motion tokens carry their own
-# MHR70 anchors:
-#   [62, 41, 15, 18, 17, 20, 9] = L wrist, R wrist, L big-toe-tip, R big-toe-tip,
-#                                 L heel, R heel, L HIP
-# The first six match the kindyn group order [LH, RH, LF, RF, LA, RA]; the 7th is
-# the PELVIS token. MHR70 has no pelvis keypoint (the model's own pelvis is
-# mean(kp[9], kp[10])), so the token is anchored at the left hip — a
-# feature-location choice, ~10 cm off. Its TARGET is the true kindyn pelvis joint
-# (52-joint index 0), the v1-comparable quantity.
-#
-# Targets (contact/data/climbing_corpus.py::_load_motion): central differences of
-# kindyn `joints_world` over the FULL scene trajectory at the scene's stored
-# (fractional) fps, rotated world -> body-root with R(q_xyzw)^T — the identical
-# convention v1 used, so the numbers are directly comparable. frame_stride MUST be
-# 1 (the targets are native-rate derivatives).
-#
-# Loss (contact/motion_supervision.py): Huber (delta 1.0) on STANDARDIZED values,
-# vel:acc 1:1, all clip frames supervised (v1 supervised every window frame; 7x the
-# supervision per forward). Per-(frame, joint) outlier bit |acc_world| > 50 m/s^2
-# zeroes both terms in TRAIN only — a per-frame drop would discard 14.3% of train
-# frames while the pelvis alone is only 0.32%.
-#
-# T=7 / stride 1 with the mandatory motion temporal attention (post_decoder,
-# zero-init gate, real-seconds sinusoidal encoding): a per-frame head provably
-# cannot represent a derivative. attend: joint so the seven slots see each other.
+# TEST FIXTURE — the retired motion-tokens-v2 seven-token build (was
+# configs/climbing_corpus_motion_t7.yaml; its run is gone). Kept verbatim under
+# tests/ because it is the only config exercising the multi-token motion path:
+# 7 anchors, joint_names=null, rotated_world targets, full standardize table.
 base: configs/base.yaml
 
 model:

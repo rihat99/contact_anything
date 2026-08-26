@@ -162,19 +162,6 @@ def test_blind_config_differs_from_baseline_in_one_knob():
     assert cfg == baseline
 
 
-def test_blind_rejects_pre_decoder_temporal(tmp_path):
-    """pre_decoder temporal exists only to feed the anchored update, which is gone."""
-    run = tmp_path / "run.yaml"
-    run.write_text("""
-base: configs/climbing_videos_joint_temporal_center_blind.yaml
-model:
-  temporal:
-    placement: pre_decoder
-""")
-    with pytest.raises(ValueError, match="no-op"):
-        load_config(run)
-
-
 # ---------------------------------------------------------------- model wiring
 
 

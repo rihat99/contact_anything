@@ -143,7 +143,8 @@ def _resume_config_diffs(saved: dict, current: dict) -> list[str]:
 
     diffs: list[str] = []
     for section in ("model", "contact", "physics", "force_supervision",
-                    "motion_supervision", "pose_supervision", "loss"):
+                    "motion_supervision", "motion_consistency",
+                    "pose_supervision", "loss"):
         if _normalized(saved, section) != _normalized(current, section):
             diffs.append(f"  {section}: differs")
     for key in ("datasets", "sequence", "eval_split"):
@@ -298,8 +299,14 @@ class Trainer:
         # it is not in the base checkpoint either — persisting it keeps the checkpoint
         # self-contained so evaluate/demo/resume never run with a random contact head.
         # The arch fingerprint still keys on ``trainable_names`` (see checkpoint.save).
+        # ``finetune_pose_head`` params live outside the name filter (head_pose
+        # is upstream), so they are added explicitly — a pose-finetuned
+        # checkpoint must carry its own head weights.
+        _finetune_pose = bool(self.cfg["train"]["finetune_pose_head"])
         self.saved_names = [
-            n for n, _ in self.model.named_parameters() if _trainable_name_filter(n)]
+            n for n, _ in self.model.named_parameters()
+            if _trainable_name_filter(n)
+            or (_finetune_pose and n.startswith("head_pose.proj."))]
         warm_state = None
         warm_path = self.cfg["model"].get("init_contact_checkpoint")
         if resume_ckpt is None and warm_path:
@@ -383,17 +390,33 @@ class Trainer:
                 "for training: without a motion objective the motion params never "
                 "receive gradients")
 
-        # Kindyn-MHR pseudo-GT pose objective (model.pose_temporal, E2).
+        # Kindyn-MHR pseudo-GT pose objective (pose_temporal E2, the 'pose'
+        # modality of cross_modal_temporal / frame_attn, or the pose-head
+        # fine-tune). Same trainer-only guard as the branches above: without a
+        # pose objective, moving the pose output is unconstrained drift — and a
+        # fine-tuned head would be entirely gradient-less (DDP crash).
         self.pose_supervised = bool(self.cfg["pose_supervision"]["enabled"])
         self.pose_loss = None
         if self.pose_supervised:
             from contact.pose_supervision import PoseSupervisedLoss
             self.pose_loss = PoseSupervisedLoss(self.cfg, device=device)
-        elif self.cfg["model"]["pose_temporal"]["enabled"]:
-            raise ValueError(
-                "model.pose_temporal.enabled requires pose_supervision.enabled=true "
-                "for training: without a pose objective the pose_temporal params "
-                "never receive gradients")
+        else:
+            from contact.config import _pose_trainable_paths
+            pose_paths = _pose_trainable_paths(self.cfg)
+            if pose_paths:
+                raise ValueError(
+                    f"{', '.join(pose_paths)} require(s) "
+                    "pose_supervision.enabled=true for training: without a pose "
+                    "objective the pose-moving params never receive gradients")
+
+        # Pose->motion consistency: the predicted pose differentiated to a
+        # pelvis twist, pulled toward the kindyn GT and the motion head (grads
+        # reach the pose path AND the motion head). Config-validated to require
+        # motion_supervision + a trainable pose path.
+        self.consistency_loss = None
+        if self.cfg["motion_consistency"]["enabled"]:
+            from contact.motion_consistency import MotionConsistencyLoss
+            self.consistency_loss = MotionConsistencyLoss(self.cfg, device=device)
 
         # Regime-(b) physics-gradient leak guard: the documented physics/contact
         # gradient isolation holds only in regime (a) (contact frozen). When physics
@@ -432,8 +455,21 @@ class Trainer:
 
         ocfg = self.cfg["optim"]
         self.grad_clip = float(self.cfg["loss"]["grad_clip"])
+        # The fine-tuned pose head (pretrained weights) gets its own lr-scaled
+        # param group; without the fine-tune this is the original single group.
+        _trainable = [(n, p) for n, p in self.model.named_parameters()
+                      if p.requires_grad]
+        _groups = [{"params": [p for n, p in _trainable
+                               if not n.startswith("head_pose.")]}]
+        _head_pose = [p for n, p in _trainable if n.startswith("head_pose.")]
+        if _head_pose:
+            _groups.append({
+                "params": _head_pose,
+                "lr": float(ocfg["lr"]) * float(
+                    self.cfg["train"]["pose_head_lr_scale"]),
+            })
         self.optimizer = torch.optim.AdamW(
-            (p for p in self.model.parameters() if p.requires_grad),
+            _groups,
             lr=float(ocfg["lr"]), weight_decay=float(ocfg["weight_decay"]),
         )
         self.scheduler = _build_scheduler(self.optimizer, ocfg)
@@ -749,6 +785,19 @@ class Trainer:
         return scalars
 
     @staticmethod
+    def _consistency_scalars(prefix: str, cons_parts: dict) -> dict:
+        """Flatten MotionConsistencyLoss parts into ``{prefix}/consistency/*``."""
+        scalars = {f"{prefix}/consistency/loss": cons_parts["loss"]}
+        for name, term in cons_parts["terms"].items():
+            scalars[f"{prefix}/consistency/{name}"] = term["loss"]
+            scalars[f"{prefix}/consistency/{name}_mass"] = term["weight_mass"]
+        for key in ("vel_rmse", "acc_rmse", "pos_err_m", "rot_err_deg",
+                    "cam_dev_m", "rail_frac", "rot_dev_deg", "rot_rail_frac"):
+            if key in cons_parts:
+                scalars[f"{prefix}/consistency/{key}"] = cons_parts[key]
+        return scalars
+
+    @staticmethod
     def _motion_eval_metrics(stats: torch.Tensor, names: tuple[str, ...],
                              terms: tuple[str, ...] = ("vel", "acc")) -> dict:
         """Global Pearson r + 3-D RMSE from all-reduced sufficient stats.
@@ -832,7 +881,9 @@ class Trainer:
             force_parts = None
             motion_parts = None
             pose_parts = None
+            cons_parts = None
             physics_active = force_active = motion_active = pose_active = False
+            cons_active = False
             total = (None if (self.freeze_contact or contact_loss is None)
                      else contact_loss)
             if self.physics_loss is not None:
@@ -859,6 +910,12 @@ class Trainer:
                 pose_scaled, pose_active = self._ddp_physics_loss(
                     pose_total, pose_parts)
                 total = pose_scaled if total is None else total + pose_scaled
+            if self.consistency_loss is not None:
+                cons_total, cons_parts = self.consistency_loss(
+                    out, batch, exclude_outliers=True)
+                cons_scaled, cons_active = self._ddp_physics_loss(
+                    cons_total, cons_parts)
+                total = cons_scaled if total is None else total + cons_scaled
             if total is None:
                 raise RuntimeError(
                     "no training objective: the contact loss is frozen/absent and "
@@ -870,7 +927,7 @@ class Trainer:
             # decay would still nudge the weights. Skip the optimiser step for those.
             active = ((contact_active and not self.freeze_contact)
                       or physics_active or force_active or motion_active
-                      or pose_active)
+                      or pose_active or cons_active)
             loss = total
             finite = torch.tensor(
                 int(bool(torch.isfinite(loss).item())), device=self.device,
@@ -946,6 +1003,8 @@ class Trainer:
                     scalars.update(self._motion_scalars("train", motion_parts))
                 if pose_parts is not None:
                     scalars.update(self._pose_scalars("train", pose_parts))
+                if cons_parts is not None:
+                    scalars.update(self._consistency_scalars("train", cons_parts))
                 self.logger.log(scalars, self.global_step)
 
             if self.is_main:
@@ -1020,6 +1079,8 @@ class Trainer:
         # in float64 over the split, then all-reduced once (exact global values).
         motion_stats = None
         pose_stats = None
+        cons_terms = ("gt", "head", "pos", "rot", "cam_rail", "rot_rail")
+        cons_sums = [0.0] * (2 * len(cons_terms))   # (num, mass) per term
         for batch in tqdm(
             self.eval_loader, desc=self.eval_split, disable=not self.is_main,
         ):
@@ -1060,6 +1121,16 @@ class Trainer:
                 pose_stats = stats.clone() if pose_stats is None else pose_stats + stats
                 if self.loss_fn is None:
                     running_loss += pose_parts["loss"]
+            if self.consistency_loss is not None:
+                # Eval is NEVER outlier-filtered, like the motion loss.
+                _, cons_parts = self.consistency_loss(
+                    out, batch, exclude_outliers=False)
+                for i, name in enumerate(cons_terms):
+                    term = cons_parts["terms"].get(name)
+                    if term is not None:
+                        cons_sums[2 * i] += float(
+                            term["weighted_numerator_tensor"].detach())
+                        cons_sums[2 * i + 1] += term["weight_mass"]
             for t in self.targets:
                 tgt = targets[t]
                 add_counts(counts[t], contact_counts(logits[t], tgt["gt"], tgt["mask"]))
@@ -1105,6 +1176,18 @@ class Trainer:
             if self.distributed:
                 dist.all_reduce(pose_stats, op=dist.ReduceOp.SUM)
             metrics["pose"] = metrics_from_stats(pose_stats)
+        if self.consistency_loss is not None:
+            if self.distributed:
+                packed = torch.tensor(
+                    cons_sums, dtype=torch.float64, device=self.device)
+                dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+                cons_sums = packed.cpu().tolist()
+            metrics["consistency"] = {
+                name: cons_sums[2 * i] / max(cons_sums[2 * i + 1], 1.0)
+                for i, name in enumerate(cons_terms)
+                # A zero-weight term never accumulates mass — drop it so the
+                # report only carries the terms this run actually trains.
+                if cons_sums[2 * i + 1] > 0.0}
         return {"loss": running_loss / max(n, 1),
                 "metrics": metrics,
                 "per_output": {
@@ -1147,6 +1230,11 @@ class Trainer:
                     phys_note = f"  physics_residual {v['metrics']['physics']['residual']:.4f}"
                 if "force" in v["metrics"]:
                     phys_note += f"  force_mae {v['metrics']['force']['mae']:.4f}"
+                if "consistency" in v["metrics"]:
+                    c = v["metrics"]["consistency"]
+                    phys_note += ("  cons["
+                                  + " ".join(f"{k} {val:.3f}" for k, val in c.items())
+                                  + "]")
                 if "pose" in v["metrics"]:
                     p = v["metrics"]["pose"]
                     phys_note += (
@@ -1190,6 +1278,9 @@ class Trainer:
                 if "motion" in v["metrics"]:
                     for key, val in v["metrics"]["motion"].items():
                         val_scalars[f"{self.eval_split}/motion/{key}"] = val
+                if "consistency" in v["metrics"]:
+                    for key, val in v["metrics"]["consistency"].items():
+                        val_scalars[f"{self.eval_split}/consistency/{key}"] = val
                 self.logger.log(val_scalars, self.global_step)
                 val_metric = self._monitor_value(v)
 

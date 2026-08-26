@@ -67,6 +67,13 @@ camera-0-derived direction, and ``load_forces=True`` adds per-frame GT forces:
   angular part of the same twist). Under the ``twist`` convention the world
   acceleration is ``R (a + omega x v)``, so the metric needs it to reach world
   axes.
+* ``motion_root_pos`` ``[3]`` float32 — the smoothed kindyn root position in
+  the metric WORLD frame (``q_root[:3]``, same trajectory ``motion_rot`` comes
+  from). With ``motion_rot`` it is the absolute root-pose anchor of the
+  consistency loss (``motion_consistency.loss.pos/rot``).
+* ``motion_root_valid`` bool — the raw kindyn-coverage bit for that frame.
+  Unlike ``motion_valid`` it needs no stencil support or edge trim: an
+  absolute pose is per-frame.
 
 ``cond_features_path`` adds ``cond_feat`` ``[10]`` float32, the *input*-side
 conditioning feature (``model.cond_input``): standardized root-frame smoothed
@@ -1176,6 +1183,8 @@ class ClimbingCorpusDataset(Dataset):
             "motion_outlier": outlier[:, :, cols_out],              # [P, N, K] bool
             "motion_rot": rot.astype(np.float32),                   # [P,N,3,3] world-from-root
             "motion_omega": omega.astype(np.float32),               # [P,N,3] body angular vel
+            "motion_root_pos": q_root[..., :3].astype(np.float32),  # [P,N,3] world (smoothed)
+            "motion_root_valid": kindyn_valid.copy(),               # [P, N] bool (no stencil)
         }
 
     # ------------------------------------------------------------------ epoch / jitter
@@ -1284,6 +1293,10 @@ class ClimbingCorpusDataset(Dataset):
                 frame["motion_omega"] = torch.from_numpy(
                     data["motion_omega"][person, pos])                            # [3]
                 frame["motion_valid"] = valid and bool(data["motion_valid"][person, pos])
+                frame["motion_root_pos"] = torch.from_numpy(
+                    data["motion_root_pos"][person, pos])                         # [3]
+                frame["motion_root_valid"] = valid and bool(
+                    data["motion_root_valid"][person, pos])
             if self.load_pose:
                 frame["pose_gt_q"] = torch.from_numpy(
                     data["pose_gt_q"][person, pos])                           # [132]

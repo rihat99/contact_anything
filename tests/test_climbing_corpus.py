@@ -555,11 +555,11 @@ def test_clip_collates_into_training_batch(corpus):
 
 
 def test_clip_collates_kindyn6_targets(corpus):
-    """The gated experiment config reduces the same clip to six kindyn groups."""
+    """The joint contact+force experiment config reduces the clip to six kindyn groups."""
     ds = ClimbingCorpusDataset(
         corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
         frame_stride=2, jitter=False, load_forces=True)
-    cfg = load_config(REPO / "configs" / "climbing_corpus_joint_force_gated.yaml")
+    cfg = load_config(REPO / "configs" / "climbing_corpus_joint_force_cond_sum1_postdec.yaml")
     collate = make_collate((256, 256), TargetSpec.from_config(cfg))
     joint = collate([ds[0]])["targets"]["joint"]
     assert joint["gt"].shape == (2, 6)
@@ -643,7 +643,7 @@ def test_cond_features_require_standardization(corpus, tmp_path):
 
 
 def test_cond_feat_collates_with_and_without_features(corpus, tmp_path):
-    cfg = load_config(REPO / "configs" / "climbing_corpus_joint_force_gated.yaml")
+    cfg = load_config(REPO / "configs" / "climbing_corpus_joint_force_cond_sum1_postdec.yaml")
     collate = make_collate((256, 256), TargetSpec.from_config(cfg))
     common = dict(
         scenes=["vidA_0000"], split="train", frames_per_clip=2, frame_stride=2,
