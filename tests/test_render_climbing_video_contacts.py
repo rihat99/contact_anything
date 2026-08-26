@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from contact.targets import JOINT_SET_GROUPS
 from scripts.render_climbing_video_contacts import (
     CONTACT_COLOR,
     FREE_COLOR,
@@ -55,7 +56,7 @@ def test_scene_ground_truth_reduces_hands_and_ankle_or_foot():
         "contact_conf": np.ones_like(contact, dtype=np.float32),
         "valid_mask": np.array([[True, False]]),
         "annotated": None,
-    })
+    }, JOINT_SET_GROUPS["extremities_4"])
 
     np.testing.assert_array_equal(labels[0, 0], [True, False, True, False])
     np.testing.assert_array_equal(known[0, 0], [True, True, True, True])
