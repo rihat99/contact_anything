@@ -141,10 +141,12 @@ for the double central difference. With the default kernel the residual frames
 are `{t : 3 ≤ t ≤ T − 4}`, which means **a clip needs T ≥ 7 to produce any
 physics signal at all**. This bit us: contact training used T=5, where the
 physics objective is silently dead. The first force runs used T=8 (2 residual
-frames per clip); the current config uses **T=16 with frame stride 2**, giving
-10 residual frames per clip and, because stride 2 doubles the time step,
-roughly 4× less amplification of reconstruction noise through the double
-derivative (velocity scales as 1/dt, acceleration as 1/dt²).
+frames per clip); a T=16/stride-2 variant was also run (10 residual frames per
+clip, and stride 2 doubles the time step, so roughly 4× less amplification of
+reconstruction noise through the double derivative — velocity scales as 1/dt,
+acceleration as 1/dt²), but the kept physics config
+(`climbing_videos_force_warmstart_t7hinge.yaml`) settled on **T=7, stride 1**
+(1 residual frame per clip) — see [experiments.md](experiments.md).
 
 One honest limitation: the acceleration is formed by central-differencing the
 velocity with a doubled interval, which is exact only for uniformly spaced
@@ -257,10 +259,12 @@ T=16. Does a T=5-trained temporal module survive T=16 inference? It depends
 which one: `climb4_t5` (trained to predict all frames) is nearly a passthrough
 and holds F1 0.888 at T=16/stride 2 (vs 0.897 native); `climb4_t5mid` (trained
 to predict the centre frame) genuinely uses its temporal context and
-**collapses to F1 0.70** outside its training window. So the current config
-warm-starts from `climb4_t5` and pins the temporal architecture to byte-match
-the source; the checkpoint loader hard-fails on any architecture mismatch
-rather than silently reinitialising.
+**collapses to F1 0.70** outside its training window — which is why the
+T=16-extrapolation experiments warm-started from `climb4_t5`. The kept T=7
+config instead warm-starts from `climb4_t5mid` (T=7 sits close enough to its
+window). The checkpoint loader hard-fails on any architecture mismatch rather
+than silently reinitialising (`window_frames` itself is deliberately not part
+of the architecture signature).
 
 Other training mechanics worth knowing: the gradient clip is 5.0 (raised from
 1.0 — see the collapse story below) and the raw pre-clip norm is logged every

@@ -412,8 +412,9 @@ class MotionConsistencyLoss:
             terms["rot_rail"] = (zero_touch, 0.0)
 
         with torch.no_grad():
-            pose_phys = pose_twist * self.std + self.mean
-            diff = (pose_phys - gt).reshape(batch_rows, -1)
+            # pose_twist is already physical (clip_body_twist output) — compare
+            # raw against the raw GT; only the loss terms are standardized.
+            diff = (pose_twist - gt).reshape(batch_rows, -1)
             m = gt_mask.to(torch.float64)
             n = m.sum().clamp(min=1.0)
             n_pose = pose_ok.to(torch.float64).sum().clamp(min=1.0)

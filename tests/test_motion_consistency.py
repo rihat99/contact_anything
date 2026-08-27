@@ -366,6 +366,29 @@ def test_short_clips_are_inactive():
     assert out["motion"]["joint_motion"].grad is None    # detached head
 
 
+def test_rmse_diagnostics_are_physical_units():
+    """vel/acc RMSE stay raw m/s / m/s^2 under a non-trivial standardize table
+    (regression: the diagnostic once re-applied std/mean to the already
+    physical pose twist)."""
+    cfg = _toy_cfg()
+    cfg["motion_supervision"]["standardize"] = {
+        "mean": [[[0.5] * 3] * 4], "std": [[[2.0] * 3] * 4]}
+    loss_fn = MotionConsistencyLoss(cfg, device="cpu")
+    n_clips, t = 2, 5
+    out, batch = _toy_out(n_clips=n_clips, t=t), _toy_batch(n_clips=n_clips, t=t)
+    _, parts = loss_fn(out, batch)
+
+    pos_w, rot_w = predicted_root_world(out["mhr"], batch["cam_from_world"])
+    pos_sec = batch["frame_pos_sec"].to(torch.float64).reshape(n_clips, t)
+    dt = (pos_sec[:, 1:] - pos_sec[:, :-1]).mean(dim=1).clamp(min=1e-6)
+    vel, acc, _, _ = clip_body_twist(
+        pos_w.reshape(n_clips, t, 3), rot_w.reshape(n_clips, t, 3, 3), dt)
+    # motion_gt is zero, every interior row supervised -> RMSE = interior RMS.
+    for key, arr in (("vel_rmse", vel), ("acc_rmse", acc)):
+        expected = float(arr[:, 1:-1].square().sum(-1).mean().sqrt())
+        assert parts[key] == pytest.approx(expected, rel=1e-4), key
+
+
 def test_still_pose_gives_zero_twist():
     """A frozen-in-place trajectory must produce exactly zero vel/acc."""
     loss_fn = MotionConsistencyLoss(_toy_cfg(), device="cpu")

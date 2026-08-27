@@ -291,7 +291,7 @@ ClimbingVideos corpus label semantics (important):
 - The four-output target order is `left_hand, right_hand, left_foot, right_foot`; each foot is
   `ankle OR foot`. A known positive wins under partial annotation, while a known negative needs
   both source joints annotated. Confidence is max over positive evidence and mean when both are
-  known free. The current experiment uses focal-only loss (`alpha=0.8`, `gamma=2`) and exact
+  known free. The current experiment uses focal-only loss (`alpha=0.6`, `gamma=2`) and exact
   global confidence-mass reduction under DDP.
 
 Datasets emit per-target `(gt, sup_mask)`; missing targets are fully masked, so image (vertex) and
