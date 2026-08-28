@@ -64,17 +64,31 @@ class DistributedEvalSampler(Sampler[int]):
 
 # -------------------------------------------------------------------- transform
 
-def _build_transform(image_size: Tuple[int, int]):
-    """SAM-3D-Body's standard top-down crop pipeline at the model resolution."""
-    return Compose([
+def _build_transform(image_size: Tuple[int, int], *, imageless: bool = False):
+    """SAM-3D-Body's standard top-down crop pipeline at the model resolution.
+
+    :param imageless: drop the torchvision wrapper (it requires ``img``); the
+        geometric transforms run identically without one (``TopdownAffine``
+        skips a missing ``img`` and the warp matrix depends only on the bbox).
+    """
+    transforms = [
         GetBBoxCenterScale(),
         TopdownAffine(input_size=image_size, use_udp=False),
-        VisionTransformWrapper(ToTensor()),
-    ])
+    ]
+    if not imageless:
+        transforms.append(VisionTransformWrapper(ToTensor()))
+    return Compose(transforms)
 
 
-def _process_sample(frame: dict, transform):
-    """Run the SAM-3D-Body transform on a single frame dict (image/mask/bbox)."""
+def _process_sample(frame: dict, transform, transform_imageless=None):
+    """Run the SAM-3D-Body transform on a single frame dict (image/mask/bbox).
+
+    Frames with ``image is None`` and a header-read ``img_wh`` (the
+    embedding-cache load path) take an imageless fast path: same geometry
+    (bbox center/scale, affine, ``ori_img_size``) and the same mask warp, but
+    no JPEG decode and a zero crop for ``img`` — the model provably never
+    reads its values when ``batch["embedding"]`` is present.
+    """
     img  = frame["image"]
     mask = frame["mask"]
     bbox = frame["bbox"]
@@ -85,9 +99,13 @@ def _process_sample(frame: dict, transform):
             or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]):
         raise RuntimeError(
             f"frame {frame.get('key', '?')} has invalid xyxy bbox {bbox.tolist()}")
+    imageless = img is None and frame.get("img_wh") is not None
     has_mask = mask is not None
     if mask is None:
-        H, W = img.shape[:2]
+        if imageless:
+            W, H = frame["img_wh"]
+        else:
+            H, W = img.shape[:2]
         mask = np.zeros((H, W, 1), dtype=np.uint8)
     elif mask.ndim == 2:
         mask = mask[..., None]
@@ -95,13 +113,23 @@ def _process_sample(frame: dict, transform):
     # mask_score>0 tells the model this is a real mask (sam3d_body.py:883-889);
     # a substituted all-zeros mask must score 0.0 so it is treated as "no mask".
     data_info = dict(
-        img=img,
         bbox=bbox,
         bbox_format="xyxy",
         mask=mask,
         mask_score=np.array(1.0 if has_mask else 0.0, dtype=np.float32),
     )
-    out = transform(data_info)
+    if imageless:
+        if transform_imageless is None:
+            raise RuntimeError(
+                f"frame {frame.get('key', '?')} has no decoded image "
+                "(embedding-cache fast path) but no imageless transform was given")
+        out = transform_imageless(data_info)
+        out["ori_img_size"] = np.array(frame["img_wh"])             # [W, H]
+        w, h = (int(v) for v in out["img_size"])
+        out["img"] = torch.zeros(3, h, w)
+    else:
+        data_info["img"] = img
+        out = transform(data_info)
     m = out["mask"]
     if m.ndim == 3:
         m = m[..., 0]
@@ -122,6 +150,7 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec,
         when ``motion_supervision.angular`` adds the root angular pair.
     """
     transform = _build_transform(image_size)
+    transform_imageless = _build_transform(image_size, imageless=True)
 
     def _collate(batch):
         clips = [item if isinstance(item, list) else [item] for item in batch]
@@ -130,7 +159,8 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec,
             raise AssertionError("homogeneous-T batches only: all clips must share the same length")
         frames = [f for clip in clips for f in clip]   # flatten -> B = B_clips * T
 
-        per_sample = [_process_sample(f, transform) for f in frames]
+        per_sample = [_process_sample(f, transform, transform_imageless)
+                      for f in frames]
         cam_ints = torch.stack([
             torch.as_tensor(f["cam_int"], dtype=torch.float32) for f in frames
         ], dim=0)
@@ -148,6 +178,13 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec,
             out[k] = torch.stack(tensors, dim=0).float().unsqueeze(1)   # [B, 1, ...]
         if "mask" in out and out["mask"].dim() == 4:
             out["mask"] = out["mask"].unsqueeze(2)                      # [B, 1, 1, H, W]
+
+        # Precomputed backbone embeddings (climbing_corpus with embedding_dir):
+        # kept bf16 — forward_pose_branch casts to the img dtype, reproducing
+        # the live path's bf16 -> fp32 cast bit-exactly.
+        if "embedding" in frames[0]:
+            out["embedding"] = torch.stack(
+                [f["embedding"] for f in frames], dim=0)        # [B, C, h, w] bf16
 
         out["person_valid"] = torch.ones((len(frames), 1))
         out["cam_int"]      = cam_ints
@@ -283,6 +320,12 @@ def _to_device(value, device):
 
 def batch_to_device(batch: dict, device: str) -> dict:
     for k, v in batch.items():
+        if k == "img" and "embedding" in batch:
+            # Embedding-cache batches carry a zero img stub the model reads
+            # only for shape/dtype — allocate it on-device instead of copying
+            # ~220 MB of zeros over PCIe every batch.
+            batch[k] = torch.zeros(tuple(v.shape), dtype=v.dtype, device=device)
+            continue
         batch[k] = _to_device(v, device)
     return batch
 
@@ -494,7 +537,9 @@ def make_loaders(
                 cond_features_path=(
                     cond_cfg["features_path"] if cond_cfg["enabled"] else None),
                 cond_standardize=cond_cfg["standardize"],
-                cond_clip=float(cond_cfg["clip"]))
+                cond_clip=float(cond_cfg["clip"]),
+                embedding_dir=(Path(root) / "features" / "embedding"
+                               if bool(dcfg["embedding_cache"]) else None))
             all_train_scenes = list_corpus_scenes(root, "train")
             if eval_split == "test":
                 all_test_scenes = list_annotated_test_scenes(root)

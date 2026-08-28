@@ -204,6 +204,12 @@ data:
   seed: 42
   frames_per_batch: 32                # B_clips = frames_per_batch // T (homogeneous-T batches)
   num_workers: 16
+  # Load precomputed bf16 backbone embeddings (<root>/features/embedding, built
+  # by scripts/precompute_embeddings.py) for climbing_corpus datasets and skip
+  # the frozen backbone. Missing per-frame files hard-error (no live fallback).
+  # Frame JPEGs are then not pixel-decoded (batch["img"] is a zero crop — the
+  # model reads only its shape/dtype); masks still decode for mask conditioning.
+  embedding_cache: false
   # target_frame: all supervises every temporal row; center supervises only the
   # middle row (and therefore requires an odd frames_per_clip).
   # frame_stride: an integer, or `auto` = per-scene max(1, round(fps / 25)) so a
@@ -359,6 +365,13 @@ keypoint_supervision:                 # SAM3D-style keypoint losses from kindyn 
     huber_delta_acc: 2.0              # m/s^2
     outlier_acc: 50.0                 # drop stencil rows whose GT keypoint acceleration exceeds
                                       # this (m/s^2) — broken kindyn frames
+    cam_rail: 0.0                     # trust region on pred_cam_t vs the FROZEN model's own
+                                      # output: relu(|dev| - margin), exactly zero inside — the
+                                      # derivative terms are blind to constant offsets of the
+                                      # absolute placement; the rail makes that direction uphill
+    rot_rail: 0.0                     # same trust region on global_rot (geodesic radians)
+    cam_rail_margin_m: 0.5            # rail margin (metres)
+    rot_rail_margin_rad: 0.2          # rail margin (radians, ~11.5 deg)
 
 loss: {dice_eps: 1.0e-5, grad_clip: 1.0}
 

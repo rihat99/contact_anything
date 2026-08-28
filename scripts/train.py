@@ -810,7 +810,8 @@ class Trainer:
             scalars[f"{prefix}/keypoint/{name}"] = term["loss"]
             scalars[f"{prefix}/keypoint/{name}_mass"] = term["weight_mass"]
         for key in ("kp2d_err_crop", "kp3d_err_m", "depth_err_m",
-                    "kp_vel_err_ms", "kp_acc_err_ms2"):
+                    "kp_vel_err_ms", "kp_acc_err_ms2",
+                    "cam_dev_m", "rot_dev_deg"):
             if key in kp_parts:
                 scalars[f"{prefix}/keypoint/{key}"] = kp_parts[key]
         return scalars
@@ -1120,6 +1121,14 @@ class Trainer:
         pose_stats = None
         cons_terms = ("gt", "head", "pos", "rot", "cam_rail", "rot_rail")
         cons_sums = [0.0] * (2 * len(cons_terms))   # (num, mass) per term
+        # Keypoint diagnostics: exact global mass-weighted means. The camera /
+        # depth health is INVISIBLE to pose_mae (rotations only) — the v2 probe
+        # collapsed the camera to metres of depth error while posting a "new
+        # best" — so eval carries the keypoint errors explicitly.
+        kp_keys = ("kp2d_err_crop", "kp3d_err_m", "depth_err_m",
+                   "kp_vel_err_ms", "kp_acc_err_ms2",
+                   "cam_dev_m", "rot_dev_deg")
+        kp_sums = [0.0] * (2 * len(kp_keys))        # (num, mass) per key
         for batch in tqdm(
             self.eval_loader, desc=self.eval_split, disable=not self.is_main,
         ):
@@ -1170,6 +1179,23 @@ class Trainer:
                         cons_sums[2 * i] += float(
                             term["weighted_numerator_tensor"].detach())
                         cons_sums[2 * i + 1] += term["weight_mass"]
+            if self.keypoint_loss is not None:
+                _, kp_parts = self.keypoint_loss(out, batch)
+                rows = float(kp_parts["n_supervised_rows"])
+                kp_masses = {
+                    "kp2d_err_crop": rows if self.keypoint_loss.w_kp2d > 0 else 0.0,
+                    "kp3d_err_m": rows, "depth_err_m": rows}
+                for term, key in (("kp_vel", "kp_vel_err_ms"),
+                                  ("kp_acc", "kp_acc_err_ms2"),
+                                  ("cam_rail", "cam_dev_m"),
+                                  ("rot_rail", "rot_dev_deg")):
+                    t = kp_parts["terms"].get(term)
+                    kp_masses[key] = (t["weight_mass"]
+                                      if t is not None and key in kp_parts else 0.0)
+                for i, key in enumerate(kp_keys):
+                    if kp_masses[key] > 0:
+                        kp_sums[2 * i] += kp_parts[key] * kp_masses[key]
+                        kp_sums[2 * i + 1] += kp_masses[key]
             for t in self.targets:
                 tgt = targets[t]
                 add_counts(counts[t], contact_counts(logits[t], tgt["gt"], tgt["mask"]))
@@ -1227,6 +1253,15 @@ class Trainer:
                 # A zero-weight term never accumulates mass — drop it so the
                 # report only carries the terms this run actually trains.
                 if cons_sums[2 * i + 1] > 0.0}
+        if self.keypoint_loss is not None:
+            if self.distributed:
+                packed = torch.tensor(
+                    kp_sums, dtype=torch.float64, device=self.device)
+                dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+                kp_sums = packed.cpu().tolist()
+            metrics["keypoint"] = {
+                key: kp_sums[2 * i] / kp_sums[2 * i + 1]
+                for i, key in enumerate(kp_keys) if kp_sums[2 * i + 1] > 0.0}
         return {"loss": running_loss / max(n, 1),
                 "metrics": metrics,
                 "per_output": {
@@ -1280,6 +1315,10 @@ class Trainer:
                         f"  pose[mae {p['mae']:.4f} rad  acc_rms "
                         f"{p['acc_rms_pred']:.4f}/{p['acc_rms_gt']:.4f} "
                         f"(x{p['acc_ratio']:.1f})  rows {int(p['n_rows'])}]")
+                if "keypoint" in v["metrics"]:
+                    k = v["metrics"]["keypoint"]
+                    phys_note += ("  kp[" + " ".join(
+                        f"{key} {val:.3f}" for key, val in k.items()) + "]")
                 if "motion" in v["metrics"]:
                     m = v["metrics"]["motion"]
                     j = self.motion_headline_joint
@@ -1320,6 +1359,9 @@ class Trainer:
                 if "consistency" in v["metrics"]:
                     for key, val in v["metrics"]["consistency"].items():
                         val_scalars[f"{self.eval_split}/consistency/{key}"] = val
+                if "keypoint" in v["metrics"]:
+                    for key, val in v["metrics"]["keypoint"].items():
+                        val_scalars[f"{self.eval_split}/keypoint/{key}"] = val
                 self.logger.log(val_scalars, self.global_step)
                 val_metric = self._monitor_value(v)
 

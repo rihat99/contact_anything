@@ -215,6 +215,11 @@ DEFAULTS: dict[str, Any] = {
         "seed": 42,
         "frames_per_batch": 32,         # B_clips = frames_per_batch // T (homogeneous T)
         "num_workers": 16,
+        # Load precomputed backbone embeddings (<root>/features/embedding, bf16)
+        # for climbing_corpus datasets and skip the frozen backbone entirely.
+        # Build the cache with scripts/precompute_embeddings.py first; a missing
+        # per-frame file is a hard error (never silent live fallback).
+        "embedding_cache": False,
         "sequence": {
             "frames_per_clip": 8,
             "frame_stride": 2,
@@ -368,6 +373,13 @@ DEFAULTS: dict[str, Any] = {
             "huber_delta_vel": 0.5,     # m/s
             "huber_delta_acc": 2.0,     # m/s^2
             "outlier_acc": 50.0,        # drop rows whose GT keypoint acc exceeds this (m/s^2)
+            "cam_rail": 0.0,            # trust region on pred_cam_t vs the FROZEN model's own
+                                        # output (pred_cam_t_frozen): relu(|dev| - margin) —
+                                        # zero for a healthy model, closes the constant-offset
+                                        # null space of the derivative terms
+            "rot_rail": 0.0,            # same trust region on global_rot (geodesic radians)
+            "cam_rail_margin_m": 0.5,   # rail margin (metres)
+            "rot_rail_margin_rad": 0.2, # rail margin (radians, ~11.5 deg)
         },
     },
     "loss": {"dice_eps": 1.0e-5, "grad_clip": 1.0},
@@ -947,23 +959,27 @@ def _validate_keypoint_supervision(cfg: dict) -> None:
     """Validate ``keypoint_supervision`` (kindyn keypoint losses) and the
     ``train.finetune_camera_head`` flag whose only objectives live here."""
     ks = cfg["keypoint_supervision"]
-    for key in ("kp2d", "kp3d", "kp3d_abs", "kp_vel", "kp_acc"):
+    for key in ("kp2d", "kp3d", "kp3d_abs", "kp_vel", "kp_acc",
+                "cam_rail", "rot_rail"):
         value = float(ks["loss"][key])
         if not math.isfinite(value) or value < 0:
             raise ValueError(
                 f"keypoint_supervision.loss.{key} must be finite and >= 0")
     for key in ("huber_delta_2d", "huber_delta_3d", "huber_delta_vel",
-                "huber_delta_acc", "outlier_acc"):
+                "huber_delta_acc", "outlier_acc", "cam_rail_margin_m",
+                "rot_rail_margin_rad"):
         value = float(ks["loss"][key])
         if not math.isfinite(value) or value <= 0:
             raise ValueError(
                 f"keypoint_supervision.loss.{key} must be finite and positive")
     if ks["enabled"]:
         if not any(float(ks["loss"][k]) > 0
-                   for k in ("kp2d", "kp3d", "kp3d_abs", "kp_vel", "kp_acc")):
+                   for k in ("kp2d", "kp3d", "kp3d_abs", "kp_vel",
+                             "kp_acc")):
             raise ValueError(
                 "keypoint_supervision.enabled requires a positive loss weight")
-        if (any(float(ks["loss"][k]) > 0 for k in ("kp_vel", "kp_acc"))
+        if (any(float(ks["loss"][k]) > 0
+                for k in ("kp_vel", "kp_acc"))
                 and int(cfg["data"]["sequence"]["frames_per_clip"]) < 3):
             raise ValueError(
                 "keypoint_supervision kp_vel/kp_acc require "

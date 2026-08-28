@@ -1979,19 +1979,25 @@ class SAM3DBody(BaseModel):
 
         if precomputed_features is not None:
             # --- Skip backbone, use precomputed features ---
-            image_embeddings = precomputed_features
+            # The cache stores the RAW backbone output (bf16, pre-cast, pre
+            # mask-conditioning); this cast reproduces the live path's
+            # bf16 -> img-dtype cast bit-exactly. Mask conditioning below and
+            # ray conditioning inside forward_decoder still run live.
+            if self.cfg.MODEL.BACKBONE.TYPE in [
+                "vit_hmr", "vit", "vit_b", "vit_l", "vit_hmr_512_384",
+            ]:
+                raise NotImplementedError(
+                    "precomputed_features assumes the full-square backbone input; "
+                    f"backbone {self.cfg.MODEL.BACKBONE.TYPE!r} width-crops it")
+            image_embeddings = precomputed_features.type(batch["img"].dtype)
 
-            # Resize if precomputed spatial dims don't match expected backbone output.
-            # Expected: input_size / patch_size (e.g. 896/16 = 56).
             expected_h = self.cfg.MODEL.IMAGE_SIZE[0] // self.ray_cond_emb.patch_size
             expected_w = self.cfg.MODEL.IMAGE_SIZE[1] // self.ray_cond_emb.patch_size
             if image_embeddings.shape[-2:] != (expected_h, expected_w):
-                image_embeddings = torch.nn.functional.interpolate(
-                    image_embeddings,
-                    size=(expected_h, expected_w),
-                    mode="bilinear",
-                    align_corners=False,
-                )
+                raise ValueError(
+                    f"precomputed features grid {tuple(image_embeddings.shape[-2:])} "
+                    f"does not match the backbone output ({expected_h}, {expected_w}) "
+                    "— the cache was built for a different model")
 
             # Still need ray conditioning for the decoder
             ray_cond = self.get_ray_condition(batch)
@@ -2057,11 +2063,10 @@ class SAM3DBody(BaseModel):
                 image_embeddings = image_embeddings[-1]
             image_embeddings = image_embeddings.type(x.dtype)
 
-        # Mask condition if available (skip for precomputed features — already baked in)
-        if (
-            precomputed_features is None
-            and self.cfg.MODEL.PROMPT_ENCODER.get("MASK_EMBED_TYPE", None) is not None
-        ):
+        # Mask condition if available. Runs for precomputed features too: the
+        # cache holds the raw backbone output, and this addition depends only on
+        # batch["mask"]/["mask_score"] (never on embedding values).
+        if self.cfg.MODEL.PROMPT_ENCODER.get("MASK_EMBED_TYPE", None) is not None:
             # v1: non-iterative mask conditioning
             if self.cfg.MODEL.PROMPT_ENCODER.get("MASK_PROMPT", "v1") == "v1":
                 mask_embeddings = self._get_mask_prompt(batch, image_embeddings)

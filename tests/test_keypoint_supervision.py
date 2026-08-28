@@ -20,7 +20,8 @@ def _loss(**overrides) -> KeypointSupervisedLoss:
         "kp_vel": 1.0, "kp_acc": 1.0,
         "huber_delta_2d": 0.05, "huber_delta_3d": 0.1,
         "huber_delta_vel": 0.5, "huber_delta_acc": 2.0,
-        "outlier_acc": 50.0,
+        "outlier_acc": 50.0, "cam_rail": 0.0, "rot_rail": 0.0,
+        "cam_rail_margin_m": 0.5, "rot_rail_margin_rad": 0.2,
     }
     loss_cfg.update(overrides)
     return KeypointSupervisedLoss(
@@ -147,3 +148,51 @@ def test_gradients_reach_the_prediction():
     total, _ = _loss()(out, batch)
     total.backward()
     assert float(out["mhr"]["pred_cam_t"].grad.abs().max()) > 1.0
+
+
+def test_rails_are_zero_inside_the_margin():
+    """Small deviations from the frozen stash cost exactly nothing."""
+    out, batch = _batch_and_out()
+    n = batch["frame_valid"].shape[0]
+    frozen_t = out["mhr"]["pred_cam_t"].clone()
+    frozen_t[:, 2] += 0.3                                             # < 0.5 m
+    out["mhr"]["pred_cam_t_frozen"] = frozen_t
+    out["mhr"]["global_rot"] = torch.zeros(n, 3)
+    out["mhr"]["global_rot_frozen"] = torch.full((n, 3), 0.05)        # ~5 deg
+    _, parts = _loss(kp_vel=0.0, kp_acc=0.0, cam_rail=10.0, rot_rail=10.0)(
+        out, batch)
+    assert parts["terms"]["cam_rail"]["loss"] == 0.0
+    assert parts["terms"]["rot_rail"]["loss"] == 0.0
+    assert parts["terms"]["cam_rail"]["weight_mass"] == n
+    assert parts["cam_dev_m"] == pytest.approx(0.3, rel=1e-4)
+
+
+def test_rails_penalize_linearly_beyond_the_margin():
+    """A 1 m camera escape costs w * (1 - margin) per row; a 30 deg rotation
+    escape costs w * (0.524 - 0.2)."""
+    out, batch = _batch_and_out()
+    n = batch["frame_valid"].shape[0]
+    frozen_t = out["mhr"]["pred_cam_t"].clone()
+    frozen_t[:, 2] += 1.0
+    out["mhr"]["pred_cam_t_frozen"] = frozen_t
+    out["mhr"]["global_rot"] = torch.zeros(n, 3)
+    rot = torch.zeros(n, 3)
+    rot[:, 1] = math.radians(30.0)
+    out["mhr"]["global_rot_frozen"] = rot
+    _, parts = _loss(kp_vel=0.0, kp_acc=0.0, cam_rail=10.0, rot_rail=10.0)(
+        out, batch)
+    assert parts["terms"]["cam_rail"]["loss"] == pytest.approx(
+        10.0 * (1.0 - 0.5), rel=1e-5)
+    assert parts["terms"]["rot_rail"]["loss"] == pytest.approx(
+        10.0 * (math.radians(30.0) - 0.2), rel=1e-3)
+    assert parts["rot_dev_deg"] == pytest.approx(30.0, rel=1e-3)
+
+
+def test_rails_fall_back_to_zero_mass_without_the_stash():
+    """No recompute ran (no stash): terms stay in the DDP set with no mass."""
+    out, batch = _batch_and_out()
+    out["mhr"]["global_rot"] = torch.zeros(batch["frame_valid"].shape[0], 3)
+    _, parts = _loss(kp_vel=0.0, kp_acc=0.0, cam_rail=10.0, rot_rail=10.0)(
+        out, batch)
+    assert parts["terms"]["cam_rail"]["weight_mass"] == 0
+    assert parts["terms"]["rot_rail"]["weight_mass"] == 0

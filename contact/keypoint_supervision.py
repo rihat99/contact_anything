@@ -17,6 +17,14 @@ carries few-cm SMPL-X-joint vs MHR70-keypoint rig offsets. Three terms:
 * ``kp3d_abs`` — ABSOLUTE camera-frame 3D (metres): pins ``pred_cam_t``
   (depth included) to the metric extrinsics — the anti-collapse anchor the
   upstream recipe never had (no metric extrinsics there; the corpus has them).
+* ``cam_rail`` / ``rot_rail`` — trust regions on the camera translation /
+  global orientation vs the FROZEN model's own outputs
+  (``pred_cam_t_frozen`` / ``global_rot_frozen``, stashed by the recompute):
+  ``relu(deviation - margin)`` — exactly zero for a healthy model, linear
+  beyond. The v4-proven anti-collapse device: derivative losses reward
+  temporal constancy and leave the absolute placement in a null space, so
+  the collapse region must be explicitly uphill regardless of how the other
+  terms' gradient magnitudes evolve (the v2 probe drifted metres in depth).
 * ``kp_vel`` / ``kp_acc`` — WORLD-frame velocity/acceleration of the predicted
   keypoints vs the finite-differenced GT (central 3-point stencil on the
   clip's real elapsed seconds; interior rows only). The predictions are lifted
@@ -26,7 +34,6 @@ carries few-cm SMPL-X-joint vs MHR70-keypoint rig offsets. Three terms:
   the camera's rotation rate), and the GT side needs no transform at all
   (``joints_world`` is stored in world). Rows whose GT acceleration exceeds
   ``outlier_acc`` (broken kindyn frames) are dropped.
-
 The 13 supervised joints are ``KP_JOINT_NAMES`` (climbing_corpus order)
 matched to MHR70 keypoints by name (:data:`KP_MHR70_INDICES`). Terms follow
 the force/motion ``(weighted_numerator, mass)`` contract so the trainer's
@@ -37,13 +44,16 @@ copies) and the camera copy; every frozen param has ``requires_grad=False``.
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
+import roma
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from .data.climbing_corpus import KP_JOINT_NAMES
+from .motion_consistency import quat_xyzw_from_matrix, so3_log_xyzw
 
 #: MHR70 keypoint index for each :data:`KP_JOINT_NAMES` entry (name-matched:
 #: shoulders 5/6, elbows 7/8, wrists 62/41, hips 9/10, knees 11/12, ankles
@@ -79,6 +89,11 @@ class KeypointSupervisedLoss:
         self.delta_vel = float(ks["loss"].get("huber_delta_vel", 0.5))
         self.delta_acc = float(ks["loss"].get("huber_delta_acc", 2.0))
         self.outlier_acc = float(ks["loss"].get("outlier_acc", 50.0))
+        self.w_cam_rail = float(ks["loss"].get("cam_rail", 0.0))
+        self.w_rot_rail = float(ks["loss"].get("rot_rail", 0.0))
+        self.cam_rail_margin_m = float(ks["loss"].get("cam_rail_margin_m", 0.5))
+        self.rot_rail_margin_rad = float(
+            ks["loss"].get("rot_rail_margin_rad", 0.2))
         self.kp_idx = torch.tensor(KP_MHR70_INDICES, device=device)
 
     def forward(self, out: dict, batch: dict) -> tuple[Tensor, dict[str, Any]]:
@@ -189,6 +204,47 @@ class KeypointSupervisedLoss:
                         vel_diag["kp_acc_err_ms2"] = float(
                             (acc_p - acc_g)[srows].norm(dim=-1).mean())
 
+        rail_diag: dict[str, float] = {}
+        if self.w_cam_rail > 0.0 or self.w_rot_rail > 0.0:
+            fv = batch["frame_valid"].to(kp3d.device)
+            fv_mask = fv.to(self.dtype)
+            fv_mass = float(fv.sum())
+            if self.w_cam_rail > 0.0:
+                frozen_t = out["mhr"].get("pred_cam_t_frozen")
+                if frozen_t is None:
+                    terms["cam_rail"] = (kp3d.new_zeros(()), 0.0)
+                else:
+                    cam_dev = (cam_t - frozen_t.to(cam_t.device, self.dtype)
+                               ).norm(dim=-1)                       # (B,)
+                    rail = F.relu(cam_dev - self.cam_rail_margin_m)
+                    terms["cam_rail"] = (
+                        self.w_cam_rail * (rail * fv_mask).sum(), fv_mass)
+                    with torch.no_grad():
+                        rail_diag["cam_dev_m"] = float(
+                            (cam_dev * fv_mask).sum() / max(fv_mass, 1.0))
+            if self.w_rot_rail > 0.0:
+                frozen_r = out["mhr"].get("global_rot_frozen")
+                if frozen_r is None:
+                    terms["rot_rail"] = (kp3d.new_zeros(()), 0.0)
+                else:
+                    # Native-axes relative rotation, the motion_consistency
+                    # formulation exactly (so3 log is Taylor-smooth at I —
+                    # a geodesic acos would have an exploding gradient there).
+                    r_pred = roma.euler_to_rotmat(
+                        "xyz", out["mhr"]["global_rot"].to(torch.float64))
+                    r_frz = roma.euler_to_rotmat(
+                        "xyz", frozen_r.to(kp3d.device, torch.float64))
+                    rot_dev = so3_log_xyzw(quat_xyzw_from_matrix(
+                        r_pred.transpose(-1, -2) @ r_frz)
+                    ).norm(dim=-1).to(self.dtype)                   # (B,) rad
+                    rail = F.relu(rot_dev - self.rot_rail_margin_rad)
+                    terms["rot_rail"] = (
+                        self.w_rot_rail * (rail * fv_mask).sum(), fv_mass)
+                    with torch.no_grad():
+                        rail_diag["rot_dev_deg"] = float(
+                            (rot_dev * fv_mask).sum() / max(fv_mass, 1.0)
+                            * 180.0 / math.pi)
+
         total = None
         parts_terms: dict[str, Any] = {}
         for name, (weighted_raw, term_mass) in terms.items():
@@ -208,6 +264,7 @@ class KeypointSupervisedLoss:
         if self.w_vel > 0.0 or self.w_acc > 0.0:
             parts["kp_vel_err_ms"] = vel_diag.get("kp_vel_err_ms", 0.0)
             parts["kp_acc_err_ms2"] = vel_diag.get("kp_acc_err_ms2", 0.0)
+        parts.update(rail_diag)
         with torch.no_grad():
             if mass > 0:
                 sel = valid

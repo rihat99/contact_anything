@@ -245,12 +245,13 @@ def test_item_contract_and_dtypes(corpus):
     assert isinstance(clip, list) and len(clip) == 2
     frame = clip[0]
     assert set(frame) == {
-        "image", "mask", "bbox", "cam_int", "cam_from_world", "gravity_world",
-        "cam_jump_m", "joint_contact", "joint_mask", "joint_supervised",
-        "joint_confidence", "frame_pos_sec", "frame_position", "frame_index",
-        "frame_valid", "key", "dataset", "force_gt", "force_contact",
-        "force_lever", "force_valid", "force_conf",
+        "image", "img_wh", "mask", "bbox", "cam_int", "cam_from_world",
+        "gravity_world", "cam_jump_m", "joint_contact", "joint_mask",
+        "joint_supervised", "joint_confidence", "frame_pos_sec",
+        "frame_position", "frame_index", "frame_valid", "key", "dataset",
+        "force_gt", "force_contact", "force_lever", "force_valid", "force_conf",
     }
+    assert frame["img_wh"] is None                 # only set on embedding-cache rows
     assert frame["image"].shape == (32, 24, 3) and frame["image"].dtype == np.uint8
     assert frame["mask"].shape == (32, 24)
     assert frame["bbox"].shape == (4,)

@@ -225,6 +225,21 @@ def list_annotated_test_scenes(corpus_root: str | Path) -> list[str]:
     ]
 
 
+def embedding_path(
+    embedding_dir: str | Path, scene: str, object_id: int, position: int,
+) -> Path:
+    """Cache file for one person-frame crop's frozen-backbone embedding.
+
+    ``<embedding_dir>/<shard>/<scene>/<oid:02d>/<pos:06d>.npy`` — an int16 bit
+    view of the bf16 ``[1280, 32, 32]`` backbone output (the tensor
+    ``forward_pose_branch`` produces right before its fp32 cast). Written by
+    ``scripts/precompute_embeddings.py``; read back via
+    ``torch.from_numpy(np.load(path)).view(torch.bfloat16)``.
+    """
+    return (Path(embedding_dir) / scene_shard(scene) / scene
+            / f"{object_id:02d}" / f"{position:06d}.npy")
+
+
 def merge_contacts_52_to_22(
     jc52: np.ndarray, conf52: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -664,6 +679,16 @@ class ClimbingCorpusDataset(Dataset):
     :param load_images: read frame JPEGs + person masks in ``__getitem__``.
         ``False`` returns ``image``/``mask`` as ``None`` (metadata-only access;
         such items cannot go through the training collate).
+    :param embedding_dir: precomputed-embedding root (``features/embedding``,
+        see :func:`embedding_path`). When set, every frame additionally carries
+        ``embedding`` — the bf16 ``[1280, 32, 32]`` frozen-backbone output — and
+        the model skips the backbone. A missing file raises (a stale or
+        incomplete cache must never silently fall back to live compute).
+        Frame JPEGs are then NOT pixel-decoded: the model provably never reads
+        ``batch["img"]`` values in the cached path (metadata only), so
+        ``image`` stays ``None``, ``img_wh`` carries the header-read full-frame
+        size, and the collate emits a zero crop (masks still decode — mask
+        conditioning runs live).
     """
 
     supervised_targets = frozenset({"joint"})
@@ -698,6 +723,7 @@ class ClimbingCorpusDataset(Dataset):
         cond_standardize: Optional[dict] = None,
         cond_clip: float = 5.0,
         load_images: bool = True,
+        embedding_dir: Optional[str | Path] = None,
     ):
         super().__init__()
         if split not in ("train", "val", "test"):
@@ -769,6 +795,7 @@ class ClimbingCorpusDataset(Dataset):
         self.cond_standardize = dict(cond_standardize or {})
         self.cond_clip = float(cond_clip)
         self.load_images = bool(load_images)
+        self.embedding_dir = None if embedding_dir is None else Path(embedding_dir)
         self._epoch = 0
 
         if scenes is None:
@@ -1372,11 +1399,16 @@ class ClimbingCorpusDataset(Dataset):
         clip = []
         for row, pos in enumerate(positions):
             pos = int(pos)
-            image = mask = None
+            image = mask = img_wh = None
             if self.load_images:
-                image = np.array(
-                    Image.open(data["frames_dir"] / f"{pos:06d}.jpg").convert("RGB"),
-                    np.uint8)
+                frame_path = data["frames_dir"] / f"{pos:06d}.jpg"
+                if self.embedding_dir is not None:
+                    # Cached-embedding rows never read pixels (the backbone is
+                    # skipped); the header open reads only the JPEG dimensions.
+                    with Image.open(frame_path) as im:
+                        img_wh = im.size                              # (W, H)
+                else:
+                    image = np.array(Image.open(frame_path).convert("RGB"), np.uint8)
                 mask_path = data["mask_dir"] / f"{oid:02d}" / f"frame_{pos:06d}.png"
                 mask = np.array(Image.open(mask_path), np.uint8) if mask_path.is_file() else None
 
@@ -1402,6 +1434,7 @@ class ClimbingCorpusDataset(Dataset):
 
             frame = {
                 "image": image,
+                "img_wh": img_wh,
                 "mask": mask,
                 "bbox": data["bbox"][person, pos],                                    # [4] xyxy
                 "cam_int": data["intrinsics"][pos],                                   # [3, 3]
@@ -1424,6 +1457,9 @@ class ClimbingCorpusDataset(Dataset):
                 "key": f"{scene}#{oid}@{pos}",
                 "dataset": self.name,
             }
+            if self.embedding_dir is not None:
+                bits = np.load(embedding_path(self.embedding_dir, scene, oid, pos))
+                frame["embedding"] = torch.from_numpy(bits).view(torch.bfloat16)
             if self.load_forces:
                 frame["force_gt"] = torch.from_numpy(data["force_gt"][person, pos])   # [6, 3]
                 frame["force_contact"] = torch.from_numpy(

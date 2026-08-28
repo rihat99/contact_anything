@@ -76,6 +76,9 @@ python scripts/extract_corpus_frames.py           # corpus frames/ JPEG tree (36
 python scripts/precompute_masks_damon.py          # SAM3 person masks for DAMON
 python scripts/precompute_cam_params_damon.py     # MoGe2 intrinsics for DAMON
 python scripts/build_climbing_images.py --config configs/datasets/climbing_images.yaml
+# bf16 frozen-backbone embedding cache (corpus features/embedding, ~0.8 TB; one
+# process per GPU; data.embedding_cache: true consumes it and skips the backbone)
+CUDA_VISIBLE_DEVICES=0 python scripts/precompute_embeddings.py --split all --shard-index 0 --num-shards 4
 python -m viewer --port 8765                      # Contact Atlas dataset browser
 ```
 
@@ -268,7 +271,7 @@ Key sections (see `configs/base.yaml` for full commented defaults):
 | `keypoint_supervision` | SAM3D-style stabilizers from kindyn `joints_world` (13 joints ↔ MHR70 by name): `kp2d` crop-normalized reprojection (constrains the camera), `kp3d` hips-relative camera-frame, `kp3d_abs` absolute metric anchor; `kp_vel`/`kp_acc` WORLD-frame keypoint velocity/acceleration (central stencil over the clip's real elapsed seconds, predictions lifted with the GT extrinsics — loss-only use; camera-frame differences would bury body motion under camera egomotion) vs finite-differenced `joints_world`, GT-acc outlier rows dropped; corpus loader flag `load_keypoints` |
 | `contact.topology` | `smpl` / `smplx` (`mhr` → NotImplementedError) |
 | `contact.targets.vertex/joint` | enabled, weight, loss params, `joint_set`, subset masking, `derive_from_vertex`, confidence weights |
-| `data.datasets` | list of `{name, config, split}`; `frames_per_batch` (memory-flat batch budget), `sequence.{frames_per_clip,frame_stride,jitter}` |
+| `data.datasets` | list of `{name, config, split}`; `frames_per_batch` (memory-flat batch budget), `sequence.{frames_per_clip,frame_stride,jitter}`; `embedding_cache` (corpus loaders emit precomputed bf16 backbone embeddings from `features/embedding` — built by `scripts/precompute_embeddings.py` — and the model skips the frozen backbone; missing files hard-error; frame JPEGs are not pixel-decoded — `img` is a zero crop, masks still decode) |
 | `train` | `backbone_no_grad`, `detach_interm_preds` (both true; ~20% faster, grad-asserted no-ops) |
 | `logging` | wandb (project `contact-anything`) + tensorboard |
 | `output` | run dir, `monitor` (e.g. `val/vertex_f1`; `*_f1`/`*_iou`→max, `loss`→min) |

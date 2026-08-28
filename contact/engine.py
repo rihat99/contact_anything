@@ -14,12 +14,17 @@ import torch.nn as nn
 def forward_model(model: nn.Module, batch: dict) -> dict:
     """Forward one collated batch through the body decoder; return the raw output.
 
+    Batches carrying precomputed backbone embeddings (``batch["embedding"]``,
+    bf16 ``[B, C, h, w]`` from the ``data.embedding_cache`` load path) skip the
+    frozen backbone; mask/ray conditioning still run live inside the model.
+
     :param model: a built SAM-3D-Body model (see :func:`contact.model.build_model`).
     :param batch: collated batch already moved to the model's device.
     :returns: the full model output dict (``"mhr"``, ``"contact"``, ...).
     """
     model._initialize_batch(batch)
-    return model.forward_step(batch, decoder_type="body")
+    return model.forward_step(
+        batch, decoder_type="body", precomputed_features=batch.get("embedding"))
 
 
 def forward_contact(model: nn.Module, batch: dict) -> dict:

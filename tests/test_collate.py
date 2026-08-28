@@ -224,3 +224,72 @@ def test_interleaved_loader_forwards_epoch_to_sampler_and_dataset():
     loader.set_epoch(9)
     assert dataset.epoch == 9
     assert sampler.epoch == 9
+
+
+def test_imageless_fast_path_matches_full_geometry():
+    """Embedding-cache frames skip pixel decode; geometry must be identical.
+
+    Same synthetic frame through the normal path (decoded image) and the
+    imageless fast path (image None + header ``img_wh`` + ``embedding``):
+    every geometric output and the warped mask must match exactly; ``img``
+    becomes a zero crop of the same shape/dtype.
+    """
+    from contact.data.collate import _build_transform, _process_sample
+
+    rng = np.random.default_rng(0)
+    image = (rng.random((96, 120, 3)) * 255).astype(np.uint8)
+    mask = (rng.random((96, 120)) > 0.5).astype(np.uint8) * 255
+    base = {
+        "image": image,
+        "mask": mask.copy(),
+        "bbox": np.array([10.0, 6.0, 100.0, 90.0], np.float32),
+        "key": "synthetic#0@0",
+    }
+    fast = dict(base, image=None, img_wh=(120, 96),
+                mask=mask.copy(), embedding=torch.zeros(4, 2, 2))
+
+    transform = _build_transform(_IMG)
+    transform_imageless = _build_transform(_IMG, imageless=True)
+    out_full = _process_sample(base, transform, transform_imageless)
+    out_fast = _process_sample(fast, transform, transform_imageless)
+
+    for key in ("bbox_center", "bbox_scale", "affine_trans", "img_size",
+                "ori_img_size", "mask_score"):
+        np.testing.assert_array_equal(
+            np.asarray(out_full[key]), np.asarray(out_fast[key]), err_msg=key)
+    np.testing.assert_array_equal(out_full["mask"], out_fast["mask"])
+    assert isinstance(out_fast["img"], torch.Tensor)
+    assert out_fast["img"].shape == out_full["img"].shape
+    assert out_fast["img"].dtype == out_full["img"].dtype
+    assert torch.all(out_fast["img"] == 0.0)
+
+
+def test_imageless_frame_without_transform_raises():
+    from contact.data.collate import _build_transform, _process_sample
+
+    frame = {
+        "image": None,
+        "img_wh": (120, 96),
+        "mask": None,
+        "bbox": np.array([10.0, 6.0, 100.0, 90.0], np.float32),
+    }
+    with pytest.raises(RuntimeError, match="imageless transform"):
+        _process_sample(frame, _build_transform(_IMG))
+
+
+def test_batch_to_device_replaces_img_stub_for_embedding_batches():
+    from contact.data.collate import batch_to_device
+
+    batch = {
+        "img": torch.ones(2, 1, 3, 8, 8),
+        "embedding": torch.zeros(2, 4, 2, 2, dtype=torch.bfloat16),
+        "mask": torch.ones(2, 1, 1, 8, 8),
+    }
+    out = batch_to_device(batch, "cpu")
+    assert torch.all(out["img"] == 0.0)            # stub re-allocated, not copied
+    assert out["img"].shape == (2, 1, 3, 8, 8)
+    assert out["img"].dtype == torch.float32
+    assert torch.all(out["mask"] == 1.0)           # everything else moves as-is
+
+    no_cache = {"img": torch.ones(2, 1, 3, 8, 8)}
+    assert torch.all(batch_to_device(no_cache, "cpu")["img"] == 1.0)

@@ -13,7 +13,7 @@ class _ContactModel(torch.nn.Module):
     def _initialize_batch(self, batch):
         pass
 
-    def forward_step(self, batch, decoder_type="body"):
+    def forward_step(self, batch, decoder_type="body", precomputed_features=None):
         assert decoder_type == "body"
         return {"contact": {"joint_logits": batch["logits"]}}
 
