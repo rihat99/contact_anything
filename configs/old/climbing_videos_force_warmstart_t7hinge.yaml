@@ -48,6 +48,7 @@
 base: configs/base.yaml
 
 model:
+  extra_token_attention: causal   # pinned 2026-08-27: the repo default flipped to mutual
   # Frozen contact branch is warm-started from the t5mid CENTER-FRAME temporal
   # checkpoint (monitor test/joint_f1); point this at your own best contact
   # checkpoint before launching.

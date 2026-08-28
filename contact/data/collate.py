@@ -32,6 +32,7 @@ from ..targets import TargetSpec, validate_targets
 from .climbing_corpus import (
     COND_FEATURE_DIM,
     FORCE_GROUP_NAMES,
+    KP_JOINT_NAMES,
     MOTION_JOINT_NAMES,
     NUM_MOTION_JOINTS,
     ClimbingCorpusDataset,
@@ -193,6 +194,8 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec,
             torch.as_tensor(f["force_lever"], dtype=torch.float32)
             if "force_lever" in f else torch.zeros(n_groups, 3, dtype=torch.float32)
             for f in frames], dim=0)                                       # [B, 6, 3]
+        out["force_conf"] = torch.tensor(
+            [float(f.get("force_conf", 1.0)) for f in frames], dtype=torch.float32)
         out["force_valid"] = torch.tensor(
             [bool(f.get("force_valid", False)) for f in frames],
             dtype=torch.bool)                                              # [B]
@@ -240,6 +243,19 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec,
             for f in frames], dim=0)                                       # [B, 132]
         out["pose_valid"] = torch.tensor(
             [bool(f.get("pose_valid", False)) for f in frames],
+            dtype=torch.bool)                                              # [B]
+
+        # Kindyn GT keypoints (climbing_corpus with load_keypoints): the 13
+        # KP_JOINT_NAMES joints in the metric world frame. Frames without
+        # keypoints fall back to zeros with kp_valid=False, so mixed batches
+        # collate.
+        n_kp = len(KP_JOINT_NAMES)
+        out["kp3d_world"] = torch.stack([
+            torch.as_tensor(f["kp3d_world"], dtype=torch.float32)
+            if "kp3d_world" in f else torch.zeros(n_kp, 3, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 13, 3] world
+        out["kp_valid"] = torch.tensor(
+            [bool(f.get("kp_valid", False)) for f in frames],
             dtype=torch.bool)                                              # [B]
 
         # Input-side conditioning feature (climbing_corpus with cond_features_path):
@@ -460,6 +476,8 @@ def make_loaders(
                 seed=seed, contact_level=int(ccfg.get("contact_level", 1)),
                 use_confidence_weights=use_conf,
                 load_forces=bool(ccfg.get("load_forces", False)),
+                force_frame=str(cfg["force_supervision"]["gt_frame"]),
+                force_units=str(cfg["force_supervision"]["units"]),
                 load_motion=bool(ccfg.get("load_motion", False)),
                 motion_joint_names=motion_names,
                 motion_root_convention=str(
@@ -470,6 +488,7 @@ def make_loaders(
                     cfg["motion_supervision"]["loss"]["outlier_acc_ms2"]),
                 motion_angular=motion_angular,
                 load_pose=bool(cfg["pose_supervision"]["enabled"]),
+                load_keypoints=bool(cfg["keypoint_supervision"]["enabled"]),
                 # Input conditioning (model.cond_input): label-free, so it is a
                 # loader option rather than a target — null path = no cond_feat.
                 cond_features_path=(

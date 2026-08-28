@@ -249,17 +249,17 @@ for start in block_starts:
     token_mask[:, :start, start:] = False   # nothing before `start` may read anything at/after it
 ```
 
-Passing the start index of *every* appended block gives the **`causal`** regime (the default,
-`model.extra_token_attention: causal`) — block-triangular:
+Passing the start index of *every* appended block gives the **`causal`** regime
+(`model.extra_token_attention: causal`; the default until 2026-08-27) — block-triangular:
 
 - original tokens read nothing appended;
 - contact tokens read the originals and each other, but not force or motion;
 - force tokens read originals + contact, but not motion;
 - motion tokens read everything before them.
 
-Passing only the *first* block's start gives the **`mutual`** regime: the single barrier in front of
-the first appended block stays, so the original tokens are still blind to everything we added, but
-contact, force and motion tokens fully inter-attend.
+Passing only the *first* block's start gives the **`mutual`** regime (the default since
+2026-08-27): the single barrier in front of the first appended block stays, so the original tokens
+are still blind to everything we added, but contact, force and motion tokens fully inter-attend.
 
 ![The decoder attention mask as a block matrix: in both regimes the original tokens attend
 only themselves; causal additionally blocks earlier appended blocks from attending later
@@ -483,7 +483,7 @@ flowchart TD
 `{pose, contact, force, motion}` with at least two entries; the blocks are concatenated in canonical
 sequence order (pose < contact < force < motion) regardless of how the config lists them. Every
 participating token attends every other participating token across every frame of the clip. In the
-all-modality configuration — **allmod**, `configs/climbing_corpus_allmod.yaml`, the run that trains
+all-modality configuration — **allmod**, `configs/old/climbing_corpus_allmod.yaml`, the run that trains
 pose, contact, force and motion together — that is 14 tokens (1 pose + 6 contact + 6 force +
 1 motion) attending jointly over `T = 7` frames, and it is the *only* cross-frame path in that
 build (every per-modality temporal block is off). Updated slices are scattered back into their
@@ -521,13 +521,26 @@ is an explicit, individually-named opt-in.
 2. **The `pose` modality of a cross-modal brick** — listing `pose` in
    `model.cross_modal_temporal.modalities` or `model.frame_attn.modalities` makes those bricks
    *write* the pose token, not just read it.
-3. **`train.finetune_pose_head`** — unfreezes `head_pose.proj` (the MHR head's FFN; its constant
-   rig tables and the entire `head_pose_hand` branch stay frozen) as its own optimizer parameter
-   group at `optim.lr * train.pose_head_lr_scale` (default 0.1x). This one lives *outside* the
-   name-based freeze filter and so is handled explicitly in both `contact/model.py` and
-   `scripts/train.py`.
+3. **`train.finetune_pose_head` / `train.finetune_camera_head`** — SPLIT-HEAD fine-tune
+   (2026-08-27). The original `head_pose` / `head_camera` stay entirely frozen and keep producing
+   every in-decoder intermediate prediction; a trainable COPY of just the projection FFN
+   (`head_pose_ft_proj` / `head_camera_ft_proj`, deepcopy-initialized — bit-identical behavior at
+   init) is applied to the FINAL pose token only, inside the final-readout recompute. Why the
+   split matters: each decoder layer's intermediate prediction drives the keypoint-token refresh
+   (`keypoint_token_update_fn` — positional re-encoding + feature grid-sampling at the predicted
+   2D keypoints), so fine-tuning the *shared* head perturbed the frozen decoder's token
+   trajectory layer by layer — the suspected mechanism of the earlier pose divergence. The copies
+   form their own optimizer parameter group at `optim.lr * train.pose_head_lr_scale` (default
+   0.1x), live *outside* the name-based freeze filter, and are handled explicitly in
+   `contact/model.py` and `scripts/train.py`. A free consequence: the stashed
+   `pred_cam_t_frozen`/`global_rot_frozen` rail anchors are now genuinely the frozen model's
+   outputs even while the heads fine-tune (under the shared scheme they drifted with training).
 
-All three require `pose_supervision` to be enabled — config validation refuses a build with a
+All these require a pose objective — `pose_supervision` and/or `keypoint_supervision` (the
+SAM3D-style stabilizers: `kp2d` crop-space reprojection, `kp3d` hips-relative and `kp3d_abs`
+absolute camera-frame keypoints against kindyn `joints_world`; `kp2d` is also the only loss that
+constrains the camera head, so `finetune_camera_head` demands it or `motion_consistency`) — config
+validation refuses a build with a
 trainable pose path and no pose objective, because an unconstrained pose token under a
 contact/force/motion loss will happily wander somewhere convenient for those losses and useless as a
 body estimate.
@@ -577,9 +590,10 @@ the dotted parameter name:
 
 This is blunt on purpose. It means any new trainable module must carry one of those substrings in
 its attribute path — a convention, checked by `tests/test_cross_modal.py`, that has held for every
-brick we have added. It also means `head_pose.proj` (which contains none of them) can only become
-trainable through the explicit `train.finetune_pose_head` flag, which `scripts/train.py` also has to
-add to the checkpoint's saved-name set by hand.
+brick we have added. It also means the fine-tuned head copies `head_pose_ft_proj`/`head_camera_ft_proj` (which contain
+none of them) only exist through the explicit `train.finetune_pose_head`/`finetune_camera_head`
+flags, and `scripts/train.py` has to add them to the checkpoint's saved-name set by hand (the
+originals `head_pose.proj`/`head_camera.proj` are never trainable at all under the split scheme).
 
 Two regime switches ride on top:
 
@@ -591,7 +605,7 @@ Two regime switches ride on top:
   gradients into the contact head through force→contact attention, which the trainer warns about
   and which all shipped force runs avoid by using regime (a). See
   [`forces.md`](forces.md).
-- **`train.finetune_pose_head`** — described above.
+- **`train.finetune_pose_head` / `train.finetune_camera_head`** — described above.
 
 For the current all-modality configuration this comes out to roughly 17M trainable parameters;
 `build_model` prints the exact count and the fraction of the total at startup.

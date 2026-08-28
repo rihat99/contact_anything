@@ -1,5 +1,19 @@
 # Data — datasets, labels, and every ground-truth signal
 
+> **2026-08-27 — the corpus was regenerated; the loader is adapted, this page's corpus sections
+> are partially stale.** The new corpus has better contact/force/pose ground truth, **864 train /
+> 108 test scenes (31 annotated)**, and a new archive schema: `contacts_*.npz` carries
+> `contact_label_schema` 2 with `joint_label_confidence` (NaN = joint not assessed — spines, neck,
+> individual fingers); `kindyn_1.npz` stores forces on **35 named contact frames in world-frame
+> newtons** (`frame_forces`), a per-frame `force_confidence`, a fitted `gravity_world` (tilts up
+> to ~27° from `[0, 1, 0]`), and a 211-dim `q`. `contact/data/climbing_corpus.py` folds the
+> frames into the six groups by parent joint (hands sum palm + fingers + thumb into the wrist;
+> non-group frames — knees, sit, elbows… ~4 % of force mass — are dropped), converts to
+> body-weight units in the root frame by default (`force_supervision.gt_frame` / `units` offer
+> world / newtons), and the force loss weights rows by `force_confidence`. `mhr_1.npz` pose
+> pseudo-GT is **not yet regenerated** for the new scenes. Results across the two corpora are not
+> comparable.
+
 This page explains what the model is trained on. It covers the five datasets the repo can read,
 what one training example actually is, where every label comes from, and — the part that takes the
 most care — what those labels *mean*, because several of them are not what their names suggest.
@@ -452,6 +466,13 @@ metric convert a root-frame vector back to world axes; and `motion_root_pos [3]`
 — the smoothed world root position, which is the *absolute* anchor the pose→motion consistency loss
 needs (a derivative target alone leaves absolute placement in a null space).
 
+With `load_keypoints` (switched on by `keypoint_supervision.enabled`) each video frame also
+emits `kp3d_world [13, 3]` — the kindyn `joints_world` rows for the 13 joints of
+`KP_JOINT_NAMES` (shoulders, elbows, wrists, hips, knees, ankles, neck — the set with a clean
+name-matched MHR70 keypoint counterpart, used by `contact/keypoint_supervision.py`) — and
+`kp_valid` (kindyn frame validity AND finiteness). World metres; the loss lifts them to the
+camera with `cam_from_world`.
+
 ### Pose pseudo-GT (`mhr_1.npz`)
 
 kindyn's trajectory is SMPL-X; the frozen network predicts MHR. To supervise the pose path at all,
@@ -577,6 +598,7 @@ collate at all:
 | `motion_gt`, `motion_outlier`, `motion_rot`, `motion_omega`, `motion_valid` | `[B,K,6\|12]`, `[B,K]`, `[B,3,3]`, `[B,3]`, `[B]` | zeros / identity / `False` |
 | `motion_root_pos`, `motion_root_valid` | `[B,3]`, `[B]` | zeros / `False` |
 | `pose_gt_q`, `pose_valid` | `[B,132]`, `[B]` | zeros / `False` |
+| `kp3d_world`, `kp_valid` | `[B,13,3]`, `[B]` | zeros / `False` |
 | `cond_feat` | `[B,10]` | zeros (**always emitted**, so DDP never sees an unused parameter) |
 
 Which datasets a run may combine is checked before training starts (`validate_targets`): every

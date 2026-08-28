@@ -6,6 +6,9 @@ table must match the anchor list; native-rate targets forbid a strided clip), th
 three-block token attention mask, ``MotionHead`` sizing/zero-init, the
 ``_patch_model_cfg`` wiring, and stability of the checkpoint arch signature (the
 new keys must stay out of every signature written before the motion branch).
+The ``anchored: false`` variant (pure learned queries) is covered here too; the
+one assertion needing a real build — that its two anchored-update projections do
+not exist — is marked slow.
 """
 from __future__ import annotations
 
@@ -22,8 +25,8 @@ from sam_3d_body.models.meta_arch.sam3d_body import SAM3DBody
 
 REPO = Path(__file__).resolve().parents[1]
 _MOTION_CFG = REPO / "tests" / "fixtures" / "motion_seven_tokens.yaml"
-_PELVIS_CFG = REPO / "configs" / "climbing_corpus_motion_pelvis_t7.yaml"
-_T7HINGE_CFG = REPO / "configs" / "climbing_videos_force_warmstart_t7hinge.yaml"
+_PELVIS_CFG = REPO / "configs" / "old" / "climbing_corpus_motion_pelvis_t7.yaml"
+_T7HINGE_CFG = REPO / "configs" / "old" / "climbing_videos_force_warmstart_t7hinge.yaml"
 
 #: Seven motion anchors: the six kindyn force anchors + MHR70 9 (left hip) for pelvis.
 _SEVEN_ANCHORS = [62, 41, 15, 18, 17, 20, 9]
@@ -61,6 +64,34 @@ def test_motion_only_build_accepted(tmp_path):
     assert cfg["model"]["motion_temporal"]["enabled"] is True
     assert cfg["contact"]["targets"]["vertex"]["enabled"] is False
     assert cfg["contact"]["targets"]["joint"]["enabled"] is False
+
+
+def _with_anchored(value: str) -> str:
+    """``_MOTION_ONLY`` with an ``anchored:`` line inside ``model.motion_head``."""
+    return _MOTION_ONLY.replace(
+        "    motion_keypoint_indices: [62, 41, 15, 18, 17, 20, 9]",
+        f"    motion_keypoint_indices: [62, 41, 15, 18, 17, 20, 9]\n    anchored: {value}")
+
+
+def test_motion_unanchored_config_accepted(tmp_path):
+    """``anchored: false`` = pure learned queries; the anchors still name the slots."""
+    cfg = load_config(_write(tmp_path, _with_anchored("false")))
+    assert cfg["model"]["motion_head"]["anchored"] is False
+    # The anchor list is untouched: it still defines K and the supervision order.
+    assert cfg["model"]["motion_head"]["motion_keypoint_indices"] == _SEVEN_ANCHORS
+
+
+def test_motion_anchored_accepted_and_defaults_to_true(tmp_path):
+    assert load_config(
+        _write(tmp_path, _with_anchored("true")))["model"]["motion_head"]["anchored"] is True
+    assert load_config(
+        _write(tmp_path, _MOTION_ONLY))["model"]["motion_head"]["anchored"] is True
+
+
+@pytest.mark.parametrize("bad", ["0", "'false'", "null"])
+def test_bad_motion_anchored_value_rejected(tmp_path, bad):
+    with pytest.raises(ValueError, match="motion_head.anchored must be a boolean"):
+        load_config(_write(tmp_path, _with_anchored(bad)))
 
 
 def test_shipped_motion_experiment_validates():
@@ -219,7 +250,7 @@ model:
 def test_anchor_count_must_match_the_joint_name_subset(tmp_path):
     with pytest.raises(ValueError, match="requires exactly 1 .*pelvis"):
         load_config(_write(tmp_path, """
-base: configs/climbing_corpus_motion_pelvis_t7.yaml
+base: configs/old/climbing_corpus_motion_pelvis_t7.yaml
 model:
   motion_head:
     motion_keypoint_indices: [9, 62]
@@ -232,7 +263,7 @@ model:
 def test_bad_joint_names_rejected(tmp_path, names):
     with pytest.raises(ValueError, match="joint_names must be null"):
         load_config(_write(tmp_path, f"""
-base: configs/climbing_corpus_motion_pelvis_t7.yaml
+base: configs/old/climbing_corpus_motion_pelvis_t7.yaml
 motion_supervision:
   joint_names: {names}
 """))
@@ -243,7 +274,7 @@ def test_limb_slots_with_label_smoothing_rejected(tmp_path):
     # expressed in a SMOOTHED frame. Must fail loudly, not ship silently.
     with pytest.raises(ValueError, match="pelvis slot only"):
         load_config(_write(tmp_path, """
-base: configs/climbing_corpus_motion_pelvis_t7.yaml
+base: configs/old/climbing_corpus_motion_pelvis_t7.yaml
 model:
   motion_head:
     motion_keypoint_indices: [9, 62]
@@ -266,7 +297,7 @@ def test_auto_stride_rejected_without_motion_supervision(tmp_path):
     # evaluate.py / demo.py / the renderers read frame_stride as a plain int.
     with pytest.raises(ValueError, match="frame_stride: auto requires"):
         load_config(_write(tmp_path, """
-base: configs/climbing_videos_joint.yaml
+base: configs/old/climbing_videos_joint.yaml
 data:
   sequence: {frames_per_clip: 7, frame_stride: auto, jitter: true, target_frame: center}
 """))
@@ -275,7 +306,7 @@ data:
 def test_bad_root_convention_rejected(tmp_path):
     with pytest.raises(ValueError, match="root_convention must be one of"):
         load_config(_write(tmp_path, """
-base: configs/climbing_corpus_motion_pelvis_t7.yaml
+base: configs/old/climbing_corpus_motion_pelvis_t7.yaml
 motion_supervision:
   root_convention: world
 """))
@@ -313,6 +344,7 @@ def test_motion_defaults_load():
     assert cfg["model"]["motion_head"] == {
         "enabled": False,
         "motion_keypoint_indices": _SEVEN_ANCHORS,
+        "anchored": True,
         "mlp_depth": 2,
         "mlp_channel_div_factor": 4,
         "dropout": 0.0,
@@ -564,6 +596,17 @@ def test_patch_model_cfg_motion_only(tmp_path):
     assert len(model_cfg.MODEL.CONTACT_HEAD.TARGETS) == 0
 
 
+def test_patch_model_cfg_threads_the_anchored_flag(tmp_path):
+    from contact.model import _patch_model_cfg
+
+    cfg = load_config(_write(tmp_path, _with_anchored("false")))
+    assert _patch_model_cfg(
+        _min_model_cfg(), cfg, "mhr.pt").MODEL.MOTION_HEAD.ANCHORED is False
+    cfg = load_config(_write(tmp_path, _MOTION_ONLY))
+    assert _patch_model_cfg(
+        _min_model_cfg(), cfg, "mhr.pt").MODEL.MOTION_HEAD.ANCHORED is True
+
+
 def test_patch_model_cfg_motion_disabled_is_still_self_describing():
     from contact.model import _patch_model_cfg
 
@@ -571,6 +614,7 @@ def test_patch_model_cfg_motion_disabled_is_still_self_describing():
     model_cfg = _patch_model_cfg(_min_model_cfg(), cfg, "mhr.pt")
     assert model_cfg.MODEL.DECODER.DO_MOTION_TOKENS is False
     assert model_cfg.MODEL.MOTION_HEAD.KEYPOINT_INDICES == _SEVEN_ANCHORS
+    assert model_cfg.MODEL.MOTION_HEAD.ANCHORED is True
     assert model_cfg.MODEL.MOTION_TEMPORAL.ENABLED is False
 
 
@@ -606,6 +650,21 @@ def test_arch_signature_carries_motion_keys_when_enabled():
     assert sig["motion_temporal"]["attend"] == "joint"
     assert sig["motion_temporal"]["num_layers"] == 2
     assert sig["motion_temporal"]["position_scale"] == pytest.approx(30.0)
+
+
+def test_arch_signature_records_only_the_non_default_anchoring(tmp_path):
+    """Anchored (default) signatures stay byte-identical; unanchored ones say so.
+
+    Unanchored builds have a different trainable param set (no motion posemb/feat
+    linears), so the signature must separate them — but only by a key that every
+    already-written anchored checkpoint also omits.
+    """
+    anchored = ckpt_io._arch_signature(load_config(_write(tmp_path, _MOTION_ONLY)))
+    unanchored = ckpt_io._arch_signature(
+        load_config(_write(tmp_path, _with_anchored("false"))))
+    assert "anchored" not in anchored["motion"]
+    assert unanchored["motion"].pop("anchored") is False
+    assert unanchored == anchored          # nothing else moved
 
 
 # ---------------------------------------------------------------- angular (12-dim)
@@ -680,3 +739,51 @@ def test_motion_head_supports_twelve_outputs():
     out = head(torch.randn(2, 1, 16))
     assert out.shape == (2, 1, 12)
     assert torch.equal(out, torch.zeros_like(out))
+
+
+# ---------------------------------------------------------------- unanchored build (slow)
+
+_BASE_CKPT = load_config(REPO / "configs" / "base.yaml")["model"]["checkpoint_path"]
+
+
+def _build_motion(anchored: bool):
+    from contact.model import build_model
+
+    cfg = load_config(_MOTION_CFG)
+    cfg["model"]["motion_head"]["anchored"] = anchored
+    torch.manual_seed(0)
+    return build_model(cfg, "cuda")
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.skipif(not Path(_BASE_CKPT).exists(), reason="checkpoint missing")
+def test_unanchored_build_drops_the_anchored_projections():
+    """``anchored: false`` builds no projections at all — no dead trainable params.
+
+    They would otherwise never receive a gradient, which DDP rejects without
+    ``find_unused_parameters``; their absence is also what makes the per-layer
+    anchored update *impossible* rather than merely skipped.
+    """
+    model, trainable = _build_motion(False)
+
+    assert model.motion_anchored is False
+    assert not hasattr(model, "motion_posemb_linear")
+    assert not hasattr(model, "motion_feat_linear")
+    assert not any("motion_posemb" in name or "motion_feat" in name
+                   for name in trainable)
+    # Tokens, head and the temporal block must still train.
+    assert any("motion_embedding" in name for name in trainable)
+    assert any("head_motion" in name for name in trainable)
+    assert any("motion_temporal" in name for name in trainable)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.skipif(not Path(_BASE_CKPT).exists(), reason="checkpoint missing")
+def test_anchored_build_keeps_the_anchored_projections():
+    model, trainable = _build_motion(True)
+
+    assert model.motion_anchored is True
+    assert any("motion_posemb_linear" in name for name in trainable)
+    assert any("motion_feat_linear" in name for name in trainable)

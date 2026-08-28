@@ -33,21 +33,21 @@ from contact.targets import NUM_BODY_22, TargetSpec
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _POSTDEC_CFG = os.path.join(
-    REPO, "configs", "climbing_corpus_joint_force_cond_sum1_postdec.yaml")
+    REPO, "configs", "old", "climbing_corpus_joint_force_cond_sum1_postdec.yaml")
 _CKPT = load_config(os.path.join(REPO, "configs", "base.yaml"))["model"]["checkpoint_path"]
 
 # The retired shipped A/B ladder is reconstructed from the kept production
 # config: the bare-linear pre_decoder cond arm, and the same build with the
 # conditioning stripped back to its defaults.
 _COND_TEXT = """
-base: configs/climbing_corpus_joint_force_cond_sum1_postdec.yaml
+base: configs/old/climbing_corpus_joint_force_cond_sum1_postdec.yaml
 model:
   cond_input:
     encoder_hidden: null
     injection: pre_decoder
 """
 _UNCOND_TEXT = """
-base: configs/climbing_corpus_joint_force_cond_sum1_postdec.yaml
+base: configs/old/climbing_corpus_joint_force_cond_sum1_postdec.yaml
 model:
   cond_input:
     enabled: false

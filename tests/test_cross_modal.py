@@ -17,7 +17,7 @@ from contact.config import _pose_trainable_paths, load_config
 from contact.model import _trainable_name_filter
 
 REPO = Path(__file__).resolve().parents[1]
-JOINT_CFG = REPO / "configs" / "climbing_videos_joint.yaml"
+JOINT_CFG = REPO / "configs" / "old" / "climbing_videos_joint.yaml"
 _CKPT = load_config(REPO / "configs" / "base.yaml")["model"]["checkpoint_path"]
 
 
@@ -96,14 +96,15 @@ contact:
 
 def test_extra_token_attention_validation(tmp_path):
     assert load_config(REPO / "configs" / "base.yaml")["model"][
-        "extra_token_attention"] == "causal"
+        "extra_token_attention"] == "mutual"
     with pytest.raises(ValueError, match="extra_token_attention"):
         load_config(_write(tmp_path, _joint_cfg_text(
             "model: {extra_token_attention: sideways}")))
-    # JOINT_CFG has only the contact branch -> nothing to inter-attend.
-    with pytest.raises(ValueError, match="requires >= 2 of the contact"):
-        load_config(_write(tmp_path, _joint_cfg_text(
-            "model: {extra_token_attention: mutual}")))
+    # JOINT_CFG has only the contact branch -> mutual is vacuous (identical
+    # mask to causal) but, as the repo default, must be legal for every build.
+    cfg = load_config(_write(tmp_path, _joint_cfg_text(
+        "model: {extra_token_attention: mutual}")))
+    assert cfg["model"]["extra_token_attention"] == "mutual"
     cfg = load_config(_write(tmp_path, _joint_cfg_text(
         "model:\n"
         "  extra_token_attention: mutual\n"
@@ -189,7 +190,7 @@ def test_signature_captures_bricks_only_when_enabled(tmp_path):
     assert "cross_modal_temporal" not in sig
     assert "frame_attn" not in sig
     assert "pose_head_finetune" not in sig
-    assert "extra_token_attention" not in sig      # causal = the historic default
+    assert "extra_token_attention" not in sig      # causal is never recorded
 
     cfg = load_config(_write(tmp_path, _joint_cfg_text(
         "model:\n"
@@ -202,8 +203,16 @@ def test_signature_captures_bricks_only_when_enabled(tmp_path):
     # The attend_all key is a pinned constant now (the config knob was removed;
     # stored signatures compare by exact equality).
     assert sig2["frame_attn"]["attend_all"] is True
-    assert sig2["pose_head_finetune"] == {"enabled": True}
+    assert sig2["pose_head_finetune"] == {"enabled": True, "split": True}
+    assert "camera_head_finetune" not in sig2
     assert sig != sig2
+
+    cfg3 = load_config(_write(tmp_path, _joint_cfg_text(
+        "train: {finetune_camera_head: true}\n"
+        "keypoint_supervision: {enabled: true}")))
+    sig3 = ckpt_io._arch_signature(cfg3)
+    assert sig3["camera_head_finetune"] == {"enabled": True}
+    assert "pose_head_finetune" not in sig3
 
 
 def test_signature_captures_mutual_mask(tmp_path):
@@ -361,12 +370,18 @@ def test_finetune_pose_head_trainable_set(tmp_path):
         "train: {finetune_pose_head: true}\n"
         "pose_supervision: {enabled: true}",
         tmp_path)
-    head = [n for n in trainable if n.startswith("head_pose.")]
-    assert head and all(n.startswith("head_pose.proj.") for n in head)
-    # The constant tables and the hand head stay frozen.
+    head = [n for n in trainable if n.startswith("head_pose")]
+    # Split-head: the trainable params are the COPY's, never the original's.
+    assert head and all(n.startswith("head_pose_ft_proj.") for n in head)
     frozen = {n for n, p in model.named_parameters() if not p.requires_grad}
+    assert any(n.startswith("head_pose.proj.") for n in frozen)
     assert "head_pose.hand_pose_comps" in frozen
     assert any(n.startswith("head_pose_hand.") for n in frozen)
+    # The copy starts exactly equal to the original (frozen init behavior).
+    for (na, pa), (nb, pb) in zip(
+            sorted(model.head_pose.proj.named_parameters()),
+            sorted(model.head_pose_ft_proj.named_parameters())):
+        assert na == nb and torch.equal(pa, pb)
 
 
 @pytest.mark.slow
@@ -413,3 +428,66 @@ def test_mutual_mask_gpu_semantics(tmp_path):
         diff = float((mhr_mut[key] - mhr_ref[key]).abs().max())
         limit = _NOISE_MARGIN * mhr_floor[key] + _NOISE_FLOOR_EPS
         assert diff <= limit, f"MHR {key!r} moved {diff:.2e} > {limit:.2e}"
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.skipif(not os.path.exists(_CKPT), reason="checkpoint missing")
+def test_head_split_isolation_gpu(tmp_path):
+    """Perturbing the fine-tuned head COPIES moves ONLY the final readout.
+
+    The in-decoder trajectory — contact logits and the stashed frozen anchors
+    (produced by the original heads) — stays at the CUDA repeat floor, proving
+    the frozen decoder never sees the fine-tuned weights (the old shared-head
+    scheme failed exactly this: per-layer interm predictions feed the keypoint
+    token refresh). At init (copies == originals) the final outputs match a
+    no-finetune build.
+    """
+    from contact.engine import forward_model
+
+    model, _, cfg = _gpu_build(
+        "train: {finetune_pose_head: true, finetune_camera_head: true}\n"
+        "pose_supervision: {enabled: true}\n"
+        "keypoint_supervision: {enabled: true}",
+        tmp_path)
+    batch = _gpu_batch(cfg, model)
+    with torch.no_grad():
+        ref_a = forward_model(model, batch)
+        ref_b = forward_model(model, batch)
+    contact_ref = ref_a["contact"]["joint_logits"].detach().float().clone()
+    floor = float((contact_ref
+                   - ref_b["contact"]["joint_logits"].float()).abs().max())
+    mhr_ref = _mhr_floats(ref_a)
+    mhr_floor = {k: float((v - _mhr_floats(ref_b)[k]).abs().max())
+                 for k, v in mhr_ref.items()}
+
+    # Init equality: the ft build's final readout (recompute with identical
+    # copy weights) matches a no-finetune build on the same batch.
+    model0, _, cfg0 = _gpu_build("", tmp_path)
+    with torch.no_grad():
+        out0 = forward_model(model0, _gpu_batch(cfg0, model0))
+    for key in ("pred_cam_t", "mhr_model_params"):
+        delta = float((ref_a["mhr"][key].float()
+                       - out0["mhr"][key].float()).abs().max())
+        assert delta <= max(10 * mhr_floor[key], 1e-4), (key, delta)
+
+    with torch.no_grad():
+        for module in (model.head_pose_ft_proj, model.head_camera_ft_proj):
+            for param in module.parameters():
+                param.add_(torch.randn_like(param) * 0.01)
+        out_p = forward_model(model, batch)
+
+    # Decoder-side unchanged: contact logits + frozen anchors at the floor.
+    d_contact = float((out_p["contact"]["joint_logits"].float()
+                       - contact_ref).abs().max())
+    assert d_contact <= max(2 * floor, 1e-6), (d_contact, floor)
+    for key in ("pred_cam_t_frozen", "global_rot_frozen"):
+        delta = float((out_p["mhr"][key].float()
+                       - ref_a["mhr"][key].float()).abs().max())
+        assert delta <= max(2 * mhr_floor.get(key, 0.0), 1e-6), (key, delta)
+
+    # Final readout moved well above the floor (both heads).
+    for key in ("pred_cam_t", "mhr_model_params"):
+        delta = float((out_p["mhr"][key].float()
+                       - ref_a["mhr"][key].float()).abs().max())
+        assert delta > max(100 * mhr_floor[key], 1e-3), (key, delta)

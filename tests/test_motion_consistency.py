@@ -51,7 +51,7 @@ def test_defaults_disabled():
 
 
 def test_shipped_allmod_mutual_validates():
-    cfg = load_config(REPO / "configs" / "climbing_corpus_allmod_mutual.yaml")
+    cfg = load_config(REPO / "configs" / "old" / "climbing_corpus_allmod_mutual.yaml")
     assert cfg["motion_consistency"]["enabled"] is True
     assert cfg["force_supervision"]["loss"]["noncontact"] == pytest.approx(0.2)
     assert cfg["model"]["extra_token_attention"] == "mutual"
@@ -59,7 +59,7 @@ def test_shipped_allmod_mutual_validates():
 
 def test_shipped_allmod_consistency_validates():
     cfg = load_config(
-        REPO / "configs" / "climbing_corpus_allmod_consistency.yaml")
+        REPO / "configs" / "old" / "climbing_corpus_allmod_consistency.yaml")
     mc = cfg["motion_consistency"]
     assert mc["enabled"] is True
     assert (mc["loss"]["pos"], mc["loss"]["rot"], mc["loss"]["cam_rail"]) == (
@@ -71,7 +71,7 @@ def test_shipped_allmod_consistency_validates():
 
 def test_shipped_allmod_consistency_v4_validates():
     cfg = load_config(
-        REPO / "configs" / "climbing_corpus_allmod_consistency_v4.yaml")
+        REPO / "configs" / "old" / "climbing_corpus_allmod_consistency_v4.yaml")
     mc = cfg["motion_consistency"]
     assert mc["enabled"] is True
     # v4 = v3 + the two rot-collapse fixes: linear-only twist + rot rail.
@@ -86,7 +86,7 @@ def test_shipped_allmod_consistency_v4_validates():
 def test_requires_motion_supervision(tmp_path):
     with pytest.raises(ValueError, match="requires motion_supervision"):
         load_config(_write(tmp_path, """
-base: configs/climbing_corpus_pose_temporal.yaml
+base: configs/old/climbing_corpus_pose_temporal.yaml
 motion_consistency: {enabled: true}
 """))
 
@@ -94,7 +94,7 @@ motion_consistency: {enabled: true}
 def test_requires_a_trainable_pose_path(tmp_path):
     with pytest.raises(ValueError, match="trainable pose path"):
         load_config(_write(tmp_path, """
-base: configs/climbing_corpus_motion_pelvis12_angw05.yaml
+base: configs/old/climbing_corpus_motion_pelvis12_angw05.yaml
 motion_consistency: {enabled: true}
 """))
 
@@ -119,7 +119,7 @@ motion_consistency: {enabled: true}
 def test_requires_three_frame_clips(tmp_path):
     with pytest.raises(ValueError, match="frames_per_clip >= 3"):
         load_config(_write(tmp_path, """
-base: configs/climbing_corpus_motion_pelvis12_angw05.yaml
+base: configs/old/climbing_corpus_motion_pelvis12_angw05.yaml
 model:
   pose_temporal: {enabled: true}
 data:
@@ -132,7 +132,7 @@ motion_consistency: {enabled: true}
 def test_zero_weights_rejected(tmp_path):
     with pytest.raises(ValueError, match="does nothing"):
         load_config(_write(tmp_path, """
-base: configs/climbing_corpus_motion_pelvis12_angw05.yaml
+base: configs/old/climbing_corpus_motion_pelvis12_angw05.yaml
 model:
   pose_temporal: {enabled: true}
 pose_supervision: {enabled: true}
@@ -145,7 +145,7 @@ motion_consistency:
 def test_negative_pos_weight_rejected(tmp_path):
     with pytest.raises(ValueError, match="loss.pos"):
         load_config(_write(tmp_path, """
-base: configs/climbing_corpus_motion_pelvis12_angw05.yaml
+base: configs/old/climbing_corpus_motion_pelvis12_angw05.yaml
 model:
   pose_temporal: {enabled: true}
 pose_supervision: {enabled: true}
@@ -156,7 +156,7 @@ motion_consistency: {enabled: true, loss: {pos: -1.0}}
 def test_bad_hip_offset_rejected(tmp_path):
     with pytest.raises(ValueError, match="hip_offset_root"):
         load_config(_write(tmp_path, """
-base: configs/climbing_corpus_motion_pelvis12_angw05.yaml
+base: configs/old/climbing_corpus_motion_pelvis12_angw05.yaml
 model:
   pose_temporal: {enabled: true}
 pose_supervision: {enabled: true}
@@ -170,7 +170,7 @@ def test_no_arch_signature_key(tmp_path):
     from contact import checkpoint as ckpt_io
 
     sig = ckpt_io._arch_signature(
-        load_config(REPO / "configs" / "climbing_corpus_allmod_mutual.yaml"))
+        load_config(REPO / "configs" / "old" / "climbing_corpus_allmod_mutual.yaml"))
     assert "motion_consistency" not in sig
 
 
@@ -570,7 +570,7 @@ def test_full_model_gradient_routing(tmp_path):
 
     torch.manual_seed(0)
     cfg = load_config(_write(tmp_path, """
-base: configs/climbing_corpus_motion_pelvis12_angw05.yaml
+base: configs/old/climbing_corpus_motion_pelvis12_angw05.yaml
 model:
   pose_temporal: {enabled: true}
 train: {finetune_pose_head: true}

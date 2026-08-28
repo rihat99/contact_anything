@@ -2,7 +2,7 @@
 
 Real SAM-3D-Body checkpoint required. Mirrors ``test_force_invariance.py`` for the
 motion-only builds (``tests/fixtures/motion_seven_tokens.yaml``
-with seven motion tokens and ``configs/climbing_corpus_motion_pelvis_t7.yaml``
+with seven motion tokens and ``configs/old/climbing_corpus_motion_pelvis_t7.yaml``
 with one: no contact tokens, no force tokens, K motion tokens appended last).
 
 The motion tokens are appended *after* every other token block and the asymmetric
@@ -35,7 +35,7 @@ from contact.targets import TargetSpec
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MOTION_CFG = os.path.join(REPO, "tests", "fixtures", "motion_seven_tokens.yaml")
-PELVIS_CFG = os.path.join(REPO, "configs", "climbing_corpus_motion_pelvis_t7.yaml")
+PELVIS_CFG = os.path.join(REPO, "configs", "old", "climbing_corpus_motion_pelvis_t7.yaml")
 #: Both shipped motion builds: seven anchored tokens (v2) and one (v3, pelvis).
 MOTION_CFGS = (MOTION_CFG, PELVIS_CFG)
 _CKPT = load_config(os.path.join(REPO, "configs", "base.yaml"))["model"]["checkpoint_path"]

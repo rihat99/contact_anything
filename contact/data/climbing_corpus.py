@@ -25,24 +25,29 @@ to invalid (as in :mod:`contact.data.reconstruction_scenes`).
 
 ``__getitem__`` returns a **clip** (list of ``T`` per-frame dicts) matching the
 v1 item contract, with two deliberate differences: ``gravity_world`` is the
-kindyn convention's exact ``[0, 1, 0]`` (world y is down) rather than the v1
-camera-0-derived direction, and ``load_forces=True`` adds per-frame GT forces:
+kindyn convention's world-y-down direction — kindyn's FITTED per-scene vector
+when forces load, the exact ``[0, 1, 0]`` fallback otherwise — rather than the
+v1 camera-0-derived direction, and ``load_forces=True`` adds per-frame GT forces:
 
 * ``force_gt`` ``[6, 3]`` float32 — solved contact force per group in
-  :data:`FORCE_GROUP_NAMES` order, in body-weight units
-  (``newtons / (total_mass * 9.81)``), rotated **world -> body-root**:
-  ``f_root = R(q_xyzw)^T @ f_world`` where ``q[3:7]`` is the kindyn root
-  quaternion in ``xyzw`` order (numerically verified against the stored
-  axis-angle ``global_orient``; ``R(q)`` is world-from-root).
-* ``force_contact`` ``[6]`` bool — the kindyn/contacts_2 contact mask the
-  forces were solved under, folded per group (hands = wrist + 15 fingers).
+  :data:`FORCE_GROUP_NAMES` order, folded from kindyn's ~35 contact frames by
+  parent joint (hands sum palm + fingers + thumb into the wrist, feet the
+  toe/ball frames, ankles the heels; see :meth:`_load_forces`). Units follow
+  ``force_units`` (default ``bw``: ``newtons / (total_mass * 9.81)``); frame
+  follows ``force_frame`` (default ``root``: ``f_root = R(q_xyzw)^T @ f_world``
+  where ``q[3:7]`` is the kindyn root quaternion in ``xyzw`` order, numerically
+  verified against the stored axis-angle ``global_orient``; ``R(q)`` is
+  world-from-root).
+* ``force_contact`` ``[6]`` bool — kindyn's per-frame solve mask
+  (``frame_contact``) folded per group with the same frame -> group map.
   A zero force means *unlabeled*, not measured-zero.
-* ``force_lever`` ``[6, 3]`` float32 — root-frame lever arm (metres) of each
-  group's kindyn joint from the pelvis: ``R(q_xyzw)^T @ (joints_world[group_i]
-  - joints_world[pelvis])`` — the same world -> body-root rotation as
-  ``force_gt``. Consumed by the net-torque consistency loss; may be non-finite
-  on frames the solve did not cover (the loss skips those rows).
+* ``force_lever`` ``[6, 3]`` float32 — lever arm (metres) of each group's
+  kindyn joint from the pelvis, in the same ``force_frame`` as ``force_gt``.
+  Consumed by the net-torque consistency loss; may be non-finite on frames the
+  solve did not cover (the loss skips those rows).
 * ``force_valid`` bool — frame valid and covered by the kindyn solve.
+* ``force_conf`` float — kindyn's per-frame solve confidence in ``[0, 1]``
+  (loss row weight when ``force_supervision.confidence``).
 
 ``load_motion=True`` adds the per-frame kindyn motion targets (motion tokens v2):
 
@@ -74,6 +79,15 @@ camera-0-derived direction, and ``load_forces=True`` adds per-frame GT forces:
 * ``motion_root_valid`` bool — the raw kindyn-coverage bit for that frame.
   Unlike ``motion_valid`` it needs no stencil support or edge trim: an
   absolute pose is per-frame.
+
+``load_keypoints=True`` adds the kindyn GT keypoints the SAM3D-style keypoint
+losses are supervised by:
+
+* ``kp3d_world`` ``[13, 3]`` float32 — the :data:`KP_JOINT_NAMES` columns of
+  ``joints_world``, metres in kindyn's metric WORLD frame (the losses map them
+  into the camera with the frame's ``cam_from_world``, which video items always
+  carry). Exactly zero on rows the solve did not cover.
+* ``kp_valid`` bool — frame valid, covered by the kindyn solve, and finite.
 
 ``cond_features_path`` adds ``cond_feat`` ``[10]`` float32, the *input*-side
 conditioning feature (``model.cond_input``): standardized root-frame smoothed
@@ -116,8 +130,8 @@ LEFT_HAND_GROUP_52 = (20,) + tuple(range(22, 37))
 RIGHT_HAND_GROUP_52 = (21,) + tuple(range(37, 52))
 _HAND_FOLDS = ((20, LEFT_HAND_GROUP_52), (21, RIGHT_HAND_GROUP_52))
 
-# Pinned confidence schema of contacts_<level>.npz (same pin as the v1 exporter).
-CONTACT_CONFIDENCE_SCHEMA = 8
+# Pinned label schema of contacts_<level>.npz (2026-08-27 corpus regeneration).
+CONTACT_LABEL_SCHEMA = 2
 
 #: Canonical six force groups, in kindyn's ``contact_force_joints`` column order.
 #: ``*_foot`` is the big-toe joint (SMPL-X 10/11), ``*_ankle`` the heel (7/8).
@@ -155,14 +169,25 @@ MOTION_TARGET_SMOOTH_SEC = 0.12
 #: T-frame clip spans the same physical time at every corpus fps.
 MOTION_REFERENCE_FPS = 25.0
 
+#: SMPL-X kindyn joints with a clean MHR70 keypoint correspondence, canonical
+#: order shared with contact/keypoint_supervision.py (which owns the MHR70 side).
+KP_JOINT_NAMES = (
+    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist", "left_hip", "right_hip",
+    "left_knee", "right_knee", "left_ankle", "right_ankle", "neck",
+)
+
 #: Width of the ``cond_feat`` input-conditioning vector (``model.cond_input``):
 #: standardized root-frame velocity (3) + acceleration (3) + the gravity
 #: direction in root axes (3) + a validity bit.
 COND_FEATURE_DIM = 10
 
 GRAVITY_MAG = 9.81
-# Exact scene-world down direction of every kindyn solve (world y is down). The
-# v1 export instead *derived* gravity from camera 0 — do not mix the two.
+# Fallback world down direction (world y is down). Since the 2026-08-27 corpus
+# regeneration every kindyn solve carries a per-scene FITTED ``gravity_world``
+# (tilts of up to ~27 deg from +y occur); force-loading scenes override this
+# constant with the fitted vector. The v1 export instead *derived* gravity from
+# camera 0 — do not mix the two.
 GRAVITY_WORLD = np.array([0.0, 1.0, 0.0], np.float32)
 
 # BetterContactAnnotator's 14 manual joints -> SMPL-X 22-body index (by name).
@@ -211,8 +236,15 @@ def merge_contacts_52_to_22(
     (max) and the weakest member when it is free (min over all 16 — one
     occluded finger makes the whole-hand free label uncertain).
 
+    A non-finite confidence entry means the joint is **not assessed** by the
+    confidence method (since the 2026-08-27 regeneration: spine1/spine3/neck
+    and every individual finger joint are NaN on all frames; NaN never
+    coincides with ``joint_contact=True``). Unassessed entries are ignored in
+    the hand folds and become confidence ``0.0`` for the pass-through joints.
+
     :param jc52: ``(P, N, 52)`` bool contact labels.
-    :param conf52: ``(P, N, 52)`` float32 label confidence in ``[0, 1]``.
+    :param conf52: ``(P, N, 52)`` float32 label confidence in ``[0, 1]``
+        (non-finite = not assessed).
     :returns: ``(jc22 (P,N,22) bool, conf22 (P,N,22) float32)``.
     """
     jc52 = np.asarray(jc52, bool)
@@ -222,19 +254,24 @@ def merge_contacts_52_to_22(
     if conf52.shape != jc52.shape:
         raise ValueError(
             f"label_confidence shape {conf52.shape} does not match contacts {jc52.shape}")
-    if not np.isfinite(conf52).all() or bool(((conf52 < 0.0) | (conf52 > 1.0)).any()):
-        raise ValueError("label_confidence must be finite and within [0, 1]")
+    finite = np.isfinite(conf52)
+    if bool(((conf52 < 0.0) | (conf52 > 1.0))[finite].any()):
+        raise ValueError("finite label_confidence must be within [0, 1]")
 
     jc22 = jc52[..., :NUM_BODY_22].copy()
-    conf22 = conf52[..., :NUM_BODY_22].copy()
+    conf22 = np.where(finite, conf52, 0.0)[..., :NUM_BODY_22].copy()
     for wrist, group in _HAND_FOLDS:
         sub_lbl = jc52[..., group]                                      # (P, N, 16)
         sub_conf = conf52[..., group]
+        sub_fin = finite[..., group]
         lbl = sub_lbl.any(axis=-1)
-        conf_touch = np.where(sub_lbl, sub_conf, -np.inf).max(axis=-1)  # strongest touching vote
-        conf_free = sub_conf.min(axis=-1)                               # weakest member of the free AND
+        # strongest touching vote / weakest member of the free AND — over the
+        # ASSESSED members only (a NaN finger casts no vote either way).
+        conf_touch = np.where(sub_lbl & sub_fin, sub_conf, -np.inf).max(axis=-1)
+        conf_free = np.where(sub_fin, sub_conf, np.inf).min(axis=-1)
+        folded = np.where(lbl, conf_touch, conf_free)
         jc22[..., wrist] = lbl
-        conf22[..., wrist] = np.where(lbl, conf_touch, conf_free)
+        conf22[..., wrist] = np.where(np.isfinite(folded), folded, 0.0)
     return jc22, conf22
 
 
@@ -584,7 +621,14 @@ class ClimbingCorpusDataset(Dataset):
     :param require_labels: on ``test``, require the manual annotation (raise when
         missing; discovery skips unannotated scenes). Train labels are always loaded.
     :param load_forces: read ``kindyn_1.npz`` and emit ``force_gt`` /
-        ``force_contact`` / ``force_lever`` / ``force_valid`` per frame.
+        ``force_contact`` / ``force_lever`` / ``force_valid`` / ``force_conf``
+        per frame; the scene's ``gravity_world`` becomes kindyn's fitted vector.
+    :param force_frame: coordinate frame of ``force_gt``/``force_lever`` —
+        ``"root"`` (body-root, the default; no extrinsics anywhere) or
+        ``"world"`` (kindyn's metric world, whose yaw is NOT observable from a
+        single crop — pair it with a loss that maps predictions into world).
+    :param force_units: ``"bw"`` (force divided by ``total_mass * g``,
+        dimensionless, the default) or ``"newtons"`` (raw solve output).
     :param load_motion: read ``kindyn_1.npz`` and emit ``motion_gt`` /
         ``motion_valid`` / ``motion_outlier`` / ``motion_rot`` / ``motion_omega``
         per frame.
@@ -608,6 +652,9 @@ class ClimbingCorpusDataset(Dataset):
     :param motion_angular: append the root slot's body angular velocity and
         acceleration to ``motion_gt`` (``[K, 12]``). Requires the ``twist``
         convention and a pelvis-only joint list.
+    :param load_keypoints: read ``kindyn_1.npz`` and emit ``kp3d_world`` /
+        ``kp_valid`` per frame — the 13 :data:`KP_JOINT_NAMES` world joints the
+        keypoint losses reproject.
     :param cond_features_path: ``cond_features.npz`` to read the input-side
         conditioning feature from (``None`` = no ``cond_feat`` emitted). Entries
         are keyed ``"<scene>__p<object_id>"`` and joined per frame on ``frame_idx``.
@@ -637,6 +684,8 @@ class ClimbingCorpusDataset(Dataset):
         use_confidence_weights: bool = False,
         require_labels: bool = True,
         load_forces: bool = False,
+        force_frame: str = "root",
+        force_units: str = "bw",
         load_motion: bool = False,
         motion_joint_names: Optional[Sequence[str]] = None,
         motion_root_convention: str = "twist",
@@ -644,6 +693,7 @@ class ClimbingCorpusDataset(Dataset):
         motion_outlier_acc_ms2: float = MOTION_OUTLIER_ACC_MS2,
         motion_angular: bool = False,
         load_pose: bool = False,
+        load_keypoints: bool = False,
         cond_features_path: Optional[str] = None,
         cond_standardize: Optional[dict] = None,
         cond_clip: float = 5.0,
@@ -671,6 +721,12 @@ class ClimbingCorpusDataset(Dataset):
         self.use_confidence_weights = bool(use_confidence_weights)
         self.require_labels = bool(require_labels)
         self.load_forces = bool(load_forces)
+        if force_frame not in ("root", "world"):
+            raise ValueError(f"force_frame must be 'root' or 'world'; got {force_frame!r}")
+        if force_units not in ("bw", "newtons"):
+            raise ValueError(f"force_units must be 'bw' or 'newtons'; got {force_units!r}")
+        self.force_frame = str(force_frame)
+        self.force_units = str(force_units)
         self.load_motion = bool(load_motion)
         self.motion_joints = tuple(
             MOTION_JOINT_NAMES if motion_joint_names is None else motion_joint_names)
@@ -692,6 +748,7 @@ class ClimbingCorpusDataset(Dataset):
         self.motion_outlier_acc_ms2 = float(motion_outlier_acc_ms2)
         self.motion_angular = bool(motion_angular)
         self.load_pose = bool(load_pose)
+        self.load_keypoints = bool(load_keypoints)
         # Angular twist targets exist for the root slot only; mirroring the
         # config validator keeps the class safe for direct construction.
         if self.motion_angular and (
@@ -841,13 +898,13 @@ class ClimbingCorpusDataset(Dataset):
 
         joint_contact = contact_conf = annotated = None
         if self.split in ("train", "val"):
-            schema = int(np.asarray(contacts["confidence_schema"]).item())
-            if schema != CONTACT_CONFIDENCE_SCHEMA:
+            schema = int(np.asarray(contacts["contact_label_schema"]).item())
+            if schema != CONTACT_LABEL_SCHEMA:
                 raise ValueError(
-                    f"{scene}: contacts_{self.contact_level} confidence_schema={schema}, "
-                    f"expected {CONTACT_CONFIDENCE_SCHEMA}")
+                    f"{scene}: contacts_{self.contact_level} contact_label_schema="
+                    f"{schema}, expected {CONTACT_LABEL_SCHEMA}")
             joint_contact, contact_conf = merge_contacts_52_to_22(
-                contacts["joint_contact"], contacts["label_confidence"])
+                contacts["joint_contact"], contacts["joint_label_confidence"])
         elif self.require_labels:
             joint_contact, annotated = self._load_test_labels(scene, object_ids, n)
 
@@ -881,6 +938,8 @@ class ClimbingCorpusDataset(Dataset):
                 scene, human_dir, object_ids, n, float(contacts["fps"])))
         if self.load_pose:
             data.update(self._load_pose(scene, human_dir, object_ids, n))
+        if self.load_keypoints:
+            data.update(self._load_keypoints(scene, human_dir, object_ids, n))
         if self.cond_features_path is not None:
             data.update(self._load_cond(scene, object_ids, n))
         return data
@@ -910,6 +969,41 @@ class ClimbingCorpusDataset(Dataset):
             np.asarray(mhr["valid_mask"], bool), mhr_ids, object_ids,
             scene, "mhr_1")                                     # [P, N]
         return {"pose_gt_q": q_world, "pose_valid_mask": pose_valid}
+
+    def _load_keypoints(
+        self, scene: str, human_dir: Path, object_ids: np.ndarray, n: int,
+    ) -> dict:
+        """Kindyn world keypoints for the SAM3D-style reprojection losses.
+
+        The :data:`KP_JOINT_NAMES` columns of ``joints_world``, resolved BY NAME
+        once per scene (the same rule the force lever arms use). Rows the kindyn
+        solve did not cover — or that carry a non-finite coordinate — come back
+        as exact zeros with ``kp_valid`` False; the loss masks on the bit.
+        """
+        kindyn = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
+        kindyn_ids = np.asarray(kindyn["object_ids"])
+        joint_names = [str(x) for x in kindyn["joint_names"]]
+        missing = [name for name in KP_JOINT_NAMES if name not in joint_names]
+        if missing:
+            raise ValueError(f"{scene}: kindyn joint_names is missing {missing}")
+        cols = [joint_names.index(name) for name in KP_JOINT_NAMES]
+        kp3d = _rows_by_object_id(
+            np.asarray(kindyn["joints_world"], np.float32),
+            kindyn_ids, object_ids, scene, "kindyn")[:, :, cols]   # [P, N, 13, 3] m, world
+        kp_valid = _rows_by_object_id(
+            np.asarray(kindyn["valid_mask"], bool),
+            kindyn_ids, object_ids, scene, "kindyn")               # [P, N]
+        n_people = len(object_ids)
+        if kp3d.shape != (n_people, n, len(KP_JOINT_NAMES), 3):
+            raise ValueError(
+                f"{scene}: keypoint joints_world {kp3d.shape} does not match "
+                f"({n_people}, {n}, {len(KP_JOINT_NAMES)}, 3)")
+        kp_valid = kp_valid & np.isfinite(kp3d).all(axis=(2, 3))
+        return {
+            "kp3d_world": np.where(kp_valid[:, :, None, None], kp3d, 0.0).astype(
+                np.float32),                                       # [P, N, 13, 3] world
+            "kp_valid": kp_valid,                                  # [P, N] bool
+        }
 
     def _load_test_labels(
         self, scene: str, object_ids: np.ndarray, n: int,
@@ -974,19 +1068,48 @@ class ClimbingCorpusDataset(Dataset):
     def _load_forces(
         self, scene: str, human_dir: Path, object_ids: np.ndarray, n: int,
     ) -> dict:
-        """Load kindyn GT forces: body-weight units, rotated world -> body-root."""
+        """Load kindyn GT forces, folding the contact frames into the six groups.
+
+        Since the 2026-08-27 corpus regeneration kindyn stores per-frame forces
+        on ~35 named contact frames (``frame_forces``, newtons, world frame).
+        Each frame maps to a group through its PARENT JOINT
+        (``contact_frame_parents`` -> :data:`FORCE_GROUPS_52` membership): the
+        hand groups aggregate the wrist plus every finger frame (palm, fingers,
+        thumb sum into the wrist), the foot groups the big-toe/ball/toe frames,
+        the ankle groups the heels. Frames whose parent belongs to no group
+        (knees, sit, elbows, back, shoulders, chest, head, ...) are dropped —
+        corpus-wide they carry ~4 % of the total force magnitude. Group contact
+        is the OR of the member frames' ``frame_contact`` (the mask the solve
+        placed forces under). Units follow ``force_units`` (``bw`` divides by
+        ``total_mass * g``), the coordinate frame follows ``force_frame``
+        (``root`` rotates world -> body-root by the kindyn root quaternion).
+        Also emits the per-frame solve confidence and the scene's FITTED
+        ``gravity_world``.
+        """
         kindyn = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
         kindyn_ids = np.asarray(kindyn["object_ids"])
-        force_joints = _rows_by_object_id(
-            kindyn["contact_force_joints"], kindyn_ids, object_ids, scene, "kindyn")
-        for row in force_joints:
-            if tuple(str(x) for x in row) != KINDYN_FORCE_JOINTS:
+        frame_names = [str(x) for x in kindyn["contact_frame_names"]]
+        parents = np.asarray(kindyn["contact_frame_parents"], np.int64).reshape(-1)
+        n_cframes = len(frame_names)
+        if parents.shape != (n_cframes,) or (parents < 0).any() or (
+                parents >= N_JOINTS_52).any():
+            raise ValueError(
+                f"{scene}: contact_frame_parents is not {n_cframes} valid "
+                f"52-joint indices")
+        group_of = np.full(n_cframes, -1, np.int64)
+        for g, members in enumerate(FORCE_GROUPS_52):
+            group_of[np.isin(parents, list(members))] = g
+        for g, name in enumerate(FORCE_GROUP_NAMES):
+            if not (group_of == g).any():
                 raise ValueError(
-                    f"{scene}: contact_force_joints {[str(x) for x in row]} != "
-                    f"{list(KINDYN_FORCE_JOINTS)}")
-        forces_n = _rows_by_object_id(
-            np.asarray(kindyn["contact_forces"], np.float32),
-            kindyn_ids, object_ids, scene, "kindyn")          # [P, N, 6, 3] newtons, world
+                    f"{scene}: no kindyn contact frame maps to force group "
+                    f"{name!r} — the corpus schema changed again?")
+        frame_forces = _rows_by_object_id(
+            np.asarray(kindyn["frame_forces"], np.float32),
+            kindyn_ids, object_ids, scene, "kindyn")      # [P, N, F, 3] newtons, world
+        frame_contact = _rows_by_object_id(
+            np.asarray(kindyn["frame_contact"], bool),
+            kindyn_ids, object_ids, scene, "kindyn")      # [P, N, F]
         q = _rows_by_object_id(
             np.asarray(kindyn["q"], np.float32),
             kindyn_ids, object_ids, scene, "kindyn")          # [P, N, 211]
@@ -996,20 +1119,23 @@ class ClimbingCorpusDataset(Dataset):
         force_valid = _rows_by_object_id(
             np.asarray(kindyn["valid_mask"], bool),
             kindyn_ids, object_ids, scene, "kindyn")          # [P, N]
-        group_contact = fold_force_group_contact(
-            _rows_by_object_id(
-                np.asarray(kindyn["joint_contact"], bool),
-                kindyn_ids, object_ids, scene, "kindyn"))     # [P, N, 6]
+        force_conf = _rows_by_object_id(
+            np.asarray(kindyn["force_confidence"], np.float32),
+            kindyn_ids, object_ids, scene, "kindyn")          # [P, N]
         joints_world = _rows_by_object_id(
             np.asarray(kindyn["joints_world"], np.float32),
             kindyn_ids, object_ids, scene, "kindyn")          # [P, N, J, 3] m, world
         joint_names = [str(x) for x in kindyn["joint_names"]]
 
         n_people = len(object_ids)
-        if forces_n.shape != (n_people, n, NUM_FORCE_GROUPS, 3):
+        if frame_forces.shape != (n_people, n, n_cframes, 3):
             raise ValueError(
-                f"{scene}: contact_forces {forces_n.shape} does not match "
-                f"({n_people}, {n}, {NUM_FORCE_GROUPS}, 3)")
+                f"{scene}: frame_forces {frame_forces.shape} does not match "
+                f"({n_people}, {n}, {n_cframes}, 3)")
+        if frame_contact.shape != (n_people, n, n_cframes):
+            raise ValueError(
+                f"{scene}: frame_contact {frame_contact.shape} does not match "
+                f"({n_people}, {n}, {n_cframes})")
         if joints_world.shape != (n_people, n, len(joint_names), 3):
             raise ValueError(
                 f"{scene}: joints_world {joints_world.shape} does not match "
@@ -1019,11 +1145,29 @@ class ClimbingCorpusDataset(Dataset):
         if missing_joints:
             raise ValueError(
                 f"{scene}: kindyn joint_names is missing {missing_joints}")
-        if not np.isfinite(forces_n).all():
-            raise ValueError(f"{scene}: contact_forces contain non-finite values")
+        if not np.isfinite(frame_forces).all():
+            raise ValueError(f"{scene}: frame_forces contain non-finite values")
+        if not np.isfinite(force_conf).all():
+            raise ValueError(f"{scene}: force_confidence contains non-finite values")
+        force_conf = np.clip(force_conf, 0.0, 1.0).astype(np.float32)
         if (not np.isfinite(total_mass).all() or (total_mass <= 0).any()
                 or not np.isfinite(np.asarray(kindyn["betas"])).all()):
             raise ValueError(f"{scene}: kindyn total_mass/betas are not sane")
+        gravity = np.asarray(kindyn["gravity_world"], np.float32).reshape(3)
+        grav_norm = float(np.linalg.norm(gravity))
+        if not np.isfinite(gravity).all() or not 0.9 < grav_norm < 1.1:
+            raise ValueError(
+                f"{scene}: kindyn gravity_world {gravity.tolist()} is not a "
+                f"unit direction")
+        gravity = (gravity / grav_norm).astype(np.float32)
+
+        # Fold frames -> groups: forces sum, contact ORs, over the member frames.
+        forces_n = np.stack(
+            [frame_forces[:, :, group_of == g].sum(axis=2)
+             for g in range(NUM_FORCE_GROUPS)], axis=2)   # [P, N, 6, 3] newtons, world
+        group_contact = np.stack(
+            [frame_contact[:, :, group_of == g].any(axis=2)
+             for g in range(NUM_FORCE_GROUPS)], axis=2)   # [P, N, 6]
         # Forces are only ever solved under the contact mask: a nonzero force on
         # an uncontacted group means corrupted data. (The converse — zero force
         # during contact — is possible in principle, so it is not asserted.)
@@ -1032,26 +1176,30 @@ class ClimbingCorpusDataset(Dataset):
             raise ValueError(
                 f"{scene}: nonzero contact force on a group with no contact label")
 
-        forces_bw = forces_n / (total_mass[:, None, None, None] * GRAVITY_MAG)
-        # q[3:7] is the root quaternion, xyzw, R(q) = world-from-root (verified
-        # against the stored axis-angle global_orient); rotate world -> root.
-        rot = quat_xyzw_to_matrix(q[..., 3:7])                # [P, N, 3, 3]
-        force_root = np.einsum("pnji,pnkj->pnki", rot, forces_bw).astype(np.float32)
+        forces_out = forces_n
+        if self.force_units == "bw":
+            forces_out = forces_n / (total_mass[:, None, None, None] * GRAVITY_MAG)
         # Lever arms for the net-torque consistency loss: the six group joints'
-        # world offsets from the pelvis, rotated world -> root with the same
-        # rotation as the forces. Resolved by NAME once per scene (the group
-        # names are validated against KINDYN_FORCE_JOINTS above). Not checked
-        # for finiteness — uncovered frames may hold garbage; the loss skips them.
+        # world offsets from the pelvis. Resolved by NAME once per scene. Not
+        # checked for finiteness — uncovered frames may hold garbage; the loss
+        # skips them.
         pelvis = joint_names.index("pelvis")
         group_joints = [joint_names.index(name) for name in KINDYN_FORCE_JOINTS]
-        lever_world = joints_world[:, :, group_joints] - joints_world[:, :, [pelvis]]
-        force_lever = np.einsum(
-            "pnji,pnkj->pnki", rot, lever_world).astype(np.float32)
+        lever = joints_world[:, :, group_joints] - joints_world[:, :, [pelvis]]
+        if self.force_frame == "root":
+            # q[3:7] is the root quaternion, xyzw, R(q) = world-from-root
+            # (verified against the stored axis-angle global_orient); rotate
+            # world -> root, forces and lever arms with the same rotation.
+            rot = quat_xyzw_to_matrix(q[..., 3:7])            # [P, N, 3, 3]
+            forces_out = np.einsum("pnji,pnkj->pnki", rot, forces_out)
+            lever = np.einsum("pnji,pnkj->pnki", rot, lever)
         return {
-            "force_gt": force_root,                          # [P, N, 6, 3] bw, root frame
-            "force_contact": group_contact,                  # [P, N, 6] bool
-            "force_lever": force_lever,                      # [P, N, 6, 3] m, root frame
-            "force_valid": force_valid,                      # [P, N] bool
+            "force_gt": forces_out.astype(np.float32),   # [P, N, 6, 3] units/frame per cfg
+            "force_contact": group_contact,              # [P, N, 6] bool
+            "force_lever": lever.astype(np.float32),     # [P, N, 6, 3] m, same frame
+            "force_valid": force_valid,                  # [P, N] bool
+            "force_conf": force_conf,                    # [P, N] solve confidence [0, 1]
+            "gravity_world": gravity,                    # [3] FITTED unit down direction
         }
 
     def _load_motion(
@@ -1283,6 +1431,7 @@ class ClimbingCorpusDataset(Dataset):
                 frame["force_lever"] = torch.from_numpy(
                     data["force_lever"][person, pos])                                 # [6, 3]
                 frame["force_valid"] = valid and bool(data["force_valid"][person, pos])
+                frame["force_conf"] = float(data["force_conf"][person, pos])
             if self.load_motion:
                 frame["motion_gt"] = torch.from_numpy(
                     data["motion_gt"][person, pos])                               # [K, 6|12]
@@ -1302,6 +1451,10 @@ class ClimbingCorpusDataset(Dataset):
                     data["pose_gt_q"][person, pos])                           # [132]
                 frame["pose_valid"] = valid and bool(
                     data["pose_valid_mask"][person, pos])
+            if self.load_keypoints:
+                frame["kp3d_world"] = torch.from_numpy(
+                    data["kp3d_world"][person, pos])                          # [13, 3]
+                frame["kp_valid"] = valid and bool(data["kp_valid"][person, pos])
             if self.cond_features_path is not None:
                 frame["cond_feat"] = torch.from_numpy(data["cond_feat"][person, pos])  # [10]
             clip.append(frame)

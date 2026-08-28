@@ -4,7 +4,7 @@ Alphabetical reference for the project-specific terms used in these docs and in 
 Cross-references in *italics* point at other entries; file paths point at the defining code.
 
 **allmod** — shorthand for the all-modality experiment
-(`configs/climbing_corpus_allmod.yaml`): contact + force + motion + pose branches trained
+(`configs/old/climbing_corpus_allmod.yaml`): contact + force + motion + pose branches trained
 together on the climbing corpus with the *causal* decoder mask and the *cross-modal temporal* +
 *frame attention* bricks (per-modality temporal blocks off). The strongest all-modality recipe;
 the contact+force specialist `corpus6_jf_cond_sum1_postdec` still leads on those two tasks alone —
@@ -43,9 +43,9 @@ its outputs are this repo's ground truth.
 (`|F| / (m g)`), making them dimensionless and comparable across climbers.
 
 **causal / mutual** — the two regimes of `model.extra_token_attention`, governing attention
-*among* the appended token blocks. `causal` (default): no earlier block attends a later one
-(contact ⊥ force ⊥ motion). `mutual`: appended blocks fully inter-attend. Original tokens
-attend neither, in both regimes.
+*among* the appended token blocks. `causal` (the default until 2026-08-27): no earlier block
+attends a later one (contact ⊥ force ⊥ motion). `mutual` (the default since): appended blocks
+fully inter-attend. Original tokens attend neither, in both regimes.
 
 **clip** — a fixed-length window of `T` consecutive sampled frames from one scene
 (`data.sequence.frames_per_clip`, typically 7). Batches flatten clips to `[B_clips * T, ...]`
@@ -61,7 +61,8 @@ Used by the `corpus6_jf_cond*` line; see [experiments.md](experiments.md).
 force solve was run under, and therefore the gate for the supervised force loss.
 
 **corpus** — the raw `ClimbingVideos` dataset tree read directly by
-`contact/data/climbing_corpus.py`: 331 train + 30 manually-annotated test scenes with frames,
+`contact/data/climbing_corpus.py`: 864 train + 108 test scenes (31 annotated so far;
+pre-2026-08-27: 331 + 30) with frames,
 contacts, masks, camera geometry, and kindyn ground truth.
 
 **cross-modal temporal** — ONE zero-gated temporal attention block run over the concatenation

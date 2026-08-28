@@ -1,0 +1,64 @@
+# Stage-1 A — s1_posecam_temporal. New-era smoke probe (1 epoch): can the pose
+# path train WITHOUT diverging now that the fine-tuned heads are SPLIT (frozen
+# originals keep every in-decoder interm prediction; trainable copies read out
+# the FINAL token only) and the SAM3D-style keypoint losses anchor the camera?
+#
+# Build: PURE pose — no contact / force / motion tokens at all. The trainable
+# set is pose_temporal + head_pose_ft_proj + head_camera_ft_proj, nothing else.
+# (frame_attn cannot run here by design: it needs a second modality's tokens in
+# the frame — it returns in stage 2 with the motion token.)
+#
+# Objectives (all rows of every T=7 clip):
+#   * pose_supervision   — kindyn-MHR pseudo-GT q-Huber (125 local channels)
+#   * keypoint_supervision — kp2d (crop reprojection, constrains the camera),
+#     kp3d (hips-relative), kp3d_abs (metric camera-frame anchor vs collapse)
+#
+# Contrast arm: s1_posecam_heads.yaml (same minus pose_temporal) separates the
+# temporal module's contribution from the head fine-tune's.
+#
+# Launch:
+#   CUDA_VISIBLE_DEVICES=1,4 torchrun --standalone --nproc-per-node=2 \
+#     scripts/train.py --config configs/s1_posecam_temporal.yaml
+base: configs/base.yaml
+
+model:
+  init_contact_checkpoint: null       # nothing to warm-start: no contact branch
+  pose_temporal:
+    enabled: true                     # base defaults: 2 layers, bottleneck 256, zero-init gates
+
+contact:
+  targets:
+    vertex: {enabled: false}
+    joint: {enabled: false}           # pose-only: no contact branch at all
+
+data:
+  datasets:
+    - {name: climbing_corpus, config: configs/datasets/climbing_corpus_pose.yaml}
+  eval_split: test                    # no val split: all 864 train scenes train, test evaluates
+  frames_per_batch: 35                # per GPU -> 5 clips x T=7
+  sequence: {frames_per_clip: 7, frame_stride: 1, jitter: true, target_frame: all}
+
+pose_supervision:
+  enabled: true
+  loss:
+    pose: 1.0
+    acc: 0.0                          # no explicit smoothness term in stage 1
+    huber_delta: 0.1                  # radians
+
+keypoint_supervision:
+  enabled: true                       # base defaults: kp2d 1.0, kp3d 0.5, kp3d_abs 0.25
+
+train:
+  compile_backbone: true
+  finetune_pose_head: true            # the split COPY (head_pose_ft_proj) at 0.1x lr
+  finetune_camera_head: true          # the split COPY (head_camera_ft_proj) at 0.1x lr
+
+optim:
+  lr: 1.0e-4
+  warmup_epochs: 0                    # 1-epoch probe: no warmup
+  lr_min: 1.0e-6
+  epochs: 1
+
+output:
+  exp_name: s1_posecam_temporal
+  monitor: test/pose_mae              # minimised

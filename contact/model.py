@@ -21,6 +21,7 @@ trains. Frozen modules are eval-pinned (:func:`pin_frozen_eval`).
 """
 from __future__ import annotations
 
+import copy
 import os
 from typing import List, Tuple
 
@@ -62,7 +63,7 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
     # Decoder mask over the appended token blocks: causal (block-triangular) or
     # mutual (contact/force/motion inter-attend; original tokens still blind).
     model_cfg.MODEL.EXTRA_TOKEN_ATTENTION = str(
-        cfg["model"].get("extra_token_attention", "causal"))
+        cfg["model"].get("extra_token_attention", "mutual"))
     if "CONTACT_HEAD" not in model_cfg.MODEL:
         model_cfg.MODEL.CONTACT_HEAD = CfgNode()
     ch = model_cfg.MODEL.CONTACT_HEAD
@@ -161,6 +162,9 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
         cfg.get("motion_supervision", {}).get("angular", False))
     model_cfg.MODEL.MOTION_HEAD = CfgNode({
         "KEYPOINT_INDICES":       [int(i) for i in motion_kp],
+        # False = no per-layer anchored token update; the motion tokens are pure
+        # learned queries and the two anchored-update projections are not built.
+        "ANCHORED":               bool(mhcfg.get("anchored", True)),
         "MLP_DEPTH":              int(mhcfg.get("mlp_depth", 2)),
         "MLP_CHANNEL_DIV_FACTOR": int(mhcfg.get("mlp_channel_div_factor", 4)),
         "DROPOUT":                float(mhcfg.get("dropout", 0.0)),
@@ -349,17 +353,22 @@ def build_model(cfg: dict, device: str = "cuda") -> Tuple[nn.Module, List[str]]:
         if _trainable_name_filter(name):
             p.requires_grad = True
 
-    # Optional pose-head fine-tune: unfreeze ONLY the MHR head's projection FFN
-    # (everything else in MHRHead is a frozen constant table, and
-    # head_pose_hand must not match). Deliberate exception to the frozen-pose
-    # rule; train.py enforces a pose objective and gives these params their own
-    # lr-scaled optimizer group.
+    # Optional pose/camera-head fine-tune (split-head): the ORIGINAL heads stay
+    # frozen and keep producing every in-decoder intermediate prediction (whose
+    # keypoint-token refresh feeds back into the frozen decoder — training the
+    # shared head would perturb the frozen model layer by layer), while a COPY
+    # of the projection FFN — initialized identical, so init behavior is
+    # exactly the frozen model — is applied to the FINAL pose token only (the
+    # meta-arch's final-readout recompute). Deliberate exception to the
+    # frozen-pose rule; train.py enforces a pose/keypoint objective and gives
+    # these params their own lr-scaled optimizer group.
     if cfg.get("train", {}).get("finetune_pose_head", False):
-        head_pose_params = [
-            (name, p) for name, p in model.named_parameters()
-            if name.startswith("head_pose.proj.")]
-        assert head_pose_params, "head_pose.proj not found on the model"
-        for _, p in head_pose_params:
+        model.head_pose_ft_proj = copy.deepcopy(model.head_pose.proj)
+        for p in model.head_pose_ft_proj.parameters():
+            p.requires_grad = True
+    if cfg.get("train", {}).get("finetune_camera_head", False):
+        model.head_camera_ft_proj = copy.deepcopy(model.head_camera.proj)
+        for p in model.head_camera_ft_proj.parameters():
             p.requires_grad = True
 
     # Regime (a): warm-start from a contact checkpoint and train the force branch

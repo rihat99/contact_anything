@@ -160,6 +160,24 @@ def test_collate_camera_fallback_for_mixed_batch():
     assert torch.all(batch["gravity_world"][1] == 0.0)                     # zeros fallback
 
 
+def test_keypoint_collate_defaults_for_frames_without_keypoints():
+    # Kindyn GT keypoints ride along on corpus video frames only; a still-image
+    # frame in the same batch must collate to zeros with kp_valid False.
+    collate = make_collate(_IMG, _joint_spec())
+    gt = torch.zeros(NUM_BODY_22)
+    with_kp = _frame(joint={"gt": gt, "mask": torch.ones(NUM_BODY_22)})
+    with_kp["kp3d_world"] = torch.arange(39, dtype=torch.float32).reshape(13, 3)
+    with_kp["kp_valid"] = True
+    without_kp = _frame(joint={"gt": gt, "mask": torch.ones(NUM_BODY_22)})
+    batch = collate([with_kp, without_kp])              # two T=1 items -> B=2
+
+    assert batch["kp3d_world"].shape == (2, 13, 3)
+    assert batch["kp3d_world"].dtype == torch.float32
+    assert batch["kp_valid"].tolist() == [True, False]
+    torch.testing.assert_close(batch["kp3d_world"][0], with_kp["kp3d_world"])
+    assert float(batch["kp3d_world"][1].abs().sum()) == 0.0             # zeros fallback
+
+
 def test_distributed_eval_sampler_is_exact_without_padding():
     dataset = list(range(7))
     shards = [

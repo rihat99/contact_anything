@@ -260,6 +260,9 @@ def main() -> int:
     ap.add_argument("--scenes", nargs="*", default=None,
                     help="scene names; default = every scene with a kindyn_1.npz")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="split the scene list into this many interleaved shards")
+    ap.add_argument("--shard-index", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
@@ -275,6 +278,8 @@ def main() -> int:
             raise SystemExit(f"scenes not found: {sorted(missing)}")
     if args.limit:
         scene_dirs = scene_dirs[: args.limit]
+    if args.num_shards > 1:
+        scene_dirs = scene_dirs[args.shard_index :: args.num_shards]
 
     adapter = MHRAdapter(device=args.device)
     done = skipped = failed = 0

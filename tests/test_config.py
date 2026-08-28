@@ -44,7 +44,7 @@ output:
 
 
 def test_ported_baselines_keep_semantics():
-    joint = load_config(REPO / "configs" / "climbing_videos_joint.yaml")
+    joint = load_config(REPO / "configs" / "old" / "climbing_videos_joint.yaml")
     assert joint["contact"]["primary_target"] == "joint"
     assert joint["contact"]["targets"]["vertex"]["enabled"] is False
     assert joint["contact"]["targets"]["joint"]["enabled"] is True
@@ -76,7 +76,7 @@ def test_ported_baselines_keep_semantics():
     assert joint["output"]["exp_name"] == "climb4_frame"
     assert joint["output"]["monitor"] == "test/joint_f1"
 
-    v2 = load_config(REPO / "configs" / "climbing_videos_joint_temporal_center_v2.yaml")
+    v2 = load_config(REPO / "configs" / "old" / "climbing_videos_joint_temporal_center_v2.yaml")
     assert v2["model"]["temporal"] == {
         "enabled": True,
         "bottleneck_dim": 256,
@@ -98,7 +98,7 @@ def test_ported_baselines_keep_semantics():
     assert v2["output"]["exp_name"] == "climb4_t5mid_v2"
 
     blind = load_config(
-        REPO / "configs" / "climbing_videos_joint_temporal_center_blind.yaml")
+        REPO / "configs" / "old" / "climbing_videos_joint_temporal_center_blind.yaml")
     assert blind["model"]["contact_head"]["blind_to_image"] is True
     assert blind["output"]["exp_name"] == "climb4_t5mid_blind"
     # The ablation is the identical recipe apart from blindness and its name.
@@ -108,7 +108,7 @@ def test_ported_baselines_keep_semantics():
 
 
 def test_force_t7hinge_launch_config():
-    cfg = load_config(REPO / "configs" / "climbing_videos_force_warmstart_t7hinge.yaml")
+    cfg = load_config(REPO / "configs" / "old" / "climbing_videos_force_warmstart_t7hinge.yaml")
     # Regime (a): frozen t5mid temporal contact source, force-only training on
     # T=7 center-frame clips with the hinge-gated non-contact penalty.
     assert cfg["train"]["freeze_contact"] is True
@@ -116,10 +116,10 @@ def test_force_t7hinge_launch_config():
     assert cfg["model"]["init_contact_checkpoint"] == (
         "output/climb4_t5mid_20260717_140624/best.pth")
     # The contact temporal block must byte-match the t5mid source architecture
-    # (kept as configs/climbing_videos_joint_temporal_center_v2.yaml) or the warm
+    # (kept as configs/old/climbing_videos_joint_temporal_center_v2.yaml) or the warm
     # start hard-fails; window_frames restricts attention to the native T=5.
     source = load_config(
-        REPO / "configs" / "climbing_videos_joint_temporal_center_v2.yaml")
+        REPO / "configs" / "old" / "climbing_videos_joint_temporal_center_v2.yaml")
     assert cfg["model"]["temporal"] == {
         **source["model"]["temporal"], "window_frames": 5}
     assert cfg["model"]["force_temporal"] == {
@@ -213,11 +213,20 @@ def test_physics_residual_monitor_requires_residual_weight(tmp_path):
     # the residual objective runs — a zero weight would starve the monitor forever.
     with pytest.raises(ValueError, match="physics_residual.*requires physics.loss.residual > 0"):
         load_config(_write(tmp_path, """
-base: configs/climbing_videos_force_warmstart_t7hinge.yaml
+base: configs/old/climbing_videos_force_warmstart_t7hinge.yaml
 physics:
   loss:
     residual: 0.0
 """))
+
+
+def test_force_supervision_gt_frame_and_units_validated(tmp_path):
+    for override, match in (
+            ("gt_frame: sideways", "gt_frame"), ("units: kg", "units"),
+            ("confidence: 3", "confidence")):
+        with pytest.raises(ValueError, match=match):
+            load_config(_write(
+                tmp_path, f"base: configs/base.yaml\nforce_supervision:\n  {override}\n"))
 
 
 def test_center_target_frame_requires_odd_clip_length(tmp_path):
@@ -537,6 +546,7 @@ def test_freeze_contact_with_init_checkpoint_is_accepted(tmp_path):
 base: configs/base.yaml
 model:
   init_contact_checkpoint: /tmp/frame.pth
+  extra_token_attention: causal   # regime (a) requires causal since mutual became the default
   contact_head: {contact_keypoint_indices: [62, 41, 13, 14], num_global_tokens: 0,
                  pool_mode: per_token}
   force_head: {enabled: true}
@@ -662,3 +672,76 @@ def test_resolved_config_does_not_alias_defaults(tmp_path):
     a["contact"]["targets"]["vertex"]["loss"]["focal_alpha"] = 0.123
     b = load_config(REPO / "configs" / "base.yaml")
     assert b["contact"]["targets"]["vertex"]["loss"]["focal_alpha"] == pytest.approx(0.75)
+
+
+def test_keypoint_supervision_validation(tmp_path):
+    corpus = ("data:\n  datasets:\n"
+              "    - {name: climbing_corpus,"
+              " config: configs/datasets/climbing_corpus.yaml}\n")
+    # Bad weights / deltas hard-error whether or not enabled.
+    for override, match in (
+            ("loss: {kp2d: -1.0}", "kp2d"),
+            ("loss: {huber_delta_2d: 0.0}", "huber_delta_2d")):
+        with pytest.raises(ValueError, match=match):
+            load_config(_write(
+                tmp_path,
+                f"base: configs/base.yaml\nkeypoint_supervision:\n  {override}\n"))
+    # Enabled without anything trainable to constrain.
+    with pytest.raises(ValueError, match="trainable pose or camera"):
+        load_config(_write(tmp_path, f"""
+base: configs/base.yaml
+{corpus}keypoint_supervision: {{enabled: true}}
+"""))
+    # Enabled without a corpus dataset (GT source).
+    with pytest.raises(ValueError, match="climbing_corpus"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+model: {pose_temporal: {enabled: true}}
+pose_supervision: {enabled: true}
+keypoint_supervision: {enabled: true}
+"""))
+    # All-zero weights while enabled.
+    with pytest.raises(ValueError, match="positive loss weight"):
+        load_config(_write(tmp_path, f"""
+base: configs/base.yaml
+model: {{pose_temporal: {{enabled: true}}}}
+pose_supervision: {{enabled: true}}
+{corpus}keypoint_supervision:
+  enabled: true
+  loss: {{kp2d: 0.0, kp3d: 0.0, kp3d_abs: 0.0}}
+"""))
+    # Valid combo: pose path + corpus.
+    cfg = load_config(_write(tmp_path, f"""
+base: configs/base.yaml
+model: {{pose_temporal: {{enabled: true}}}}
+pose_supervision: {{enabled: true}}
+{corpus}keypoint_supervision: {{enabled: true}}
+"""))
+    assert cfg["keypoint_supervision"]["enabled"] is True
+
+
+def test_finetune_camera_head_requires_camera_objective(tmp_path):
+    corpus = ("data:\n  datasets:\n"
+              "    - {name: climbing_corpus,"
+              " config: configs/datasets/climbing_corpus.yaml}\n")
+    with pytest.raises(ValueError, match="finetune_camera_head"):
+        load_config(_write(tmp_path, """
+base: configs/base.yaml
+train: {finetune_camera_head: true}
+"""))
+    # kp2d weight 0 does not constrain the camera either.
+    with pytest.raises(ValueError, match="finetune_camera_head"):
+        load_config(_write(tmp_path, f"""
+base: configs/base.yaml
+train: {{finetune_camera_head: true}}
+{corpus}keypoint_supervision:
+  enabled: true
+  loss: {{kp2d: 0.0}}
+"""))
+    # Camera-only fine-tune with the reprojection loss is a legal build.
+    cfg = load_config(_write(tmp_path, f"""
+base: configs/base.yaml
+train: {{finetune_camera_head: true}}
+{corpus}keypoint_supervision: {{enabled: true}}
+"""))
+    assert cfg["train"]["finetune_camera_head"] is True

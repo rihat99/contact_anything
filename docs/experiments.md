@@ -155,7 +155,7 @@ limb, not at a vertex), and video supplies temporal context that a still image c
 
 The July 2026 refactor (commits `20f19f5`..`5d07b36`, 2026-07-10) rebuilt the repo around a
 `contact/` package, per-target heads, an optional temporal module, and versioned checkpoints. On
-top of it, the four-extremity experiment (`configs/climbing_videos_joint.yaml` and its temporal
+top of it, the four-extremity experiment (`configs/old/climbing_videos_joint.yaml` and its temporal
 descendants): four contact tokens, each **anchored** to one predicted MHR70 keypoint (indices
 `[62, 41, 13, 14]` = left wrist, right wrist, left ankle, right ankle), each producing a single
 logit — `left_hand, right_hand, left_foot, right_foot`. Loss is **focal loss** (a cross-entropy
@@ -188,7 +188,7 @@ change — supervising the center rather than every frame — was worth more tha
 itself (+0.012 over `t5`, which spends capacity predicting boundary frames it can barely see).
 
 A causal variant (`climb4_t5c`, each limb attending only to its own past) was configured
-(`legacy/configs/climbing_videos_joint_temporal_causal.yaml`) but no result survives in the
+(`legacy/configs/old/climbing_videos_joint_temporal_causal.yaml`) but no result survives in the
 records.
 
 ### The dataset re-export, and a number that doubled
@@ -260,7 +260,7 @@ and the residual. Two regimes were defined and both are still in the code:
 **regime (a)** = load a trained contact branch, *freeze* it, train only the force branch (gradients
 provably never reach contact); **regime (b)** = train both, which leaks physics gradients into
 contact through force→contact attention. Every physics run below is regime (a); regime (b) was
-configured (`legacy/configs/climbing_videos_force_scratch.yaml`) but no result from it survives in
+configured (`legacy/configs/old/climbing_videos_force_scratch.yaml`) but no result from it survives in
 the records.
 
 Full formulation: [`forces.md`](forces.md).
@@ -682,7 +682,7 @@ still isolated from everything *except* the explicitly pose-writing paths.
 
 ### allmod
 
-**`corpus_allmod`** (`configs/climbing_corpus_allmod.yaml`, launched 2026-08-24, 20 epochs, two
+**`corpus_allmod`** (`configs/old/climbing_corpus_allmod.yaml`, launched 2026-08-24, 20 epochs, two
 GPUs, 17.1 M trainable parameters) is the maximal configuration: pose + six-group contact +
 six-group force + pelvis motion, all four listed in `cross_modal_temporal` (2 layers) and in
 `frame_attn`, with the pose head fine-tuned, **no** per-modality temporal blocks, **no** motion

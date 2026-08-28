@@ -16,22 +16,49 @@ def make_cfg(**loss_overrides) -> dict:
             "huber_delta_bw": 0.5, "huber_delta_bwm": 0.1, "outlier_bw": 4.0,
             "group_weights": None}
     loss.update(loss_overrides)
-    return {"force_supervision": {"target_frame": "all", "loss": loss}}
+    return {"force_supervision": {
+        "target_frame": "all", "confidence": True, "loss": loss}}
 
 
 def make_batch(n_rows: int, gt: torch.Tensor, contact: torch.Tensor,
                valid: torch.Tensor | None = None, seq_len: int = 1,
-               lever: torch.Tensor | None = None) -> dict:
+               lever: torch.Tensor | None = None,
+               conf: torch.Tensor | None = None) -> dict:
     batch = {
         "force_gt": gt,
         "force_contact": contact,
         "force_valid": torch.ones(n_rows, dtype=torch.bool) if valid is None else valid,
         "frame_valid": torch.ones(n_rows, dtype=torch.bool),
+        "force_conf": torch.ones(n_rows) if conf is None else conf,
         "seq_len": seq_len,
     }
     if lever is not None:
         batch["force_lever"] = lever
     return batch
+
+
+def test_confidence_reweights_rows_numerator_and_mass():
+    """Row confidence scales numerator AND mass; confidence=False ignores it."""
+    pred = torch.zeros(2, K, 3)
+    gt = torch.zeros(2, K, 3)
+    gt[0, 0, 0] = 0.1                       # row 0: |e| = 0.1 -> huber 0.01
+    gt[1, 0, 0] = 0.3                       # row 1: |e| = 0.3 -> huber 0.09
+    contact = torch.zeros(2, K, dtype=torch.bool)
+    contact[:, 0] = True
+    conf = torch.tensor([1.0, 0.5])
+
+    loss_fn = ForceSupervisedLoss(make_cfg(noncontact=0.0), device="cpu")
+    _, parts = loss_fn(out_for(pred), make_batch(2, gt, contact, conf=conf))
+    assert parts["terms"]["force"]["weight_mass"] == pytest.approx(1.5)
+    assert parts["terms"]["force"]["loss"] == pytest.approx(
+        (0.01 * 1.0 + 0.09 * 0.5) / 1.5)
+
+    cfg = make_cfg(noncontact=0.0)
+    cfg["force_supervision"]["confidence"] = False
+    loss_fn = ForceSupervisedLoss(cfg, device="cpu")
+    _, parts = loss_fn(out_for(pred), make_batch(2, gt, contact, conf=conf))
+    assert parts["terms"]["force"]["weight_mass"] == pytest.approx(2.0)
+    assert parts["terms"]["force"]["loss"] == pytest.approx((0.01 + 0.09) / 2.0)
 
 
 def out_for(pred: torch.Tensor) -> dict:

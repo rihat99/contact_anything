@@ -13,11 +13,13 @@ REPO = Path(__file__).resolve().parents[1]
 
 from contact.config import load_config
 from contact.data.climbing_corpus import (
+    FORCE_GROUPS_52,
     COND_FEATURE_DIM,
     ClimbingCorpusDataset,
     FORCE_GROUP_NAMES,
     GRAVITY_WORLD,
     KINDYN_FORCE_JOINTS,
+    KP_JOINT_NAMES,
     cond_feature_rows,
     fold_force_group_contact,
     list_annotated_test_scenes,
@@ -26,7 +28,7 @@ from contact.data.climbing_corpus import (
     quat_xyzw_to_matrix,
     scene_shard,
 )
-from contact.data.collate import make_collate
+from contact.data.collate import make_collate, make_loaders
 from contact.targets import TargetSpec
 
 CORPUS = Path("/data3/rikhat.akizhanov/better/data/ClimbingVideos")
@@ -39,6 +41,9 @@ FPS = 25.0
 GRAVITY_MAG = 9.81
 # Root rotation 90 deg about +z, xyzw (matches the kindyn q[3:7] layout).
 QUAT_Z90 = np.array([0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)], np.float32)
+#: 52-joint (SMPL-X body) indices of KP_JOINT_NAMES, same order — the synthetic
+#: kindyn joint axis is named with them so the loader can resolve the keypoints.
+KP_JOINT_INDICES = (16, 17, 18, 19, 20, 21, 1, 2, 4, 5, 7, 8, 12)
 
 
 # ------------------------------------------------------------------ fixture
@@ -84,22 +89,37 @@ def _write_scene(
         jc52[:, f] = False
     contacts = dict(
         num_frames=np.int64(N_FRAMES), object_ids=oids, valid_mask=valid,
-        fps=np.float32(FPS), joint_contact=jc52, label_confidence=conf52,
-        confidence_schema=np.int32(8),
+        fps=np.float32(FPS), joint_contact=jc52, joint_label_confidence=conf52,
+        contact_label_schema=np.int32(2),
         frame_indices=np.arange(N_FRAMES, dtype=np.int32),
     )
     np.savez(human / "contacts_1.npz", **contacts)
     np.savez(human / "contacts_2.npz", **contacts)
 
-    # kindyn: forces in newtons, world frame, zero exactly off the contact mask.
+    # kindyn (2026-08-27 schema): per-contact-frame forces in newtons, world
+    # frame, zero exactly off the frame_contact mask. The left hand splits its
+    # 0.1 bw across palm + finger (the fold must sum them into the wrist); the
+    # knee frame maps to NO group and must be dropped by the loader.
     group_contact = fold_force_group_contact(jc52)                      # [P, N, 6]
     masses = 60.0 + 10.0 * np.arange(n_people, dtype=np.float32)        # per-person kg
-    forces = np.zeros((n_people, N_FRAMES, 6, 3), np.float32)
+    cframe_names = np.array(
+        ["palm_left", "finger_left", "palm_right", "toe_left", "heel_left",
+         "toe_right", "heel_right", "knee_left"], "<U16")
+    cframe_parents = np.array([20, 27, 21, 10, 7, 11, 8, 4], np.int64)
+    n_cf = len(cframe_names)
+    frame_contact = np.zeros((n_people, N_FRAMES, n_cf), bool)
+    frame_contact[..., 0] = group_contact[..., 0]                       # palm_left
+    frame_contact[..., 1] = group_contact[..., 0]                       # finger_left
+    frame_contact[..., 3] = group_contact[..., 2]                       # toe_left
+    frame_contact[..., 7] = True                                        # knee (dropped)
+    frame_forces = np.zeros((n_people, N_FRAMES, n_cf, 3), np.float32)
     for p in range(n_people):
         bw = masses[p] * GRAVITY_MAG
-        forces[p, :, 0] = np.array([0.1 * bw, 0.0, 0.0], np.float32)    # left hand
-        forces[p, :, 2] = np.array([0.0, -0.5 * bw, 0.0], np.float32)   # left foot (support, y down)
-    forces[~group_contact] = 0.0
+        frame_forces[p, :, 0] = np.array([0.06 * bw, 0.0, 0.0], np.float32)
+        frame_forces[p, :, 1] = np.array([0.04 * bw, 0.0, 0.0], np.float32)
+        frame_forces[p, :, 3] = np.array([0.0, -0.5 * bw, 0.0], np.float32)
+        frame_forces[p, :, 7] = np.array([0.0, -0.2 * bw, 0.0], np.float32)
+    frame_forces[~frame_contact] = 0.0
     q = np.zeros((n_people, N_FRAMES, 211), np.float32)
     q[..., 3:7] = QUAT_Z90
     # World joints for the lever arms: everything at the pelvis except a known
@@ -108,16 +128,22 @@ def _write_scene(
     joint_names[0] = "pelvis"
     for name, jidx in zip(KINDYN_FORCE_JOINTS, (20, 21, 10, 11, 7, 8)):
         joint_names[jidx] = name
+    for name, jidx in zip(KP_JOINT_NAMES, KP_JOINT_INDICES):
+        joint_names[jidx] = name
     joints_world = np.tile(
         np.array([1.0, 2.0, 3.0], np.float32), (n_people, N_FRAMES, 52, 1))
     joints_world[..., 20, 0] += 0.5                                     # left wrist
     joints_world[..., 10, 1] += 0.8                                     # left foot (toe)
+    joints_world[..., 12, 2] += 0.4                                     # neck (keypoints)
     order = list(range(n_people)) if kindyn_id_order is None else kindyn_id_order
     np.savez(
         human / "kindyn_1.npz",
         object_ids=oids[order],
-        contact_force_joints=np.tile(np.array(KINDYN_FORCE_JOINTS, "<U16"), (n_people, 1)),
-        contact_forces=forces[order], q=q[order], total_mass=masses[order],
+        contact_frame_names=cframe_names, contact_frame_parents=cframe_parents,
+        frame_forces=frame_forces[order], frame_contact=frame_contact[order],
+        force_confidence=np.full((n_people, N_FRAMES), 0.9, np.float32)[order],
+        gravity_world=np.array([0.0, 1.0, 0.0], np.float32),
+        q=q[order], total_mass=masses[order],
         valid_mask=valid[order], joint_contact=jc52[order],
         joint_names=np.array(joint_names), joints_world=joints_world[order],
         betas=np.zeros((n_people, 10), np.float32),
@@ -223,7 +249,7 @@ def test_item_contract_and_dtypes(corpus):
         "cam_jump_m", "joint_contact", "joint_mask", "joint_supervised",
         "joint_confidence", "frame_pos_sec", "frame_position", "frame_index",
         "frame_valid", "key", "dataset", "force_gt", "force_contact",
-        "force_lever", "force_valid",
+        "force_lever", "force_valid", "force_conf",
     }
     assert frame["image"].shape == (32, 24, 3) and frame["image"].dtype == np.uint8
     assert frame["mask"].shape == (32, 24)
@@ -237,6 +263,7 @@ def test_item_contract_and_dtypes(corpus):
     assert frame["force_contact"].shape == (6,) and frame["force_contact"].dtype == torch.bool
     assert frame["force_lever"].shape == (6, 3) and frame["force_lever"].dtype == torch.float32
     assert frame["force_valid"] is True
+    assert frame["force_conf"] == pytest.approx(0.9)
     assert frame["key"] == "vidA_0000#0@0" and frame["dataset"] == "climbing_corpus"
     # cam centres move 0.1 m per source frame -> 0.2 m per stride-2 sampled step.
     assert clip[0]["cam_jump_m"] == 0.0
@@ -278,8 +305,19 @@ def test_hand_fold_confidence_rule(corpus):
         frame_stride=1, jitter=False, use_confidence_weights=True)[0][0]
     assert float(weighted["joint_mask"][21]) == pytest.approx(0.15)
 
-    with pytest.raises(ValueError, match="finite and within"):
+    with pytest.raises(ValueError, match="within \\[0, 1\\]"):
         merge_contacts_52_to_22(jc52, conf52 + 2.0)
+
+    # NaN = "not assessed" (new-schema fingers/spine): casts no vote in the
+    # folds and passes through as confidence 0.0.
+    conf_nan = conf52.copy()
+    conf_nan[..., 22:37] = np.nan       # every left finger unassessed
+    conf_nan[..., 3] = np.nan           # spine1 unassessed
+    jc_nan = jc52.copy()
+    jc_nan[..., 25] = False             # contact never coincides with NaN
+    jc22n, conf22n = merge_contacts_52_to_22(jc_nan, conf_nan)
+    assert conf22n[0, 0, 20] == pytest.approx(0.2)   # wrist = only assessed member
+    assert conf22n[0, 0, 3] == 0.0
 
 
 def test_contact_level_selects_npz(corpus):
@@ -424,6 +462,50 @@ def test_force_lever_group_resolution_is_by_name(corpus):
             frame_stride=1, jitter=False, load_forces=True)
 
 
+def test_force_units_and_frame_options(corpus):
+    """force_units='newtons' skips the bw division; force_frame='world' skips
+    the root rotation (forces AND lever arms stay world vectors)."""
+    ds = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="train", frames_per_clip=1,
+        frame_stride=1, jitter=False, load_forces=True,
+        force_frame="world", force_units="newtons")
+    frame = ds[0][0]
+    bw = 60.0 * GRAVITY_MAG
+    torch.testing.assert_close(
+        frame["force_gt"][0], torch.tensor([0.1 * bw, 0.0, 0.0]), atol=1e-3, rtol=0)
+    torch.testing.assert_close(
+        frame["force_gt"][2], torch.tensor([0.0, -0.5 * bw, 0.0]), atol=1e-3, rtol=0)
+    torch.testing.assert_close(
+        frame["force_lever"][0], torch.tensor([0.5, 0.0, 0.0]), atol=1e-6, rtol=0)
+    with pytest.raises(ValueError, match="force_frame"):
+        ClimbingCorpusDataset(corpus, scenes=["vidA_0000"], force_frame="camera")
+    with pytest.raises(ValueError, match="force_units"):
+        ClimbingCorpusDataset(corpus, scenes=["vidA_0000"], force_units="kg")
+
+
+def test_fitted_gravity_replaces_the_constant(corpus):
+    """The scene's gravity_world is kindyn's fitted vector (normalised); a
+    non-unit stored vector is corrupt data."""
+    human = corpus / "features" / "human_optim" / "vi" / "dA" / "vidA_0000"
+    with np.load(human / "kindyn_1.npz", allow_pickle=True) as npz:
+        kindyn = dict(npz)
+    tilted = np.array([0.1, 0.99, -0.05], np.float32)
+    kindyn["gravity_world"] = tilted
+    np.savez(human / "kindyn_1.npz", **kindyn)
+    frame = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="train", frames_per_clip=1,
+        frame_stride=1, jitter=False, load_forces=True)[0][0]
+    np.testing.assert_allclose(
+        frame["gravity_world"], tilted / np.linalg.norm(tilted), atol=1e-6)
+
+    kindyn["gravity_world"] = np.array([0.0, 5.0, 0.0], np.float32)
+    np.savez(human / "kindyn_1.npz", **kindyn)
+    with pytest.raises(ValueError, match="unit direction"):
+        ClimbingCorpusDataset(
+            corpus, scenes=["vidA_0000"], split="train", frames_per_clip=1,
+            frame_stride=1, jitter=False, load_forces=True)
+
+
 def test_force_valid_follows_kindyn_and_frame_validity(corpus):
     _write_scene(corpus, "vidB_0000", invalid_frames=(0,))
     ds = ClimbingCorpusDataset(
@@ -438,8 +520,8 @@ def test_nonzero_force_off_the_contact_mask_raises(corpus):
     human = corpus / "features" / "human_optim" / "vi" / "dA" / "vidA_0000"
     with np.load(human / "kindyn_1.npz", allow_pickle=True) as npz:
         kindyn = dict(npz)
-    kindyn["contact_forces"] = kindyn["contact_forces"].copy()
-    kindyn["contact_forces"][0, 0, 1] = [1.0, 0.0, 0.0]     # right hand has no contact
+    kindyn["frame_forces"] = kindyn["frame_forces"].copy()
+    kindyn["frame_forces"][0, 0, 2] = [1.0, 0.0, 0.0]      # palm_right has no contact
     np.savez(human / "kindyn_1.npz", **kindyn)
     with pytest.raises(ValueError, match="no contact label"):
         ClimbingCorpusDataset(
@@ -476,6 +558,104 @@ def test_two_person_scene_aligns_kindyn_rows_by_object_id(corpus):
         ClimbingCorpusDataset(
             corpus, scenes=["vidB_0000"], split="train", frames_per_clip=1,
             frame_stride=1, jitter=False, load_forces=True)
+
+
+# ------------------------------------------------------------------ keypoints
+
+def test_keypoints_select_named_joints_by_name(corpus):
+    """load_keypoints emits the 13 KP_JOINT_NAMES rows of kindyn joints_world,
+    resolved BY NAME — a permuted joint axis changes nothing, a missing name is
+    a hard error."""
+    ds = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
+        frame_stride=2, jitter=False, load_images=False, load_keypoints=True)
+    frame = ds[0][0]
+    assert frame["kp3d_world"].shape == (13, 3)
+    assert frame["kp3d_world"].dtype == torch.float32
+    assert frame["kp_valid"] is True
+    assert frame["cam_from_world"].shape == (4, 4)       # extrinsics ride along
+    # Every fixture joint sits at the pelvis [1, 2, 3] except the two poked ones:
+    # the left wrist (+0.5 x) and the neck (+0.4 z).
+    expected = torch.tensor([1.0, 2.0, 3.0]).repeat(13, 1)
+    expected[KP_JOINT_NAMES.index("left_wrist"), 0] += 0.5
+    expected[KP_JOINT_NAMES.index("neck"), 2] += 0.4
+    torch.testing.assert_close(frame["kp3d_world"], expected, atol=1e-6, rtol=0)
+
+    plain = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
+        frame_stride=2, jitter=False, load_images=False)[0][0]
+    assert "kp3d_world" not in plain and "kp_valid" not in plain
+
+    human = corpus / "features" / "human_optim" / "vi" / "dA" / "vidA_0000"
+    with np.load(human / "kindyn_1.npz", allow_pickle=True) as npz:
+        kindyn = dict(npz)
+    perm = np.roll(np.arange(52), 5)
+    kindyn["joint_names"] = np.asarray(kindyn["joint_names"])[perm]
+    kindyn["joints_world"] = np.asarray(kindyn["joints_world"])[:, :, perm]
+    np.savez(human / "kindyn_1.npz", **kindyn)
+    permuted = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
+        frame_stride=2, jitter=False, load_images=False, load_keypoints=True)[0][0]
+    torch.testing.assert_close(permuted["kp3d_world"], expected, atol=1e-6, rtol=0)
+
+    kindyn["joint_names"] = np.asarray(
+        ["nope" if str(n) == "neck" else str(n) for n in kindyn["joint_names"]])
+    np.savez(human / "kindyn_1.npz", **kindyn)
+    with pytest.raises(ValueError, match="missing \\['neck'\\]"):
+        ClimbingCorpusDataset(
+            corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
+            frame_stride=2, jitter=False, load_images=False, load_keypoints=True)
+
+
+def test_kp_valid_follows_kindyn_coverage_and_finiteness(corpus):
+    """A frame the kindyn solve does not cover, and one with a non-finite
+    coordinate, both come back as exact zeros with the bit cleared."""
+    human = corpus / "features" / "human_optim" / "vi" / "dA" / "vidA_0000"
+    with np.load(human / "kindyn_1.npz", allow_pickle=True) as npz:
+        kindyn = dict(npz)
+    kindyn["valid_mask"] = kindyn["valid_mask"].copy()
+    kindyn["valid_mask"][0, 1] = False                  # solve skipped frame 1
+    kindyn["joints_world"] = kindyn["joints_world"].copy()
+    kindyn["joints_world"][0, 2, 12, 2] = np.nan        # neck lost on frame 2
+    np.savez(human / "kindyn_1.npz", **kindyn)
+    # Only the kindyn coverage changed — the contacts valid_mask still tiles the
+    # scene, so all N frames are windowed and the bit is the only difference.
+    clip = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="train", frames_per_clip=N_FRAMES,
+        frame_stride=1, jitter=False, load_images=False, load_keypoints=True)[0]
+    assert [f["kp_valid"] for f in clip[:4]] == [True, False, False, True]
+    assert float(clip[1]["kp3d_world"].abs().sum()) == 0.0
+    assert float(clip[2]["kp3d_world"].abs().sum()) == 0.0
+    assert float(clip[3]["kp3d_world"].abs().sum()) > 0.0
+
+
+def _corpus_run_config(run_dir: Path, corpus: Path, extra: str = "") -> dict:
+    """A minimal joint-contact corpus run config pointed at a synthetic corpus."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dataset_yaml = run_dir / "dataset.yaml"
+    dataset_yaml.write_text(f"name: climbing_corpus\ndata:\n  root: {corpus}\n")
+    run_yaml = run_dir / "run.yaml"
+    run_yaml.write_text(
+        "base: configs/old/climbing_videos_joint.yaml\n"
+        f"data: {{datasets: [{{name: climbing_corpus, config: {dataset_yaml}}}]}}\n"
+        + extra)
+    return load_config(run_yaml)
+
+
+def test_make_loaders_threads_keypoint_supervision(corpus, tmp_path):
+    """keypoint_supervision.enabled reaches every corpus dataset as load_keypoints."""
+    off = _corpus_run_config(tmp_path / "off", corpus)
+    train_loader, eval_loader, _ = make_loaders(off, (256, 256))
+    assert [ldr.dataset.load_keypoints for ldr in train_loader.loaders] == [False]
+    assert [ldr.dataset.load_keypoints for ldr in eval_loader.loaders] == [False]
+
+    on = _corpus_run_config(
+        tmp_path / "on", corpus,
+        "model: {pose_temporal: {enabled: true}}\n"
+        "keypoint_supervision: {enabled: true}\n")
+    train_loader, eval_loader, _ = make_loaders(on, (256, 256))
+    assert [ldr.dataset.load_keypoints for ldr in train_loader.loaders] == [True]
+    assert [ldr.dataset.load_keypoints for ldr in eval_loader.loaders] == [True]
 
 
 # ------------------------------------------------------------------ test split
@@ -535,7 +715,7 @@ def test_clip_collates_into_training_batch(corpus):
     ds = ClimbingCorpusDataset(
         corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
         frame_stride=2, jitter=False, load_forces=True)
-    cfg = load_config(REPO / "configs" / "climbing_videos_joint.yaml")
+    cfg = load_config(REPO / "configs" / "old" / "climbing_videos_joint.yaml")
     collate = make_collate((256, 256), TargetSpec.from_config(cfg))
     batch = collate([ds[0]])
     assert batch["img"].shape == (2, 1, 3, 256, 256)
@@ -559,7 +739,7 @@ def test_clip_collates_kindyn6_targets(corpus):
     ds = ClimbingCorpusDataset(
         corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
         frame_stride=2, jitter=False, load_forces=True)
-    cfg = load_config(REPO / "configs" / "climbing_corpus_joint_force_cond_sum1_postdec.yaml")
+    cfg = load_config(REPO / "configs" / "old" / "climbing_corpus_joint_force_cond_sum1_postdec.yaml")
     collate = make_collate((256, 256), TargetSpec.from_config(cfg))
     joint = collate([ds[0]])["targets"]["joint"]
     assert joint["gt"].shape == (2, 6)
@@ -643,7 +823,7 @@ def test_cond_features_require_standardization(corpus, tmp_path):
 
 
 def test_cond_feat_collates_with_and_without_features(corpus, tmp_path):
-    cfg = load_config(REPO / "configs" / "climbing_corpus_joint_force_cond_sum1_postdec.yaml")
+    cfg = load_config(REPO / "configs" / "old" / "climbing_corpus_joint_force_cond_sum1_postdec.yaml")
     collate = make_collate((256, 256), TargetSpec.from_config(cfg))
     common = dict(
         scenes=["vidA_0000"], split="train", frames_per_clip=2, frame_stride=2,
@@ -674,9 +854,11 @@ def test_cond_feat_collates_with_and_without_features(corpus, tmp_path):
 
 @requires_corpus
 def test_real_scene_discovery_counts():
-    assert len(list_corpus_scenes(CORPUS, "train")) == 331
-    assert len(list_corpus_scenes(CORPUS, "test")) == 30
-    assert len(list_annotated_test_scenes(CORPUS)) == 30
+    # 2026-08-27 corpus update (better contacts/forces/poses): 864 train and
+    # 108 curated test scenes; annotation is ongoing (32 as of 2026-08-28).
+    assert len(list_corpus_scenes(CORPUS, "train")) == 864
+    assert len(list_corpus_scenes(CORPUS, "test")) == 108
+    assert len(list_annotated_test_scenes(CORPUS)) == 32
 
 
 def _real_scene() -> str:
@@ -725,25 +907,35 @@ def test_real_forces_support_body_weight_and_rotation_preserves_norms():
     data = ds._scenes[sid]
     npz = np.load(CORPUS / "features" / "human_optim" / scene_shard(sid) / sid
                   / "kindyn_1.npz", allow_pickle=True)
-    forces_world = np.asarray(npz["contact_forces"], np.float32)
+    # Reference fold, independently of the loader: frames -> groups by parent.
+    parents = np.asarray(npz["contact_frame_parents"], np.int64)
+    group_of = np.full(len(parents), -1, np.int64)
+    for g, members in enumerate(FORCE_GROUPS_52):
+        group_of[np.isin(parents, list(members))] = g
+    frame_forces = np.asarray(npz["frame_forces"], np.float32)
+    forces_world = np.stack(
+        [frame_forces[:, :, group_of == g].sum(axis=2) for g in range(6)], axis=2)
     mass = np.asarray(npz["total_mass"], np.float32)
     forces_world_bw = forces_world / (mass[:, None, None, None] * 9.81)
+    valid = data["force_valid"]
 
-    # force_contact matches the zero pattern of the solved forces exactly.
+    # On valid rows force_contact matches the zero pattern of the solved forces.
     nonzero = np.linalg.norm(forces_world, axis=-1) > 0
-    contact = data["force_contact"] & data["force_valid"][..., None]
-    np.testing.assert_array_equal(nonzero, contact)
+    np.testing.assert_array_equal(nonzero[valid], data["force_contact"][valid])
 
     # The world->root rotation preserves per-group magnitudes.
     np.testing.assert_allclose(
-        np.linalg.norm(data["force_gt"], axis=-1),
-        np.linalg.norm(forces_world_bw, axis=-1), atol=1e-5)
+        np.linalg.norm(data["force_gt"], axis=-1)[valid],
+        np.linalg.norm(forces_world_bw, axis=-1)[valid], atol=1e-5)
 
-    # On contact frames the world-frame force sum supports ~1 body weight
-    # against gravity (world y is down): sum(f) . y_hat ~ -0.98 bw.
-    frame_contact = contact.any(axis=-1)
-    y_sum = forces_world_bw.sum(axis=2)[..., 1][frame_contact]
-    assert -1.15 < float(y_sum.mean()) < -0.85
+    # The loader's gravity is kindyn's FITTED unit vector, and on contact
+    # frames the world force sum supports ~1 body weight against it.
+    ghat = np.asarray(npz["gravity_world"], np.float64)
+    ghat = ghat / np.linalg.norm(ghat)
+    np.testing.assert_allclose(data["gravity_world"], ghat, atol=1e-6)
+    frame_contact = (data["force_contact"] & valid[..., None]).any(axis=-1)
+    proj = (forces_world_bw.sum(axis=2) @ ghat)[frame_contact]
+    assert -1.15 < float(proj.mean()) < -0.85
 
 
 @requires_corpus
@@ -757,7 +949,7 @@ def test_real_clip_collates_without_reading_frames():
     for frame in clip:                      # frames/ extraction may be in flight
         frame["image"] = rng.integers(0, 255, (64, 48, 3), np.uint8)
         frame["mask"] = None
-    cfg = load_config(REPO / "configs" / "climbing_videos_joint.yaml")
+    cfg = load_config(REPO / "configs" / "old" / "climbing_videos_joint.yaml")
     collate = make_collate((256, 256), TargetSpec.from_config(cfg))
     batch = collate([clip])
     assert batch["img"].shape == (2, 1, 3, 256, 256)

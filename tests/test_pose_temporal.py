@@ -20,7 +20,7 @@ from contact.config import load_config
 from contact.model import _trainable_name_filter
 
 REPO = Path(__file__).resolve().parents[1]
-_POSE_CFG = REPO / "configs" / "climbing_corpus_pose_temporal.yaml"
+_POSE_CFG = REPO / "configs" / "old" / "climbing_corpus_pose_temporal.yaml"
 
 
 def _write(tmp_path: Path, text: str) -> Path:
@@ -197,3 +197,56 @@ def test_validate_targets_accepts_a_pose_only_corpus_dataset():
     _Ds.load_pose = False
     with pytest.raises(ValueError, match="supervises none"):
         validate_targets(cfg, [_Ds()])
+
+
+# ------------------------------------------------------------- shape/scale rail
+
+def test_shape_scale_rail_terms():
+    """L2 rail vs the frozen stash: exact values, masking, zero-mass fallback.
+    The MHR body is stubbed — the rail never touches q conversion."""
+    pytest.importorskip("better_human")
+    from contact.pose_supervision import PoseSupervisedLoss
+
+    loss = PoseSupervisedLoss.__new__(PoseSupervisedLoss)
+    loss.weight = 0.0
+    loss.acc_weight = 0.0
+    loss.shape_rail_w = 1.0
+    loss.scale_rail_w = 2.0
+    loss.huber_delta = 0.1
+    loss.device = torch.device("cpu")
+    loss.dtype = torch.float32
+
+    class _StubBody:
+        @staticmethod
+        def from_classic(classic):
+            return None, classic.model_parameters[:, :132]
+
+    loss.body = _StubBody()
+
+    n = 4
+    shape = torch.randn(n, 45)
+    scale = torch.randn(n, 28)
+    out = {"mhr": {
+        "mhr_model_params": torch.zeros(n, 204),
+        "shape": shape + 0.5,
+        "scale": scale,
+        "shape_frozen": shape,
+        "scale_frozen": scale,
+    }}
+    batch = {"pose_gt_q": torch.zeros(n, 132),
+             "pose_valid": torch.ones(n, dtype=torch.bool),
+             "frame_valid": torch.tensor([True, True, True, False]),
+             "seq_len": 1}
+    _, parts = loss(out, batch)
+    # scale matches frozen exactly; shape deviates by 0.5 in every channel.
+    assert parts["terms"]["scale_rail"]["loss"] == pytest.approx(0.0, abs=1e-10)
+    assert parts["terms"]["shape_rail"]["weight_mass"] == 3
+    assert parts["terms"]["shape_rail"]["loss"] == pytest.approx(
+        45 * 0.5 ** 2, rel=1e-5)
+    assert parts["shape_dev"] == pytest.approx(0.5, rel=1e-5)
+
+    # Missing stash (no recompute ran): zero-mass fallback, term still present
+    # so the DDP term set stays rank-identical.
+    del out["mhr"]["shape_frozen"], out["mhr"]["scale_frozen"]
+    _, parts = loss(out, batch)
+    assert parts["terms"]["shape_rail"]["weight_mass"] == 0

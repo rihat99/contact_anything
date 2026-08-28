@@ -200,6 +200,12 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
             "mlp_channel_div_factor": int(mhcfg.get("mlp_channel_div_factor", 4)),
             "dropout": float(mhcfg.get("dropout", 0.0)),
         }
+        # Unanchored motion tokens (no per-layer posemb/feature update) are a
+        # different architecture with a different param set. Added only when
+        # non-default, so every anchored checkpoint keeps a byte-identical
+        # stored signature (same rule as `force_keypoint_indices`).
+        if not mhcfg.get("anchored", True):
+            sig_extra["motion"]["anchored"] = False
         mtcfg = model_cfg.get("motion_temporal", {}) or {}
         if mtcfg.get("enabled", False):
             sig_extra["motion_temporal"] = {
@@ -234,7 +240,7 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
     # The mutual decoder mask changes what every appended token was trained to
     # read (contact attends force/motion and vice versa) — semantic. Emitted
     # only when set, so pre-existing causal signatures stay byte-identical.
-    if model_cfg.get("extra_token_attention", "causal") == "mutual":
+    if model_cfg.get("extra_token_attention", "mutual") == "mutual":
         sig_extra["extra_token_attention"] = "mutual"
 
     facfg = model_cfg.get("frame_attn", {}) or {}
@@ -252,11 +258,17 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
             "mlp_ratio": float(facfg.get("mlp_ratio", 2.0)),
         }
 
-    # Pose-head fine-tune (train.finetune_pose_head). Enabled-only: the
-    # checkpoint then carries head_pose.proj weights, which must never load
-    # into (or be expected by) a frozen-pose run.
+    # Pose/camera-head fine-tune (train.finetune_pose_head /
+    # train.finetune_camera_head). Enabled-only: the checkpoint then carries
+    # the fine-tuned COPY weights (head_pose_ft_proj / head_camera_ft_proj,
+    # split-head), which must never load into (or be expected by) a
+    # frozen-pose run. "split": True distinguishes from the pre-split scheme
+    # whose weights lived at head_pose.proj (loads hard-fail on the param
+    # diff either way).
     if (config.get("train", {}) or {}).get("finetune_pose_head", False):
-        sig_extra["pose_head_finetune"] = {"enabled": True}
+        sig_extra["pose_head_finetune"] = {"enabled": True, "split": True}
+    if (config.get("train", {}) or {}).get("finetune_camera_head", False):
+        sig_extra["camera_head_finetune"] = {"enabled": True}
 
     # Pose-token temporal module (E2). Enabled-only, like `motion`: absent from
     # every checkpoint written before it existed.

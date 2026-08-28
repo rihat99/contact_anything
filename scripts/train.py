@@ -299,14 +299,17 @@ class Trainer:
         # it is not in the base checkpoint either — persisting it keeps the checkpoint
         # self-contained so evaluate/demo/resume never run with a random contact head.
         # The arch fingerprint still keys on ``trainable_names`` (see checkpoint.save).
-        # ``finetune_pose_head`` params live outside the name filter (head_pose
-        # is upstream), so they are added explicitly — a pose-finetuned
-        # checkpoint must carry its own head weights.
+        # The fine-tuned head COPIES (``head_pose_ft_proj`` /
+        # ``head_camera_ft_proj``, split-head) live outside the name filter, so
+        # they are added explicitly — a head-finetuned checkpoint must carry
+        # its own copy weights.
         _finetune_pose = bool(self.cfg["train"]["finetune_pose_head"])
+        _finetune_cam = bool(self.cfg["train"]["finetune_camera_head"])
         self.saved_names = [
             n for n, _ in self.model.named_parameters()
             if _trainable_name_filter(n)
-            or (_finetune_pose and n.startswith("head_pose.proj."))]
+            or (_finetune_pose and n.startswith("head_pose_ft_proj."))
+            or (_finetune_cam and n.startswith("head_camera_ft_proj."))]
         warm_state = None
         warm_path = self.cfg["model"].get("init_contact_checkpoint")
         if resume_ckpt is None and warm_path:
@@ -400,13 +403,23 @@ class Trainer:
         if self.pose_supervised:
             from contact.pose_supervision import PoseSupervisedLoss
             self.pose_loss = PoseSupervisedLoss(self.cfg, device=device)
-        else:
+
+        # SAM3D-style keypoint objective (2D crop reprojection + camera-frame
+        # 3D) from the kindyn joints_world GT — the stabilizer for pose/camera
+        # fine-tuning and the only loss that constrains the camera copy.
+        self.keypoint_supervised = bool(self.cfg["keypoint_supervision"]["enabled"])
+        self.keypoint_loss = None
+        if self.keypoint_supervised:
+            from contact.keypoint_supervision import KeypointSupervisedLoss
+            self.keypoint_loss = KeypointSupervisedLoss(self.cfg, device=device)
+
+        if not self.pose_supervised and not self.keypoint_supervised:
             from contact.config import _pose_trainable_paths
             pose_paths = _pose_trainable_paths(self.cfg)
             if pose_paths:
                 raise ValueError(
-                    f"{', '.join(pose_paths)} require(s) "
-                    "pose_supervision.enabled=true for training: without a pose "
+                    f"{', '.join(pose_paths)} require(s) pose_supervision or "
+                    "keypoint_supervision enabled for training: without a pose "
                     "objective the pose-moving params never receive gradients")
 
         # Pose->motion consistency: the predicted pose differentiated to a
@@ -455,16 +468,18 @@ class Trainer:
 
         ocfg = self.cfg["optim"]
         self.grad_clip = float(self.cfg["loss"]["grad_clip"])
-        # The fine-tuned pose head (pretrained weights) gets its own lr-scaled
-        # param group; without the fine-tune this is the original single group.
+        # The fine-tuned head copies (pretrained weights) get their own
+        # lr-scaled param group; without a fine-tune this is the original
+        # single group.
+        _ft_prefixes = ("head_pose_ft_proj.", "head_camera_ft_proj.")
         _trainable = [(n, p) for n, p in self.model.named_parameters()
                       if p.requires_grad]
         _groups = [{"params": [p for n, p in _trainable
-                               if not n.startswith("head_pose.")]}]
-        _head_pose = [p for n, p in _trainable if n.startswith("head_pose.")]
-        if _head_pose:
+                               if not n.startswith(_ft_prefixes)]}]
+        _head_ft = [p for n, p in _trainable if n.startswith(_ft_prefixes)]
+        if _head_ft:
             _groups.append({
-                "params": _head_pose,
+                "params": _head_ft,
                 "lr": float(ocfg["lr"]) * float(
                     self.cfg["train"]["pose_head_lr_scale"]),
             })
@@ -782,6 +797,22 @@ class Trainer:
         for name, term in pose_parts["terms"].items():
             scalars[f"{prefix}/pose/{name}"] = term["loss"]
             scalars[f"{prefix}/pose/{name}_mass"] = term["weight_mass"]
+        for key in ("shape_dev", "scale_dev"):
+            if key in pose_parts:
+                scalars[f"{prefix}/pose/{key}"] = pose_parts[key]
+        return scalars
+
+    @staticmethod
+    def _keypoint_scalars(prefix: str, kp_parts: dict) -> dict:
+        """Flatten KeypointSupervisedLoss parts into ``{prefix}/keypoint/*``."""
+        scalars = {f"{prefix}/keypoint/loss": kp_parts["loss"]}
+        for name, term in kp_parts["terms"].items():
+            scalars[f"{prefix}/keypoint/{name}"] = term["loss"]
+            scalars[f"{prefix}/keypoint/{name}_mass"] = term["weight_mass"]
+        for key in ("kp2d_err_crop", "kp3d_err_m", "depth_err_m",
+                    "kp_vel_err_ms", "kp_acc_err_ms2"):
+            if key in kp_parts:
+                scalars[f"{prefix}/keypoint/{key}"] = kp_parts[key]
         return scalars
 
     @staticmethod
@@ -882,8 +913,9 @@ class Trainer:
             motion_parts = None
             pose_parts = None
             cons_parts = None
+            kp_parts = None
             physics_active = force_active = motion_active = pose_active = False
-            cons_active = False
+            cons_active = kp_active = False
             total = (None if (self.freeze_contact or contact_loss is None)
                      else contact_loss)
             if self.physics_loss is not None:
@@ -916,18 +948,23 @@ class Trainer:
                 cons_scaled, cons_active = self._ddp_physics_loss(
                     cons_total, cons_parts)
                 total = cons_scaled if total is None else total + cons_scaled
+            if self.keypoint_loss is not None:
+                # Same (numerator, mass) term contract again.
+                kp_total, kp_parts = self.keypoint_loss(out, batch)
+                kp_scaled, kp_active = self._ddp_physics_loss(kp_total, kp_parts)
+                total = kp_scaled if total is None else total + kp_scaled
             if total is None:
                 raise RuntimeError(
                     "no training objective: the contact loss is frozen/absent and "
                     "none of physics / force_supervision / motion_supervision / "
-                    "pose_supervision is enabled")
+                    "pose_supervision / keypoint_supervision is enabled")
 
             # A batch with zero active supervision (an all-invalid video window, or a
             # fully physics-ineligible clip) has zero gradient — but AdamW weight
             # decay would still nudge the weights. Skip the optimiser step for those.
             active = ((contact_active and not self.freeze_contact)
                       or physics_active or force_active or motion_active
-                      or pose_active or cons_active)
+                      or pose_active or cons_active or kp_active)
             loss = total
             finite = torch.tensor(
                 int(bool(torch.isfinite(loss).item())), device=self.device,
@@ -1005,6 +1042,8 @@ class Trainer:
                     scalars.update(self._pose_scalars("train", pose_parts))
                 if cons_parts is not None:
                     scalars.update(self._consistency_scalars("train", cons_parts))
+                if kp_parts is not None:
+                    scalars.update(self._keypoint_scalars("train", kp_parts))
                 self.logger.log(scalars, self.global_step)
 
             if self.is_main:

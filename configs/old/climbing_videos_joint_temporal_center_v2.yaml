@@ -17,6 +17,7 @@
 base: configs/base.yaml
 
 model:
+  extra_token_attention: causal   # pinned 2026-08-27: the repo default flipped to mutual
   init_contact_checkpoint: null       # train the complete contact stack from scratch
   temporal:
     enabled: true

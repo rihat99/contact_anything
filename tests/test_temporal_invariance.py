@@ -36,7 +36,7 @@ from contact.targets import NUM_BODY_22, TargetSpec
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPORAL_CFG = os.path.join(
-    REPO, "configs", "climbing_videos_joint_temporal_center_v2.yaml")
+    REPO, "configs", "old", "climbing_videos_joint_temporal_center_v2.yaml")
 _CKPT = load_config(os.path.join(REPO, "configs", "base.yaml"))["model"]["checkpoint_path"]
 
 # Margins: enabled-vs-disabled must stay within a few × the base noise floor; a

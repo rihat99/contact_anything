@@ -24,7 +24,7 @@ def test_renderer_consumes_current_evaluator_schema(tmp_path):
          "results": {"vertex": {"precision": 0.8, "recall": 0.7, "f1": 0.75, "iou": 0.6,
                                 "tp": 100, "fp": 20, "fn": 30, "tn": 500}}},
         {"checkpoint": "output/contact_climbing_x/best.pth",
-         "config": "configs/climbing_baseline.yaml",
+         "config": "configs/old/climbing_baseline.yaml",
          "results": {"vertex": {"precision": 0.6, "recall": 0.5, "f1": 0.55, "iou": 0.4,
                                 "tp": 50, "fp": 10, "fn": 40, "tn": 300}}},
     ]

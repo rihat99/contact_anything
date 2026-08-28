@@ -274,14 +274,19 @@ class MHRHead(nn.Module):
         init_estimate: Optional[torch.Tensor] = None,
         do_pcblend=True,
         slim_keypoints=False,
+        proj: Optional[nn.Module] = None,
     ):
         """
         Args:
             x: pose token with shape [B, C], usually C=DECODER.DIM
             init_estimate: [B, self.npose]
+            proj: optional external projection FFN replacing self.proj for this
+                call only (the contact fork's fine-tuned final-readout copy)
         """
         batch_size = x.shape[0]
-        pred = self.proj(x)
+        # --- contact split-head hook ---
+        pred = (self.proj if proj is None else proj)(x)
+        # --- end contact split-head hook ---
         if init_estimate is not None:
             pred = pred + init_estimate
 

@@ -36,6 +36,7 @@
 base: configs/base.yaml
 
 model:
+  extra_token_attention: causal   # pinned 2026-08-27: the repo default flipped to mutual
   force_head:
     enabled: true
     force_keypoint_indices: [62, 41, 15, 18, 17, 20]

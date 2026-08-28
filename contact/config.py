@@ -40,11 +40,12 @@ DEFAULTS: dict[str, Any] = {
         "mhr_model_path": f"{_CKPT_DIR}/assets/mhr_model.pt",
         "init_contact_checkpoint": None,   # optional contact-only warm start (not optimiser resume)
         "mask_embed_type": "v2",
-        "extra_token_attention": "causal",  # decoder mask over the appended token blocks:
-                                            # causal = no earlier block attends a later one
-                                            # (original ⊥ contact ⊥ force ⊥ motion); mutual =
-                                            # contact/force/motion fully inter-attend (original
-                                            # tokens still attend none of them)
+        "extra_token_attention": "mutual",  # decoder mask over the appended token blocks:
+                                            # mutual (default) = contact/force/motion fully
+                                            # inter-attend (original tokens still attend none
+                                            # of them); causal = legacy regime — no earlier
+                                            # block attends a later one
+                                            # (original ⊥ contact ⊥ force ⊥ motion)
         "contact_head": {
             "contact_keypoint_indices": None,   # None = list(range(21))
             "num_global_tokens": 3,
@@ -97,6 +98,10 @@ DEFAULTS: dict[str, Any] = {
             # Always explicit (no contact inheritance, no global tokens). Default =
             # the six kindyn force anchors + MHR70 9 (left hip) for the pelvis token.
             "motion_keypoint_indices": [62, 41, 15, 18, 17, 20, 9],
+            # false = no per-layer anchored token update (posemb + grid-sampled
+            # image features): pure learned queries. The anchor list then only
+            # names/counts the slots.
+            "anchored": True,
             "mlp_depth": 2,
             "mlp_channel_div_factor": 4,
             "dropout": 0.0,
@@ -253,6 +258,12 @@ DEFAULTS: dict[str, Any] = {
     "force_supervision": {              # supervised GT-force loss (corpus kindyn forces)
         "enabled": False,               # requires model.force_head.enabled; excludes physics.enabled
         "target_frame": "center",       # center | all (rows per clip contributing to the loss)
+        "gt_frame": "root",             # root | world — coordinate frame the loader emits the GT
+                                        # forces/levers in (world yaw is unobservable from a crop)
+        "units": "bw",                  # bw | newtons — GT force units; the loss deltas/cuts
+                                        # (huber_delta_bw, outlier_bw) are in these units
+        "confidence": True,             # weight every loss term's rows by kindyn's per-frame
+                                        # force_confidence (numerator AND mass, exact DDP mean)
         "loss": {
             "force": 1.0,               # Huber on in-contact limb-frames (bw units)
             "huber_delta_bw": 0.5,      # smooth-L1 quadratic->linear transition (bw)
@@ -329,11 +340,34 @@ DEFAULTS: dict[str, Any] = {
             "pose": 1.0,                # Huber weight on the 125 local MHR q channels
             "acc": 0.0,                 # Huber weight on clip-wise q second differences
                                         # (pred vs GT) — the explicit smoothness term
+            "shape_rail": 0.0,          # L2 pinning the 45 blendshape outputs to the FROZEN
+                                        # readout's own values (shape_frozen stash) — nothing
+                                        # else supervises them
+            "scale_rail": 0.0,          # same L2 for the 28 bone-scale outputs
             "huber_delta": 0.1,         # smooth-L1 transition (radians)
         },
         "mhr": {                        # BetterHuman archive for q <-> params conversion
             "model_path": None,         # null resolves like the physics adapter
             "lod": 1,
+        },
+    },
+    "keypoint_supervision": {           # kindyn joints_world keypoint losses — the SAM3D-style
+        "enabled": False,               # stabilizers for pose/camera fine-tuning (video scenes)
+        "loss": {
+            "kp2d": 1.0,                # Huber on crop-normalized 2D reprojection (the CLIFF-
+                                        # style term that constrains the camera head)
+            "kp3d": 0.5,                # Huber on mean-hips-relative camera-frame 3D (metres)
+            "kp3d_abs": 0.25,           # Huber on ABSOLUTE camera-frame 3D (metres) — pins
+                                        # pred_cam_t depth with the metric extrinsics
+            "kp_vel": 0.0,              # Huber on WORLD-frame keypoint velocity (central
+                                        # stencil over the clip; extrinsics loss-only) vs the
+                                        # finite-differenced kindyn joints_world
+            "kp_acc": 0.0,              # same for acceleration — the explicit smoothness term
+            "huber_delta_2d": 0.05,     # crop-normalized units (crop spans [-0.5, 0.5])
+            "huber_delta_3d": 0.1,      # metres
+            "huber_delta_vel": 0.5,     # m/s
+            "huber_delta_acc": 2.0,     # m/s^2
+            "outlier_acc": 50.0,        # drop rows whose GT keypoint acc exceeds this (m/s^2)
         },
     },
     "loss": {"dice_eps": 1.0e-5, "grad_clip": 1.0},
@@ -342,10 +376,15 @@ DEFAULTS: dict[str, Any] = {
         "backbone_no_grad": True,       # wrap only the frozen backbone call in no_grad
         "compile_backbone": False,      # torch.compile the frozen backbone (~1.2x step)
         "freeze_contact": False,        # regime (a): freeze contact, train force branch only
-        "finetune_pose_head": False,    # unfreeze head_pose.proj (the MHR head's FFN; its
-                                        # constant tables stay frozen). Deliberate exception
-                                        # to the frozen-pose rule; needs pose_supervision
-        "pose_head_lr_scale": 0.1,      # lr multiplier for the head_pose param group
+        "finetune_pose_head": False,    # train a COPY of head_pose.proj applied to the FINAL
+                                        # pose token only — in-decoder interm predictions keep
+                                        # the frozen original (split-head). Deliberate exception
+                                        # to the frozen-pose rule; needs pose_supervision or
+                                        # keypoint_supervision
+        "finetune_camera_head": False,  # same split for head_camera.proj (s, tx, ty readout);
+                                        # needs keypoint_supervision (kp2d) or motion_consistency
+                                        # — the only losses that constrain the camera
+        "pose_head_lr_scale": 0.1,      # lr multiplier for the fine-tuned head param group(s)
     },
     "optim": {
         "lr": 1.0e-4,
@@ -636,6 +675,12 @@ def _validate_force_supervision(cfg: dict, force_head: dict) -> None:
     target_frame = str(fs["target_frame"])
     if target_frame not in ("all", "center"):
         raise ValueError("force_supervision.target_frame must be 'all' or 'center'")
+    if str(fs["gt_frame"]) not in ("root", "world"):
+        raise ValueError("force_supervision.gt_frame must be 'root' or 'world'")
+    if str(fs["units"]) not in ("bw", "newtons"):
+        raise ValueError("force_supervision.units must be 'bw' or 'newtons'")
+    if not isinstance(fs["confidence"], bool):
+        raise ValueError("force_supervision.confidence must be a boolean")
     for key in ("force", "noncontact", "sum_force", "sum_torque", "outlier_bw"):
         value = float(fs["loss"][key])
         if not math.isfinite(value) or value < 0:
@@ -704,6 +749,10 @@ def _validate_motion(cfg: dict) -> None:
         raise ValueError(
             "model.motion_head.motion_keypoint_indices must be a non-empty list of "
             f"MHR70 indices in [0, 70); got {motion_kp!r}")
+    if not isinstance(motion_head["anchored"], bool):
+        raise ValueError(
+            "model.motion_head.anchored must be a boolean; got "
+            f"{motion_head['anchored']!r}")
 
     motion_temporal = cfg["model"]["motion_temporal"]
     if motion_temporal["enabled"] and not motion_head["enabled"]:
@@ -714,7 +763,7 @@ def _validate_motion(cfg: dict) -> None:
     _validate_temporal_common(cfg["model"]["pose_temporal"], "model.pose_temporal")
 
     ps = cfg["pose_supervision"]
-    for key in ("pose", "acc"):
+    for key in ("pose", "acc", "shape_rail", "scale_rail"):
         value = float(ps["loss"][key])
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"pose_supervision.loss.{key} must be finite and >= 0")
@@ -894,6 +943,53 @@ def _validate_motion_consistency(cfg: dict) -> None:
             "(the twist stencil reads frames t-1, t, t+1)")
 
 
+def _validate_keypoint_supervision(cfg: dict) -> None:
+    """Validate ``keypoint_supervision`` (kindyn keypoint losses) and the
+    ``train.finetune_camera_head`` flag whose only objectives live here."""
+    ks = cfg["keypoint_supervision"]
+    for key in ("kp2d", "kp3d", "kp3d_abs", "kp_vel", "kp_acc"):
+        value = float(ks["loss"][key])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"keypoint_supervision.loss.{key} must be finite and >= 0")
+    for key in ("huber_delta_2d", "huber_delta_3d", "huber_delta_vel",
+                "huber_delta_acc", "outlier_acc"):
+        value = float(ks["loss"][key])
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"keypoint_supervision.loss.{key} must be finite and positive")
+    if ks["enabled"]:
+        if not any(float(ks["loss"][k]) > 0
+                   for k in ("kp2d", "kp3d", "kp3d_abs", "kp_vel", "kp_acc")):
+            raise ValueError(
+                "keypoint_supervision.enabled requires a positive loss weight")
+        if (any(float(ks["loss"][k]) > 0 for k in ("kp_vel", "kp_acc"))
+                and int(cfg["data"]["sequence"]["frames_per_clip"]) < 3):
+            raise ValueError(
+                "keypoint_supervision kp_vel/kp_acc require "
+                "data.sequence.frames_per_clip >= 3 (the stencil reads "
+                "frames t-1, t, t+1)")
+        if not (_pose_trainable_paths(cfg)
+                or cfg["train"]["finetune_camera_head"]):
+            raise ValueError(
+                "keypoint_supervision.enabled requires a trainable pose or "
+                "camera path (a pose path or train.finetune_camera_head) — "
+                "otherwise the keypoint losses reach no parameters")
+        if not any(entry["name"] == "climbing_corpus"
+                   for entry in cfg["data"]["datasets"]):
+            raise ValueError(
+                "keypoint_supervision.enabled requires a climbing_corpus "
+                "dataset in data.datasets (GT keypoints come from the corpus "
+                "kindyn joints_world)")
+    if cfg["train"]["finetune_camera_head"] and not (
+            (ks["enabled"] and float(ks["loss"]["kp2d"]) > 0)
+            or cfg["motion_consistency"]["enabled"]):
+        raise ValueError(
+            "train.finetune_camera_head requires keypoint_supervision with a "
+            "positive kp2d weight (or motion_consistency) — no other loss "
+            "constrains the camera head")
+
+
 def _validate_cond_input(cfg: dict, contact_enabled: bool) -> None:
     """Validate ``model.cond_input`` (smoothed vel/acc token conditioning)."""
     cond = cfg["model"]["cond_input"]
@@ -960,17 +1056,20 @@ def _validate_semantics(cfg: dict) -> None:
     motion_head = cfg["model"]["motion_head"]
     if (not contact_enabled and not (force_head["enabled"] and force_kp is not None)
             and not motion_head["enabled"]
-            and not cfg["model"]["pose_temporal"]["enabled"]):
+            and not cfg["model"]["pose_temporal"]["enabled"]
+            and not cfg["train"]["finetune_pose_head"]
+            and not cfg["train"]["finetune_camera_head"]):
         # Force-only builds (no contact tokens/head at all) are legal, but only
         # with the force branch on and its own explicit anchors — null anchors
-        # inherit from the contact tokens, which do not exist here. Motion-only
-        # and pose-temporal-only builds are legal too.
+        # inherit from the contact tokens, which do not exist here. Motion-only,
+        # pose-temporal-only and fine-tuned-heads-only builds are legal too.
         raise ValueError(
             "no contact target is enabled — enable at least one of vertex/joint, "
             "or configure a force-only build (model.force_head.enabled=true with "
             "explicit model.force_head.force_keypoint_indices), a motion-only "
-            "build (model.motion_head.enabled=true), or a pose-temporal build "
-            "(model.pose_temporal.enabled=true)")
+            "build (model.motion_head.enabled=true), a pose-temporal build "
+            "(model.pose_temporal.enabled=true), or a fine-tuned-heads build "
+            "(train.finetune_pose_head / train.finetune_camera_head)")
 
     joint_cfg = targets["joint"]
     joint_set = joint_cfg["joint_set"]
@@ -1044,12 +1143,6 @@ def _validate_semantics(cfg: dict) -> None:
     if eta not in ("causal", "mutual"):
         raise ValueError(
             f"model.extra_token_attention must be 'causal' or 'mutual'; got {eta!r}")
-    if eta == "mutual" and sum(
-            v for m, v in _enabled_modalities(cfg).items() if m != "pose") < 2:
-        raise ValueError(
-            "model.extra_token_attention='mutual' requires >= 2 of the contact/"
-            "force/motion branches enabled (with fewer appended blocks there is "
-            "no cross-block attention to open up)")
 
     lr_scale = float(cfg["train"]["pose_head_lr_scale"])
     if not math.isfinite(lr_scale) or lr_scale <= 0:
@@ -1120,6 +1213,7 @@ def _validate_semantics(cfg: dict) -> None:
     _validate_force_supervision(cfg, force_head)
     _validate_motion(cfg)
     _validate_motion_consistency(cfg)
+    _validate_keypoint_supervision(cfg)
     _validate_cond_input(cfg, contact_enabled)
 
     if cfg["train"]["freeze_contact"]:

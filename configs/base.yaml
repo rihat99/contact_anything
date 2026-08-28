@@ -13,11 +13,12 @@ model:
   mhr_model_path:  /data3/rikhat.akizhanov/.cache/huggingface/hub/models--facebook--sam-3d-body-dinov3/snapshots/11aaa346c7204874a1cbafe3d39a979080b2c55a/assets/mhr_model.pt
   init_contact_checkpoint: null       # warm-start common contact weights; fresh optimiser/run
   mask_embed_type: v2                 # pretrained mask conditioning (frozen)
-  extra_token_attention: causal       # decoder mask over the appended token blocks:
-                                      # causal = no earlier block attends a later one
-                                      # (original ⊥ contact ⊥ force ⊥ motion); mutual =
-                                      # contact/force/motion fully inter-attend (original
-                                      # tokens still attend none of them)
+  extra_token_attention: mutual       # decoder mask over the appended token blocks:
+                                      # mutual (default) = contact/force/motion fully
+                                      # inter-attend (original tokens still attend none of
+                                      # them); causal = legacy pre-2026-08-27 regime — no
+                                      # earlier block attends a later one
+                                      # (original ⊥ contact ⊥ force ⊥ motion)
   contact_head:
     contact_keypoint_indices: null    # null = list(range(21)) = body16 + toes/heels.
                                       # Climbing recommendation: add wrists 41/62 + nose 0.
@@ -85,6 +86,13 @@ model:
     # mean(kp[9], kp[10]). The anchor only chooses where the token grid-samples
     # image features; its TARGET is the true kindyn pelvis joint (52-joint 0).
     motion_keypoint_indices: [62, 41, 15, 18, 17, 20, 9]
+    anchored: true                    # per-layer anchored token update inside the decoder (2D
+                                      # keypoint posemb + grid-sampled image features at the
+                                      # anchors). false = the motion tokens are pure learned
+                                      # queries reading the image only through the decoder's
+                                      # cross-attention; the anchor list then merely NAMES and
+                                      # COUNTS the slots (supervision order is unchanged).
+                                      # Drops motion_posemb_linear / motion_feat_linear.
     mlp_depth: 2
     mlp_channel_div_factor: 4
     dropout: 0.0
@@ -241,6 +249,11 @@ force_supervision:
   enabled: false                      # requires force_head.enabled + a climbing_corpus dataset
                                       # with load_forces: true
   target_frame: center                # center | all (rows per clip contributing to the loss)
+  gt_frame: root                      # root | world — coordinate frame the loader emits the GT
+                                      # forces/levers in (world yaw is unobservable from one crop)
+  units: bw                           # bw | newtons — GT force units; huber_delta_bw / outlier_bw
+                                      # are read in these units
+  confidence: true                    # weight all loss rows by kindyn's per-frame force_confidence
   loss:
     force: 1.0                        # Huber on valid in-contact limb-frames
     huber_delta_bw: 0.5               # smooth-L1 quadratic->linear transition (bw)
@@ -317,10 +330,35 @@ pose_supervision:
     pose: 1.0                         # Huber weight on the 125 local q channels (radians)
     acc: 0.0                          # Huber weight on clip-wise q second differences (pred vs
                                       # GT) — the explicit smoothness term; 0 = off
+    shape_rail: 0.0                   # L2 pinning the 45 blendshape outputs to the FROZEN
+                                      # readout's own values (nothing else supervises them —
+                                      # the pose/keypoint losses are girth-blind)
+    scale_rail: 0.0                   # same L2 for the 28 bone-scale outputs
     huber_delta: 0.1                  # smooth-L1 transition (radians)
   mhr:                                # BetterHuman archive for q <-> params conversion
     model_path: null                  # null resolves like the physics adapter
     lod: 1
+
+keypoint_supervision:                 # SAM3D-style keypoint losses from kindyn joints_world —
+  enabled: false                      # the pose/camera fine-tune stabilizers (video scenes only;
+                                      # requires a trainable pose path or train.finetune_camera_head
+                                      # + a climbing_corpus dataset)
+  loss:
+    kp2d: 1.0                         # Huber on crop-normalized 2D reprojection (the CLIFF-style
+                                      # term; the ONLY loss constraining the camera head)
+    kp3d: 0.5                         # Huber on mean-hips-relative camera-frame 3D (metres)
+    kp3d_abs: 0.25                    # Huber on ABSOLUTE camera-frame 3D (metres) — pins the
+                                      # pred_cam_t depth with the metric extrinsics
+    kp_vel: 0.0                       # Huber on WORLD-frame keypoint velocity (central stencil
+                                      # over the clip's real elapsed seconds; extrinsics used in
+                                      # the loss only) vs finite-differenced kindyn joints_world
+    kp_acc: 0.0                       # same for acceleration — the explicit smoothness term
+    huber_delta_2d: 0.05              # crop-normalized units (the crop spans [-0.5, 0.5])
+    huber_delta_3d: 0.1               # metres
+    huber_delta_vel: 0.5              # m/s
+    huber_delta_acc: 2.0              # m/s^2
+    outlier_acc: 50.0                 # drop stencil rows whose GT keypoint acceleration exceeds
+                                      # this (m/s^2) — broken kindyn frames
 
 loss: {dice_eps: 1.0e-5, grad_clip: 1.0}
 
@@ -331,10 +369,14 @@ train:                               # Phase 4: narrow the autograd graph (grad-
                                      # ~44 s warmup, output delta ~1e-2 (bf16 noise order)
   freeze_contact: false              # regime (a): freeze contact, train force branch only
                                      # (requires model.init_contact_checkpoint)
-  finetune_pose_head: false          # unfreeze head_pose.proj (the MHR head's FFN; the
-                                     # constant tables stay frozen) — deliberate exception to
-                                     # the frozen-pose rule; requires pose_supervision.enabled
-  pose_head_lr_scale: 0.1            # lr multiplier for the head_pose optimizer group ("a bit")
+  finetune_pose_head: false          # train a COPY of head_pose.proj applied to the FINAL pose
+                                     # token only — every in-decoder interm prediction keeps the
+                                     # frozen original (split-head). Deliberate exception to the
+                                     # frozen-pose rule; requires pose_supervision or
+                                     # keypoint_supervision
+  finetune_camera_head: false        # same split for head_camera.proj (s, tx, ty readout);
+                                     # requires keypoint_supervision (kp2d) or motion_consistency
+  pose_head_lr_scale: 0.1            # lr multiplier for the fine-tuned head param group(s) ("a bit")
 
 optim: {lr: 1.0e-4, weight_decay: 1.0e-4, epochs: 20, warmup_epochs: 1, lr_min: 1.0e-5}
 

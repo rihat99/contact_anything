@@ -1,0 +1,60 @@
+# Stage-1 B — s1_posecam_heads. New-era smoke probe (1 epoch): can the pose
+# path train WITHOUT diverging now that the fine-tuned heads are SPLIT (frozen
+# originals keep every in-decoder interm prediction; trainable copies read out
+# the FINAL token only) and the SAM3D-style keypoint losses anchor the camera?
+#
+# Build: PURE pose — no contact / force / motion tokens at all. The trainable
+# set is head_pose_ft_proj + head_camera_ft_proj ONLY (no temporal module).
+#
+# Objectives (all rows of every T=7 clip):
+#   * pose_supervision   — kindyn-MHR pseudo-GT q-Huber (125 local channels)
+#   * keypoint_supervision — kp2d (crop reprojection, constrains the camera),
+#     kp3d (hips-relative), kp3d_abs (metric camera-frame anchor vs collapse)
+#
+# Contrast arm of s1_posecam_temporal.yaml: NO temporal module — heads-only
+# fine-tune. Separates the head fine-tune's contribution (and stability) from
+# the temporal attention's.
+#
+# Launch:
+#   CUDA_VISIBLE_DEVICES=6,7 torchrun --standalone --nproc-per-node=2 \
+#     scripts/train.py --config configs/s1_posecam_heads.yaml
+base: configs/base.yaml
+
+model:
+  init_contact_checkpoint: null       # nothing to warm-start: no contact branch
+contact:
+  targets:
+    vertex: {enabled: false}
+    joint: {enabled: false}           # pose-only: no contact branch at all
+
+data:
+  datasets:
+    - {name: climbing_corpus, config: configs/datasets/climbing_corpus_pose.yaml}
+  eval_split: test                    # no val split: all 864 train scenes train, test evaluates
+  frames_per_batch: 35                # per GPU -> 5 clips x T=7
+  sequence: {frames_per_clip: 7, frame_stride: 1, jitter: true, target_frame: all}
+
+pose_supervision:
+  enabled: true
+  loss:
+    pose: 1.0
+    acc: 0.0                          # no explicit smoothness term in stage 1
+    huber_delta: 0.1                  # radians
+
+keypoint_supervision:
+  enabled: true                       # base defaults: kp2d 1.0, kp3d 0.5, kp3d_abs 0.25
+
+train:
+  compile_backbone: true
+  finetune_pose_head: true            # the split COPY (head_pose_ft_proj) at 0.1x lr
+  finetune_camera_head: true          # the split COPY (head_camera_ft_proj) at 0.1x lr
+
+optim:
+  lr: 1.0e-4
+  warmup_epochs: 0                    # 1-epoch probe: no warmup
+  lr_min: 1.0e-6
+  epochs: 1
+
+output:
+  exp_name: s1_posecam_heads
+  monitor: test/pose_mae              # minimised

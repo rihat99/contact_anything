@@ -1,5 +1,5 @@
 # TEST FIXTURE — the retired motion-tokens-v2 seven-token build (was
-# configs/climbing_corpus_motion_t7.yaml; its run is gone). Kept verbatim under
+# configs/old/climbing_corpus_motion_t7.yaml; its run is gone). Kept verbatim under
 # tests/ because it is the only config exercising the multi-token motion path:
 # 7 anchors, joint_names=null, rotated_world targets, full standardize table.
 base: configs/base.yaml

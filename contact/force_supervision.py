@@ -43,6 +43,13 @@ mean under DDP):
   r-origin is a consistency choice, not a physics claim. Same row eligibility
   as ``sum_force`` plus rows with non-finite lever arms are skipped.
 
+``force_supervision.confidence`` (default on) weights every term's rows by
+kindyn's per-frame ``force_confidence`` — the weight enters numerator and mass,
+so it reweights rows without changing any term's scale; the ``force_mae``
+monitor stays unweighted. ``force_supervision.units`` / ``gt_frame`` choose the
+GT representation the loader emits (``bw``/``newtons``, ``root``/``world``);
+``huber_delta_bw`` and ``outlier_bw`` are read in the configured units.
+
 ``target_frame: center`` supervises only row ``T // 2`` of each clip (the
 :func:`contact.engine.select_temporal_supervision` convention — odd ``T``
 required); the temporal module still attends the full window.
@@ -74,6 +81,7 @@ class ForceSupervisedLoss:
     ) -> None:
         fs = cfg["force_supervision"]
         self.target_frame = str(fs["target_frame"])
+        self.use_confidence = bool(fs["confidence"])
         loss_cfg = fs["loss"]
         self.weights = {name: float(loss_cfg[name]) for name in _TERM_NAMES}
         self.huber_delta = float(loss_cfg["huber_delta_bw"])
@@ -116,6 +124,12 @@ class ForceSupervisedLoss:
                 f"force groups must agree")
         contact = batch["force_contact"].to(self.device)                  # (B, K) bool
         valid = (batch["force_valid"] & batch["frame_valid"]).to(self.device)  # (B)
+        # Per-frame solve confidence: every term's rows are weighted by it
+        # (numerator AND mass), so low-confidence solves contribute
+        # proportionally less without changing any term's scale.
+        conf = (batch["force_conf"].to(self.device, self.dtype)           # (B)
+                if self.use_confidence
+                else torch.ones_like(valid, dtype=self.dtype))
         lever = (batch["force_lever"].to(self.device, self.dtype)         # (B, K, 3)
                  if self.weights["sum_torque"] != 0.0 else None)
 
@@ -132,6 +146,7 @@ class ForceSupervisedLoss:
 
             pred, gt = _center(pred), _center(gt)
             contact, valid = _center(contact), _center(valid)
+            conf = _center(conf)
             lever = _center(lever) if lever is not None else None
         elif self.target_frame != "all":
             raise ValueError(
@@ -150,6 +165,8 @@ class ForceSupervisedLoss:
         huber = F.smooth_l1_loss(
             pred, gt, reduction="none", beta=self.huber_delta).sum(dim=-1)  # (rows, K)
         l1_mag = pred.abs().sum(dim=-1)                                     # (rows, K)
+        w_ic = in_contact.to(self.dtype) * conf[:, None]                    # (rows, K)
+        w_off = off_contact.to(self.dtype) * conf[:, None]
         if self.group_weights is not None:
             if self.group_weights.numel() != pred.shape[1]:
                 raise ValueError(
@@ -157,23 +174,22 @@ class ForceSupervisedLoss:
                     f"{self.group_weights.numel()} entries but the model predicts "
                     f"{pred.shape[1]} force groups")
             gw = self.group_weights.to(self.device)[None, :]                # (1, K)
-            force_num = (huber * in_contact * gw).sum()
-            force_mass = float((in_contact * gw).sum())
-        else:
-            force_num = (huber * in_contact).sum()
-            force_mass = float(in_contact.sum())
+            w_ic = w_ic * gw
+        force_num = (huber * w_ic).sum()
+        force_mass = float(w_ic.sum())
         terms: dict[str, tuple[Tensor, float]] = {
             "force": (force_num, force_mass),
-            "noncontact": ((l1_mag * off_contact).sum(), float(off_contact.sum())),
+            "noncontact": ((l1_mag * w_off).sum(), float(w_off.sum())),
         }
 
         # Sum-consistency terms: net force / net torque over ALL six groups per
         # eligible row (valid, no outlier group — one blowup poisons the sum).
         sum_rows = valid & ~outlier.any(dim=-1)                           # (rows,)
+        w_sum = sum_rows.to(self.dtype) * conf                            # (rows,)
         sum_huber = F.smooth_l1_loss(
             pred.sum(dim=1), gt.sum(dim=1), reduction="none",
             beta=self.huber_delta).sum(dim=-1)                            # (rows,)
-        terms["sum_force"] = ((sum_huber * sum_rows).sum(), float(sum_rows.sum()))
+        terms["sum_force"] = ((sum_huber * w_sum).sum(), float(w_sum.sum()))
         if lever is not None:
             torque_rows = sum_rows & torch.isfinite(lever).all(dim=-1).all(dim=-1)
             # Zero the skipped rows' arms BEFORE the cross product: a non-finite
@@ -185,8 +201,9 @@ class ForceSupervisedLoss:
             torque_huber = F.smooth_l1_loss(
                 tau_pred, tau_gt, reduction="none",
                 beta=self.huber_delta_bwm).sum(dim=-1)                    # (rows,)
+            w_torque = torque_rows.to(self.dtype) * conf                  # (rows,)
             terms["sum_torque"] = (
-                (torque_huber * torque_rows).sum(), float(torque_rows.sum()))
+                (torque_huber * w_torque).sum(), float(w_torque.sum()))
 
         err_norm = torch.linalg.vector_norm(pred - gt, dim=-1)            # (rows, K)
         mae_mass = float(in_contact.sum())

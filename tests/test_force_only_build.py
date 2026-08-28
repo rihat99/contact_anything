@@ -30,7 +30,7 @@ from sam_3d_body.models.meta_arch.sam3d_body import SAM3DBody
 
 REPO = Path(__file__).resolve().parents[1]
 _CKPT = load_config(REPO / "configs" / "base.yaml")["model"]["checkpoint_path"]
-_T7HINGE_CFG = REPO / "configs" / "climbing_videos_force_warmstart_t7hinge.yaml"
+_T7HINGE_CFG = REPO / "configs" / "old" / "climbing_videos_force_warmstart_t7hinge.yaml"
 _T7HINGE_BEST = REPO / "output" / "climb4_force_t7hinge_20260724_121450" / "best.pth"
 
 # Six-anchor list of the supervised force experiment, kindyn column order

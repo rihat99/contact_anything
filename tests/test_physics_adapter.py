@@ -160,7 +160,7 @@ def _real_clip_batch(seq_len: int, n_clips: int):
         scenes = []
     if not scenes:
         pytest.skip("ClimbingVideos corpus unavailable")
-    cfg = load_config(os.path.join(REPO, "configs", "climbing_videos_joint.yaml"))
+    cfg = load_config(os.path.join(REPO, "configs", "old", "climbing_videos_joint.yaml"))
     model, _ = build_model(cfg, "cuda")
     model.eval()
     dataset = ClimbingCorpusDataset(

@@ -464,14 +464,14 @@ model with *no contact tokens and no contact head at all* — the six force toke
 trainable addition, the block-triangular mask degenerates to original ⊥ force, and
 `out["contact"]` is `None`. `tests/test_force_only_build.py` proves the trainable set, the mask
 pattern, and MHR noise-floor invariance for this shape. The first experiment is
-`configs/climbing_corpus_force_supervised.yaml` (`corpus6_force_sup_t7`): T=7 / stride 1 clips
+`configs/old/climbing_corpus_force_supervised.yaml` (`corpus6_force_sup_t7`): T=7 / stride 1 clips
 with center-frame supervision, force temporal attention on and `attend: joint` (the allocation
 coupling argument from t7mid still applies), monitor `val/force_mae` (mean in-contact error
 norm, bw, minimised).
 
 ### Contact-gated forces and the sum-consistency terms
 
-The joint contact+force experiment (`configs/climbing_corpus_joint_force_gated.yaml`) puts a
+The joint contact+force experiment (`configs/old/climbing_corpus_joint_force_gated.yaml`) puts a
 contact branch back next to the six-token supervised force branch — with **six contact tokens
 matched 1:1 to the force groups** — and couples them at the output, not in the loss:
 
@@ -518,8 +518,8 @@ matched 1:1 to the force groups** — and couples them at the output, not in the
   `contact/physics/loss.py` (objective + diagnostics + affine baselines),
   `contact/force_supervision.py` (supervised kindyn-force loss),
   `sam_3d_body/models/heads/force_head.py`.
-- Configs: `configs/climbing_videos_force_warmstart_t7hinge.yaml` (the kept physics run,
-  flattened + heavily annotated), `configs/climbing_corpus_force_supervised.yaml` (supervised
+- Configs: `configs/old/climbing_videos_force_warmstart_t7hinge.yaml` (the kept physics run,
+  flattened + heavily annotated), `configs/old/climbing_corpus_force_supervised.yaml` (supervised
   kindyn forces); defaults in `configs/base.yaml`. Retired physics-run configs
   (`_warmstart`, `_scratch`, `_t16`, `_t7mid`, …) are archived in `legacy/configs/`.
 - Design record with the original decision/risk register: `plan/README.md`

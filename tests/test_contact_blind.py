@@ -33,8 +33,8 @@ from contact.config import load_config
 from sam_3d_body.models.modules.transformer import TransformerDecoderLayer
 
 REPO = Path(__file__).resolve().parents[1]
-BLIND_CFG = REPO / "configs" / "climbing_videos_joint_temporal_center_blind.yaml"
-BASELINE_CFG = REPO / "configs" / "climbing_videos_joint_temporal_center_v2.yaml"
+BLIND_CFG = REPO / "configs" / "old" / "climbing_videos_joint_temporal_center_blind.yaml"
+BASELINE_CFG = REPO / "configs" / "old" / "climbing_videos_joint_temporal_center_v2.yaml"
 _CKPT = load_config(REPO / "configs" / "base.yaml")["model"]["checkpoint_path"]
 
 needs_model = [

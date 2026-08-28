@@ -23,7 +23,7 @@
 # Launch:
 #   CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
 #     scripts/train.py --config configs/climbing_corpus_allmod_consistency_v4.yaml
-base: configs/climbing_corpus_allmod.yaml
+base: configs/old/climbing_corpus_allmod.yaml
 
 force_supervision:
   loss:

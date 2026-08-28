@@ -465,16 +465,28 @@ class SAM3DBody(BaseModel):
                 self.num_motion_tokens, self.cfg.MODEL.DECODER.DIM
             )
             self.head_motion = build_head(self.cfg, "motion")
-            self.motion_posemb_linear = FFN(
-                embed_dims=2,
-                feedforward_channels=self.cfg.MODEL.DECODER.DIM,
-                output_dims=self.cfg.MODEL.DECODER.DIM,
-                num_fcs=2,
-                add_identity=False,
-            )
-            self.motion_feat_linear = nn.Linear(
-                self.backbone.embed_dims, self.cfg.MODEL.DECODER.DIM
-            )
+            # --- motion unanchored hook (pure learned queries) ---
+            # ANCHORED=False drops the per-layer anchored update: the motion
+            # tokens enter the sequence with no positional embedding and read the
+            # image only through the decoder's cross-attention, so the anchor list
+            # merely names/counts the slots. The two projections are then not built
+            # at all — keeping them would leave params that never receive a
+            # gradient, which DDP rejects without find_unused_parameters.
+            self.motion_anchored = bool(motion_head_cfg.get("ANCHORED", True))
+            if self.motion_anchored:
+                # Positional encoding: project 2D keypoint position -> decoder dim
+                self.motion_posemb_linear = FFN(
+                    embed_dims=2,
+                    feedforward_channels=self.cfg.MODEL.DECODER.DIM,
+                    output_dims=self.cfg.MODEL.DECODER.DIM,
+                    num_fcs=2,
+                    add_identity=False,
+                )
+                # Feature projection: project sampled image features -> decoder dim
+                self.motion_feat_linear = nn.Linear(
+                    self.backbone.embed_dims, self.cfg.MODEL.DECODER.DIM
+                )
+            # --- end motion unanchored hook ---
 
             # --- motion temporal hook (module construction) ---
             # A per-frame head cannot represent a derivative, so a temporal
@@ -1053,18 +1065,32 @@ class SAM3DBody(BaseModel):
                 # --- end contact blind hook ---
 
         # We're doing intermediate model predictions
-        def token_to_pose_output_fn(tokens, prev_pose_output, layer_idx):
+        def token_to_pose_output_fn(tokens, prev_pose_output, layer_idx,
+                                    use_ft_heads=False):
             # Get the pose token
             pose_token = tokens[:, 0]
 
             prev_pose = init_pose.view(batch_size, -1)
             prev_camera = init_camera.view(batch_size, -1)
 
+            # --- contact split-head hook ---
+            # In-decoder (interm) calls always use the frozen original heads,
+            # so the per-layer keypoint-token refresh — and with it every
+            # frozen token trajectory — stays bit-identical to the base model.
+            # Only the FINAL readout (the post-brick recompute below) applies
+            # the fine-tuned copies, when they exist.
+            _proj_pose = (getattr(self, "head_pose_ft_proj", None)
+                          if use_ft_heads else None)
+            _proj_cam = (getattr(self, "head_camera_ft_proj", None)
+                         if use_ft_heads else None)
+            # --- end contact split-head hook ---
+
             # Get pose outputs
-            pose_output = self.head_pose(pose_token, prev_pose)
+            pose_output = self.head_pose(pose_token, prev_pose, proj=_proj_pose)
             # Get Camera Translation
             if hasattr(self, "head_camera"):
-                pred_cam = self.head_camera(pose_token, prev_camera)
+                pred_cam = self.head_camera(pose_token, prev_camera,
+                                            proj=_proj_cam)
                 pose_output["pred_cam"] = pred_cam
             # Run camera projection
             pose_output = self.camera_project(pose_output, batch)
@@ -1097,9 +1123,13 @@ class SAM3DBody(BaseModel):
         # --- end force hook ---
 
         # --- motion hook (per-layer anchored update) ---
+        # Not registered at all under `model.motion_head.anchored: false`: the
+        # motion tokens are pure learned queries and their two projections do
+        # not exist (see the motion unanchored hook in __init__).
         mt_token_update_fn = (
             self.motion_token_update_fn
-            if self.cfg.MODEL.DECODER.get("DO_MOTION_TOKENS", False)
+            if (self.cfg.MODEL.DECODER.get("DO_MOTION_TOKENS", False)
+                and getattr(self, "motion_anchored", True))
             else None
         )
         # --- end motion hook ---
@@ -1141,24 +1171,35 @@ class SAM3DBody(BaseModel):
             token_context_gate=token_context_gate,
         )
 
+        _ft_recompute_done = [False]
+
         def _recompute_final_pose_output(pose_output):
             # Recompute the FINAL pose output from the CURRENT (updated) pose
             # token. The decoder returns the interm list with the final output
             # last — only the final one is replaced. Shared by every hook that
             # is allowed to move the pose token (pose_temporal, cross-modal
-            # temporal / frame attention with the 'pose' modality).
+            # temporal / frame attention with the 'pose' modality). Uses the
+            # fine-tuned head copies when they exist (split-head): the frozen
+            # anchors below therefore really are the FROZEN model's outputs —
+            # the in-decoder final entry was produced by the original heads.
             _old = (pose_output[-1] if isinstance(pose_output, (list, tuple))
                     else pose_output)
             _final = token_to_pose_output_fn(
-                pose_token, None, len(self.decoder.layers) - 1)
+                pose_token, None, len(self.decoder.layers) - 1,
+                use_ft_heads=True)
+            _ft_recompute_done[0] = True
             # The first recompute's predecessor is the frozen model's own final
-            # output; carry its camera translation and global orientation
-            # through every later recompute as the anchors for the camera /
-            # rotation trust-region losses.
+            # output; carry its camera translation, global orientation and
+            # shape/scale coefficients through every later recompute as the
+            # anchors for the trust-region / rail losses.
             _final["pred_cam_t_frozen"] = _old.get(
                 "pred_cam_t_frozen", _old["pred_cam_t"].detach())
             _final["global_rot_frozen"] = _old.get(
                 "global_rot_frozen", _old["global_rot"].detach())
+            _final["shape_frozen"] = _old.get(
+                "shape_frozen", _old["shape"].detach())
+            _final["scale_frozen"] = _old.get(
+                "scale_frozen", _old["scale"].detach())
             if isinstance(pose_output, (list, tuple)):
                 return list(pose_output[:-1]) + [_final]
             return _final
@@ -1307,6 +1348,16 @@ class SAM3DBody(BaseModel):
                 pose_token = torch.cat([_upd["pose"], pose_token[:, 1:]], dim=1)
                 pose_output = _recompute_final_pose_output(pose_output)
         # --- end frame attention hook ---
+
+        # --- contact split-head hook (final readout) ---
+        # A fine-tuned head copy must always produce the FINAL output, even
+        # when no pose-writing brick triggered a recompute above (finetune-only
+        # runs with no temporal module).
+        if (not _ft_recompute_done[0]) and (
+                getattr(self, "head_pose_ft_proj", None) is not None
+                or getattr(self, "head_camera_ft_proj", None) is not None):
+            pose_output = _recompute_final_pose_output(pose_output)
+        # --- end contact split-head hook ---
 
         # Process contact tokens if enabled
         contact_output = None
@@ -3030,7 +3081,8 @@ class SAM3DBody(BaseModel):
         + grid-sampled features at ``motion_keypoint_indices``), applied to the
         motion-token slice with the motion linears. Every motion token is
         anchored (no global tokens). No temporal hook — motion temporal is
-        post_decoder only.
+        post_decoder only. Never registered under ``MOTION_HEAD.ANCHORED=False``
+        (the motion linears do not exist then).
         """
         # Skip after the last layer (same pattern as force_token_update_fn)
         if layer_idx == len(decoder_layers) - 1:

@@ -5,6 +5,12 @@ recomputed final pose output when ``model.pose_temporal`` is enabled — and the
 collated ``pose_gt_q (B, 132)`` / ``pose_valid (B)`` / ``frame_valid (B)`` batch
 keys (``scripts/convert_kindyn_to_mhr.py`` targets, world-frame MHR ``q``).
 
+Optional ``loss.shape_rail`` / ``loss.scale_rail`` terms pin the head's
+45 blendshape / 28 bone-scale outputs to the FROZEN readout's own values
+(``shape_frozen`` / ``scale_frozen``, stashed by the final-recompute hook)
+with a plain L2 — the pose/keypoint objectives are girth-blind, so without
+the rail a fine-tuned head warps the unsupervised channels freely.
+
 The comparison runs in **q space** (the rig's 125 local pose channels): the
 prediction's ``mhr_model_params`` go through the BetterHuman body's
 ``from_classic`` (differentiable in the parameters), the target ``q`` is used
@@ -70,6 +76,8 @@ class PoseSupervisedLoss:
         ps = cfg["pose_supervision"]
         self.weight = float(ps["loss"]["pose"])
         self.acc_weight = float(ps["loss"].get("acc", 0.0))
+        self.shape_rail_w = float(ps["loss"].get("shape_rail", 0.0))
+        self.scale_rail_w = float(ps["loss"].get("scale_rail", 0.0))
         self.huber_delta = float(ps["loss"]["huber_delta"])
         self.device = torch.device(device)
         self.dtype = dtype
@@ -131,6 +139,35 @@ class PoseSupervisedLoss:
                 acc_mass = float(v3.sum())
             terms["acc"] = (self.acc_weight * acc_raw, acc_mass)
 
+        # Shape/scale rail: L2 against the FROZEN readout's own coefficients
+        # (stashed by the final-recompute hook). The stage-1 objectives cover
+        # rotations and 13 joint positions only — girth-blind — so a pose
+        # write path is free to warp the unsupervised 45 blendshape + 28
+        # bone-scale channels (observed drift to |x| ~ 5 in the s1 probe).
+        # The frozen model is the only shape GT there is.
+        rail_diag: dict[str, float] = {}
+        if self.shape_rail_w > 0.0 or self.scale_rail_w > 0.0:
+            fv = batch["frame_valid"].to(self.device)
+            fv_mask = fv.to(self.dtype)
+            fv_mass = float(fv.sum())
+            for name, key, w in (
+                    ("shape_rail", "shape", self.shape_rail_w),
+                    ("scale_rail", "scale", self.scale_rail_w)):
+                if w <= 0.0:
+                    continue
+                frozen = out["mhr"].get(f"{key}_frozen")
+                if frozen is None:
+                    terms[name] = (zero_touch, 0.0)
+                    continue
+                dev = (out["mhr"][key].to(self.device, self.dtype)
+                       - frozen.to(self.device, self.dtype))       # (B, C)
+                terms[name] = (
+                    w * (dev.square().sum(dim=-1) * fv_mask).sum(), fv_mass)
+                with torch.no_grad():
+                    rail_diag[f"{key}_dev"] = float(
+                        (dev.abs().mean(dim=-1) * fv_mask).sum()
+                        / max(fv_mass, 1.0))
+
         stats = self._diagnostics(pred.detach(), tgt, valid, int(batch["seq_len"]))
         total = None
         parts_terms: dict[str, Any] = {}
@@ -150,6 +187,7 @@ class PoseSupervisedLoss:
             "pose_mae": float(stats[0] / max(float(stats[1]), 1.0)),
             "n_supervised_rows": int(valid.sum()),
         }
+        parts.update(rail_diag)
         return total, parts
 
     @torch.no_grad()
