@@ -410,12 +410,6 @@ def _predict_scene(
     A model without a contact head (force-only build) leaves ``probs`` NaN —
     no disks are drawn — and anchors at its ``force_keypoint_indices``.
     """
-    # A conditioned checkpoint (model.cond_input) needs the real per-frame
-    # cond_feat rows — the collate zero-fills missing ones, which is out of
-    # distribution for a trained conditioning path (and with an MLP encoder a
-    # zero row is a learned constant, not a no-op).
-    cond_cfg = cfg["model"].get("cond_input", {}) or {}
-    cond_enabled = bool(cond_cfg.get("enabled", False))
     ds = ClimbingCorpusDataset(
         root,
         scenes=[scene],
@@ -428,9 +422,6 @@ def _predict_scene(
         use_confidence_weights=False,
         require_labels=require_labels,
         load_forces=collect_force and force_frame == "root",
-        cond_features_path=cond_cfg.get("features_path") if cond_enabled else None,
-        cond_standardize=cond_cfg.get("standardize") if cond_enabled else None,
-        cond_clip=float(cond_cfg.get("clip", 5.0)),
     )
     data = ds._scenes[scene]
     n_people, n_frames = data["valid_mask"].shape

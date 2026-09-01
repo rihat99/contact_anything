@@ -28,89 +28,8 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from ..targets import NUM_BODY_22
-from .climbing_corpus import COND_FEATURE_DIM, cond_feature_rows
 
 FRAME_JPEG_QUALITY = 95     # matches export_contact_dataset.py's default export
-
-#: Fixed physical smoothing of the conditioning trajectory (seconds) — the
-#: artifact recipe (output/motion_probe_geom/build_cond_features.py): both the
-#: consumed velocity and acceleration channels use sigma = 0.12 s.
-COND_SIGMA_SEC = 0.12
-#: MHR70 keypoint rows averaged into the pelvis proxy (left/right hip).
-COND_HIP_KEYPOINTS = (9, 10)
-_COND_FLIP = np.diag([1.0, -1.0, -1.0])
-
-
-def _valid_runs(valid: np.ndarray) -> list[np.ndarray]:
-    """Index arrays of each contiguous True run of a 1D bool mask."""
-    padded = np.pad(np.asarray(valid, bool).astype(np.int8), (1, 1))
-    changes = np.flatnonzero(np.diff(padded))
-    return [np.arange(lo, hi) for lo, hi in zip(changes[0::2], changes[1::2])]
-
-
-def cond_rows_from_mhr(
-    pelvis_cam: np.ndarray,
-    global_rot: np.ndarray,
-    extrinsics: np.ndarray,
-    valid: np.ndarray,
-    fps: float,
-    standardize: dict,
-    clip: float,
-) -> np.ndarray:
-    """Assemble ``cond_feat`` rows for one person of a reconstruction scene.
-
-    Mirrors the training artifact recipe exactly
-    (``output/motion_probe_geom/build_cond_features.py``): the camera-frame
-    pelvis is lifted to world with the per-frame extrinsics, Gaussian-smoothed
-    at a fixed :data:`COND_SIGMA_SEC` physical bandwidth per contiguous valid
-    run (never across a hole), central-differenced inside the run, and the
-    world v/a plus the predicted world-from-root rotation
-    ``R_ext^T @ diag(1,-1,-1) @ euler_xyz(global_rot)`` feed
-    :func:`~contact.data.climbing_corpus.cond_feature_rows`. Run endpoints and
-    invalid frames give all-zero rows (validity bit 0), exactly like frames the
-    training artifact did not cover.
-
-    :param pelvis_cam: ``(N, 3)`` camera-frame pelvis (mean hip keypoints +
-        ``pred_cam_t``), NaN where invalid.
-    :param global_rot: ``(N, 3)`` the frozen head's euler ``global_rot`` output.
-    :param extrinsics: ``(N, 4, 4)`` metric OpenCV ``cam_from_world``.
-    :param valid: ``(N,)`` bool — frames with a model prediction.
-    :param standardize: the checkpoint config's pinned scaler literals.
-    :param clip: clamp on the standardized components.
-    :returns: ``(N, 10)`` float32.
-    """
-    from scipy.ndimage import gaussian_filter1d
-    import roma
-
-    n = len(valid)
-    valid = np.asarray(valid, bool) & np.isfinite(pelvis_cam).all(axis=-1)
-    rot_cw = np.asarray(extrinsics, np.float64)[:, :3, :3]
-    t_cw = np.asarray(extrinsics, np.float64)[:, :3, 3]
-    pos_world = np.einsum(
-        "nji,nj->ni", rot_cw, np.asarray(pelvis_cam, np.float64) - t_cw)
-
-    dt = 1.0 / float(fps)
-    vel = np.zeros((n, 3))
-    acc = np.zeros((n, 3))
-    feat_valid = np.zeros(n, bool)
-    for run in _valid_runs(valid):
-        if len(run) < 3:
-            continue
-        smooth = gaussian_filter1d(
-            pos_world[run], sigma=COND_SIGMA_SEC * float(fps), axis=0,
-            mode="nearest", truncate=4.0)
-        vel[run[1:-1]] = (smooth[2:] - smooth[:-2]) / (2.0 * dt)
-        acc[run[1:-1]] = (smooth[2:] - 2.0 * smooth[1:-1] + smooth[:-2]) / (dt * dt)
-        feat_valid[run[1:-1]] = True
-
-    # Invalid frames carry NaN eulers; their rows are zeroed by the validity
-    # mask below, but NaN * 0 = NaN — make them finite first.
-    rot_native = roma.euler_to_rotmat(
-        "xyz", torch.as_tensor(
-            np.nan_to_num(np.asarray(global_rot, np.float64)))).numpy()
-    rot_world_from_root = np.einsum("nji,jk,nkl->nil", rot_cw, _COND_FLIP, rot_native)
-    return cond_feature_rows(
-        vel, acc, rot_world_from_root, feat_valid, standardize, float(clip))
 
 
 def extract_frames(video_path: Path, out_dir: Path, n_expected: int) -> None:
@@ -231,23 +150,6 @@ class ReconstructionSceneDataset(Dataset):
             if valid_mask[person, pos]
         ]
 
-    def set_cond_features(self, cond: np.ndarray | None) -> None:
-        """Attach (or clear) per-frame ``cond_feat`` rows for the scene.
-
-        :param cond: ``[P, N, 10]`` float32 (see :func:`cond_rows_from_mhr`),
-            or ``None`` to stop emitting the key.
-        """
-        data = self._scenes[self.scene]
-        if cond is None:
-            data.pop("cond_feat", None)
-            return
-        cond = np.asarray(cond, np.float32)
-        expected = (*data["valid_mask"].shape, COND_FEATURE_DIM)
-        if cond.shape != expected:
-            raise ValueError(
-                f"{self.scene}: cond features {cond.shape} != {expected}")
-        data["cond_feat"] = cond
-
     def __len__(self) -> int:
         return len(self._items)
 
@@ -278,6 +180,4 @@ class ReconstructionSceneDataset(Dataset):
             "key": f"{scene}#{oid}@{pos}",
             "dataset": self.name,
         }
-        if "cond_feat" in data:
-            frame["cond_feat"] = torch.from_numpy(data["cond_feat"][person, pos])  # [10]
         return [frame]

@@ -96,15 +96,6 @@ keypoint regressor as the predictions, so there is no cross-rig bias):
 ``load_pose`` / ``load_keypoints`` additionally emit ``mhr_fit_err_cm`` float —
 the ``mhr_1`` mesh-fit residual of that row (cm), the optional row-confidence
 weight of the MHR-native metric losses.
-
-``cond_features_path`` adds ``cond_feat`` ``[10]`` float32, the *input*-side
-conditioning feature (``model.cond_input``): standardized root-frame smoothed
-velocity (0:3) and acceleration (3:6), the gravity direction in root axes (6:9)
-and a validity bit (9). Unlike everything above it is **label-free** — it is
-derived from the frozen model's own reconstructed pelvis trajectory plus the
-dataset extrinsics (see :func:`cond_feature_rows`), so it is available at
-inference time. Frames outside the artifact (or outside its validity mask) get
-exact zeros with bit 0.
 """
 from __future__ import annotations
 
@@ -217,11 +208,6 @@ MOTION_MHR70_INDICES = (62, 41, 15, 18, 17, 20)
 #: predictions are lifted from (``contact.root_world._HIP_KPS``), so it is
 #: also the position half of the ``mhr`` motion root.
 _MHR70_HIP_KPS = (9, 10)
-
-#: Width of the ``cond_feat`` input-conditioning vector (``model.cond_input``):
-#: standardized root-frame velocity (3) + acceleration (3) + the gravity
-#: direction in root axes (3) + a validity bit.
-COND_FEATURE_DIM = 10
 
 GRAVITY_MAG = 9.81
 # Fallback world down direction (world y is down). Since the 2026-08-27 corpus
@@ -579,50 +565,6 @@ def root_body_twist(q_root: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarr
     return twist[..., :3], acc[..., :3], twist[..., 3:], acc[..., 3:]
 
 
-def cond_feature_rows(
-    vel_world: np.ndarray,
-    acc_world: np.ndarray,
-    rot_world_from_root: np.ndarray,
-    valid: np.ndarray,
-    standardize: dict,
-    clip: float,
-) -> np.ndarray:
-    """Assemble the 10-d ``cond_feat`` rows from a ``cond_features.npz`` entry.
-
-    Everything is rotated into the PREDICTED root axes (``x_root = R^T x_world``,
-    the artifact's own ``root_frame_use`` recipe), velocity and acceleration are
-    standardized with the pinned literals and clamped to ``+-clip``, and invalid
-    rows are zeroed so an unusable frame is indistinguishable from a missing one.
-
-    :param vel_world: ``(F, 3)`` smoothed world velocity (m/s).
-    :param acc_world: ``(F, 3)`` smoothed world acceleration (m/s^2).
-    :param rot_world_from_root: ``(F, 3, 3)`` predicted world-from-root rotation.
-    :param valid: ``(F,)`` bool validity mask of the artifact.
-    :param standardize: ``vel_mean``/``vel_std``/``acc_mean``/``acc_std``, each 3.
-    :param clip: clamp on the standardized components.
-    :returns: ``(F, 10)`` float32 — standardized v (0:3), a (3:6), the gravity
-        direction in root axes (6:9), the validity bit (9).
-    """
-    rot = np.asarray(rot_world_from_root, np.float64)
-    valid = np.asarray(valid, bool)
-    vel_root = np.einsum("fji,fj->fi", rot, np.asarray(vel_world, np.float64))
-    acc_root = np.einsum("fji,fj->fi", rot, np.asarray(acc_world, np.float64))
-    grav_root = np.einsum("fji,j->fi", rot, GRAVITY_WORLD.astype(np.float64))
-
-    vel_z = (vel_root - np.asarray(standardize["vel_mean"], np.float64)) / np.asarray(
-        standardize["vel_std"], np.float64)
-    acc_z = (acc_root - np.asarray(standardize["acc_mean"], np.float64)) / np.asarray(
-        standardize["acc_std"], np.float64)
-    clip = float(clip)
-    feat = np.concatenate([
-        np.clip(vel_z, -clip, clip),
-        np.clip(acc_z, -clip, clip),
-        grav_root,
-        valid[:, None].astype(np.float64),
-    ], axis=-1)
-    return (feat * valid[:, None]).astype(np.float32)
-
-
 def fold_force_group_contact(jc52: np.ndarray) -> np.ndarray:
     """Fold 52-joint contact into per-force-group contact.
 
@@ -845,12 +787,6 @@ class ClimbingCorpusDataset(Dataset):
         ``kp_valid`` / ``vert_gt_world`` / ``vert_valid`` / ``vert_indices`` per
         frame — the MHR70 world keypoints and vertex subset the
         keypoint losses reproject.
-    :param cond_features_path: ``cond_features.npz`` to read the input-side
-        conditioning feature from (``None`` = no ``cond_feat`` emitted). Entries
-        are keyed ``"<scene>__p<object_id>"`` and joined per frame on ``frame_idx``.
-    :param cond_standardize: ``vel_mean``/``vel_std``/``acc_mean``/``acc_std``
-        literals (each 3), required with ``cond_features_path``.
-    :param cond_clip: clamp on the standardized conditioning components.
     :param load_images: read frame JPEGs + person masks in ``__getitem__``.
         ``False`` returns ``image``/``mask`` as ``None`` (metadata-only access;
         such items cannot go through the training collate).
@@ -895,9 +831,6 @@ class ClimbingCorpusDataset(Dataset):
         motion_root_source: str = "kindyn",
         load_pose: bool = False,
         load_keypoints: bool = False,
-        cond_features_path: Optional[str] = None,
-        cond_standardize: Optional[dict] = None,
-        cond_clip: float = 5.0,
         load_images: bool = True,
         embedding_dir: Optional[str | Path] = None,
         full_scenes: bool = False,
@@ -981,16 +914,6 @@ class ClimbingCorpusDataset(Dataset):
                 "'gravity_view' (the angular pair is the SE3-log body rate under "
                 "both) and motion_joint_names=['pelvis']; got "
                 f"{self.motion_root_convention!r}, {list(self.motion_joints)}")
-        self.cond_features_path = (
-            None if cond_features_path is None else str(cond_features_path))
-        if self.cond_features_path is not None:
-            missing = [key for key in ("vel_mean", "vel_std", "acc_mean", "acc_std")
-                       if not (cond_standardize or {}).get(key)]
-            if missing:
-                raise ValueError(
-                    f"cond_features_path requires cond_standardize entries {missing}")
-        self.cond_standardize = dict(cond_standardize or {})
-        self.cond_clip = float(cond_clip)
         self.load_images = bool(load_images)
         self.embedding_dir = None if embedding_dir is None else Path(embedding_dir)
         self._epoch = 0
@@ -1009,12 +932,6 @@ class ClimbingCorpusDataset(Dataset):
                     self.val_fraction, self.seed)
                 keep = train_videos if split == "train" else val_videos
                 scenes = [s for s in all_train if video_id_from_scene(s) in keep]
-
-        # Opened once for the whole scene loop (a zip member read per scene) and
-        # dropped before the loaders fork their workers.
-        self._cond_npz = (
-            None if self.cond_features_path is None
-            else np.load(self.cond_features_path, allow_pickle=True))
         self._scenes: dict[str, dict] = {}
         # (scene, person, base_start, jitter_range, t_frames); t_frames == self.T
         # for tiled windows, per-item for full_scenes.
@@ -1059,9 +976,6 @@ class ClimbingCorpusDataset(Dataset):
                         continue  # every temporal row needs a real bbox/camera crop
                     jitter_range = max(1, min(step, max_start - base + 1))
                     self._items.append((scene, person, base, jitter_range, self.T))
-        if self._cond_npz is not None:
-            self._cond_npz.close()
-            self._cond_npz = None
 
     def scene_stride(self, scene: str) -> int:
         """Frame stride used inside this scene's clips.
@@ -1189,8 +1103,6 @@ class ClimbingCorpusDataset(Dataset):
             data.update(self._load_pose(scene, human_dir, object_ids, n))
         if self.load_keypoints:
             data.update(self._load_keypoints(scene, human_dir, object_ids, n))
-        if self.cond_features_path is not None:
-            data.update(self._load_cond(scene, object_ids, n))
         return data
 
     def _load_pose(
@@ -1336,35 +1248,6 @@ class ClimbingCorpusDataset(Dataset):
         reviewed = annotated[..., OBSERVABLE_14].any(axis=-1)
         annotated[..., ALWAYS_NON_CONTACT_8] |= reviewed[..., None]
         return joint_contact, annotated
-
-    def _load_cond(
-        self, scene: str, object_ids: np.ndarray, n: int,
-    ) -> dict:
-        """Read the input-conditioning feature for this scene's tracked people.
-
-        The artifact is keyed by ``"<scene>__p<object_id>"`` and stores its own
-        ``frame_idx``, which may be shorter than the scene (bbox-degenerate
-        frames are skipped) or have internal holes. Rows are scattered back onto
-        the scene's frame axis; everything it does not cover stays exactly zero
-        (validity bit included), which is also what a wholly missing entry gives.
-        """
-        cond = np.zeros((len(object_ids), n, COND_FEATURE_DIM), np.float32)
-        for person, oid in enumerate(object_ids):
-            key = f"{scene}__p{int(oid)}"
-            if f"{key}#frame_idx" not in self._cond_npz.files:
-                continue
-            frame_idx = np.asarray(self._cond_npz[f"{key}#frame_idx"], np.int64)
-            rows = cond_feature_rows(
-                self._cond_npz[f"{key}#vel_smooth_world"],
-                self._cond_npz[f"{key}#acc_smooth_world_alt"],
-                self._cond_npz[f"{key}#R_pred_world_from_root"],
-                self._cond_npz[f"{key}#feat_valid"],
-                self.cond_standardize,
-                self.cond_clip,
-            )
-            keep = (frame_idx >= 0) & (frame_idx < n)
-            cond[person, frame_idx[keep]] = rows[keep]
-        return {"cond_feat": cond}                           # [P, N, 10] f32
 
     def _load_forces(
         self, scene: str, human_dir: Path, object_ids: np.ndarray, n: int,
@@ -1903,7 +1786,5 @@ class ClimbingCorpusDataset(Dataset):
                 # same mhr_1 array, so one key serves either.
                 frame["mhr_fit_err_cm"] = float(
                     data["mhr_fit_err_cm"][person, pos])
-            if self.cond_features_path is not None:
-                frame["cond_feat"] = torch.from_numpy(data["cond_feat"][person, pos])  # [10]
             clip.append(frame)
         return clip

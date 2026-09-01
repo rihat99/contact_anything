@@ -29,7 +29,6 @@ from sam_3d_body.data.transforms import (
 )
 from ..targets import TargetSpec, validate_targets
 from .climbing_corpus import (
-    COND_FEATURE_DIM,
     FORCE_GROUP_NAMES,
     NUM_MHR70,
     NUM_MHR_BONES,
@@ -338,16 +337,6 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec,
             torch.arange(NUM_SUP_VERTICES, dtype=torch.long) if idx is None
             else torch.as_tensor(idx, dtype=torch.long))                   # [V]
 
-        # Input-side conditioning feature (climbing_corpus with cond_features_path):
-        # standardized root-frame smoothed vel/acc + gravity direction + validity
-        # bit. ALWAYS emitted so the model's zero-init projections are used on
-        # every step (DDP rejects a param that some ranks leave unused); frames
-        # and datasets without features contribute exact zeros, which is what the
-        # bit-0 rows of the artifact itself look like.
-        out["cond_feat"] = torch.stack([
-            torch.as_tensor(f["cond_feat"], dtype=torch.float32)
-            if "cond_feat" in f else torch.zeros(COND_FEATURE_DIM, dtype=torch.float32)
-            for f in frames], dim=0)                                       # [B, 10]
         return out
 
     return _collate
@@ -507,7 +496,6 @@ def make_loaders(
         eval_full = bool(seq.get("eval_full_scenes", False))
         eval_clips_per_batch = 1 if eval_full else clips_per_batch
         eval_max_frames = seq.get("eval_max_frames", None)
-        cond_cfg = cfg["model"]["cond_input"]
         for s in corpus_specs:
             ccfg = yaml.safe_load(Path(s["config"]).read_text())["data"]
             root = ccfg["root"]
@@ -535,12 +523,6 @@ def make_loaders(
                     cfg["motion_supervision"]["root_source"]),
                 load_pose=bool(cfg["pose_supervision"]["enabled"]),
                 load_keypoints=bool(cfg["keypoint_supervision"]["enabled"]),
-                # Input conditioning (model.cond_input): label-free, so it is a
-                # loader option rather than a target — null path = no cond_feat.
-                cond_features_path=(
-                    cond_cfg["features_path"] if cond_cfg["enabled"] else None),
-                cond_standardize=cond_cfg["standardize"],
-                cond_clip=float(cond_cfg["clip"]),
                 embedding_dir=(Path(root) / "features" / "embedding"
                                if bool(dcfg["embedding_cache"]) else None))
             all_train_scenes = list_corpus_scenes(root, "train")

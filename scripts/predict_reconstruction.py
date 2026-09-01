@@ -58,12 +58,10 @@ from contact.config import load_config
 from contact.data.climbing_corpus import (
     FORCE_GROUP_NAMES, _rows_by_object_id, quat_xyzw_to_matrix,
 )
-from contact.data.collate import batch_to_device, make_collate
+from contact.data.collate import make_collate
 from contact.data.reconstruction_scenes import (
-    COND_HIP_KEYPOINTS, ReconstructionSceneDataset, cond_rows_from_mhr,
-    extract_frames,
+    ReconstructionSceneDataset, extract_frames,
 )
-from contact.engine import forward_model  # noqa: F401  (imported by rcv internally)
 from contact.model import build_model
 from contact.targets import EXTREMITY_4_NAMES, KINDYN_6_NAMES, TargetSpec
 
@@ -147,73 +145,6 @@ def _predict(bundle: dict, ds: ReconstructionSceneDataset, batch_size: int,
     return probs, points, force_data
 
 
-def _cond_cfg(bundle: dict) -> dict:
-    """The bundle's ``model.cond_input`` section ({} when absent/disabled)."""
-    cond = bundle["cfg"]["model"].get("cond_input", {}) or {}
-    return cond if cond.get("enabled", False) else {}
-
-
-def _collect_mhr_trajectory(bundle: dict, ds: ReconstructionSceneDataset,
-                            batch_size: int, device: str):
-    """Pass 1 for conditioned checkpoints: the frozen head's own reconstruction.
-
-    Runs plain per-frame (T=1) forwards over every valid ``(person, frame)`` and
-    collects the camera-frame pelvis proxy (mean hip keypoints + ``pred_cam_t``)
-    and the euler ``global_rot`` — the exact inputs of the training-time
-    conditioning artifact. The frozen MHR outputs are independent of the
-    contact/force branches (mask invariant), so one pass serves every bundle.
-
-    :returns: ``(pelvis_cam [P,N,3], global_rot [P,N,3])``, NaN where invalid.
-    """
-    data = ds._scenes[ds.scene]
-    n_people, n_frames = data["valid_mask"].shape
-    pelvis_cam = np.full((n_people, n_frames, 3), np.nan, dtype=np.float32)
-    global_rot = np.full((n_people, n_frames, 3), np.nan, dtype=np.float32)
-    hips = list(COND_HIP_KEYPOINTS)
-    for lo in range(0, len(ds._items), batch_size):
-        chunk = ds._items[lo:lo + batch_size]
-        batch = batch_to_device(
-            bundle["collate"]([ds[lo + i] for i in range(len(chunk))]), device)
-        out = forward_model(bundle["model"], batch)
-        pel = (
-            out["mhr"]["pred_keypoints_3d"][:, hips].mean(dim=1)
-            + out["mhr"]["pred_cam_t"]
-        ).float().cpu().numpy()
-        rot = out["mhr"]["global_rot"].float().cpu().numpy()
-        for row, (_, person, pos, _) in enumerate(chunk):
-            pelvis_cam[person, pos] = pel[row]
-            global_rot[person, pos] = rot[row]
-    return pelvis_cam, global_rot
-
-
-def _set_bundle_cond(bundle: dict, ds: ReconstructionSceneDataset, traj) -> None:
-    """Attach this bundle's ``cond_feat`` rows to ``ds`` (or clear them).
-
-    Each conditioned bundle standardizes with its own pinned scaler literals, so
-    the rows are assembled per bundle from the shared pass-1 trajectory.
-    """
-    cond = _cond_cfg(bundle)
-    if not cond:
-        ds.set_cond_features(None)
-        return
-    if traj is None:
-        raise RuntimeError("conditioned bundle without a pass-1 trajectory")
-    pelvis_cam, global_rot = traj
-    data = ds._scenes[ds.scene]
-    rows = np.stack([
-        cond_rows_from_mhr(
-            pelvis_cam[person], global_rot[person], data["extrinsics"],
-            data["valid_mask"][person], data["fps"],
-            cond["standardize"], cond["clip"])
-        for person in range(pelvis_cam.shape[0])
-    ])
-    ds.set_cond_features(rows)
-    n_valid = int(data["valid_mask"].sum())
-    n_feat = int(rows[..., 9].sum())
-    print(f"  cond_feat: {n_feat}/{n_valid} valid person-frames carry motion "
-          f"features ({n_feat / max(n_valid, 1):.3f})")
-
-
 def _provenance(bundle: dict, ds: ReconstructionSceneDataset, video: Path) -> dict:
     data = ds._scenes[ds.scene]
     return {
@@ -229,7 +160,6 @@ def _provenance(bundle: dict, ds: ReconstructionSceneDataset, video: Path) -> di
         "windows": (
             f"centered sliding windows T={bundle['seq_len']} "
             f"stride={bundle['stride']}; each frame predicted once"),
-        "conditioned": np.bool_(bool(_cond_cfg(bundle))),
     }
 
 
@@ -339,17 +269,7 @@ def _run_scene(args, bundles: dict, scene: str, index: int, total: int,
     pred_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.inference_mode():
-        # Conditioned checkpoints (model.cond_input) need per-frame motion
-        # features computed from the frozen head's own reconstruction — one
-        # shared pass-1 trajectory, standardized per bundle.
-        traj = None
-        if any(_cond_cfg(b) for b in bundles.values()):
-            first = next(b for b in bundles.values() if _cond_cfg(b))
-            print(f"  cond pass: reconstructing the pelvis trajectory …")
-            traj = _collect_mhr_trajectory(first, ds, args.batch_size, args.device)
-
         if "contact" in bundles:
-            _set_bundle_cond(bundles["contact"], ds, traj)
             probs, points, _ = _predict(
                 bundles["contact"], ds, args.batch_size, args.device, False)
             contacts = np.where(np.isfinite(probs), probs >= args.threshold, False)
@@ -366,7 +286,6 @@ def _run_scene(args, bundles: dict, scene: str, index: int, total: int,
                   f"{float(contacts[np.isfinite(probs)].mean()):.3f}")
 
         if "force" in bundles:
-            _set_bundle_cond(bundles["force"], ds, traj)
             gate_probs, points, force_data = _predict(
                 bundles["force"], ds, args.batch_size, args.device, True)
             forces = force_data["forces"]                       # [P,N,K,3] head frame, bw

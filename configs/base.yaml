@@ -110,32 +110,6 @@ model:
     dropout: 0.0
     time_scale: 25.0                  # rope: seconds -> RoPE positions (one 25-fps step ~= 1.0)
     max_rel_sec: 2.5                  # rope: attention half-window in SECONDS; null = no window
-  cond_input:                         # feed smoothed pelvis vel/acc INTO the tokens
-    enabled: false                    # zero-init projections added to the INITIAL contact and
-                                      # force token embeddings (10-d feature per frame:
-                                      # standardized root-frame v, a, the gravity direction in
-                                      # root axes and a validity bit). No attention-mask change,
-                                      # so the frozen pose/MHR outputs stay bit-isolated; at init
-                                      # the projections are exactly zero, i.e. the conditioned
-                                      # model IS the unconditioned one.
-    features_path: null               # cond_features.npz (required when enabled): Gaussian-
-                                      # smoothed derivatives of the frozen model's own
-                                      # reconstructed pelvis lifted to world with the dataset
-                                      # extrinsics, keyed "<scene>__p<object_id>"
-    encoder_hidden: null              # null = bare zero-init linear per token block; an int H
-                                      # = small MLP Linear(10,H)+GELU+Linear(H,dim) whose OUTPUT
-                                      # layer is zero-init (still an exact no-op at init)
-    injection: pre_decoder            # pre_decoder = added to the INITIAL contact/force token
-                                      # embeddings (feature integrates with image evidence over
-                                      # all decoder layers); post_decoder = added to the
-                                      # decoder's token OUTPUTS, before the heads
-    clip: 5.0                         # clamp on the standardized v/a components (heavy tails
-                                      # survive smoothing: |a| reaches 183 m/s^2)
-    standardize:                      # pinned literals, root axes xyz; required when enabled
-      vel_mean: null                  # m/s
-      vel_std: null
-      acc_mean: null                  # m/s^2
-      acc_std: null
 
 contact:
   primary_target: joint               # headline metric target (monitor/pbar)

@@ -32,7 +32,6 @@ from sam_3d_body.models.meta_arch import SAM3DBody
 from sam_3d_body.utils.checkpoint import load_state_dict
 from sam_3d_body.utils.config import get_config
 
-from .data.climbing_corpus import COND_FEATURE_DIM
 from .targets import TargetSpec
 
 
@@ -158,20 +157,6 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
         "BOTTLENECK_DIM": None if _xm_bottleneck is None else int(_xm_bottleneck),
         "POSITION_SCALE": float(xmcfg.get("position_scale", 25.0)),
         "CAUSAL": bool(xmcfg.get("causal", False)),
-    })
-
-    # Input conditioning (model.cond_input). Only the switch and the feature width
-    # reach the model — the artifact path / standardization literals / clip are
-    # the LOADER's business (they define what `cond_feat` contains, not what the
-    # model does with it). Patched even when disabled so the config stays
-    # self-describing; SAM3DBody builds the projections only when ENABLED.
-    cond_cfg = cfg["model"].get("cond_input", {}) or {}
-    cond_hidden = cond_cfg.get("encoder_hidden", None)
-    model_cfg.MODEL.COND_INPUT = CfgNode({
-        "ENABLED":  bool(cond_cfg.get("enabled", False)),
-        "FEAT_DIM": COND_FEATURE_DIM,
-        "ENCODER_HIDDEN": None if cond_hidden is None else int(cond_hidden),
-        "INJECTION": str(cond_cfg.get("injection", "pre_decoder")),
     })
 
     # Efficiency flags (Phase 4). Patched even when off so the model config is

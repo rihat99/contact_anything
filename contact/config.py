@@ -117,20 +117,6 @@ DEFAULTS: dict[str, Any] = {
             "max_rel_sec": 2.5,             # rope only: attention window half-width (seconds);
                                             # null disables the window
         },
-        "cond_input": {                     # smoothed pelvis vel/acc fed INTO the tokens
-            "enabled": False,               # zero-init projections; off = bit-identical model
-            "features_path": None,          # cond_features.npz (required when enabled)
-            "encoder_hidden": None,         # null = bare linear; int H = Linear(10,H)+GELU+
-                                            # zero-init Linear(H,dim) per token block
-            "injection": "pre_decoder",     # pre_decoder = added to the INITIAL token
-                                            # embeddings; post_decoder = added to the decoder's
-                                            # contact/force token OUTPUTS, before temporal
-            "clip": 5.0,                    # clamp on the standardized v/a components
-            "standardize": {                # root-axis literals over the corpus-train frames
-                "vel_mean": None, "vel_std": None,   # m/s, required when enabled
-                "acc_mean": None, "acc_std": None,   # m/s^2, required when enabled
-            },
-        },
     },
     "contact": {
         "primary_target": "joint",      # headline metric target
@@ -1094,56 +1080,6 @@ def _validate_keypoint_supervision(cfg: dict) -> None:
             "positive kp2d weight — no other loss constrains the camera head")
 
 
-def _validate_cond_input(cfg: dict, contact_enabled: bool) -> None:
-    """Validate ``model.cond_input`` (smoothed vel/acc token conditioning)."""
-    cond = cfg["model"]["cond_input"]
-    clip = cond["clip"]
-    if (isinstance(clip, bool) or not isinstance(clip, (int, float))
-            or not math.isfinite(float(clip)) or float(clip) <= 0):
-        raise ValueError(
-            "model.cond_input.clip must be a finite positive number (the clamp on "
-            f"the standardized components); got {clip!r}")
-    hidden = cond["encoder_hidden"]
-    if hidden is not None and (
-            isinstance(hidden, bool) or not isinstance(hidden, int) or hidden <= 0):
-        raise ValueError(
-            "model.cond_input.encoder_hidden must be null (bare linear projection) "
-            f"or a positive integer hidden width; got {hidden!r}")
-    injection = cond["injection"]
-    if injection not in ("pre_decoder", "post_decoder"):
-        raise ValueError(
-            "model.cond_input.injection must be 'pre_decoder' (added to the initial "
-            "token embeddings) or 'post_decoder' (added to the decoder's token "
-            f"outputs, before the heads); got {injection!r}")
-    if not cond["enabled"]:
-        return
-    if not (contact_enabled or cfg["model"]["force_head"]["enabled"]):
-        raise ValueError(
-            "model.cond_input.enabled requires a contact target or "
-            "model.force_head.enabled=true (there are no tokens to condition)")
-    if not isinstance(cond["features_path"], str) or not cond["features_path"]:
-        raise ValueError(
-            "model.cond_input.enabled requires model.cond_input.features_path "
-            "(the cond_features.npz built from the reconstructed pelvis trajectory)")
-    if not any(entry["name"] == "climbing_corpus" for entry in cfg["data"]["datasets"]):
-        raise ValueError(
-            "model.cond_input.enabled requires a climbing_corpus dataset in "
-            "data.datasets (the features are keyed by corpus scene + object id)")
-    # Pinned in the config (never a buffer) so the conditioning a checkpoint was
-    # trained under is reproducible from its stored config alone.
-    for key in ("vel_mean", "vel_std", "acc_mean", "acc_std"):
-        row = cond["standardize"][key]
-        if (not isinstance(row, list) or len(row) != 3
-                or not all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                           and math.isfinite(float(v)) for v in row)):
-            raise ValueError(
-                f"model.cond_input.standardize.{key} must be a finite 3-list "
-                "(root-axis xyz)")
-    for key in ("vel_std", "acc_std"):
-        if any(float(v) <= 0 for v in cond["standardize"][key]):
-            raise ValueError(f"model.cond_input.standardize.{key} entries must be positive")
-
-
 
 
 def _validate_semantics(cfg: dict) -> None:
@@ -1289,7 +1225,6 @@ def _validate_semantics(cfg: dict) -> None:
     _validate_contact_consistency(cfg)
     _validate_force_consistency(cfg)
     _validate_keypoint_supervision(cfg)
-    _validate_cond_input(cfg, contact_enabled)
 
     if cfg["train"]["freeze_contact"]:
         if not contact_enabled:
