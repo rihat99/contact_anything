@@ -32,7 +32,10 @@ from ..targets import TargetSpec, validate_targets
 from .climbing_corpus import (
     COND_FEATURE_DIM,
     FORCE_GROUP_NAMES,
-    KP_JOINT_NAMES,
+    NUM_MHR70,
+    NUM_MHR_BONES,
+    NUM_MHR_SCALES,
+    NUM_SUP_VERTICES,
     MOTION_JOINT_NAMES,
     NUM_MOTION_JOINTS,
     ClimbingCorpusDataset,
@@ -256,6 +259,10 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec,
             torch.as_tensor(f["motion_rot"], dtype=torch.float32)
             if "motion_rot" in f else torch.eye(3, dtype=torch.float32)
             for f in frames], dim=0)                                       # [B, 3, 3]
+        out["motion_lin_rot"] = torch.stack([
+            torch.as_tensor(f["motion_lin_rot"], dtype=torch.float32)
+            if "motion_lin_rot" in f else torch.eye(3, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 3, 3]
         out["motion_omega"] = torch.stack([
             torch.as_tensor(f["motion_omega"], dtype=torch.float32)
             if "motion_omega" in f else torch.zeros(3, dtype=torch.float32)
@@ -281,19 +288,58 @@ def make_collate(image_size: Tuple[int, int], spec: TargetSpec,
         out["pose_valid"] = torch.tensor(
             [bool(f.get("pose_valid", False)) for f in frames],
             dtype=torch.bool)                                              # [B]
+        # Per-person MHR identity coefficients (mhr_1 v2), repeated on every
+        # row of the clip; pose_valid gates its use.
+        out["pose_identity"] = torch.stack([
+            torch.as_tensor(f["pose_identity"], dtype=torch.float32)
+            if "pose_identity" in f else torch.zeros(45, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 45]
+        # GT bone geometry (lbs slots 130..135) and the per-person 68
+        # scale slots — both directly comparable to mhr_model_params.
+        out["pose_gt_bones"] = torch.stack([
+            torch.as_tensor(f["pose_gt_bones"], dtype=torch.float32)
+            if "pose_gt_bones" in f
+            else torch.zeros(NUM_MHR_BONES, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 6]
+        out["pose_gt_scale"] = torch.stack([
+            torch.as_tensor(f["pose_gt_scale"], dtype=torch.float32)
+            if "pose_gt_scale" in f
+            else torch.zeros(NUM_MHR_SCALES, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 68]
+        # mhr_1 mesh-fit residual (cm) of the row — the optional confidence
+        # weight of the MHR-native metric losses. 0 = "no GT for this row",
+        # which the losses read as weight 1 only on rows their own valid bit
+        # already admits.
+        out["mhr_fit_err_cm"] = torch.tensor(
+            [float(f.get("mhr_fit_err_cm", 0.0)) for f in frames],
+            dtype=torch.float32)                                           # [B]
 
-        # Kindyn GT keypoints (climbing_corpus with load_keypoints): the 13
-        # KP_JOINT_NAMES joints in the metric world frame. Frames without
-        # keypoints fall back to zeros with kp_valid=False, so mixed batches
-        # collate.
-        n_kp = len(KP_JOINT_NAMES)
+        # MHR-native GT (climbing_corpus with load_keypoints): all 70 MHR70
+        # keypoints and the vertex subset, in the metric world frame. Frames
+        # without GT fall back to zeros with kp_valid/vert_valid=False, so mixed
+        # batches collate.
         out["kp3d_world"] = torch.stack([
             torch.as_tensor(f["kp3d_world"], dtype=torch.float32)
-            if "kp3d_world" in f else torch.zeros(n_kp, 3, dtype=torch.float32)
-            for f in frames], dim=0)                                       # [B, 13, 3] world
+            if "kp3d_world" in f else torch.zeros(NUM_MHR70, 3, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, 70, 3] world
         out["kp_valid"] = torch.tensor(
             [bool(f.get("kp_valid", False)) for f in frames],
             dtype=torch.bool)                                              # [B]
+        out["vert_gt_world"] = torch.stack([
+            torch.as_tensor(f["vert_gt_world"], dtype=torch.float32)
+            if "vert_gt_world" in f
+            else torch.zeros(NUM_SUP_VERTICES, 3, dtype=torch.float32)
+            for f in frames], dim=0)                                       # [B, V, 3] world
+        out["vert_valid"] = torch.tensor(
+            [bool(f.get("vert_valid", False)) for f in frames],
+            dtype=torch.bool)                                              # [B]
+        # Scene-constant subset indices into pred_vertices — ONE row, not a
+        # per-frame stack. The arange fallback is in-range (so the loss's gather
+        # never errors) and inert, since those frames carry vert_valid=False.
+        idx = next((f["vert_indices"] for f in frames if "vert_indices" in f), None)
+        out["vert_indices"] = (
+            torch.arange(NUM_SUP_VERTICES, dtype=torch.long) if idx is None
+            else torch.as_tensor(idx, dtype=torch.long))                   # [V]
 
         # Input-side conditioning feature (climbing_corpus with cond_features_path):
         # standardized root-frame smoothed vel/acc + gravity direction + validity
@@ -506,6 +552,9 @@ def make_loaders(
 
     if corpus_specs:
         clips_per_batch = max(1, frames_per_batch // clip_len)
+        eval_full = bool(seq.get("eval_full_scenes", False))
+        eval_clips_per_batch = 1 if eval_full else clips_per_batch
+        eval_max_frames = seq.get("eval_max_frames", None)
         cond_cfg = cfg["model"]["cond_input"]
         for s in corpus_specs:
             ccfg = yaml.safe_load(Path(s["config"]).read_text())["data"]
@@ -530,6 +579,8 @@ def make_loaders(
                 motion_outlier_acc_ms2=float(
                     cfg["motion_supervision"]["loss"]["outlier_acc_ms2"]),
                 motion_angular=motion_angular,
+                motion_root_source=str(
+                    cfg["motion_supervision"]["root_source"]),
                 load_pose=bool(cfg["pose_supervision"]["enabled"]),
                 load_keypoints=bool(cfg["keypoint_supervision"]["enabled"]),
                 # Input conditioning (model.cond_input): label-free, so it is a
@@ -552,7 +603,8 @@ def make_loaders(
                     root, scenes=train_scenes, split="train",
                     jitter=bool(seq["jitter"]), **common)
                 eval_ds = ClimbingCorpusDataset(
-                    root, scenes=eval_scenes, split="test", jitter=False, **common)
+                    root, scenes=eval_scenes, split="test", jitter=False,
+                    full_scenes=eval_full, eval_max_frames=eval_max_frames, **common)
                 out_manifest[key] = {
                     "train": sorted(train_scenes), "test": sorted(eval_scenes)}
                 if distributed_rank == 0:
@@ -573,7 +625,8 @@ def make_loaders(
                     root, scenes=train_scenes, split="train",
                     jitter=bool(seq["jitter"]), **common)
                 eval_ds = ClimbingCorpusDataset(
-                    root, scenes=eval_scenes, split="val", jitter=False, **common)
+                    root, scenes=eval_scenes, split="val", jitter=False,
+                    full_scenes=eval_full, eval_max_frames=eval_max_frames, **common)
                 out_manifest[key] = {"train": sorted(train_vids), "val": sorted(val_vids)}
                 if distributed_rank == 0:
                     print(
@@ -583,7 +636,7 @@ def make_loaders(
                         f"val={len(eval_ds)} (T={clip_len})")
             datasets_for_validation.extend((train_ds, eval_ds))
             train_parts.append((train_ds, clips_per_batch, True))
-            eval_parts.append((eval_ds, clips_per_batch, False))
+            eval_parts.append((eval_ds, eval_clips_per_batch, False))
 
     validate_targets(cfg, datasets_for_validation)
 

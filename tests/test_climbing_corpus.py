@@ -15,6 +15,11 @@ from contact.config import load_config
 from contact.data.climbing_corpus import (
     FORCE_GROUPS_52,
     COND_FEATURE_DIM,
+    MOTION_MHR70_INDICES,
+    NUM_MHR70,
+    NUM_MHR_BONES,
+    NUM_MHR_SCALES,
+    NUM_SUP_VERTICES,
     ClimbingCorpusDataset,
     FORCE_GROUP_NAMES,
     GRAVITY_WORLD,
@@ -62,6 +67,70 @@ def _default_labels52(n_people: int, n_frames: int) -> tuple[np.ndarray, np.ndar
     return jc, conf
 
 
+def _write_mhr(
+    human: Path, oids: np.ndarray, valid: np.ndarray, *,
+    nan_frames: tuple[int, ...] = (),
+) -> None:
+    """Write synthetic ``mhr_1.npz`` (converter v3) + ``mhr_sup_1.npz`` (schema 1).
+
+    Every array is an exact affine ramp in (person, frame, element) so the tests
+    can assert values rather than shapes:
+
+    * ``kp_world[p, n, k]  = [1 + 0.01 k, 2 + 0.1 n, 3 + p]``
+    * ``verts_world[p,n,v] = [4 + 0.001 v, 5 + 0.1 n, 6 + p]``
+    * ``lbs_params[p, n]`` — bones (130..135) ``0.1 (1 + j) + 0.01 n``,
+      scales (136..203) ``0.02 (1 + j) + p`` (per-person CONSTANT, as in the
+      real archives)
+    * ``fit_err_cm[p, n] = 0.5 + 0.1 n``
+
+    ``nan_frames`` NaNs those frames of ``kp_world``/``verts_world``, which is
+    how the real files mark rows the fit did not cover.
+    """
+    n_people, n_frames = valid.shape
+    persons = np.arange(n_people, dtype=np.float32).reshape(n_people, 1, 1)
+    frames_f = np.arange(n_frames, dtype=np.float32).reshape(1, n_frames, 1)
+    zeros3 = np.zeros((n_people, n_frames, 1), np.float32)
+
+    k_idx = np.arange(NUM_MHR70, dtype=np.float32).reshape(1, 1, NUM_MHR70)
+    kp = np.stack(np.broadcast_arrays(
+        1.0 + 0.01 * k_idx + zeros3, 2.0 + 0.1 * frames_f + 0.0 * k_idx,
+        3.0 + persons + 0.0 * k_idx), axis=-1).astype(np.float32)
+    v_idx = np.arange(NUM_SUP_VERTICES, dtype=np.float32).reshape(
+        1, 1, NUM_SUP_VERTICES)
+    verts = np.stack(np.broadcast_arrays(
+        4.0 + 0.001 * v_idx + zeros3, 5.0 + 0.1 * frames_f + 0.0 * v_idx,
+        6.0 + persons + 0.0 * v_idx), axis=-1).astype(np.float32)
+    for f in nan_frames:
+        kp[:, f] = np.nan
+        verts[:, f] = np.nan
+
+    lbs = np.zeros((n_people, n_frames, 204), np.float32)
+    lbs[..., 130:136] = (
+        0.1 * (1.0 + np.arange(NUM_MHR_BONES, dtype=np.float32)) + 0.01 * frames_f)
+    lbs[..., 136:204] = (
+        0.02 * (1.0 + np.arange(NUM_MHR_SCALES, dtype=np.float32)) + persons)
+    q_world = np.zeros((n_people, n_frames, 132), np.float32)
+    # A deliberately foot-level free-flyer root: the loader must NOT use it as
+    # the motion root (the real MHR root sits ~0.93 m from the hips).
+    q_world[..., 1] = 9.0 + 0.1 * frames_f[..., 0]
+    q_world[..., 3:7] = QUAT_Z90
+    np.savez(
+        human / "mhr_1.npz", object_ids=oids, q_world=q_world, valid_mask=valid,
+        identity=(0.03 * (1.0 + np.arange(45, dtype=np.float32))
+                  + persons[:, :, 0]).astype(np.float32),
+        lbs_params=lbs,
+        fit_err_cm=np.broadcast_to(
+            0.5 + 0.1 * frames_f[..., 0], (n_people, n_frames)).astype(np.float32),
+        num_frames=np.int32(n_frames), fps=np.float32(FPS),
+        converter_version=np.int32(3))
+    np.savez(
+        human / "mhr_sup_1.npz", kp_world=kp, verts_world=verts,
+        vert_indices=(np.arange(NUM_SUP_VERTICES, dtype=np.int64) * 7),
+        kp_vs_kindyn_med_cm=np.full(n_people, 3.1, np.float32),
+        schema_version=np.int32(1), source_converter_version=np.int32(3),
+        num_frames=np.int32(n_frames), fps=np.float32(FPS))
+
+
 def _write_scene(
     root: Path,
     sid: str,
@@ -71,6 +140,7 @@ def _write_scene(
     invalid_frames: tuple[int, ...] = (),
     kindyn_id_order: list[int] | None = None,
     with_annotation: bool = False,
+    mhr_nan_frames: tuple[int, ...] = (),
 ) -> None:
     """Write one synthetic corpus scene (features + frames + masks)."""
     shard = scene_shard(sid)
@@ -144,10 +214,13 @@ def _write_scene(
         force_confidence=np.full((n_people, N_FRAMES), 0.9, np.float32)[order],
         gravity_world=np.array([0.0, 1.0, 0.0], np.float32),
         q=q[order], total_mass=masses[order],
+        num_frames=np.int64(N_FRAMES), fps=np.float32(FPS),
         valid_mask=valid[order], joint_contact=jc52[order],
         joint_names=np.array(joint_names), joints_world=joints_world[order],
         betas=np.zeros((n_people, 10), np.float32),
     )
+
+    _write_mhr(human, oids, valid, nan_frames=mhr_nan_frames)
 
     bbox = np.tile(np.array([2, 3, 20, 30], np.float32), (n_people, N_FRAMES, 1))
     np.savez(sam3 / "bboxes.npz", bboxes_per_obj=bbox.astype(np.int32),
@@ -342,11 +415,11 @@ def test_windowing_tiles_and_val_terminal_window(corpus):
     train = ClimbingCorpusDataset(
         corpus, scenes=["vidA_0000"], split="train", frames_per_clip=3,
         frame_stride=1, jitter=False)
-    assert [(base, rng) for _, _, base, rng in train._items] == [(0, 3), (3, 3)]
+    assert [(base, rng) for _, _, base, rng, _ in train._items] == [(0, 3), (3, 3)]
     # Val appends the terminal window 5 so the tail frames are scored.
     val = ClimbingCorpusDataset(
         corpus, scenes=["vidA_0000"], split="val", frames_per_clip=3, frame_stride=1)
-    assert [base for _, _, base, _ in val._items] == [0, 3, 5]
+    assert [base for _, _, base, _, _ in val._items] == [0, 3, 5]
     positions = [f["frame_position"] for f in val[2]]
     assert positions == [5, 6, 7]
     assert [f["frame_pos_sec"] for f in val[2]] == pytest.approx([0.0, 1 / FPS, 2 / FPS])
@@ -357,7 +430,7 @@ def test_invalid_and_degenerate_frames_skip_windows(corpus):
     ds = ClimbingCorpusDataset(
         corpus, scenes=["vidB_0000"], split="train", frames_per_clip=3,
         frame_stride=1, jitter=False)
-    assert [base for _, _, base, _ in ds._items] == [0]     # window [3,4,5] skipped
+    assert [base for _, _, base, _, _ in ds._items] == [0]  # window [3,4,5] skipped
 
     # A valid-tracked frame with a degenerate bbox is demoted to invalid.
     sam3 = corpus / "features" / "sam3" / "vi" / "dA" / "vidA_0000"
@@ -370,7 +443,7 @@ def test_invalid_and_degenerate_frames_skip_windows(corpus):
         corpus, scenes=["vidA_0000"], split="train", frames_per_clip=3,
         frame_stride=1, jitter=False)
     assert not bool(ds._scenes["vidA_0000"]["valid_mask"][0, 4])
-    assert [base for _, _, base, _ in ds._items] == [0]
+    assert [base for _, _, base, _, _ in ds._items] == [0]
 
 
 def test_jitter_is_stateless_and_falls_back_over_gaps(corpus):
@@ -382,11 +455,11 @@ def test_jitter_is_stateless_and_falls_back_over_gaps(corpus):
         corpus, scenes=["vidB_0000"], split="train", frames_per_clip=2,
         frame_stride=1, jitter=True, seed=7)
     # Windows [0,1], [2,3], [4,5] survive; [6,7] contains the invalid frame.
-    assert [base for _, _, base, _ in ds._items] == [0, 2, 4]
+    assert [base for _, _, base, _, _ in ds._items] == [0, 2, 4]
     for epoch in (0, 1, 5):
         ds.set_epoch(epoch)
         twin.set_epoch(epoch)
-        for index, (_, _, base, jitter_range) in enumerate(ds._items):
+        for index, (_, _, base, jitter_range, _) in enumerate(ds._items):
             start = ds._window_start(base, jitter_range, index)
             assert base <= start < base + jitter_range
             assert start == twin._window_start(base, jitter_range, index)
@@ -563,71 +636,154 @@ def test_two_person_scene_aligns_kindyn_rows_by_object_id(corpus):
 
 # ------------------------------------------------------------------ keypoints
 
-def test_keypoints_select_named_joints_by_name(corpus):
-    """load_keypoints emits the 13 KP_JOINT_NAMES rows of kindyn joints_world,
-    resolved BY NAME — a permuted joint axis changes nothing, a missing name is
-    a hard error."""
+def test_keypoints_and_vertices_come_from_mhr_sup(corpus):
+    """load_keypoints emits all 70 MHR70 keypoints and the vertex subset from
+    mhr_sup_1.npz — the MHR-native GT — plus the mhr_1 mesh-fit residual."""
     ds = ClimbingCorpusDataset(
         corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
         frame_stride=2, jitter=False, load_images=False, load_keypoints=True)
-    frame = ds[0][0]
-    assert frame["kp3d_world"].shape == (13, 3)
+    frame = ds[0][0]                                     # scene frame 0, person 0
+    assert frame["kp3d_world"].shape == (NUM_MHR70, 3)
     assert frame["kp3d_world"].dtype == torch.float32
-    assert frame["kp_valid"] is True
+    assert frame["vert_gt_world"].shape == (NUM_SUP_VERTICES, 3)
+    assert frame["vert_indices"].shape == (NUM_SUP_VERTICES,)
+    assert frame["vert_indices"].dtype == torch.int64
+    assert frame["kp_valid"] is True and frame["vert_valid"] is True
     assert frame["cam_from_world"].shape == (4, 4)       # extrinsics ride along
-    # Every fixture joint sits at the pelvis [1, 2, 3] except the two poked ones:
-    # the left wrist (+0.5 x) and the neck (+0.4 z).
-    expected = torch.tensor([1.0, 2.0, 3.0]).repeat(13, 1)
-    expected[KP_JOINT_NAMES.index("left_wrist"), 0] += 0.5
-    expected[KP_JOINT_NAMES.index("neck"), 2] += 0.4
-    torch.testing.assert_close(frame["kp3d_world"], expected, atol=1e-6, rtol=0)
+
+    k = torch.arange(NUM_MHR70, dtype=torch.float32)
+    expected_kp = torch.stack(
+        [1.0 + 0.01 * k, torch.full((NUM_MHR70,), 2.0), torch.full((NUM_MHR70,), 3.0)],
+        dim=-1)
+    torch.testing.assert_close(frame["kp3d_world"], expected_kp, atol=1e-6, rtol=0)
+    v = torch.arange(NUM_SUP_VERTICES, dtype=torch.float32)
+    expected_v = torch.stack(
+        [4.0 + 0.001 * v, torch.full((NUM_SUP_VERTICES,), 5.0),
+         torch.full((NUM_SUP_VERTICES,), 6.0)], dim=-1)
+    torch.testing.assert_close(frame["vert_gt_world"], expected_v, atol=1e-6, rtol=0)
+    torch.testing.assert_close(
+        frame["vert_indices"], torch.arange(NUM_SUP_VERTICES) * 7)
+    assert frame["mhr_fit_err_cm"] == pytest.approx(0.5)
 
     plain = ClimbingCorpusDataset(
         corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
         frame_stride=2, jitter=False, load_images=False)[0][0]
-    assert "kp3d_world" not in plain and "kp_valid" not in plain
+    for key in ("kp3d_world", "kp_valid", "vert_gt_world", "vert_valid",
+                "vert_indices", "mhr_fit_err_cm"):
+        assert key not in plain
 
+
+def test_keypoint_path_never_reads_kindyn(corpus):
+    """The MHR-native swap removed the last kindyn read from the keypoint path:
+    the loader must work with kindyn_1.npz gone entirely."""
     human = corpus / "features" / "human_optim" / "vi" / "dA" / "vidA_0000"
-    with np.load(human / "kindyn_1.npz", allow_pickle=True) as npz:
-        kindyn = dict(npz)
-    perm = np.roll(np.arange(52), 5)
-    kindyn["joint_names"] = np.asarray(kindyn["joint_names"])[perm]
-    kindyn["joints_world"] = np.asarray(kindyn["joints_world"])[:, :, perm]
-    np.savez(human / "kindyn_1.npz", **kindyn)
-    permuted = ClimbingCorpusDataset(
+    (human / "kindyn_1.npz").rename(human / "kindyn_1.npz.moved")
+    frame = ClimbingCorpusDataset(
         corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
-        frame_stride=2, jitter=False, load_images=False, load_keypoints=True)[0][0]
-    torch.testing.assert_close(permuted["kp3d_world"], expected, atol=1e-6, rtol=0)
+        frame_stride=2, jitter=False, load_images=False, load_keypoints=True,
+        load_pose=True)[0][0]
+    assert frame["kp3d_world"].shape == (NUM_MHR70, 3)
+    assert frame["pose_gt_bones"].shape == (NUM_MHR_BONES,)
 
-    kindyn["joint_names"] = np.asarray(
-        ["nope" if str(n) == "neck" else str(n) for n in kindyn["joint_names"]])
-    np.savez(human / "kindyn_1.npz", **kindyn)
-    with pytest.raises(ValueError, match="missing \\['neck'\\]"):
+
+def test_kp_and_vert_valid_follow_mhr_fit_coverage(corpus):
+    """NaN rows of mhr_sup_1 (the frames the fit did not cover) come back as
+    exact zeros with the bit cleared, independently per array."""
+    human = corpus / "features" / "human_optim" / "vi" / "dA" / "vidA_0000"
+    with np.load(human / "mhr_sup_1.npz") as npz:
+        sup = dict(npz)
+    sup["kp_world"] = sup["kp_world"].copy()
+    sup["kp_world"][0, 1] = np.nan                       # keypoints lost on frame 1
+    sup["verts_world"] = sup["verts_world"].copy()
+    sup["verts_world"][0, 2] = np.nan                    # vertices lost on frame 2
+    np.savez(human / "mhr_sup_1.npz", **sup)
+    clip = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="train", frames_per_clip=N_FRAMES,
+        frame_stride=1, jitter=False, load_images=False, load_keypoints=True)[0]
+    assert [f["kp_valid"] for f in clip[:4]] == [True, False, True, True]
+    assert [f["vert_valid"] for f in clip[:4]] == [True, True, False, True]
+    assert float(clip[1]["kp3d_world"].abs().sum()) == 0.0
+    assert float(clip[2]["vert_gt_world"].abs().sum()) == 0.0
+    assert float(clip[3]["kp3d_world"].abs().sum()) > 0.0
+    assert float(clip[3]["vert_gt_world"].abs().sum()) > 0.0
+
+
+def test_mhr_sup_schema_is_pinned(corpus):
+    """A schema bump is a hard error, never a silent shape mismatch."""
+    human = corpus / "features" / "human_optim" / "vi" / "dA" / "vidA_0000"
+    with np.load(human / "mhr_sup_1.npz") as npz:
+        sup = dict(npz)
+    sup["schema_version"] = np.int32(2)
+    np.savez(human / "mhr_sup_1.npz", **sup)
+    with pytest.raises(ValueError, match="mhr_sup_1 schema 2"):
         ClimbingCorpusDataset(
             corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
             frame_stride=2, jitter=False, load_images=False, load_keypoints=True)
 
 
-def test_kp_valid_follows_kindyn_coverage_and_finiteness(corpus):
-    """A frame the kindyn solve does not cover, and one with a non-finite
-    coordinate, both come back as exact zeros with the bit cleared."""
-    human = corpus / "features" / "human_optim" / "vi" / "dA" / "vidA_0000"
-    with np.load(human / "kindyn_1.npz", allow_pickle=True) as npz:
-        kindyn = dict(npz)
-    kindyn["valid_mask"] = kindyn["valid_mask"].copy()
-    kindyn["valid_mask"][0, 1] = False                  # solve skipped frame 1
-    kindyn["joints_world"] = kindyn["joints_world"].copy()
-    kindyn["joints_world"][0, 2, 12, 2] = np.nan        # neck lost on frame 2
-    np.savez(human / "kindyn_1.npz", **kindyn)
-    # Only the kindyn coverage changed — the contacts valid_mask still tiles the
-    # scene, so all N frames are windowed and the bit is the only difference.
+def test_pose_targets_carry_bones_scale_and_fit_err(corpus):
+    """load_pose adds the GT bone-geometry slots (per-person median, constant on
+    every frame), the 68 scale slots (per person, constant) and the fit residual."""
     clip = ClimbingCorpusDataset(
         corpus, scenes=["vidA_0000"], split="train", frames_per_clip=N_FRAMES,
-        frame_stride=1, jitter=False, load_images=False, load_keypoints=True)[0]
-    assert [f["kp_valid"] for f in clip[:4]] == [True, False, False, True]
-    assert float(clip[1]["kp3d_world"].abs().sum()) == 0.0
-    assert float(clip[2]["kp3d_world"].abs().sum()) == 0.0
-    assert float(clip[3]["kp3d_world"].abs().sum()) > 0.0
+        frame_stride=1, jitter=False, load_images=False, load_pose=True)[0]
+    j = torch.arange(NUM_MHR_BONES, dtype=torch.float32)
+    # The fixture ramps the bone slots by 0.01 per frame, but a body's proportions
+    # do not change within a scene: that spread is converter fit freedom, so the
+    # target is the person's MEDIAN over the 8 valid rows (median n = 3.5) served
+    # unchanged on every frame.
+    expected_bones = 0.1 * (1.0 + j) + 0.035
+    for row in (0, 3, N_FRAMES - 1):
+        torch.testing.assert_close(
+            clip[row]["pose_gt_bones"], expected_bones, atol=1e-6, rtol=0)
+    expected_scale = 0.02 * (1.0 + torch.arange(NUM_MHR_SCALES, dtype=torch.float32))
+    for row in (0, 3, N_FRAMES - 1):                     # per-person CONSTANT
+        torch.testing.assert_close(
+            clip[row]["pose_gt_scale"], expected_scale, atol=1e-6, rtol=0)
+    assert clip[0]["mhr_fit_err_cm"] == pytest.approx(0.5)
+    assert clip[3]["mhr_fit_err_cm"] == pytest.approx(0.8)
+
+
+def test_motion_root_source_mhr_uses_the_mhr_hips_and_root_rotation(corpus):
+    """root_source='mhr' differentiates the (MEAN-HIPS position, root
+    quaternion) free-flyer — the same construction motion_consistency builds
+    from the prediction — not q_world's foot-level root."""
+    common = dict(
+        scenes=["vidA_0000"], split="train", frames_per_clip=N_FRAMES,
+        frame_stride=1, jitter=False, load_images=False, load_motion=True,
+        motion_joint_names=["pelvis"], motion_target_smooth_sec=0.0)
+    kin = ClimbingCorpusDataset(corpus, motion_root_source="kindyn", **common)[0]
+    mhr = ClimbingCorpusDataset(corpus, motion_root_source="mhr", **common)[0]
+    frame = mhr[3]
+    assert frame["motion_valid"] is True
+    # The kindyn pelvis is static in the fixture -> zero velocity. The MHR hips
+    # ramp +0.1 m/frame along world y = 2.5 m/s at 25 fps, which R(QUAT_Z90)^T
+    # (world -> root) maps onto root +x.
+    torch.testing.assert_close(
+        frame["motion_gt"][0, :3], torch.tensor([2.5, 0.0, 0.0]), atol=1e-4, rtol=0)
+    torch.testing.assert_close(
+        kin[3]["motion_gt"][0, :3], torch.zeros(3), atol=1e-6, rtol=0)
+    # mean-hips x = 1 + 0.01 * (9 + 10) / 2; the foot-level q_world root (y = 9.3
+    # on this frame) is deliberately NOT what lands here.
+    torch.testing.assert_close(
+        frame["motion_root_pos"], torch.tensor([1.095, 2.3, 3.0]), atol=1e-4, rtol=0)
+    torch.testing.assert_close(
+        frame["motion_rot"], torch.as_tensor(quat_xyzw_to_matrix(QUAT_Z90)),
+        atol=1e-6, rtol=0)
+    # The six limb slots read the MHR70 anchor columns of kp_world.
+    limbs = ClimbingCorpusDataset(
+        corpus, motion_root_source="mhr",
+        **{**common, "motion_joint_names": None})[0][3]["motion_gt"]
+    assert limbs.shape == (7, 6)
+    assert MOTION_MHR70_INDICES == (62, 41, 15, 18, 17, 20)
+
+
+def test_motion_root_source_is_validated(corpus):
+    with pytest.raises(ValueError, match="motion_root_source"):
+        ClimbingCorpusDataset(
+            corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
+            frame_stride=1, jitter=False, load_images=False,
+            motion_root_source="smplx")
 
 
 def _corpus_run_config(run_dir: Path, corpus: Path, extra: str = "") -> dict:
@@ -637,7 +793,7 @@ def _corpus_run_config(run_dir: Path, corpus: Path, extra: str = "") -> dict:
     dataset_yaml.write_text(f"name: climbing_corpus\ndata:\n  root: {corpus}\n")
     run_yaml = run_dir / "run.yaml"
     run_yaml.write_text(
-        "base: configs/old/climbing_videos_joint.yaml\n"
+        "base: tests/fixtures/climbing_videos_joint.yaml\n"
         f"data: {{datasets: [{{name: climbing_corpus, config: {dataset_yaml}}}]}}\n"
         + extra)
     return load_config(run_yaml)
@@ -716,7 +872,7 @@ def test_clip_collates_into_training_batch(corpus):
     ds = ClimbingCorpusDataset(
         corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
         frame_stride=2, jitter=False, load_forces=True)
-    cfg = load_config(REPO / "configs" / "old" / "climbing_videos_joint.yaml")
+    cfg = load_config(REPO / "tests" / "fixtures" / "climbing_videos_joint.yaml")
     collate = make_collate((256, 256), TargetSpec.from_config(cfg))
     batch = collate([ds[0]])
     assert batch["img"].shape == (2, 1, 3, 256, 256)
@@ -740,7 +896,7 @@ def test_clip_collates_kindyn6_targets(corpus):
     ds = ClimbingCorpusDataset(
         corpus, scenes=["vidA_0000"], split="train", frames_per_clip=2,
         frame_stride=2, jitter=False, load_forces=True)
-    cfg = load_config(REPO / "configs" / "old" / "climbing_corpus_joint_force_cond_sum1_postdec.yaml")
+    cfg = load_config(REPO / "tests" / "fixtures" / "joint_force_cond_postdec.yaml")
     collate = make_collate((256, 256), TargetSpec.from_config(cfg))
     joint = collate([ds[0]])["targets"]["joint"]
     assert joint["gt"].shape == (2, 6)
@@ -824,7 +980,7 @@ def test_cond_features_require_standardization(corpus, tmp_path):
 
 
 def test_cond_feat_collates_with_and_without_features(corpus, tmp_path):
-    cfg = load_config(REPO / "configs" / "old" / "climbing_corpus_joint_force_cond_sum1_postdec.yaml")
+    cfg = load_config(REPO / "tests" / "fixtures" / "joint_force_cond_postdec.yaml")
     collate = make_collate((256, 256), TargetSpec.from_config(cfg))
     common = dict(
         scenes=["vidA_0000"], split="train", frames_per_clip=2, frame_stride=2,
@@ -856,10 +1012,10 @@ def test_cond_feat_collates_with_and_without_features(corpus, tmp_path):
 @requires_corpus
 def test_real_scene_discovery_counts():
     # 2026-08-27 corpus update (better contacts/forces/poses): 864 train and
-    # 108 curated test scenes; annotation is ongoing (32 as of 2026-08-28).
+    # 108 curated test scenes; annotation COMPLETE since 2026-08-29 (was 61).
     assert len(list_corpus_scenes(CORPUS, "train")) == 864
     assert len(list_corpus_scenes(CORPUS, "test")) == 108
-    assert len(list_annotated_test_scenes(CORPUS)) == 32
+    assert len(list_annotated_test_scenes(CORPUS)) == 108
 
 
 def _real_scene() -> str:
@@ -950,10 +1106,107 @@ def test_real_clip_collates_without_reading_frames():
     for frame in clip:                      # frames/ extraction may be in flight
         frame["image"] = rng.integers(0, 255, (64, 48, 3), np.uint8)
         frame["mask"] = None
-    cfg = load_config(REPO / "configs" / "old" / "climbing_videos_joint.yaml")
+    cfg = load_config(REPO / "tests" / "fixtures" / "climbing_videos_joint.yaml")
     collate = make_collate((256, 256), TargetSpec.from_config(cfg))
     batch = collate([clip])
     assert batch["img"].shape == (2, 1, 3, 256, 256)
     assert batch["targets"]["joint"]["gt"].shape == (2, 4)
     assert bool(batch["cam_valid"].all())
     assert batch["frame_valid"].tolist() == [True, True]
+
+
+def test_full_scenes_emits_one_longest_run_clip(corpus):
+    # N=8 all valid: one clip per person covering the whole scene.
+    ds = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="val", frames_per_clip=3,
+        frame_stride=1, jitter=False, full_scenes=True)
+    assert [(base, t) for _, _, base, _, t in ds._items] == [(0, 8)]
+    clip = ds[0]
+    assert [f["frame_position"] for f in clip] == list(range(8))
+
+    # An internal gap: the longest contiguous run wins.
+    _write_scene(corpus, "vidB_0000", invalid_frames=(2,))
+    ds = ClimbingCorpusDataset(
+        corpus, scenes=["vidB_0000"], split="val", frames_per_clip=3,
+        frame_stride=1, jitter=False, full_scenes=True)
+    assert [(base, t) for _, _, base, _, t in ds._items] == [(3, 5)]
+
+    # Stride shortens the clip: T = (run_len - 1) // stride + 1.
+    ds = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="val", frames_per_clip=3,
+        frame_stride=2, jitter=False, full_scenes=True)
+    assert [(base, t) for _, _, base, _, t in ds._items] == [(0, 4)]
+    assert [f["frame_position"] for f in ds[0]] == [0, 2, 4, 6]
+
+
+def test_full_scenes_rejected_for_train_split(corpus):
+    with pytest.raises(ValueError, match="eval protocol"):
+        ClimbingCorpusDataset(
+            corpus, scenes=["vidA_0000"], split="train", frames_per_clip=3,
+            full_scenes=True)
+
+
+def test_full_scenes_eval_max_frames_caps_the_clip(corpus):
+    ds = ClimbingCorpusDataset(
+        corpus, scenes=["vidA_0000"], split="val", frames_per_clip=3,
+        frame_stride=1, jitter=False, full_scenes=True, eval_max_frames=5)
+    assert [(base, t) for _, _, base, _, t in ds._items] == [(0, 5)]
+    assert [f["frame_position"] for f in ds[0]] == list(range(5))
+
+
+def test_gravity_view_targets_are_the_smoothed_twist_re_expressed(corpus):
+    """`gravity_view` changes the AXES of the pelvis linear target, nothing else.
+
+    Lifting both conventions back to the world with their own rotations must give
+    the same vectors (with the twist's Coriolis term on the acceleration side),
+    which pins the einsum directions, the Coriolis sign, and — because the
+    comparison is against the SMOOTHED twist — the fact that the GV branch
+    differentiates the smoothed trajectory rather than the raw one.
+    """
+    human = corpus / "features" / "human_optim" / "vi" / "dA" / "vidA_0000"
+    with np.load(human / "kindyn_1.npz", allow_pickle=True) as npz:
+        kindyn = dict(npz)
+    tilted = np.array([0.25, 0.95, -0.18], np.float32)
+    tilted /= np.linalg.norm(tilted)
+    kindyn["gravity_world"] = tilted
+    np.savez(human / "kindyn_1.npz", **kindyn)
+    # Spin the MHR root: with the fixture's constant orientation omega is zero and
+    # the Coriolis term of the world lift would be untestable.
+    with np.load(human / "mhr_1.npz", allow_pickle=True) as npz:
+        mhr = dict(npz)
+    angle = 0.15 * np.arange(N_FRAMES, dtype=np.float32)
+    mhr["q_world"][:, :, 3:7] = np.stack(
+        [np.zeros_like(angle), np.zeros_like(angle),
+         np.sin(angle / 2), np.cos(angle / 2)], axis=-1)[None]      # xyzw about z
+    np.savez(human / "mhr_1.npz", **mhr)
+
+    common = dict(
+        scenes=["vidA_0000"], split="train", frames_per_clip=N_FRAMES, frame_stride=1,
+        jitter=False, load_images=False, load_motion=True, motion_root_source="mhr",
+        motion_joint_names=["pelvis"], motion_target_smooth_sec=0.12)
+    twist = ClimbingCorpusDataset(
+        corpus, motion_root_convention="twist", **common)._scenes["vidA_0000"]
+    gview = ClimbingCorpusDataset(
+        corpus, motion_root_convention="gravity_view", **common)._scenes["vidA_0000"]
+
+    valid = gview["motion_valid"]
+    assert valid.any(), "fixture has no supervised motion row to compare"
+    # The GV frame is a genuinely different frame (else this test is vacuous).
+    assert not np.allclose(gview["motion_lin_rot"], gview["motion_rot"], atol=1e-3)
+    np.testing.assert_allclose(gview["motion_rot"], twist["motion_rot"], atol=1e-6)
+
+    def to_world(scene, rot_key, columns, coriolis):
+        vec = scene["motion_gt"][:, :, 0, columns]
+        if coriolis:
+            vec = vec + np.cross(scene["motion_omega"], scene["motion_gt"][:, :, 0, 0:3])
+        return np.einsum("pnij,pnj->pni", scene[rot_key], vec)
+
+    for columns, coriolis in ((slice(0, 3), False), (slice(3, 6), True)):
+        gv_world = to_world(gview, "motion_lin_rot", columns, False)
+        twist_world = to_world(twist, "motion_rot", columns, coriolis)
+        np.testing.assert_allclose(gv_world[valid], twist_world[valid], atol=1e-4)
+
+    # Channel 1 of the GV target IS the downward component of the world velocity.
+    world_vel = to_world(twist, "motion_rot", slice(0, 3), False)
+    np.testing.assert_allclose(
+        gview["motion_gt"][:, :, 0, 1][valid], (world_vel @ tilted)[valid], atol=1e-4)

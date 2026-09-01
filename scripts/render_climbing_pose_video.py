@@ -8,8 +8,9 @@ loaded — and writes an mp4 with two panels per frame:
     left  = frozen model      right = finetuned checkpoint
 
 Each panel overlays the predicted MHR mesh (painter-sorted, lambert-shaded,
-alpha-blended) plus the kindyn GT 13-keypoint dots (world joints lifted through
-the per-frame extrinsics and projected with the per-frame intrinsics). A
+alpha-blended) plus the GT MHR70 keypoint dots (``mhr_sup_1`` world keypoints
+lifted through the per-frame extrinsics and projected with the per-frame
+intrinsics). A
 per-scene trajectory PNG plots mean-hips camera depth (GT vs frozen vs tuned)
 and per-frame 3D / 2D keypoint errors, and ``summary.json`` aggregates the
 per-scene mean errors for both passes.
@@ -43,14 +44,51 @@ import render_climbing_video_contacts as rcv
 
 from contact import checkpoint as ckpt_io
 from contact.config import load_config
-from contact.data.climbing_corpus import KP_JOINT_NAMES, ClimbingCorpusDataset
+from contact.data.climbing_corpus import NUM_MHR70, ClimbingCorpusDataset
 from contact.data.collate import batch_to_device, make_collate
 from contact.engine import forward_model
-from contact.keypoint_supervision import KP_MHR70_INDICES
 from contact.model import build_model
 from contact.targets import TargetSpec
 
-_HIP_POSITIONS = (6, 7)  # left_hip / right_hip rows of KP_JOINT_NAMES
+#: MHR70 left/right hip rows. GT and prediction are both MHR70 since the
+#: MHR-native supervision swap (the loader's ``kp3d_world`` is 70 keypoints from
+#: ``mhr_sup_1.npz``), so the two sides share one index space.
+_HIP_POSITIONS = (9, 10)
+
+
+def full_scene_requests(
+    valid_mask: np.ndarray, stride: int, max_frames: int,
+) -> dict[int, list[tuple[int, tuple[int, ...], tuple[int, ...]]]]:
+    """Single-pass whole-run requests (the long-sequence/RoPE protocol).
+
+    Every maximal contiguous valid run yields ``stride`` offset passes (so every
+    valid frame is predicted exactly once, boundary-free within a pass), each
+    split into chunks of at most ``max_frames`` (GPU-memory cap, ~0.06-0.1
+    GiB/frame no-grad). Same return shape as ``sliding_window_requests``.
+    """
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+    requests: dict[int, list] = {}
+    for person, row in enumerate(valid_mask):
+        padded = np.concatenate([[False], row, [False]])
+        edges = np.flatnonzero(np.diff(padded.astype(np.int8)))
+        for run_start, run_end in zip(edges[::2], edges[1::2]):
+            for offset in range(min(stride, run_end - run_start)):
+                positions = np.arange(run_start + offset, run_end, stride)
+                for lo in range(0, len(positions), max_frames):
+                    seg = tuple(int(x) for x in positions[lo:lo + max_frames])
+                    requests.setdefault(len(seg), []).append(
+                        (person, seg, tuple(range(len(seg)))))
+    return requests
+
+
+def _scene_requests(args, data, seq_cfg) -> dict | None:
+    """Full-scene requests when --full-scene; None = sliding windows."""
+    if not args.full_scene:
+        return None
+    stride = seq_cfg["frame_stride"]
+    if stride == "auto":
+        stride = max(1, int(round(float(data["fps"]) / 25.0)))
+    return full_scene_requests(data["valid_mask"], int(stride), args.max_frames)
 
 MESH_COLOR = (208, 178, 130)      # BGR neutral steel blue
 GT_COLOR = (80, 220, 80)          # GT keypoint dots
@@ -61,6 +99,7 @@ MESH_ALPHA = 0.55
 def _predict_pose_pass(
     model, ds: ClimbingCorpusDataset, scene: str, batch_size: int,
     device: str, collate, seq_cfg: dict,
+    requests_by_t: dict | None = None,
 ) -> dict:
     """One full-scene pass; returns per-(person, frame) mesh + keypoint arrays."""
     data = ds._scenes[scene]
@@ -68,7 +107,7 @@ def _predict_pose_pass(
     fps = float(data["fps"])
     n_people, n_frames = data["valid_mask"].shape
     item_index = rcv._frame_index_map(ds, scene)
-    kp_idx = list(KP_MHR70_INDICES)
+    kp_idx = list(range(NUM_MHR70))
 
     out: dict = {}
 
@@ -78,8 +117,10 @@ def _predict_pose_pass(
         out["kp2d"] = np.full((n_people, n_frames, len(kp_idx), 2), np.nan, np.float32)
         out["kp3d_cam"] = np.full((n_people, n_frames, len(kp_idx), 3), np.nan, np.float32)
 
-    requests_by_t = rcv.sliding_window_requests(
-        data["valid_mask"], int(seq_cfg["frames_per_clip"]), int(seq_cfg["frame_stride"]))
+    if requests_by_t is None:
+        requests_by_t = rcv.sliding_window_requests(
+            data["valid_mask"], int(seq_cfg["frames_per_clip"]),
+            int(seq_cfg["frame_stride"]))
     for seq_len in sorted(requests_by_t):
         requests = requests_by_t[seq_len]
         for lo in tqdm(range(0, len(requests), batch_size),
@@ -191,8 +232,8 @@ def _panel(frame: np.ndarray, pass_data: dict, frame_pos: int, gt2d: np.ndarray 
 
 
 def _scene_gt(data: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """GT keypoints in camera frame + pixels: cam [P,N,13,3], px [P,N,13,2], valid [P,N]."""
-    kp_w = data["kp3d_world"]                       # [P, N, 13, 3]
+    """GT keypoints in camera frame + pixels: cam [P,N,70,3], px [P,N,70,2], valid [P,N]."""
+    kp_w = data["kp3d_world"]                       # [P, N, 70, 3]
     valid = data["kp_valid"] & data["valid_mask"]   # [P, N]
     ext = data["extrinsics"]                        # [N, 4, 4]
     cam = np.einsum("nij,pnkj->pnki", ext[:, :3, :3], kp_w) + ext[None, :, None, :3, 3]
@@ -206,7 +247,7 @@ def _scene_gt(data: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 def _pass_errors(pass_data: dict, gt_cam: np.ndarray, gt_px: np.ndarray) -> dict:
     """Per-frame mean errors vs GT (nan where nothing valid)."""
-    err3d = np.linalg.norm(pass_data["kp3d_cam"] - gt_cam, axis=-1)  # [P, N, 13]
+    err3d = np.linalg.norm(pass_data["kp3d_cam"] - gt_cam, axis=-1)  # [P, N, 70]
     err2d = np.linalg.norm(pass_data["kp2d"] - gt_px, axis=-1)
     depth = pass_data["kp3d_cam"][:, :, _HIP_POSITIONS, 2].mean(axis=2)  # [P, N]
     with np.errstate(invalid="ignore"):
@@ -236,7 +277,7 @@ def _trajectory_plot(scene: str, fps: float, gt_cam: np.ndarray,
     axes[2].set_ylabel("mean 2D kp err [px]")
     axes[2].set_xlabel("time [s]")
     axes[2].legend(loc="best")
-    fig.suptitle(f"{scene} — 13 kindyn keypoints, camera frame")
+    fig.suptitle(f"{scene} — 70 MHR70 keypoints, camera frame")
     fig.tight_layout()
     fig.savefig(path, dpi=110)
     plt.close(fig)
@@ -286,6 +327,12 @@ def main() -> int:
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--full-scene", action="store_true",
+                        help="single-pass whole-run inference (the RoPE eval "
+                             "protocol) instead of sliding windows; resolves "
+                             "frame_stride 'auto' per scene")
+    parser.add_argument("--max-frames", type=int, default=360,
+                        help="full-scene GPU chunk cap (frames per pass)")
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
 
@@ -325,7 +372,8 @@ def main() -> int:
         scene_ctx[scene] = (video_id, ds, data, *_scene_gt(data)[:2])
         # Fresh init = zero temporal gates + identity head copies = frozen model.
         frozen_passes[scene] = _predict_pose_pass(
-            model, ds, scene, args.batch_size, args.device, collate, seq_cfg)
+            model, ds, scene, args.batch_size, args.device, collate, seq_cfg,
+            requests_by_t=_scene_requests(args, data, seq_cfg))
 
     state = ckpt_io.load(checkpoint, model, config=cfg, map_location=args.device)
     print(f"loaded {checkpoint.name} (epoch {state['epoch']})")
@@ -334,7 +382,8 @@ def main() -> int:
     for video_id, scene in selected:
         _, ds, data, gt_cam, gt_px = scene_ctx[scene]
         tuned = _predict_pose_pass(
-            model, ds, scene, args.batch_size, args.device, collate, seq_cfg)
+            model, ds, scene, args.batch_size, args.device, collate, seq_cfg,
+            requests_by_t=_scene_requests(args, data, seq_cfg))
         frozen = frozen_passes.pop(scene)
 
         errors = {"frozen": _pass_errors(frozen, gt_cam, gt_px),

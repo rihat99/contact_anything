@@ -44,7 +44,7 @@ output:
 
 
 def test_ported_baselines_keep_semantics():
-    joint = load_config(REPO / "configs" / "old" / "climbing_videos_joint.yaml")
+    joint = load_config(REPO / "tests" / "fixtures" / "climbing_videos_joint.yaml")
     assert joint["contact"]["primary_target"] == "joint"
     assert joint["contact"]["targets"]["vertex"]["enabled"] is False
     assert joint["contact"]["targets"]["joint"]["enabled"] is True
@@ -58,7 +58,6 @@ def test_ported_baselines_keep_semantics():
         "dice_weight": 0.0,
         "sparsity_weight": 0.0,
     }
-    assert joint["model"]["temporal"]["enabled"] is False
     assert joint["data"]["sequence"]["frames_per_clip"] == 1
     assert joint["data"]["sequence"]["frame_stride"] == 1
     assert joint["data"]["frames_per_batch"] == 64
@@ -76,21 +75,11 @@ def test_ported_baselines_keep_semantics():
     assert joint["output"]["exp_name"] == "climb4_frame"
     assert joint["output"]["monitor"] == "test/joint_f1"
 
-    v2 = load_config(REPO / "configs" / "old" / "climbing_videos_joint_temporal_center_v2.yaml")
-    assert v2["model"]["temporal"] == {
-        "enabled": True,
-        "bottleneck_dim": 256,
-        "num_layers": 1,
-        "num_heads": 4,
-        "mlp_ratio": 2.0,
-        "attend": "per_token",
-        "causal": False,
-        "dropout": 0.0,
-        "position_scale": 30.0,
-        "window_frames": None,
-    }
+    v2 = load_config(REPO / "tests" / "fixtures" / "joint_temporal_center_v2.yaml")
     assert v2["data"]["sequence"] == {
-        "frames_per_clip": 5, "frame_stride": 1, "jitter": True, "target_frame": "center"}
+        "frames_per_clip": 5, "frame_stride": 1, "jitter": True,
+        "target_frame": "center", "eval_full_scenes": False,
+        "eval_max_frames": None}
     assert v2["data"]["frames_per_batch"] == 60
     assert v2["optim"]["lr"] == pytest.approx(3.75e-4)
     assert v2["optim"]["epochs"] == 17
@@ -98,7 +87,7 @@ def test_ported_baselines_keep_semantics():
     assert v2["output"]["exp_name"] == "climb4_t5mid_v2"
 
     blind = load_config(
-        REPO / "configs" / "old" / "climbing_videos_joint_temporal_center_blind.yaml")
+        REPO / "tests" / "fixtures" / "joint_temporal_center_blind.yaml")
     assert blind["model"]["contact_head"]["blind_to_image"] is True
     assert blind["output"]["exp_name"] == "climb4_t5mid_blind"
     # The ablation is the identical recipe apart from blindness and its name.
@@ -108,24 +97,13 @@ def test_ported_baselines_keep_semantics():
 
 
 def test_force_t7hinge_launch_config():
-    cfg = load_config(REPO / "configs" / "old" / "climbing_videos_force_warmstart_t7hinge.yaml")
+    cfg = load_config(REPO / "tests" / "fixtures" / "force_warmstart_t7hinge.yaml")
     # Regime (a): frozen t5mid temporal contact source, force-only training on
     # T=7 center-frame clips with the hinge-gated non-contact penalty.
     assert cfg["train"]["freeze_contact"] is True
     assert cfg["model"]["force_head"]["enabled"] is True
     assert cfg["model"]["init_contact_checkpoint"] == (
         "output/climb4_t5mid_20260717_140624/best.pth")
-    # The contact temporal block must byte-match the t5mid source architecture
-    # (kept as configs/old/climbing_videos_joint_temporal_center_v2.yaml) or the warm
-    # start hard-fails; window_frames restricts attention to the native T=5.
-    source = load_config(
-        REPO / "configs" / "old" / "climbing_videos_joint_temporal_center_v2.yaml")
-    assert cfg["model"]["temporal"] == {
-        **source["model"]["temporal"], "window_frames": 5}
-    assert cfg["model"]["force_temporal"] == {
-        "enabled": True, "bottleneck_dim": 256, "num_layers": 1, "num_heads": 4,
-        "mlp_ratio": 2.0, "attend": "joint", "causal": False, "dropout": 0.0,
-        "position_scale": 30.0}
     assert cfg["physics"]["use_warp"] is True
     assert cfg["physics"]["max_cam_jump_m"] == pytest.approx(0.5)
     assert cfg["physics"]["loss"]["residual_robust"] == {
@@ -135,7 +113,9 @@ def test_force_t7hinge_launch_config():
     assert cfg["physics"]["loss"]["noncontact_gate"] == {
         "kind": "hinge_l1", "p_lo": 0.2, "p_hi": 0.5}
     assert cfg["data"]["sequence"] == {
-        "frames_per_clip": 7, "frame_stride": 1, "jitter": True, "target_frame": "center"}
+        "frames_per_clip": 7, "frame_stride": 1, "jitter": True,
+        "target_frame": "center", "eval_full_scenes": False,
+        "eval_max_frames": None}
     assert cfg["data"]["frames_per_batch"] == 35
     assert cfg["data"]["eval_split"] == "test"
     assert cfg["loss"]["grad_clip"] == pytest.approx(5.0)
@@ -213,7 +193,7 @@ def test_physics_residual_monitor_requires_residual_weight(tmp_path):
     # the residual objective runs — a zero weight would starve the monitor forever.
     with pytest.raises(ValueError, match="physics_residual.*requires physics.loss.residual > 0"):
         load_config(_write(tmp_path, """
-base: configs/old/climbing_videos_force_warmstart_t7hinge.yaml
+base: tests/fixtures/force_warmstart_t7hinge.yaml
 physics:
   loss:
     residual: 0.0
@@ -478,28 +458,13 @@ contact:
         "enabled": True, "sharpness": 2.0}
 
 
-def test_force_temporal_defaults_load():
-    cfg = load_config(REPO / "configs" / "base.yaml")
-    assert cfg["model"]["force_temporal"] == {
-        "enabled": False,
-        "bottleneck_dim": 256,
-        "num_layers": 1,
-        "num_heads": 4,
-        "mlp_ratio": 2.0,
-        "attend": "per_token",
-        "causal": False,
-        "dropout": 0.0,
-        "position_scale": 1.0,
-    }
-
-
 _FORCE_TEMPORAL = """
 base: configs/base.yaml
 model:
   contact_head: {contact_keypoint_indices: [62, 41, 13, 14], num_global_tokens: 0,
                  pool_mode: per_token}
   force_head: {enabled: true}
-  force_temporal: {enabled: true%(extra)s}
+  cross_modal_temporal: {enabled: true, modalities: [contact, force]%(extra)s}
 contact:
   primary_target: joint
   targets:
@@ -508,24 +473,29 @@ contact:
 """
 
 
-def test_force_temporal_on_extremities_is_accepted(tmp_path):
+def test_cross_modal_temporal_on_extremities_is_accepted(tmp_path):
     cfg = load_config(_write(tmp_path, _FORCE_TEMPORAL % {"extra": ""}))
-    assert cfg["model"]["force_temporal"]["enabled"] is True
-    assert cfg["model"]["force_temporal"]["attend"] == "per_token"
+    assert cfg["model"]["cross_modal_temporal"]["enabled"] is True
+    assert cfg["model"]["cross_modal_temporal"]["modalities"] == ["contact", "force"]
 
 
-def test_force_temporal_requires_force_head_enabled(tmp_path):
-    with pytest.raises(ValueError, match="force_temporal.enabled requires model.force_head.enabled"):
+def test_cross_modal_temporal_requires_the_listed_branches(tmp_path):
+    with pytest.raises(
+        ValueError,
+        match=r"model.cross_modal_temporal.modalities \['force'\] have no token block"
+    ):
         load_config(_write(tmp_path, """
 base: configs/base.yaml
 model:
-  force_temporal: {enabled: true}
+  cross_modal_temporal: {enabled: true, modalities: [contact, force]}
 """))
 
 
-def test_force_temporal_bad_divisibility_rejected(tmp_path):
-    with pytest.raises(ValueError, match="model.force_temporal.bottleneck_dim must be divisible"):
-        load_config(_write(tmp_path, _FORCE_TEMPORAL % {"extra": ", bottleneck_dim: 256, num_heads: 7"}))
+def test_cross_modal_temporal_bad_time_scale_rejected(tmp_path):
+    with pytest.raises(
+        ValueError, match="model.cross_modal_temporal.time_scale must be finite"
+    ):
+        load_config(_write(tmp_path, _FORCE_TEMPORAL % {"extra": ", time_scale: 0"}))
 
 
 def test_freeze_contact_requires_force_enabled(tmp_path):
@@ -614,39 +584,40 @@ logging:
 
 
 @pytest.mark.parametrize("value", ["0", "-1", ".nan", ".inf"])
-def test_temporal_position_scale_must_be_finite_and_positive(tmp_path, value):
-    with pytest.raises(ValueError, match="position_scale must be finite and positive"):
+def test_temporal_time_scale_must_be_finite_and_positive(tmp_path, value):
+    with pytest.raises(ValueError, match="time_scale must be finite and positive"):
         load_config(_write(tmp_path, f"""
 base: configs/base.yaml
 model:
-  temporal:
-    position_scale: {value}
+  cross_modal_temporal:
+    time_scale: {value}
 """))
 
 
-def test_temporal_window_frames_defaults_null():
+def test_temporal_max_rel_sec_defaults_to_the_training_span():
     cfg = load_config(REPO / "configs" / "base.yaml")
-    assert cfg["model"]["temporal"]["window_frames"] is None
+    assert cfg["model"]["cross_modal_temporal"]["max_rel_sec"] == pytest.approx(2.5)
+    assert cfg["model"]["pose_temporal"]["max_rel_sec"] == pytest.approx(2.5)
 
 
-def test_temporal_window_frames_accepts_odd(tmp_path):
+def test_temporal_max_rel_sec_accepts_null(tmp_path):
     cfg = load_config(_write(tmp_path, """
 base: configs/base.yaml
 model:
-  temporal:
-    window_frames: 5
+  cross_modal_temporal:
+    max_rel_sec: null
 """))
-    assert cfg["model"]["temporal"]["window_frames"] == 5
+    assert cfg["model"]["cross_modal_temporal"]["max_rel_sec"] is None
 
 
-@pytest.mark.parametrize("bad", [4, 2, 1])
-def test_temporal_window_frames_rejects_non_odd_ge_3(tmp_path, bad):
-    with pytest.raises(ValueError, match="window_frames must be null or an odd int >= 3"):
+@pytest.mark.parametrize("bad", ["0", "-1", ".nan"])
+def test_temporal_max_rel_sec_rejects_non_positive(tmp_path, bad):
+    with pytest.raises(ValueError, match="max_rel_sec must be finite and positive"):
         load_config(_write(tmp_path, f"""
 base: configs/base.yaml
 model:
-  temporal:
-    window_frames: {bad}
+  cross_modal_temporal:
+    max_rel_sec: {bad}
 """))
 
 

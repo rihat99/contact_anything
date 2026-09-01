@@ -6,6 +6,12 @@ import pytest
 import torch
 
 from contact.data.collate import DistributedEvalSampler, InterleavedLoader, make_collate
+from contact.data.climbing_corpus import (
+    NUM_MHR70,
+    NUM_MHR_BONES,
+    NUM_MHR_SCALES,
+    NUM_SUP_VERTICES,
+)
 from contact.targets import NUM_BODY_22, TargetSpec
 
 _IMG = (128, 128)
@@ -161,21 +167,52 @@ def test_collate_camera_fallback_for_mixed_batch():
 
 
 def test_keypoint_collate_defaults_for_frames_without_keypoints():
-    # Kindyn GT keypoints ride along on corpus video frames only; a still-image
-    # frame in the same batch must collate to zeros with kp_valid False.
+    # The MHR-native GT (70 keypoints + the vertex subset + the mesh-fit
+    # residual) rides along on corpus video frames only; a still-image frame in
+    # the same batch must collate to zeros with the validity bits False.
     collate = make_collate(_IMG, _joint_spec())
     gt = torch.zeros(NUM_BODY_22)
     with_kp = _frame(joint={"gt": gt, "mask": torch.ones(NUM_BODY_22)})
-    with_kp["kp3d_world"] = torch.arange(39, dtype=torch.float32).reshape(13, 3)
+    with_kp["kp3d_world"] = torch.arange(
+        NUM_MHR70 * 3, dtype=torch.float32).reshape(NUM_MHR70, 3)
     with_kp["kp_valid"] = True
+    with_kp["vert_gt_world"] = torch.arange(
+        NUM_SUP_VERTICES * 3, dtype=torch.float32).reshape(NUM_SUP_VERTICES, 3)
+    with_kp["vert_valid"] = True
+    with_kp["vert_indices"] = torch.arange(NUM_SUP_VERTICES) * 7
+    with_kp["mhr_fit_err_cm"] = 0.75
+    with_kp["pose_gt_bones"] = torch.full((NUM_MHR_BONES,), 0.3)
+    with_kp["pose_gt_scale"] = torch.full((NUM_MHR_SCALES,), 0.4)
     without_kp = _frame(joint={"gt": gt, "mask": torch.ones(NUM_BODY_22)})
     batch = collate([with_kp, without_kp])              # two T=1 items -> B=2
 
-    assert batch["kp3d_world"].shape == (2, 13, 3)
+    assert batch["kp3d_world"].shape == (2, NUM_MHR70, 3)
     assert batch["kp3d_world"].dtype == torch.float32
     assert batch["kp_valid"].tolist() == [True, False]
     torch.testing.assert_close(batch["kp3d_world"][0], with_kp["kp3d_world"])
     assert float(batch["kp3d_world"][1].abs().sum()) == 0.0             # zeros fallback
+
+    assert batch["vert_gt_world"].shape == (2, NUM_SUP_VERTICES, 3)
+    assert batch["vert_valid"].tolist() == [True, False]
+    assert float(batch["vert_gt_world"][1].abs().sum()) == 0.0
+    # vert_indices is scene-constant: ONE row, taken from the frame that has it.
+    assert batch["vert_indices"].shape == (NUM_SUP_VERTICES,)
+    torch.testing.assert_close(batch["vert_indices"], torch.arange(NUM_SUP_VERTICES) * 7)
+    torch.testing.assert_close(
+        batch["mhr_fit_err_cm"], torch.tensor([0.75, 0.0]))
+    assert batch["pose_gt_bones"].shape == (2, NUM_MHR_BONES)
+    assert batch["pose_gt_scale"].shape == (2, NUM_MHR_SCALES)
+    assert float(batch["pose_gt_bones"][1].abs().sum()) == 0.0
+
+
+def test_vert_indices_falls_back_to_arange_without_any_gt():
+    """No frame carries the subset: the fallback must still be in range so the
+    loss's gather cannot error on a batch whose vertex mass is zero anyway."""
+    collate = make_collate(_IMG, _joint_spec())
+    gt = torch.zeros(NUM_BODY_22)
+    batch = collate([_frame(joint={"gt": gt, "mask": torch.ones(NUM_BODY_22)})])
+    torch.testing.assert_close(batch["vert_indices"], torch.arange(NUM_SUP_VERTICES))
+    assert batch["vert_valid"].tolist() == [False]
 
 
 def test_distributed_eval_sampler_is_exact_without_padding():

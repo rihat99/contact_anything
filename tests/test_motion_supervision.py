@@ -43,6 +43,11 @@ def make_batch(n_rows: int, gt: torch.Tensor, valid=None, outlier=None,
                            if outlier is None else outlier),
         "motion_rot": (torch.eye(3).expand(n_rows, 3, 3).contiguous()
                        if rot is None else rot),
+        # Body-frame conventions: the LINEAR frame is the root frame.
+        "motion_lin_rot": (torch.eye(3).expand(n_rows, 3, 3).contiguous()
+                           if rot is None else rot),
+        # World y down — the pre-regeneration constant these expectations assume.
+        "gravity_world": torch.tensor([0.0, 1.0, 0.0]).expand(n_rows, 3).contiguous(),
         # Zero by default: the Coriolis term vanishes and every slot then behaves
         # like `rotated_world`. `test_twist_slot_gets_the_coriolis_term` turns it on.
         "motion_omega": torch.zeros(n_rows, 3) if omega is None else omega,
@@ -281,6 +286,8 @@ def make_angular_batch(n_rows: int, gt: torch.Tensor, omega=None) -> dict:
         "motion_valid": torch.ones(n_rows, dtype=torch.bool),
         "motion_outlier": torch.zeros(n_rows, 1, dtype=torch.bool),
         "motion_rot": torch.eye(3).expand(n_rows, 3, 3).contiguous(),
+        "motion_lin_rot": torch.eye(3).expand(n_rows, 3, 3).contiguous(),
+        "gravity_world": torch.tensor([0.0, 1.0, 0.0]).expand(n_rows, 3).contiguous(),
         "motion_omega": torch.zeros(n_rows, 3) if omega is None else omega,
         "frame_valid": torch.ones(n_rows, dtype=torch.bool),
         "seq_len": 1,

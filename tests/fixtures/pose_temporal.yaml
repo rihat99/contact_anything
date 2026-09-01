@@ -1,3 +1,6 @@
+# TEST FIXTURE — a copy of configs/old/climbing_corpus_pose_temporal.yaml with the retired
+# sliding-window temporal / frame-attention sections stripped so it still
+# validates under the current schema. The archived original is unchanged.
 # Pose E2 — corpus_pose_temporal_t7. The DELIBERATE exception to the frozen-pose
 # rule: a zero-gated temporal-attention module on the POSE token (sequence index
 # 0) mixes it across the T=7 clip frames after the decoder, and the FINAL MHR
@@ -27,9 +30,6 @@ model:
     num_layers: 2
     num_heads: 4
     mlp_ratio: 2.0
-    attend: per_token                 # one pose token: per_token == joint
-    bottleneck_dim: 256
-    position_scale: 30.0              # 30-fps seconds -> well-separated frame offsets
 
 contact:
   targets:

@@ -1,6 +1,6 @@
 """GPU grad-flow test for the Phase-4 efficiency flags.
 
-Real SAM-3D-Body checkpoint + temporal (post_decoder) enabled. Asserts:
+Real SAM-3D-Body checkpoint + the cross-modal temporal block enabled. Asserts:
 
 * one training step with ``backbone_no_grad`` + ``detach_interm_preds`` on gives
   every trainable (``contact*``) param a finite, non-``None`` grad, a finite loss,
@@ -26,8 +26,14 @@ from contact.targets import NUM_BODY_22, TargetSpec
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPORAL_CFG = os.path.join(
-    REPO, "configs", "old", "climbing_videos_joint_temporal_center_v2.yaml")
-JOINT_CFG = os.path.join(REPO, "configs", "old", "climbing_videos_joint.yaml")
+    REPO, "tests", "fixtures", "joint_temporal_center_v2.yaml")
+#: ``model.cross_modal_temporal`` overrides: the ONE post-decoder mixing brick,
+#: and the only source of gated (multiply-by-zero) parameters the grad-flow
+#: assertions have to defeat.
+_XM_TEMPORAL = {"enabled": True, "modalities": ["pose", "contact"],
+                "num_layers": 2, "num_heads": 16, "mlp_ratio": 2.0,
+                "dropout": 0.0, "time_scale": 25.0, "max_rel_sec": 2.5}
+JOINT_CFG = os.path.join(REPO, "tests", "fixtures", "climbing_videos_joint.yaml")
 _CKPT = load_config(os.path.join(REPO, "configs", "base.yaml"))["model"]["checkpoint_path"]
 
 pytestmark = [
@@ -69,7 +75,7 @@ def _randomize_gammas(model, seed=7):
     """Move every temporal residual gate off zero so its subtree is on a live path."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     with torch.no_grad():
-        for name, p in model.contact_temporal.named_parameters():
+        for name, p in model.cross_modal_temporal.named_parameters():
             if "gamma" in name:
                 p.copy_(torch.randn(p.shape, generator=gen, device="cuda"))
 
@@ -132,15 +138,15 @@ def test_flags_on_every_contact_param_gets_grad(model_batch_loss):
 
 
 def test_every_trainable_param_gets_nonzero_grad():
-    placement = "post_decoder"
     """Every trainable contact param gets a *nonzero* grad.
 
     A ``p.grad is not None`` check passes even for params on a multiply-by-zero
-    path (temporal weights at zero-gate init). We move the gates off zero first,
-    then require ``p.grad.abs().sum() > 0`` for every trainable param.
+    path (the temporal block's weights at zero-gate init). We move the gates off
+    zero first, then require ``p.grad.abs().sum() > 0`` for every trainable param.
     """
     torch.manual_seed(0)
     cfg = load_config(TEMPORAL_CFG)
+    cfg["model"]["cross_modal_temporal"] = dict(_XM_TEMPORAL)
     cfg["train"]["detach_interm_preds"] = True
     cfg["train"]["backbone_no_grad"] = True
     model, _ = build_model(cfg, "cuda")
@@ -214,38 +220,31 @@ def _force_loss_step(model, batch, loss_fn, seed=7):
     return loss.detach()
 
 
-def _randomize_force_temporal_gammas(model, seed=13):
-    """Move every force_temporal residual gate off zero so its subtree is live."""
-    gen = torch.Generator(device="cuda").manual_seed(seed)
-    with torch.no_grad():
-        for name, p in model.force_temporal.named_parameters():
-            if "gamma" in name:
-                p.copy_(torch.randn(p.shape, generator=gen, device="cuda"))
-
-
-def test_force_temporal_params_get_nonzero_grad():
-    """Every force_temporal param gets a *nonzero* grad from a force-reading loss
-    across a T>1 clip, with the gammas AND the zero-init force head final layer
-    randomized. A zero final head layer would zero every upstream force grad
-    (including force_temporal.*) regardless of the gammas, so the test would pass
-    spuriously at true init unless the head is moved off zero first."""
+def test_cross_modal_params_get_nonzero_grad_from_a_force_loss():
+    """Every cross_modal_temporal param gets a *nonzero* grad from a force-reading
+    loss across a T>1 clip, with the gammas AND the zero-init force head final
+    layer randomized. A zero final head layer would zero every upstream force grad
+    regardless of the gammas, so the test would pass spuriously at true init
+    unless the head is moved off zero first."""
     torch.manual_seed(0)
     cfg = _force_cfg(freeze_contact=False)
-    cfg["model"]["force_temporal"]["enabled"] = True
+    cfg["model"]["cross_modal_temporal"] = {
+        **_XM_TEMPORAL, "modalities": ["contact", "force"]}
     model, _ = build_model(cfg, "cuda")
     try:
-        _randomize_force_temporal_gammas(model)     # gates off zero -> live subtree
+        _randomize_gammas(model, seed=13)           # gates off zero -> live subtree
         batch = _batch(cfg, model, _synth_frames(8), seq_len=4)   # 2 clips, T=4
         loss_fn = MultiTargetContactLoss(cfg).to("cuda")
         loss = _force_loss_step(model, batch, loss_fn)   # randomizes head, reads joint_forces
         assert torch.isfinite(loss).all()
 
-        ft_params = [(n, p) for n, p in model.named_parameters() if "force_temporal" in n]
-        assert ft_params, "no force_temporal params found"
-        for name, p in ft_params:
-            assert p.requires_grad, f"force_temporal {name} not trainable"
-            assert p.grad is not None, f"force_temporal {name} received no grad"
-            assert float(p.grad.abs().sum()) > 0, f"force_temporal {name} got an all-zero grad"
+        xm_params = [(n, p) for n, p in model.named_parameters()
+                     if "cross_modal_temporal" in n]
+        assert xm_params, "no cross_modal_temporal params found"
+        for name, p in xm_params:
+            assert p.requires_grad, f"cross_modal {name} not trainable"
+            assert p.grad is not None, f"cross_modal {name} received no grad"
+            assert float(p.grad.abs().sum()) > 0, f"cross_modal {name} got an all-zero grad"
     finally:
         del model
         torch.cuda.empty_cache()

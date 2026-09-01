@@ -34,10 +34,11 @@ earlier work, per-extremity contact probabilities. On top of that we add:
   the fixed order `left_hand, right_hand, left_foot, right_foot`. The final
   linear layer is **zero-initialised**, so an untrained model predicts exactly
   zero force everywhere — more on why that is nice below.
-- **An optional force temporal module** (`model.force_temporal`) — the same
-  gated cross-frame attention block the contact branch uses, so each limb's
-  force can look at neighbouring frames of the clip. It attends `per_token`
-  (each limb mixes only with itself through time).
+- **Cross-frame context** — listing `force` in `model.cross_modal_temporal`
+  puts the force tokens into the one post-decoder RoPE block, so each limb's
+  force can look at neighbouring frames of the clip (and, at `dt = 0`, at the
+  other modalities of its own frame). The dedicated `model.force_temporal`
+  module the earlier runs used was retired on 2026-08-29.
 
 One structural rule keeps all of this safe: the decoder's attention mask is
 asymmetric. The force tokens are appended *after* the contact tokens, and no
@@ -86,8 +87,10 @@ coordinates — and our cameras move. If we ignored that, camera motion would
 masquerade as body acceleration and poison the physics. So every ClimbingVideos
 scene carries **per-frame camera extrinsics** (`cam_from_world`, OpenCV
 convention, metric scale) exported from the video reconstruction pipeline,
-plus a per-scene **gravity direction** (`gravity_world`, the first camera's
-down-axis mapped into world coordinates) and the scale factor used. The adapter
+plus a per-scene **gravity direction** (`gravity_world`, the unit down vector
+the kindyn solve itself fitted — near world +y but tilted by median 3.2° and up
+to 61°, and *not* the first camera's down axis, which is how the retired v1
+export derived it) and the scale factor used. The adapter
 (`contact/physics/adapter.py::MHRAdapter`) composes the per-frame camera pose
 with the model's camera-frame body pose so that every frame of the clip lands
 in one static, metric world. The result is a configuration trajectory `q(t)`
@@ -486,7 +489,7 @@ matched 1:1 to the force groups** — and couples them at the output, not in the
   annotates hands, feet and ankles as separate observable joints, so all six groups are
   test-supervised.
 - **Contact gate** (`model.force_head.contact_gate`). The FINAL force output — after
-  `force_temporal`, so eval/inference/rendering see it unchanged — becomes
+  the temporal block, so eval/inference/rendering see it unchanged — becomes
   `f = f_raw · sigmoid(sharpness · logit)` with the **detached** contact logits: the map is
   the **identity** (`FORCE_GATE_CONTACT_MAP` in `sam_3d_body/models/heads/force_head.py`) —
   each force group is gated by its own contact output, heel force by ankle contact, toe force

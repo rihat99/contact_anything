@@ -19,6 +19,7 @@ from typing import Any
 
 import yaml
 
+from .embedding_augment import anneal_scale
 from .targets import JOINT_SET_NAMES, topology_num_vertices
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,12 @@ _CKPT_DIR = (
     "models--facebook--sam-3d-body-dinov3/snapshots/"
     "11aaa346c7204874a1cbafe3d39a979080b2c55a"
 )
+
+#: ``motion_consistency.hip_offset_root`` default under
+#: ``motion_supervision.root_source: kindyn`` — mean-hips minus the kindyn root
+#: origin in GT-root axes, metres, measured on the motion-probe artifact
+#: (363 scenes). The ``mhr`` root is the mean-hips itself, so its default is zero.
+KINDYN_HIP_OFFSET_ROOT = (-0.009, -0.060, -0.065)
 
 # The schema *is* the default tree: every allowed key appears here with its
 # default value. A ``dict`` value is a nested namespace (recursed into for both
@@ -57,18 +64,6 @@ DEFAULTS: dict[str, Any] = {
             "grid_radius": 0.1,
             "blind_to_image": False,        # ablation: no image path into contact tokens
         },
-        "temporal": {                       # Phase 3: ContactTemporalModule (post_decoder)
-            "enabled": False,
-            "bottleneck_dim": 256,           # project 1024-d contact tokens before attention
-            "num_layers": 1,
-            "num_heads": 4,
-            "mlp_ratio": 2.0,
-            "attend": "joint",              # joint (T*K tokens) | per_token (T per slot)
-            "causal": False,
-            "dropout": 0.0,
-            "position_scale": 1.0,           # multiplier on elapsed seconds before time PE
-            "window_frames": None,           # None|odd>=3: attend only the central window
-        },
         "force_head": {                     # Step 04: per-extremity 3D force regression
             "enabled": False,
             "force_keypoint_indices": None, # None = inherit the contact anchors (legacy);
@@ -81,17 +76,6 @@ DEFAULTS: dict[str, Any] = {
                 "enabled": False,           # kindyn_6 contact logits, one per force group
                 "sharpness": 4.0,           # gate = sigmoid(sharpness * contact logit)
             },
-        },
-        "force_temporal": {                 # Step 05: temporal attention over force tokens
-            "enabled": False,               # requires model.force_head.enabled
-            "bottleneck_dim": 256,          # project 1024-d force tokens before attention
-            "num_layers": 1,
-            "num_heads": 4,
-            "mlp_ratio": 2.0,
-            "attend": "per_token",          # joint (T*K tokens per clip) | per_token (T per slot)
-            "causal": False,
-            "dropout": 0.0,
-            "position_scale": 1.0,          # multiply elapsed seconds before sinusoidal time PE
         },
         "motion_head": {                    # motion tokens v2: per-joint linear vel + acc
             "enabled": False,
@@ -106,60 +90,47 @@ DEFAULTS: dict[str, Any] = {
             "mlp_channel_div_factor": 4,
             "dropout": 0.0,
         },
-        "pose_temporal": {                  # temporal attention over the POSE token (E2)
+        "pose_temporal": {                  # RoPE temporal attention over the POSE token (E2)
             "enabled": False,               # DELIBERATE exception to the frozen-pose rule:
                                             # the final MHR output is recomputed from a
                                             # temporally-mixed pose token (zero-init gates
                                             # = frozen behavior at init)
-            "bottleneck_dim": 256,
-            "num_layers": 2,
-            "num_heads": 4,
+            "type": "rope",                 # only value (the sliding-window module is retired)
+            "time_scale": 25.0,             # seconds -> RoPE positions
+            "max_rel_sec": 2.5,             # attention window half-width (seconds);
+                                            # null disables the window
+            "num_layers": 4,
+            "num_heads": 16,                # decoder dim / num_heads must be even
             "mlp_ratio": 2.0,
-            "attend": "per_token",          # one pose token: per_token == joint
-            "causal": False,
             "dropout": 0.0,
-            "position_scale": 30.0,
         },
-        "motion_temporal": {                # temporal attention over motion tokens (post_decoder)
-            "enabled": False,               # requires model.motion_head.enabled
-            "bottleneck_dim": 256,          # project 1024-d motion tokens before attention
-            "num_layers": 1,
-            "num_heads": 4,
-            "mlp_ratio": 2.0,
-            "attend": "per_token",          # joint (T*K tokens per clip) | per_token (T per slot)
-            "causal": False,
-            "dropout": 0.0,
-            "position_scale": 1.0,          # multiply elapsed seconds before sinusoidal time PE
-        },
-        "cross_modal_temporal": {           # ONE temporal block over ALL chosen modality blocks
-            "enabled": False,               # attend='joint' over the concatenation, so e.g.
-                                            # force tokens see the pose token across the clip
-                                            # and vice versa (alternative to the per-modality
-                                            # temporal blocks above)
+        "cross_modal_temporal": {           # THE post-decoder mixing brick: ONE temporal
+            "enabled": False,               # transformer over the CONCATENATION of the chosen
+                                            # modality token blocks. Every listed token attends
+                                            # every other across the clip's frames; the dt = 0
+                                            # diagonal gives within-frame cross-modal attention.
+            "type": "rope",                 # rope = native-dim block, relative-time rotary
+                                            # positions (long-sequence single-pass inference) |
+                                            # window = the sinusoidal sliding-window block
+                                            # (ContactTemporalModule, attend=joint): bottleneck
+                                            # adapter, absolute in-clip positions — eval must
+                                            # window scenes (eval_full_scenes: false)
             "modalities": ["contact", "force"],  # >= 2 of pose|contact|force|motion; each needs
                                             # its branch enabled. 'pose' WRITES the pose token:
                                             # the final MHR output is recomputed from it
                                             # (needs pose_supervision for training)
-            "bottleneck_dim": 256,
-            "num_layers": 1,
-            "num_heads": 4,
-            "mlp_ratio": 2.0,
-            "causal": False,
-            "dropout": 0.0,
-            "position_scale": 1.0,          # multiply elapsed seconds before sinusoidal time PE
-        },
-        "frame_attn": {                     # per-frame attention AFTER the temporal blocks
-            "enabled": False,               # NO temporal mixing: tokens attend within their
-                                            # own frame only (works for clips and stills alike)
-            "modalities": ["contact"],      # one own-weights block per listed modality;
-                                            # keys/values always span EVERY enabled modality's
-                                            # post-temporal tokens of the frame (pose included);
-                                            # 'pose' WRITES the pose token (same rule as above)
-            "bottleneck_dim": 256,
-            "num_layers": 1,
-            "num_heads": 4,
+            "num_layers": 4,
+            "num_heads": 16,                # decoder dim / num_heads must be even
             "mlp_ratio": 2.0,
             "dropout": 0.0,
+            "time_scale": 25.0,             # rope only: seconds -> RoPE positions
+            "max_rel_sec": 2.5,             # rope only: attention window half-width (seconds);
+                                            # null disables the window
+            "bottleneck_dim": 256,          # window only: attention width (dim -> b -> dim
+                                            # residual adapter); null = native decoder dim
+            "position_scale": 25.0,         # window only: seconds -> sinusoidal positions
+                                            # (25 ~ one auto-stride frame per position unit)
+            "causal": False,                # window only: frame-causal attention mask
         },
         "cond_input": {                     # smoothed pelvis vel/acc fed INTO the tokens
             "enabled": False,               # zero-init projections; off = bit-identical model
@@ -220,11 +191,26 @@ DEFAULTS: dict[str, Any] = {
         # Build the cache with scripts/precompute_embeddings.py first; a missing
         # per-frame file is a hard error (never silent live fallback).
         "embedding_cache": False,
+        # Train-time corruption of the cached embedding (contact/embedding_augment.py):
+        # a Gaussian on every frame plus an occasional patch pasted from another
+        # frame. Requires embedding_cache. Train-only; eval never sees it.
+        "embedding_augment": {
+            "enabled": False,
+            "gaussian_alpha": 0.1,       # sigma = alpha * per-channel feature std
+            "cutmix_prob": 0.5,          # per-frame probability of a pasted patch
+            "cutmix_area": [0.1, 0.4],   # patch area as a fraction of the feature grid
+            "anneal_start_frac": 0.8,    # cosine-anneal to 0 over the last epochs; 1.0 = off
+        },
         "sequence": {
             "frames_per_clip": 8,
             "frame_stride": 2,
             "jitter": True,
             "target_frame": "all",       # all | center (loss/metrics rows per clip)
+            "eval_full_scenes": False,   # eval/test protocol: one single-pass clip per
+                                         # (scene, person) = the longest valid run
+                                         # (batch = 1 clip; long-sequence modules only)
+            "eval_max_frames": None,     # cap the full-scene clip length (frames after
+                                         # striding); None = whole run. ~0.1 GiB/frame
         },
     },
     "physics": {                        # Step 06: RNEA root-wrench physics loss on forces
@@ -284,7 +270,23 @@ DEFAULTS: dict[str, Any] = {
         "enabled": False,               # requires model.motion_head.enabled
         "target_frame": "all",          # all | center (rows per clip contributing to the loss)
         "joint_names": None,            # null = all 7 motion joints; else an ordered subset
-        "root_convention": "twist",     # pelvis slot: twist (BVR body twist) | rotated_world
+        "root_convention": "twist",     # pelvis slot LINEAR frame: twist (BVR body twist) |
+                                        # rotated_world (R^T of the world central difference) |
+                                        # gravity_view (GVHMR's frame: vertical = the scene's
+                                        # FITTED gravity, azimuth = the camera view direction —
+                                        # gravity-aligned and free of body roll/pitch, so pose
+                                        # orientation error no longer rotates the target).
+                                        # The angular pair is the SE3-log body rate regardless.
+                                        # `standardize` is FRAME-specific: recompute it when
+                                        # this changes.
+        "root_source": "kindyn",        # rig the targets are differentiated from: kindyn
+                                        # (SMPL-X joints_world + kindyn root) | mhr
+                                        # (mhr_sup_1 MHR70 limbs + mhr_1 q_world root — the
+                                        # SAME rig as the prediction, so the pose-derived
+                                        # twist carries no cross-rig offset). The two have
+                                        # DIFFERENT target distributions: `standardize` and
+                                        # motion_consistency.hip_offset_root are per-source
+                                        # and must be recomputed when this changes.
         "angular": False,               # append the root twist's angular vel/acc (12-dim target;
                                         # requires twist + joint_names ['pelvis'])
         "target_smooth_sec": 0.12,      # Gaussian width (s) on the root trajectory; 0 = raw
@@ -301,26 +303,62 @@ DEFAULTS: dict[str, Any] = {
             "outlier_acc_ms2": 50.0,    # TRAIN-only per-(frame, joint) cut on |acc_world|; 0 = off
         },
     },
+    "motion_rollout": {                 # the MIRROR of motion_consistency: INTEGRATE the
+        "enabled": False,               # predicted root velocity over the clip and compare
+                                        # horizon DISPLACEMENTS with the kindyn GT path and
+                                        # with the PREDICTED pose's path. Differentiating
+                                        # amplifies the frequencies where the pseudo-GT is
+                                        # worst; integrating suppresses them. Requires
+                                        # motion_supervision with root_convention:
+                                        # gravity_view (see contact/motion_rollout.py).
+        "horizons": [3, 10, 30],        # frame gaps compared; short = derivative-like, long =
+                                        # the low-frequency constraint. Horizons >= the clip
+                                        # length are skipped at runtime.
+        "detach_head": True,            # detach the integrated side in the pose/rot_pose terms
+                                        # (grad -> pose path only: the pose is pulled toward the
+                                        # head's smoother trajectory, never the reverse).
+                                        # false = bidirectional.
+        "loss": {
+            "gt": 1.0,                  # displacement vs the GT root path (grad -> motion head)
+            "pose": 1.0,                # displacement vs the PREDICTED pose's root path
+            "rot_gt": 1.0,              # composed body rate vs the GT relative rotation
+            "rot_pose": 1.0,            # ... vs the predicted relative rotation
+            "huber_m": 0.1,             # smooth-L1 transition, metres
+            "huber_rad": 0.1,           # smooth-L1 transition, radians
+        },
+    },
     "motion_consistency": {             # differentiate the PREDICTED pose (world root via
         "enabled": False,               # extrinsics, BVR body-twist) and compare the pelvis
                                         # vel/acc with kindyn GT and with the motion head,
-                                        # plus ABSOLUTE root-pose anchors (pos/rot/cam_rail)
+                                        # plus ABSOLUTE root-pose anchors (pos/rot)
                                         # that close the constant-camera null space the
                                         # derivative terms leave open (corpus_allmod_mutual
                                         # collapse). Requires motion_supervision.enabled, a
                                         # trainable pose path and frames_per_clip >= 3.
-        "hip_offset_root": [-0.009, -0.060, -0.065],
-                                        # mean-hips minus kindyn root origin, GT-root frame,
-                                        # metres — measured on the motion-probe artifact
-                                        # (363 scenes); GT pos target = p_gt + R_gt @ offset.
+        "hip_offset_root": None,        # mean-hips minus the GT root origin, GT-root frame,
+                                        # metres; GT pos target = p_gt + R_gt @ offset.
+                                        # null = the default for motion_supervision.root_source
+                                        # (:data:`KINDYN_HIP_OFFSET_ROOT` for kindyn, exactly
+                                        # zero for mhr, whose root IS the mean-hips). The two
+                                        # rigs place the root differently, so a value carried
+                                        # across a root_source change is simply wrong.
         "angular": True,                # include the angular twist rows in the gt/head
                                         # comparison (only when motion_supervision.angular).
                                         # false = linear-only: the angular residuals are
                                         # differentiated orientation wobble and reward a
                                         # constant world orientation (the v3 rot collapse).
+        "detach_head": True,            # detach the motion head's row in the head term
+                                        # (grad -> pose path only). false = bidirectional:
+                                        # the head is also pulled toward the pose-derived
+                                        # twist (watch for the head chasing a degenerate
+                                        # pose trajectory).
         "loss": {
-            "gt": 1.0,                  # pose-derived twist vs kindyn GT (grad -> pose path)
-            "head": 0.5,                # pose-derived twist vs DETACHED motion head
+            "gt": 0.005,                # pose-derived twist vs kindyn GT (grad -> pose path).
+                                        # Recalibrated /200 on 2026-08-29: at 1.0 this term
+                                        # alone was 57% of the run's total gradient (norm 261
+                                        # vs contact focal 1.06), all through the 1/dt (vel)
+                                        # and 1/dt^2 (acc) finite-difference Jacobians.
+            "head": 0.0025,             # pose-derived twist vs DETACHED motion head
                                         # (grad -> pose path only; the head is never
                                         # dragged toward a degenerate pose trajectory)
             "huber_delta": 1.0,         # smooth-L1 transition (standardized units)
@@ -329,13 +367,76 @@ DEFAULTS: dict[str, Any] = {
             "pos_huber_m": 0.1,         # smooth-L1 transition for pos (metres)
             "rot": 0.0,                 # absolute root orientation: so3_log(R_pred^T R_gt)
             "rot_huber_rad": 0.1,       # smooth-L1 transition for rot (radians)
-            "cam_rail": 0.0,            # camera trust region vs the FROZEN model's own
-                                        # pred_cam_t: relu(|delta| - margin), zero inside
-            "cam_rail_margin_m": 0.5,   # rail margin (metres) — wide; wobble is cm-scale
-            "rot_rail": 0.0,            # orientation trust region vs the frozen model's own
-                                        # global_rot: relu(geodesic - margin), zero inside
-            "rot_rail_margin_rad": 0.2, # rail margin (radians, ~11.5°) — the frozen model's
-                                        # per-frame orientation error is ~7°
+                                        # NOTE: the cam/rot rails moved to
+                                        # keypoint_supervision (2026-08-29) — both modules
+                                        # carried identical copies, doubling the weight.
+        },
+    },
+    "contact_consistency": {            # world-frame velocity of the six extremity keypoints
+        "enabled": False,               # weighted by the PREDICTED contact probability —
+                                        # stable contact implies a still joint. Requires the
+                                        # kindyn_6 joint target + a trainable pose path.
+        "detach_gate": True,            # detach the contact probs in the gate (grad -> pose
+                                        # path only; false also pushes probs DOWN at moving
+                                        # joints — the supervised focal loss must counter)
+        "loss": {
+            "vel": 1.0,                 # weight on gate * huber(|v_world|)
+            "huber_delta_ms": 0.5,      # smooth-L1 transition (m/s)
+        },
+    },
+    "force_consistency": {              # linear Newton residual in body-weight units:
+        "enabled": False,               # a_root/g must equal gravity + the net predicted
+                                        # contact force (root->world via the GT kindyn root
+                                        # rotation). Mass cancels in bw units. Grad -> pose
+                                        # (via the root acceleration) + force head.
+        "ramp": {                       # weight warm-up (the residual is unstable early):
+            "start_epoch": 3,           # scale 0 before this epoch, then linear
+            "epochs": 3,                # ... reaching 1.0 at start_epoch + epochs - 1
+        },
+        "smoothing_kernel": [0.25, 0.5, 0.25],
+                                        # windowed mean on the predicted world root before
+                                        # double-differencing; [1.0] = off
+        "loss": {
+            "residual": 1.0,            # weight on huber(residual) (dimensionless, bw)
+            "huber_delta_bw": 1.0,      # smooth-L1 transition (bw)
+        },
+    },
+    "pose_smoothness": {                # jerk + snap of the PREDICTED motion pushed toward
+        "enabled": False,               # ZERO (no target): a smoothness prior on the temporal
+                                        # block. Acceleration is deliberately untouched.
+                                        # Requires a trainable pose path, a climbing_corpus
+                                        # dataset (extrinsics) and frames_per_clip >= 5.
+        "loss": {
+            # Weights: 0 = off. The shipped experiment
+            # (configs/rope_t60_mhrsup_temponly_jerksnap.yaml) sets them from a
+            # gradient probe — each term's grad norm on the trainable params
+            # equalised, the group scaled to ~20% of the summed per-term
+            # gradient energy. They are NOT interchangeable across runs: the
+            # right value depends on what else is in the objective.
+            "joint_jerk": 0.0,          # world-lifted MHR70 keypoints, m/s^3
+            "joint_snap": 0.0,          # ... m/s^4
+            "root_pos_jerk": 0.0,       # predicted world pelvis position, m/s^3
+            "root_pos_snap": 0.0,       # ... m/s^4
+            "root_rot_jerk": 0.0,       # BVR body angular jerk of the world-from-root
+                                        # rotation (staggered so3 increments), rad/s^3
+            "root_rot_snap": 0.0,       # ... rad/s^4
+            # Huber transitions = the GT's own weighted |coordinate| p75 over 40 train
+            # scenes (mhr_sup_1 keypoints / mean-hips / mhr_1 root quaternion), measured
+            # at the CLIP SAMPLER's dt (frame_stride auto = max(1, round(fps/25)), i.e.
+            # 24-30 Hz everywhere) — at the native 24-60 Hz the 1/dt^3, 1/dt^4 Jacobians
+            # inflate the fast scenes and the p75 comes out ~1.3-2x too high. GT-level
+            # smoothness then sits in the quadratic zone and rougher rows contribute a
+            # bounded, constant-magnitude pull.
+            "huber_delta_joint_jerk": 62.0,        # m/s^3
+            "huber_delta_joint_snap": 4000.0,      # m/s^4
+            "huber_delta_root_pos_jerk": 40.0,     # m/s^3
+            "huber_delta_root_pos_snap": 2700.0,   # m/s^4
+            "huber_delta_root_rot_jerk": 320.0,    # rad/s^3
+            "huber_delta_root_rot_snap": 39000.0,  # rad/s^4
+        },
+        "joint_weights": {              # same downweighting as keypoint_supervision
+            "fingers": 0.1,
+            "face": 1.0,
         },
     },
     "pose_supervision": {               # kindyn-MHR pseudo-GT pose loss (E2)
@@ -345,12 +446,31 @@ DEFAULTS: dict[str, Any] = {
             "pose": 1.0,                # Huber weight on the 125 local MHR q channels
             "acc": 0.0,                 # Huber weight on clip-wise q second differences
                                         # (pred vs GT) — the explicit smoothness term
+            "shape": 0.0,               # L2 on the 45 blendshape outputs vs the mhr_1 v2
+                                        # GT identity (per-person, mesh-fitted) — the
+                                        # full-parameter alternative to shape_rail
+            "bones": 0.0,               # Huber on the 6 per-frame flexible bone-geometry
+                                        # slots (lbs 130..135: spine/neck/shoulder-width/
+                                        # arm/hip-width/leg lengths) vs the mhr_1 v3 GT.
+                                        # Per-channel mean. The audit: unsupervised AND
+                                        # unrailed, 98% of the body-size drift lived here
+            "scale": 0.0,               # Huber on the 68 per-person scale slots (lbs
+                                        # 136..203) vs the same GT — the head's 28 PCA
+                                        # coefficients already expanded inside
+                                        # mhr_model_params. Per-channel mean
+            "huber_delta_bones": 0.05,  # smooth-L1 transition for bones/scale (slot units)
             "shape_rail": 0.0,          # L2 pinning the 45 blendshape outputs to the FROZEN
                                         # readout's own values (shape_frozen stash) — nothing
                                         # else supervises them
-            "scale_rail": 0.0,          # same L2 for the 28 bone-scale outputs
+            "scale_rail": 0.0,          # same L2 for the 28 bone-scale outputs. REDUNDANT
+                                        # and opposed once loss.scale is on (the rail pins
+                                        # to the frozen value the GT is correcting)
             "huber_delta": 0.1,         # smooth-L1 transition (radians)
         },
+        "fit_err_confidence": False,    # weight bones/scale rows by the mhr_1 mesh-fit
+                                        # residual: 1 / (1 + (fit_err_cm / ref)^2)
+        "fit_err_ref_cm": 2.0,          # residual at which the row weight is 0.5
+                                        # (corpus mean fit_err is 0.68 cm)
         "mhr": {                        # BetterHuman archive for q <-> params conversion
             "model_path": None,         # null resolves like the physics adapter
             "lod": 1,
@@ -364,6 +484,12 @@ DEFAULTS: dict[str, Any] = {
             "kp3d": 0.5,                # Huber on mean-hips-relative camera-frame 3D (metres)
             "kp3d_abs": 0.25,           # Huber on ABSOLUTE camera-frame 3D (metres) — pins
                                         # pred_cam_t depth with the metric extrinsics
+            "vert": 0.0,                # Huber on the mean-hips-relative camera-frame vertex
+                                        # subset (metres): body SHAPE, which 70 sparse
+                                        # landmarks barely constrain
+            "vert_abs": 0.0,            # same ABSOLUTE — the body-SIZE + depth anchor. The
+                                        # audit's regression channel: size drifted
+                                        # +3.9% -> -3.3% while keypoint error looked fine
             "kp_vel": 0.0,              # Huber on WORLD-frame keypoint velocity (central
                                         # stencil over the clip; extrinsics loss-only) vs the
                                         # finite-differenced kindyn joints_world
@@ -381,6 +507,22 @@ DEFAULTS: dict[str, Any] = {
             "cam_rail_margin_m": 0.5,   # rail margin (metres)
             "rot_rail_margin_rad": 0.2, # rail margin (radians, ~11.5 deg)
         },
+        # Per-joint weights. Every joint term is a weighted MEAN over the 70
+        # MHR70 keypoints, so these do not change the term's overall scale —
+        # only the relative pull of each group. NOTE the pre-2026-08-29 terms
+        # were SUMS over 13 joints: multiply a historical loss weight by 13.
+        "joint_weights": {
+            "fingers": 0.1,             # the 40 finger/thumb keypoints (wrists excluded):
+                                        # least reliable part of the mesh fit, negligible
+                                        # lever arm on the body pose
+            "face": 1.0,                # nose/eyes/ears. The audit found the head GT bad in
+                                        # 4 of 6 inspected scenes (inherited from kindyn's
+                                        # own SMPL-X fit) — the knob to turn down if the
+                                        # head still misbehaves
+        },
+        "fit_err_confidence": False,    # weight rows by the mhr_1 mesh-fit residual:
+                                        # 1 / (1 + (fit_err_cm / ref)^2)
+        "fit_err_ref_cm": 2.0,          # residual at which the row weight is 0.5
     },
     "loss": {"dice_eps": 1.0e-5, "grad_clip": 1.0},
     "train": {                          # Phase 4 efficiency flags (grad-asserted no-ops)
@@ -407,7 +549,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "logging": {
         "wandb": {          # consumed in Phase 4; present for forward-compat
-            "enabled": True,
+            "enabled": False,   # user 2026-08-28: wandb off by default
             "project": "contact-anything",
             "entity": None,
             "tags": [],
@@ -428,7 +570,6 @@ DEFAULTS: dict[str, Any] = {
 
 _KNOWN_DATASETS = frozenset({"damon", "climbing", "climbing_corpus"})
 _KNOWN_TARGETS = frozenset({"vertex", "joint"})
-_TEMPORAL_ATTEND = frozenset({"joint", "per_token"})
 _MODALITIES = ("pose", "contact", "force", "motion")
 _KNOWN_JOINT_SETS = frozenset(JOINT_SET_NAMES)
 _CONTACT_POOL_MODES = frozenset({"attention", "concat", "per_token"})
@@ -482,32 +623,62 @@ def _validate_keys(node: dict, schema: dict, path: str = "") -> None:
             _validate_keys(value, sub, dotted)
 
 
-def _validate_temporal_common(node: dict, path: str) -> None:
-    """Validate the attend/shape/scale clauses shared by every temporal /
-    frame-attention section. A clause is checked only when its key exists in
-    the section (``cross_modal_temporal`` has no ``attend`` — it is fixed to
-    ``'joint'``; ``frame_attn`` has neither ``attend`` nor the time keys).
-    """
-    if "attend" in node and node["attend"] not in _TEMPORAL_ATTEND:
-        raise ValueError(
-            f"{path}.attend must be one of {sorted(_TEMPORAL_ATTEND)}; "
-            f"got {node['attend']!r}")
-    bottleneck_dim = int(node["bottleneck_dim"])
-    num_heads = int(node["num_heads"])
-    if bottleneck_dim <= 0:
-        raise ValueError(f"{path}.bottleneck_dim must be positive")
-    if num_heads <= 0 or bottleneck_dim % num_heads:
-        raise ValueError(
-            f"{path}.bottleneck_dim must be divisible by "
-            f"{path}.num_heads; got {bottleneck_dim} and {num_heads}")
+def _validate_temporal_shape(node: dict, path: str) -> None:
+    """Validate the block-shape clauses shared by every temporal section."""
     if int(node["num_layers"]) <= 0:
         raise ValueError(f"{path}.num_layers must be positive")
+    if int(node["num_heads"]) <= 0:
+        raise ValueError(f"{path}.num_heads must be positive")
     if float(node["mlp_ratio"]) <= 0:
         raise ValueError(f"{path}.mlp_ratio must be positive")
-    if "position_scale" in node:
-        position_scale = float(node["position_scale"])
-        if not math.isfinite(position_scale) or position_scale <= 0:
-            raise ValueError(f"{path}.position_scale must be finite and positive")
+    dropout = float(node["dropout"])
+    if not 0.0 <= dropout < 1.0:
+        raise ValueError(f"{path}.dropout must be in [0, 1); got {dropout}")
+
+
+def _validate_rope_temporal(node: dict, path: str) -> None:
+    """Validate a RoPE temporal section.
+
+    RoPE blocks run natively at the decoder dim (no bottleneck adapter) and
+    are bidirectional-only, so the sliding-window keys have no counterpart
+    here.
+    """
+    _validate_temporal_shape(node, path)
+    time_scale = float(node["time_scale"])
+    if not math.isfinite(time_scale) or time_scale <= 0:
+        raise ValueError(f"{path}.time_scale must be finite and positive")
+    max_rel_sec = node["max_rel_sec"]
+    if max_rel_sec is not None:
+        max_rel_sec = float(max_rel_sec)
+        if not math.isfinite(max_rel_sec) or max_rel_sec <= 0:
+            raise ValueError(
+                f"{path}.max_rel_sec must be finite and positive, or null")
+
+
+def _validate_window_temporal(node: dict, path: str) -> None:
+    """Validate a ``type: window`` temporal section (the revived sinusoidal
+    ``ContactTemporalModule``: bottleneck adapter, absolute in-clip positions)."""
+    _validate_temporal_shape(node, path)
+    bottleneck = node["bottleneck_dim"]
+    if bottleneck is not None and int(bottleneck) <= 0:
+        raise ValueError(
+            f"{path}.bottleneck_dim must be a positive int or null; got {bottleneck!r}")
+    position_scale = float(node["position_scale"])
+    if not math.isfinite(position_scale) or position_scale <= 0:
+        raise ValueError(f"{path}.position_scale must be finite and positive")
+    if not isinstance(node["causal"], bool):
+        raise ValueError(f"{path}.causal must be a bool; got {node['causal']!r}")
+
+
+def _validate_pose_temporal(node: dict) -> None:
+    """Validate ``model.pose_temporal`` (RoPE only — the sliding module is gone)."""
+    path = "model.pose_temporal"
+    ptype = node.get("type", "rope")
+    if ptype != "rope":
+        raise ValueError(
+            f"{path}.type must be 'rope'; the sliding-window temporal module is "
+            f"retired. Got {ptype!r}")
+    _validate_rope_temporal(node, path)
 
 
 def _enabled_modalities(cfg: dict) -> dict:
@@ -556,7 +727,7 @@ _MOTION_JOINT_NAMES = ("left_wrist", "right_wrist", "left_foot", "right_foot",
                        "left_ankle", "right_ankle", "pelvis")
 _NUM_MOTION_JOINTS = len(_MOTION_JOINT_NAMES)
 
-_ROOT_CONVENTIONS = frozenset({"twist", "rotated_world"})
+_ROOT_CONVENTIONS = frozenset({"twist", "rotated_world", "gravity_view"})
 
 
 def _validate_physics(cfg: dict, force_head: dict) -> None:
@@ -743,16 +914,14 @@ def _pose_trainable_paths(cfg: dict) -> list:
         paths.append("model.pose_temporal")
     if cfg["train"]["finetune_pose_head"]:
         paths.append("train.finetune_pose_head")
-    for section in ("cross_modal_temporal", "frame_attn"):
-        node = cfg["model"][section]
-        if node["enabled"] and "pose" in node["modalities"]:
-            paths.append(f"model.{section} (pose modality)")
+    node = cfg["model"]["cross_modal_temporal"]
+    if node["enabled"] and "pose" in node["modalities"]:
+        paths.append("model.cross_modal_temporal (pose modality)")
     return paths
 
 
 def _validate_motion(cfg: dict) -> None:
-    """Validate ``model.motion_head`` / ``model.motion_temporal`` /
-    ``motion_supervision`` (motion tokens v2)."""
+    """Validate ``model.motion_head`` / ``motion_supervision`` (motion tokens v2)."""
     motion_head = cfg["model"]["motion_head"]
     motion_kp = motion_head["motion_keypoint_indices"]
     if (not isinstance(motion_kp, list) or len(motion_kp) == 0
@@ -766,28 +935,32 @@ def _validate_motion(cfg: dict) -> None:
             "model.motion_head.anchored must be a boolean; got "
             f"{motion_head['anchored']!r}")
 
-    motion_temporal = cfg["model"]["motion_temporal"]
-    if motion_temporal["enabled"] and not motion_head["enabled"]:
-        raise ValueError(
-            "model.motion_temporal.enabled requires model.motion_head.enabled=true "
-            "(motion temporal attends the motion tokens)")
-    _validate_temporal_common(motion_temporal, "model.motion_temporal")
-    _validate_temporal_common(cfg["model"]["pose_temporal"], "model.pose_temporal")
+    _validate_pose_temporal(cfg["model"]["pose_temporal"])
 
     ps = cfg["pose_supervision"]
-    for key in ("pose", "acc", "shape_rail", "scale_rail"):
+    for key in ("pose", "acc", "shape", "shape_rail", "scale_rail", "bones",
+                "scale"):
         value = float(ps["loss"][key])
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"pose_supervision.loss.{key} must be finite and >= 0")
-    ps_delta = float(ps["loss"]["huber_delta"])
-    if not math.isfinite(ps_delta) or ps_delta <= 0:
-        raise ValueError("pose_supervision.loss.huber_delta must be finite and positive")
+    for key in ("huber_delta", "huber_delta_bones"):
+        value = float(ps["loss"][key])
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"pose_supervision.loss.{key} must be finite and positive")
+    _validate_fit_err_confidence(ps, "pose_supervision")
+    if ps["enabled"] and float(ps["loss"]["scale"]) > 0 and float(
+            ps["loss"]["scale_rail"]) > 0:
+        raise ValueError(
+            "pose_supervision.loss.scale and loss.scale_rail are opposed — the "
+            "rail pins the 28 scale coefficients to the FROZEN readout while the "
+            "GT term corrects them. Set scale_rail to 0")
     if ps["enabled"]:
         if not _pose_trainable_paths(cfg):
             raise ValueError(
                 "pose_supervision.enabled requires a trainable pose path: "
                 "model.pose_temporal.enabled, train.finetune_pose_head, or the "
-                "'pose' modality in model.cross_modal_temporal / model.frame_attn")
+                "'pose' modality in model.cross_modal_temporal")
         if not any(entry["name"] == "climbing_corpus"
                    for entry in cfg["data"]["datasets"]):
             raise ValueError(
@@ -798,6 +971,10 @@ def _validate_motion(cfg: dict) -> None:
     target_frame = str(ms["target_frame"])
     if target_frame not in ("all", "center"):
         raise ValueError("motion_supervision.target_frame must be 'all' or 'center'")
+    if ms["root_source"] not in ("kindyn", "mhr"):
+        raise ValueError(
+            f"motion_supervision.root_source must be 'kindyn' or 'mhr'; "
+            f"got {ms['root_source']!r}")
     if ms["root_convention"] not in _ROOT_CONVENTIONS:
         raise ValueError(
             f"motion_supervision.root_convention must be one of "
@@ -817,14 +994,23 @@ def _validate_motion(cfg: dict) -> None:
             f"motion_supervision.angular must be a boolean; got {angular!r}")
     # The angular pair is the SE3-log twist's own components — it only exists
     # for the root slot and only under the twist convention.
-    if angular and ms["root_convention"] != "twist":
+    if angular and ms["root_convention"] not in ("twist", "gravity_view"):
         raise ValueError(
-            "motion_supervision.angular requires root_convention='twist'")
+            "motion_supervision.angular requires root_convention 'twist' or "
+            "'gravity_view' (the angular pair is the body rate under both)")
     if angular and joint_names != ["pelvis"]:
         raise ValueError(
             "motion_supervision.angular requires joint_names=['pelvis'] "
             "(angular targets exist for the root slot only); got "
             f"{joint_names!r}")
+    # The loader expresses only the ROOT slot in the gravity-view frame, and the
+    # loss de-rotates every slot with one matrix, so a mixed slot list would
+    # report the limbs in the wrong frame (a silent diagnostics bug).
+    if ms["root_convention"] == "gravity_view" and (
+            joint_names or list(_MOTION_JOINT_NAMES)) != ["pelvis"]:
+        raise ValueError(
+            "motion_supervision.root_convention='gravity_view' requires "
+            "joint_names=['pelvis'] (the limb slots stay in root axes)")
     smooth = ms["target_smooth_sec"]
     if (isinstance(smooth, bool) or not isinstance(smooth, (int, float))
             or not math.isfinite(float(smooth)) or float(smooth) < 0):
@@ -911,19 +1097,20 @@ def _validate_motion(cfg: dict) -> None:
 def _validate_motion_consistency(cfg: dict) -> None:
     """Validate ``motion_consistency`` (pose-derived twist vs GT / motion head)."""
     mc = cfg["motion_consistency"]
-    weight_keys = ("gt", "head", "pos", "rot", "cam_rail", "rot_rail")
+    weight_keys = ("gt", "head", "pos", "rot")
     for key in weight_keys:
         value = float(mc["loss"][key])
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"motion_consistency.loss.{key} must be finite and >= 0")
-    for key in ("huber_delta", "pos_huber_m", "rot_huber_rad", "cam_rail_margin_m",
-                "rot_rail_margin_rad"):
+    for key in ("huber_delta", "pos_huber_m", "rot_huber_rad"):
         value = float(mc["loss"][key])
         if not math.isfinite(value) or value <= 0:
             raise ValueError(
                 f"motion_consistency.loss.{key} must be finite and positive")
     if not isinstance(mc["angular"], bool):
         raise ValueError("motion_consistency.angular must be a boolean")
+    if not isinstance(mc["detach_head"], bool):
+        raise ValueError("motion_consistency.detach_head must be a boolean")
     offset = mc["hip_offset_root"]
     if (not isinstance(offset, (list, tuple)) or len(offset) != 3
             or not all(math.isfinite(float(v)) for v in offset)):
@@ -947,7 +1134,7 @@ def _validate_motion_consistency(cfg: dict) -> None:
         raise ValueError(
             "motion_consistency.enabled requires a trainable pose path "
             "(model.pose_temporal, train.finetune_pose_head, or the 'pose' "
-            "modality of model.cross_modal_temporal / model.frame_attn) — "
+            "modality of model.cross_modal_temporal) — "
             "otherwise the pose-derived side carries no gradient")
     if int(cfg["data"]["sequence"]["frames_per_clip"]) < 3:
         raise ValueError(
@@ -955,16 +1142,227 @@ def _validate_motion_consistency(cfg: dict) -> None:
             "(the twist stencil reads frames t-1, t, t+1)")
 
 
+def _validate_motion_rollout(cfg: dict) -> None:
+    """Validate ``motion_rollout`` (integrated velocity vs the GT / pose path)."""
+    mr = cfg["motion_rollout"]
+    weight_keys = ("gt", "pose", "rot_gt", "rot_pose")
+    for key in weight_keys:
+        value = float(mr["loss"][key])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"motion_rollout.loss.{key} must be finite and >= 0")
+    for key in ("huber_m", "huber_rad"):
+        value = float(mr["loss"][key])
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"motion_rollout.loss.{key} must be finite and positive")
+    if not isinstance(mr["detach_head"], bool):
+        raise ValueError("motion_rollout.detach_head must be a boolean")
+    horizons = mr["horizons"]
+    if (not isinstance(horizons, list) or not horizons
+            or any(isinstance(h, bool) or not isinstance(h, int) or h < 1
+                   for h in horizons)
+            or sorted(set(horizons)) != horizons):
+        raise ValueError(
+            "motion_rollout.horizons must be a strictly increasing list of positive "
+            f"frame counts; got {horizons!r}")
+    if not mr["enabled"]:
+        return
+    if all(float(mr["loss"][key]) == 0.0 for key in weight_keys):
+        raise ValueError(
+            "motion_rollout.enabled with every loss weight at 0 does nothing")
+    ms = cfg["motion_supervision"]
+    if not ms["enabled"]:
+        raise ValueError(
+            "motion_rollout.enabled requires motion_supervision.enabled=true (the "
+            "roll-out de-standardizes the head with its pinned table)")
+    # The roll-out rotates the predicted velocity to the world with the frame the
+    # TARGET was built in. A body-attached frame would compound the predicted
+    # pose's orientation error into the integral, which is the error the loss is
+    # supposed to be measuring.
+    if ms["root_convention"] != "gravity_view":
+        raise ValueError(
+            "motion_rollout.enabled requires motion_supervision.root_convention="
+            "'gravity_view' (a body-attached linear frame would make the integral "
+            "depend on the predicted body orientation)")
+    if (ms["joint_names"] or list(_MOTION_JOINT_NAMES)) != ["pelvis"]:
+        raise ValueError(
+            "motion_rollout.enabled requires motion_supervision.joint_names="
+            "['pelvis'] (the roll-out integrates the root slot)")
+    if not ms["angular"] and any(
+            float(mr["loss"][key]) > 0 for key in ("rot_gt", "rot_pose")):
+        raise ValueError(
+            "motion_rollout.loss.rot_gt/rot_pose require "
+            "motion_supervision.angular=true (there is no predicted body rate to "
+            "integrate otherwise)")
+    if (any(float(mr["loss"][key]) > 0 for key in ("pose", "rot_pose"))
+            and not _pose_trainable_paths(cfg)):
+        raise ValueError(
+            "motion_rollout.loss.pose/rot_pose require a trainable pose path "
+            "(model.pose_temporal, train.finetune_pose_head, or the 'pose' "
+            "modality of model.cross_modal_temporal) — otherwise the pose side "
+            "carries no gradient")
+    frames = int(cfg["data"]["sequence"]["frames_per_clip"])
+    if frames <= min(horizons):
+        raise ValueError(
+            f"motion_rollout.horizons {horizons} needs data.sequence."
+            f"frames_per_clip > {min(horizons)}; got {frames}")
+
+
+def _validate_contact_consistency(cfg: dict) -> None:
+    """Validate ``contact_consistency`` (gated zero-velocity at predicted contacts)."""
+    cc = cfg["contact_consistency"]
+    vel = float(cc["loss"]["vel"])
+    if not math.isfinite(vel) or vel < 0:
+        raise ValueError("contact_consistency.loss.vel must be finite and >= 0")
+    delta = float(cc["loss"]["huber_delta_ms"])
+    if not math.isfinite(delta) or delta <= 0:
+        raise ValueError(
+            "contact_consistency.loss.huber_delta_ms must be finite and positive")
+    if not isinstance(cc["detach_gate"], bool):
+        raise ValueError("contact_consistency.detach_gate must be a boolean")
+    if not cc["enabled"]:
+        return
+    if vel == 0.0:
+        raise ValueError("contact_consistency.enabled with loss.vel=0 does nothing")
+    joint = cfg["contact"]["targets"]["joint"]
+    if not (joint["enabled"] and str(joint["joint_set"]) == "kindyn_6"):
+        raise ValueError(
+            "contact_consistency.enabled requires the kindyn_6 joint contact target "
+            "(its six outputs match the six extremity keypoints 1:1)")
+    if not _pose_trainable_paths(cfg):
+        raise ValueError(
+            "contact_consistency.enabled requires a trainable pose path — with the "
+            "gate detached the velocity side carries the only gradient")
+    if not any(entry["name"] == "climbing_corpus"
+               for entry in cfg["data"]["datasets"]):
+        raise ValueError(
+            "contact_consistency.enabled requires a climbing_corpus dataset "
+            "(the world lift needs the per-frame camera extrinsics)")
+    if int(cfg["data"]["sequence"]["frames_per_clip"]) < 3:
+        raise ValueError(
+            "contact_consistency.enabled requires frames_per_clip >= 3 "
+            "(central-difference velocity stencil)")
+
+
+def _validate_force_consistency(cfg: dict) -> None:
+    """Validate ``force_consistency`` (linear Newton residual, bw units)."""
+    fc = cfg["force_consistency"]
+    weight = float(fc["loss"]["residual"])
+    if not math.isfinite(weight) or weight < 0:
+        raise ValueError("force_consistency.loss.residual must be finite and >= 0")
+    delta = float(fc["loss"]["huber_delta_bw"])
+    if not math.isfinite(delta) or delta <= 0:
+        raise ValueError(
+            "force_consistency.loss.huber_delta_bw must be finite and positive")
+    kernel = fc["smoothing_kernel"]
+    if (not isinstance(kernel, (list, tuple)) or len(kernel) % 2 != 1
+            or not all(math.isfinite(float(v)) for v in kernel)):
+        raise ValueError(
+            "force_consistency.smoothing_kernel must be an odd-length list of "
+            "finite floats ([1.0] disables smoothing)")
+    ramp = fc["ramp"]
+    if int(ramp["start_epoch"]) < 0:
+        raise ValueError("force_consistency.ramp.start_epoch must be >= 0")
+    if int(ramp["epochs"]) < 1:
+        raise ValueError("force_consistency.ramp.epochs must be >= 1")
+    if not fc["enabled"]:
+        return
+    if weight == 0.0:
+        raise ValueError("force_consistency.enabled with loss.residual=0 does nothing")
+    if not cfg["model"]["force_head"]["enabled"]:
+        raise ValueError(
+            "force_consistency.enabled requires model.force_head.enabled=true")
+    fs = cfg["force_supervision"]
+    if not fs["enabled"]:
+        raise ValueError(
+            "force_consistency.enabled requires force_supervision.enabled=true "
+            "(the residual assumes the supervised bw/root force convention)")
+    if str(fs["units"]) != "bw" or str(fs["gt_frame"]) != "root":
+        raise ValueError(
+            "force_consistency.enabled requires force_supervision units 'bw' and "
+            "gt_frame 'root' (the residual formula divides by m*g and rotates the "
+            "net force with the kindyn root rotation)")
+    if not cfg["motion_supervision"]["enabled"]:
+        raise ValueError(
+            "force_consistency.enabled requires motion_supervision.enabled=true "
+            "(the root rotation and its validity come from the motion targets)")
+    if int(cfg["data"]["sequence"]["frames_per_clip"]) < 3:
+        raise ValueError(
+            "force_consistency.enabled requires frames_per_clip >= 3 "
+            "(double-difference acceleration stencil)")
+
+
+def _validate_pose_smoothness(cfg: dict) -> None:
+    """Validate ``pose_smoothness`` (jerk/snap minimisation on the prediction)."""
+    from .pose_smoothness import STENCIL_WIDTH, TERM_NAMES
+
+    ps = cfg["pose_smoothness"]
+    for name in TERM_NAMES:
+        weight = float(ps["loss"][name])
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError(
+                f"pose_smoothness.loss.{name} must be finite and >= 0")
+        delta = float(ps["loss"][f"huber_delta_{name}"])
+        if not math.isfinite(delta) or delta <= 0:
+            raise ValueError(
+                f"pose_smoothness.loss.huber_delta_{name} must be finite and "
+                "positive")
+    for key in ("fingers", "face"):
+        value = float(ps["joint_weights"][key])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"pose_smoothness.joint_weights.{key} must be finite and >= 0")
+    if not ps["enabled"]:
+        return
+    if all(float(ps["loss"][name]) == 0.0 for name in TERM_NAMES):
+        raise ValueError(
+            "pose_smoothness.enabled with every loss weight at 0 does nothing")
+    if not _pose_trainable_paths(cfg):
+        raise ValueError(
+            "pose_smoothness.enabled requires a trainable pose path "
+            "(model.pose_temporal, train.finetune_pose_head, or the 'pose' "
+            "modality of model.cross_modal_temporal) — the penalty acts on the "
+            "prediction, so without one it carries no gradient")
+    if not any(entry["name"] == "climbing_corpus"
+               for entry in cfg["data"]["datasets"]):
+        raise ValueError(
+            "pose_smoothness.enabled requires a climbing_corpus dataset "
+            "(the world lift needs the per-frame camera extrinsics)")
+    if int(cfg["data"]["sequence"]["frames_per_clip"]) < STENCIL_WIDTH:
+        raise ValueError(
+            f"pose_smoothness.enabled requires frames_per_clip >= {STENCIL_WIDTH} "
+            "(the jerk/snap stencils read frames t-2 .. t+2)")
+
+
+def _validate_fit_err_confidence(section: dict, name: str) -> None:
+    """Validate the shared ``fit_err_confidence`` / ``fit_err_ref_cm`` pair."""
+    if not isinstance(section["fit_err_confidence"], bool):
+        raise ValueError(f"{name}.fit_err_confidence must be a boolean")
+    ref = float(section["fit_err_ref_cm"])
+    if not math.isfinite(ref) or ref <= 0:
+        raise ValueError(f"{name}.fit_err_ref_cm must be finite and positive")
+
+
 def _validate_keypoint_supervision(cfg: dict) -> None:
     """Validate ``keypoint_supervision`` (kindyn keypoint losses) and the
     ``train.finetune_camera_head`` flag whose only objectives live here."""
     ks = cfg["keypoint_supervision"]
     for key in ("kp2d", "kp3d", "kp3d_abs", "kp_vel", "kp_acc",
-                "cam_rail", "rot_rail"):
+                "vert", "vert_abs", "cam_rail", "rot_rail"):
         value = float(ks["loss"][key])
         if not math.isfinite(value) or value < 0:
             raise ValueError(
                 f"keypoint_supervision.loss.{key} must be finite and >= 0")
+    for key in ("fingers", "face"):
+        value = float(ks["joint_weights"][key])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"keypoint_supervision.joint_weights.{key} must be finite and >= 0")
+    if float(ks["joint_weights"]["fingers"]) == 0 and float(
+            ks["joint_weights"]["face"]) == 0:
+        raise ValueError(
+            "keypoint_supervision.joint_weights cannot zero both groups and the "
+            "body joints are fixed at 1.0 — this config downweights nothing")
+    _validate_fit_err_confidence(ks, "keypoint_supervision")
     for key in ("huber_delta_2d", "huber_delta_3d", "huber_delta_vel",
                 "huber_delta_acc", "outlier_acc", "cam_rail_margin_m",
                 "rot_rail_margin_rad"):
@@ -975,7 +1373,7 @@ def _validate_keypoint_supervision(cfg: dict) -> None:
     if ks["enabled"]:
         if not any(float(ks["loss"][k]) > 0
                    for k in ("kp2d", "kp3d", "kp3d_abs", "kp_vel",
-                             "kp_acc")):
+                             "kp_acc", "vert", "vert_abs")):
             raise ValueError(
                 "keypoint_supervision.enabled requires a positive loss weight")
         if (any(float(ks["loss"][k]) > 0
@@ -995,8 +1393,8 @@ def _validate_keypoint_supervision(cfg: dict) -> None:
                    for entry in cfg["data"]["datasets"]):
             raise ValueError(
                 "keypoint_supervision.enabled requires a climbing_corpus "
-                "dataset in data.datasets (GT keypoints come from the corpus "
-                "kindyn joints_world)")
+                "dataset in data.datasets (GT keypoints/vertices come from the "
+                "corpus mhr_sup_1.npz)")
     if cfg["train"]["finetune_camera_head"] and not (
             (ks["enabled"] and float(ks["loss"]["kp2d"]) > 0)
             or cfg["motion_consistency"]["enabled"]):
@@ -1026,7 +1424,7 @@ def _validate_cond_input(cfg: dict, contact_enabled: bool) -> None:
         raise ValueError(
             "model.cond_input.injection must be 'pre_decoder' (added to the initial "
             "token embeddings) or 'post_decoder' (added to the decoder's token "
-            f"outputs, before temporal attention); got {injection!r}")
+            f"outputs, before the heads); got {injection!r}")
     if not cond["enabled"]:
         return
     if not (contact_enabled or cfg["model"]["force_head"]["enabled"]):
@@ -1054,6 +1452,65 @@ def _validate_cond_input(cfg: dict, contact_enabled: bool) -> None:
     for key in ("vel_std", "acc_std"):
         if any(float(v) <= 0 for v in cond["standardize"][key]):
             raise ValueError(f"model.cond_input.standardize.{key} entries must be positive")
+
+
+def _validate_embedding_augment(cfg: dict) -> None:
+    """Check ``data.embedding_augment`` ranges and its dependency on the cache."""
+    aug = cfg["data"]["embedding_augment"]
+    if not aug["enabled"]:
+        return
+    if not cfg["data"]["embedding_cache"]:
+        raise ValueError(
+            "data.embedding_augment.enabled requires data.embedding_cache — "
+            "there is no cached embedding to corrupt otherwise")
+    alpha = float(aug["gaussian_alpha"])
+    prob = float(aug["cutmix_prob"])
+    if not math.isfinite(alpha) or alpha < 0.0:
+        raise ValueError("data.embedding_augment.gaussian_alpha must be finite and >= 0")
+    if not 0.0 <= prob <= 1.0:
+        raise ValueError("data.embedding_augment.cutmix_prob must be in [0, 1]")
+    if alpha == 0.0 and prob == 0.0:
+        raise ValueError(
+            "data.embedding_augment.enabled with both components off — set "
+            "gaussian_alpha and/or cutmix_prob, or disable the section")
+    area = aug["cutmix_area"]
+    if (not isinstance(area, (list, tuple)) or len(area) != 2
+            or not 0.0 <= float(area[0]) <= float(area[1]) <= 1.0):
+        raise ValueError(
+            "data.embedding_augment.cutmix_area must be [lo, hi] with "
+            f"0 <= lo <= hi <= 1; got {area!r}")
+    start = float(aug["anneal_start_frac"])
+    if not 0.0 < start <= 1.0:
+        raise ValueError(
+            "data.embedding_augment.anneal_start_frac must be in (0, 1]; "
+            f"got {start}")
+    # Nothing else validates that the augment ever actually runs, and a silent
+    # no-op reads exactly like a null result. Each check below closes one.
+    if anneal_scale(0, int(cfg["optim"]["epochs"]), start) <= 0.0:
+        raise ValueError(
+            f"data.embedding_augment is annealed out for the whole run: "
+            f"optim.epochs={cfg['optim']['epochs']} with anneal_start_frac="
+            f"{start} leaves no epoch at non-zero strength")
+    others = sorted({d["name"] for d in cfg["data"]["datasets"]} - {"climbing_corpus"})
+    if others:
+        # Only climbing_corpus frames carry batch["embedding"]; a mixed run
+        # would otherwise die on a bare KeyError at the first stills batch.
+        raise ValueError(
+            "data.embedding_augment requires every dataset to be "
+            f"climbing_corpus (only those carry a cached embedding); got {others}")
+    if prob > 0.0:
+        if float(area[1]) <= 0.0:
+            raise ValueError(
+                "data.embedding_augment.cutmix_prob > 0 needs a non-zero "
+                f"cutmix_area; got {area!r}")
+        clips = int(cfg["data"]["frames_per_batch"]) // int(
+            cfg["data"]["sequence"]["frames_per_clip"])
+        if clips < 2:
+            raise ValueError(
+                "data.embedding_augment.cutmix_prob > 0 needs >= 2 clips per "
+                "batch to paste from another clip; frames_per_batch="
+                f"{cfg['data']['frames_per_batch']} / frames_per_clip="
+                f"{cfg['data']['sequence']['frames_per_clip']} gives {clips}")
 
 
 def _validate_semantics(cfg: dict) -> None:
@@ -1126,34 +1583,19 @@ def _validate_semantics(cfg: dict) -> None:
                 f"target output dimension to equal the total token count {token_count}; "
                 f"got {mismatched}")
 
-    temporal = cfg["model"]["temporal"]
-    if temporal["enabled"] and not contact_enabled:
-        raise ValueError(
-            "model.temporal.enabled requires an enabled contact target (the contact "
-            "temporal module attends the contact tokens, which a force-only build "
-            "does not create — use model.force_temporal for the force tokens)")
-    _validate_temporal_common(temporal, "model.temporal")
-    window_frames = temporal["window_frames"]
-    if window_frames is not None and (int(window_frames) < 3 or int(window_frames) % 2 == 0):
-        raise ValueError(
-            f"model.temporal.window_frames must be null or an odd int >= 3; "
-            f"got {window_frames!r}")
-
     cross_modal = cfg["model"]["cross_modal_temporal"]
-    _validate_temporal_common(cross_modal, "model.cross_modal_temporal")
+    xm_type = cross_modal.get("type", "rope")
+    if xm_type == "rope":
+        _validate_rope_temporal(cross_modal, "model.cross_modal_temporal")
+    elif xm_type == "window":
+        _validate_window_temporal(cross_modal, "model.cross_modal_temporal")
+    else:
+        raise ValueError(
+            "model.cross_modal_temporal.type must be 'rope' or 'window'; "
+            f"got {xm_type!r}")
     if cross_modal["enabled"]:
         _validate_modalities(
             cfg, cross_modal, "model.cross_modal_temporal", min_count=2)
-
-    frame_attn = cfg["model"]["frame_attn"]
-    _validate_temporal_common(frame_attn, "model.frame_attn")
-    if frame_attn["enabled"]:
-        _validate_modalities(cfg, frame_attn, "model.frame_attn", min_count=1)
-        if not any(v for m, v in _enabled_modalities(cfg).items() if m != "pose"):
-            raise ValueError(
-                "model.frame_attn.enabled requires at least one of the contact/"
-                "force/motion branches: with only the pose token in the build "
-                "there is no frame context to attend")
 
     eta = cfg["model"]["extra_token_attention"]
     if eta not in ("causal", "mutual"):
@@ -1218,18 +1660,15 @@ def _validate_semantics(cfg: dict) -> None:
                 "contact->force gate map is the identity over the six kindyn "
                 f"groups); got {force_kp!r}")
 
-    force_temporal = cfg["model"]["force_temporal"]
-    if force_temporal["enabled"] and not force_head["enabled"]:
-        raise ValueError(
-            "model.force_temporal.enabled requires model.force_head.enabled=true "
-            "(force temporal attends the force tokens)")
-    _validate_temporal_common(force_temporal, "model.force_temporal")
-
     _validate_physics(cfg, force_head)
     _validate_force_supervision(cfg, force_head)
     _validate_motion(cfg)
     _validate_motion_consistency(cfg)
+    _validate_motion_rollout(cfg)
+    _validate_contact_consistency(cfg)
+    _validate_force_consistency(cfg)
     _validate_keypoint_supervision(cfg)
+    _validate_pose_smoothness(cfg)
     _validate_cond_input(cfg, contact_enabled)
 
     if cfg["train"]["freeze_contact"]:
@@ -1273,14 +1712,19 @@ def _validate_semantics(cfg: dict) -> None:
                              or not isinstance(stride, int) or stride <= 0):
         raise ValueError(
             f"data.sequence.frame_stride must be a positive int or 'auto'; got {stride!r}")
-    # Only the motion path resolves `auto` per scene. evaluate.py, demo.py,
-    # render_climbing_video_contacts.py, predict_reconstruction.py and the viewer
-    # all do int(frame_stride) and would die on it with an opaque ValueError.
-    if stride == "auto" and not cfg["motion_supervision"]["enabled"]:
+    # The corpus loader resolves `auto` per scene; the motion and pose pipelines
+    # ride it. demo.py, render_climbing_video_contacts.py,
+    # render_climbing_pose_video.py, predict_reconstruction.py and the viewer all
+    # still do int(frame_stride) and would die on it with an opaque ValueError, so
+    # the contact/force configs stay int. (evaluate.py handles `auto` since
+    # 2026-08-30 — this guard never protected it anyway: a motion/pose config is
+    # exactly the kind you then evaluate, and it crashed before scoring a batch.)
+    if stride == "auto" and not (cfg["motion_supervision"]["enabled"]
+                                 or cfg["pose_supervision"]["enabled"]):
         raise ValueError(
-            "data.sequence.frame_stride: auto requires motion_supervision.enabled=true "
-            "(only the motion pipeline resolves the per-scene stride; the contact/"
-            "force CLIs read this key as a plain int)")
+            "data.sequence.frame_stride: auto requires motion_supervision.enabled "
+            "or pose_supervision.enabled (the contact/force CLIs read this key as "
+            "a plain int)")
     if target_frame == "center" and frames_per_clip % 2 == 0:
         raise ValueError(
             "data.sequence.target_frame='center' requires an odd frames_per_clip")
@@ -1311,12 +1755,31 @@ def _validate_semantics(cfg: dict) -> None:
             "data.eval_split='test' requires a single climbing_corpus dataset "
             "(the manually annotated test split)")
 
+    _validate_embedding_augment(cfg)
+
     tb_metrics = cfg["logging"]["tensorboard_metrics"]
     if tb_metrics is not None and (
         not isinstance(tb_metrics, list)
         or not all(isinstance(metric, str) and metric for metric in tb_metrics)
     ):
         raise ValueError("logging.tensorboard_metrics must be null or a list of scalar tags")
+
+
+def _resolve_coupled_defaults(cfg: dict) -> None:
+    """Fill defaults whose value depends on another key. An explicit value wins.
+
+    ``motion_consistency.hip_offset_root`` is a property of the rig
+    ``motion_supervision.root_source`` names, not a free constant: the kindyn
+    pelvis sits ~9 cm from the mean-hips, the MHR root IS the mean-hips. Left
+    coupled by hand it is a silent footgun — flipping ``root_source`` would keep
+    a 9 cm bias on the absolute position anchor.
+    """
+    mc = cfg["motion_consistency"]
+    if mc["hip_offset_root"] is None:
+        mc["hip_offset_root"] = (
+            list(KINDYN_HIP_OFFSET_ROOT)
+            if cfg["motion_supervision"]["root_source"] == "kindyn"
+            else [0.0, 0.0, 0.0])
 
 
 def load_config(path: str | Path) -> dict:
@@ -1330,5 +1793,6 @@ def load_config(path: str | Path) -> dict:
     raw = _load_raw(Path(path))
     merged = _deep_merge(DEFAULTS, raw)
     _validate_keys(merged, DEFAULTS)
+    _resolve_coupled_defaults(merged)
     _validate_semantics(merged)
     return merged

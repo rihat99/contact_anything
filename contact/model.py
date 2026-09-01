@@ -10,10 +10,10 @@ and the new contact/force/motion modules stay at random init.
 
 After the load we freeze the whole network and unfreeze only the contact,
 force **and motion** pipelines: any param whose name contains ``contact``,
-``force`` or ``motion`` (contact tokens/head/posemb/feat/temporal, the force
-tokens, ``head_force``, ``force_temporal``, and the motion tokens,
-``head_motion``, ``motion_temporal``). Backbone, decoder, prompt
-encoder, MHR/camera heads stay frozen. Regime (a) (``train.freeze_contact``)
+``force`` or ``motion`` (contact tokens/head/posemb/feat, the force tokens,
+``head_force``, and the motion tokens, ``head_motion``) — plus the shared
+post-decoder ``cross_modal_temporal`` block and ``pose_temporal``. Backbone,
+decoder, prompt encoder, MHR/camera heads stay frozen. Regime (a) (``train.freeze_contact``)
 re-freezes the contact params after the unfreeze so only the force branch
 trains. Frozen modules are eval-pinned (:func:`pin_frozen_eval`).
 
@@ -79,37 +79,20 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
     ch.BLIND_TO_IMAGE          = bool(chead["blind_to_image"])
     ch.TARGETS = CfgNode({name.upper(): int(dim) for name, dim in out_dims.items()})
 
-    # Temporal module (Phase 3). Patched even when disabled so the model config
-    # is self-describing; SAM3DBody only builds contact_temporal when ENABLED.
-    tcfg = cfg["model"].get("temporal", {}) or {}
-    model_cfg.MODEL.TEMPORAL = CfgNode({
-        "ENABLED": bool(tcfg.get("enabled", False)),
-        "BOTTLENECK_DIM": int(tcfg.get("bottleneck_dim", 256)),
-        "NUM_LAYERS": int(tcfg.get("num_layers", 1)),
-        "NUM_HEADS": int(tcfg.get("num_heads", 4)),
-        "MLP_RATIO": float(tcfg.get("mlp_ratio", 2.0)),
-        "ATTEND": str(tcfg.get("attend", "joint")),
-        "CAUSAL": bool(tcfg.get("causal", False)),
-        "DROPOUT": float(tcfg.get("dropout", 0.0)),
-        "POSITION_SCALE": float(tcfg.get("position_scale", 1.0)),
-        # None or odd int >= 3; kept as-is (an inference attention-window choice).
-        "WINDOW_FRAMES": tcfg.get("window_frames", None),
-    })
-
     # Pose-token temporal module (E2). The DELIBERATE exception to the
     # frozen-pose rule: when enabled, the final MHR output is recomputed from a
     # temporally-mixed pose token (zero-init gates = frozen behavior at init).
     ptcfg = cfg["model"].get("pose_temporal", {}) or {}
+    _pt_max_rel = ptcfg.get("max_rel_sec", 2.5)
     model_cfg.MODEL.POSE_TEMPORAL = CfgNode({
         "ENABLED": bool(ptcfg.get("enabled", False)),
-        "BOTTLENECK_DIM": int(ptcfg.get("bottleneck_dim", 256)),
-        "NUM_LAYERS": int(ptcfg.get("num_layers", 2)),
-        "NUM_HEADS": int(ptcfg.get("num_heads", 4)),
+        "TYPE": str(ptcfg.get("type", "rope")),
+        "TIME_SCALE": float(ptcfg.get("time_scale", 25.0)),
+        "MAX_REL_SEC": None if _pt_max_rel is None else float(_pt_max_rel),
+        "NUM_LAYERS": int(ptcfg.get("num_layers", 4)),
+        "NUM_HEADS": int(ptcfg.get("num_heads", 16)),
         "MLP_RATIO": float(ptcfg.get("mlp_ratio", 2.0)),
-        "ATTEND": str(ptcfg.get("attend", "per_token")),
-        "CAUSAL": bool(ptcfg.get("causal", False)),
         "DROPOUT": float(ptcfg.get("dropout", 0.0)),
-        "POSITION_SCALE": float(ptcfg.get("position_scale", 30.0)),
     })
 
     # Force head + tokens (steps 04+). Patched even when disabled so the model
@@ -133,23 +116,6 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
         "CONTACT_GATE_SHARPNESS": float(gate_cfg.get("sharpness", 4.0)),
     })
 
-    # Force temporal module (step 05). A second ContactTemporalModule over the
-    # force tokens, post_decoder only (no PLACEMENT key — it is fixed). Patched
-    # even when disabled so the model config is self-describing; SAM3DBody only
-    # builds force_temporal when ENABLED.
-    ftcfg = cfg["model"].get("force_temporal", {}) or {}
-    model_cfg.MODEL.FORCE_TEMPORAL = CfgNode({
-        "ENABLED": bool(ftcfg.get("enabled", False)),
-        "BOTTLENECK_DIM": int(ftcfg.get("bottleneck_dim", 256)),
-        "NUM_LAYERS": int(ftcfg.get("num_layers", 1)),
-        "NUM_HEADS": int(ftcfg.get("num_heads", 4)),
-        "MLP_RATIO": float(ftcfg.get("mlp_ratio", 2.0)),
-        "ATTEND": str(ftcfg.get("attend", "per_token")),
-        "CAUSAL": bool(ftcfg.get("causal", False)),
-        "DROPOUT": float(ftcfg.get("dropout", 0.0)),
-        "POSITION_SCALE": float(ftcfg.get("position_scale", 1.0)),
-    })
-
     # Motion head + tokens (motion tokens v2). Patched even when disabled so the
     # model config is self-describing; SAM3DBody only builds the motion stack
     # when DO_MOTION_TOKENS. Anchors are always explicit (no contact inheritance,
@@ -171,49 +137,27 @@ def _patch_model_cfg(model_cfg, cfg: dict, mhr_path: str):
         "OUTPUT_DIMS":            12 if motion_angular else 6,
     })
 
-    # Motion temporal module over the motion tokens (post_decoder).
-    mtcfg = cfg["model"].get("motion_temporal", {}) or {}
-    model_cfg.MODEL.MOTION_TEMPORAL = CfgNode({
-        "ENABLED": bool(mtcfg.get("enabled", False)),
-        "BOTTLENECK_DIM": int(mtcfg.get("bottleneck_dim", 256)),
-        "NUM_LAYERS": int(mtcfg.get("num_layers", 1)),
-        "NUM_HEADS": int(mtcfg.get("num_heads", 4)),
-        "MLP_RATIO": float(mtcfg.get("mlp_ratio", 2.0)),
-        "ATTEND": str(mtcfg.get("attend", "per_token")),
-        "CAUSAL": bool(mtcfg.get("causal", False)),
-        "DROPOUT": float(mtcfg.get("dropout", 0.0)),
-        "POSITION_SCALE": float(mtcfg.get("position_scale", 1.0)),
-    })
-
-    # Cross-modal temporal module: ONE temporal block (attend fixed to 'joint')
-    # over the concatenation of the listed modality token blocks. Patched even
-    # when disabled so the model config is self-describing; SAM3DBody only
-    # builds cross_modal_temporal when ENABLED.
+    # Cross-modal temporal module: THE post-decoder mixing brick — ONE temporal
+    # transformer (rope or the revived sinusoidal window block) over the
+    # concatenation of the listed modality token blocks. Patched even when
+    # disabled so the model config is self-describing; SAM3DBody only builds
+    # cross_modal_temporal when ENABLED.
     xmcfg = cfg["model"].get("cross_modal_temporal", {}) or {}
+    _xm_max_rel = xmcfg.get("max_rel_sec", 2.5)
+    _xm_bottleneck = xmcfg.get("bottleneck_dim", 256)
     model_cfg.MODEL.CROSS_MODAL_TEMPORAL = CfgNode({
         "ENABLED": bool(xmcfg.get("enabled", False)),
+        "TYPE": str(xmcfg.get("type", "rope")),
         "MODALITIES": [str(m) for m in (xmcfg.get("modalities") or [])],
-        "BOTTLENECK_DIM": int(xmcfg.get("bottleneck_dim", 256)),
-        "NUM_LAYERS": int(xmcfg.get("num_layers", 1)),
-        "NUM_HEADS": int(xmcfg.get("num_heads", 4)),
+        "NUM_LAYERS": int(xmcfg.get("num_layers", 4)),
+        "NUM_HEADS": int(xmcfg.get("num_heads", 16)),
         "MLP_RATIO": float(xmcfg.get("mlp_ratio", 2.0)),
-        "CAUSAL": bool(xmcfg.get("causal", False)),
         "DROPOUT": float(xmcfg.get("dropout", 0.0)),
-        "POSITION_SCALE": float(xmcfg.get("position_scale", 1.0)),
-    })
-
-    # Per-frame attention (no temporal mixing) after the temporal blocks: one
-    # own-weights module per listed modality; keys/values span every modality's
-    # tokens of the frame. Same patched-even-when-disabled rule.
-    facfg = cfg["model"].get("frame_attn", {}) or {}
-    model_cfg.MODEL.FRAME_ATTN = CfgNode({
-        "ENABLED": bool(facfg.get("enabled", False)),
-        "MODALITIES": [str(m) for m in (facfg.get("modalities") or [])],
-        "BOTTLENECK_DIM": int(facfg.get("bottleneck_dim", 256)),
-        "NUM_LAYERS": int(facfg.get("num_layers", 1)),
-        "NUM_HEADS": int(facfg.get("num_heads", 4)),
-        "MLP_RATIO": float(facfg.get("mlp_ratio", 2.0)),
-        "DROPOUT": float(facfg.get("dropout", 0.0)),
+        "TIME_SCALE": float(xmcfg.get("time_scale", 25.0)),
+        "MAX_REL_SEC": None if _xm_max_rel is None else float(_xm_max_rel),
+        "BOTTLENECK_DIM": None if _xm_bottleneck is None else int(_xm_bottleneck),
+        "POSITION_SCALE": float(xmcfg.get("position_scale", 25.0)),
+        "CAUSAL": bool(xmcfg.get("causal", False)),
     })
 
     # Input conditioning (model.cond_input). Only the switch and the feature width
@@ -258,16 +202,15 @@ def _trainable_name_filter(name: str) -> bool:
     """Train the contact, force and motion pipelines only: their tokens, heads,
     and the small posemb / feat projection layers that update the tokens between
     decoder layers (all of which contain ``contact``, ``force`` or ``motion`` in
-    the dotted name) — plus the shared post-decoder bricks ``cross_modal``
-    (cross-modal temporal) and ``frame_attn`` (per-frame attention), and
+    the dotted name) — plus the shared post-decoder ``cross_modal`` block
+    (the all-modality RoPE temporal transformer) and
     ``pose_temporal``, the deliberate exception that is allowed to move the
     frozen pose outputs (E2; ``head_pose`` itself never matches, the substring
     check is on the full module name — its optional fine-tune is a separate
     explicit flag in :func:`build_model`)."""
     lname = name.lower()
     return ("contact" in lname or "force" in lname or "motion" in lname
-            or "cross_modal" in lname or "frame_attn" in lname
-            or "pose_temporal" in lname)
+            or "cross_modal" in lname or "pose_temporal" in lname)
 
 
 def _subtree_requires_grad(module: nn.Module) -> Tuple[bool, bool]:

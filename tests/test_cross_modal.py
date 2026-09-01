@@ -1,8 +1,9 @@
-"""Cross-modal temporal + frame attention + pose-head fine-tune wiring.
+"""All-modality RoPE temporal block + pose-head fine-tune wiring.
 
 Fast tests cover config validation, the yaml->yacs bridge, the arch signature
 and the freeze filter; ``-m slow`` covers the GPU semantics with the real
-checkpoint (zero-init no-op, modality isolation, trainable sets).
+checkpoint (zero-init no-op, modality isolation, trainable sets). The module's
+own maths lives in ``test_cross_modal_rope.py``.
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from contact.config import _pose_trainable_paths, load_config
 from contact.model import _trainable_name_filter
 
 REPO = Path(__file__).resolve().parents[1]
-JOINT_CFG = REPO / "configs" / "old" / "climbing_videos_joint.yaml"
+JOINT_CFG = REPO / "tests" / "fixtures" / "climbing_videos_joint.yaml"
 _CKPT = load_config(REPO / "configs" / "base.yaml")["model"]["checkpoint_path"]
 
 
@@ -40,7 +41,6 @@ base: {JOINT_CFG}
 def test_defaults_disabled():
     cfg = load_config(REPO / "configs" / "base.yaml")
     assert cfg["model"]["cross_modal_temporal"]["enabled"] is False
-    assert cfg["model"]["frame_attn"]["enabled"] is False
     assert cfg["train"]["finetune_pose_head"] is False
     assert cfg["train"]["pose_head_lr_scale"] == pytest.approx(0.1)
 
@@ -74,24 +74,24 @@ def test_cross_modal_accepts_pose_contact(tmp_path):
     assert cfg["model"]["cross_modal_temporal"]["modalities"] == ["pose", "contact"]
 
 
-def test_frame_attn_needs_frame_context(tmp_path):
-    # A pose-only build has no other tokens in the frame to attend.
-    with pytest.raises(ValueError, match="at least one of the contact"):
-        load_config(_write(tmp_path, """
-base: configs/base.yaml
-model:
-  pose_temporal: {enabled: true}
-  frame_attn: {enabled: true, modalities: [pose]}
-contact:
-  targets:
-    vertex: {enabled: false}
-    joint: {enabled: false}
-"""))
-    # With a contact branch present the same listing is legal: keys/values
-    # always span every enabled modality's tokens of the frame.
+def test_cross_modal_hyperparameters_validated(tmp_path):
+    for bad, msg in (("num_layers: 0", "num_layers must be positive"),
+                     ("num_heads: 0", "num_heads must be positive"),
+                     ("mlp_ratio: 0", "mlp_ratio must be positive"),
+                     ("dropout: 1.0", r"dropout must be in \[0, 1\)"),
+                     ("time_scale: 0", "time_scale must be finite"),
+                     ("max_rel_sec: 0", "max_rel_sec must be finite")):
+        with pytest.raises(ValueError, match=msg):
+            load_config(_write(tmp_path, _joint_cfg_text(
+                "model: {cross_modal_temporal: {enabled: true, "
+                f"modalities: [pose, contact], {bad}}}}}")))
+
+
+def test_cross_modal_max_rel_sec_accepts_null(tmp_path):
     cfg = load_config(_write(tmp_path, _joint_cfg_text(
-        "model: {frame_attn: {enabled: true, modalities: [pose]}}")))
-    assert cfg["model"]["frame_attn"]["modalities"] == ["pose"]
+        "model: {cross_modal_temporal: {enabled: true, "
+        "modalities: [pose, contact], max_rel_sec: null}}")))
+    assert cfg["model"]["cross_modal_temporal"]["max_rel_sec"] is None
 
 
 def test_extra_token_attention_validation(tmp_path):
@@ -147,10 +147,10 @@ def test_pose_trainable_paths_lists_modality_bricks(tmp_path):
 
 # ---------------------------------------------------------------- freeze filter
 
-def test_freeze_filter_matches_new_bricks_and_not_head_pose():
+def test_freeze_filter_matches_the_block_and_not_head_pose():
     assert _trainable_name_filter("cross_modal_temporal.blocks.0.gamma_attn")
-    assert _trainable_name_filter("frame_attn.contact.blocks.0.gamma_attn")
-    assert _trainable_name_filter("frame_attn.pose.token_in_proj.weight")
+    assert _trainable_name_filter("cross_modal_temporal.slot_embed")
+    assert _trainable_name_filter("cross_modal_temporal.blocks.3.qkv.weight")
     assert not _trainable_name_filter("head_pose.proj.layers.0.weight")
     assert not _trainable_name_filter("head_pose.hand_pose_comps")
 
@@ -167,8 +167,8 @@ def test_bridge_carries_new_sections_to_yacs(tmp_path):
         "  extra_token_attention: mutual\n"
         "  force_head: {enabled: true, force_keypoint_indices: [62, 41, 13, 14],"
         " frame: root}\n"
-        "  cross_modal_temporal: {enabled: true, modalities: [pose, contact]}\n"
-        "  frame_attn: {enabled: true, modalities: [contact]}")))
+        "  cross_modal_temporal: {enabled: true, modalities: [pose, contact],"
+        " num_layers: 3, num_heads: 8, time_scale: 30.0, max_rel_sec: null}")))
     mc = CN()
     mc.MODEL = CN()
     mc.MODEL.DECODER = CN()
@@ -177,8 +177,10 @@ def test_bridge_carries_new_sections_to_yacs(tmp_path):
     _patch_model_cfg(mc, cfg, mhr_path="unused.pt")
     assert mc.MODEL.CROSS_MODAL_TEMPORAL.ENABLED is True
     assert mc.MODEL.CROSS_MODAL_TEMPORAL.MODALITIES == ["pose", "contact"]
-    assert mc.MODEL.FRAME_ATTN.ENABLED is True
-    assert mc.MODEL.FRAME_ATTN.MODALITIES == ["contact"]
+    assert mc.MODEL.CROSS_MODAL_TEMPORAL.NUM_LAYERS == 3
+    assert mc.MODEL.CROSS_MODAL_TEMPORAL.NUM_HEADS == 8
+    assert mc.MODEL.CROSS_MODAL_TEMPORAL.TIME_SCALE == pytest.approx(30.0)
+    assert mc.MODEL.CROSS_MODAL_TEMPORAL.MAX_REL_SEC is None
     assert mc.MODEL.EXTRA_TOKEN_ATTENTION == "mutual"
 
 
@@ -188,21 +190,19 @@ def test_signature_captures_bricks_only_when_enabled(tmp_path):
     base = load_config(_write(tmp_path, _joint_cfg_text("")))
     sig = ckpt_io._arch_signature(base)
     assert "cross_modal_temporal" not in sig
-    assert "frame_attn" not in sig
     assert "pose_head_finetune" not in sig
     assert "extra_token_attention" not in sig      # causal is never recorded
 
     cfg = load_config(_write(tmp_path, _joint_cfg_text(
         "model:\n"
         "  cross_modal_temporal: {enabled: true, modalities: [pose, contact]}\n"
-        "  frame_attn: {enabled: true, modalities: [contact]}\n"
         "train: {finetune_pose_head: true}\n"
         "pose_supervision: {enabled: true}")))
     sig2 = ckpt_io._arch_signature(cfg)
-    assert sig2["cross_modal_temporal"]["modalities"] == ["contact", "pose"]  # sorted
-    # The attend_all key is a pinned constant now (the config knob was removed;
-    # stored signatures compare by exact equality).
-    assert sig2["frame_attn"]["attend_all"] is True
+    # The modality list sizes the learned slot embedding, so it is semantic.
+    assert sig2["cross_modal_temporal"] == {
+        "enabled": True, "type": "rope", "modalities": ["contact", "pose"],
+        "num_layers": 4, "num_heads": 16, "mlp_ratio": 2.0, "time_scale": 25.0}
     assert sig2["pose_head_finetune"] == {"enabled": True, "split": True}
     assert "camera_head_finetune" not in sig2
     assert sig != sig2
@@ -289,9 +289,10 @@ def _mhr_floats(out):
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.skipif(not os.path.exists(_CKPT), reason="checkpoint missing")
-def test_cross_modal_gpu_semantics(tmp_path):
+def test_cross_modal_gpu_semantics_pose_listed(tmp_path):
     """Zero-init == dropped module (noise floor); hot gammas move the contact
-    logits but leave the frozen MHR outputs at the floor ('pose' not listed)."""
+    logits AND — because 'pose' is a listed (written) modality — the frozen
+    MHR outputs, via the final-readout recompute."""
     from contact.engine import forward_model
 
     model, trainable, cfg = _gpu_build(
@@ -299,6 +300,9 @@ def test_cross_modal_gpu_semantics(tmp_path):
         "  cross_modal_temporal: {enabled: true, modalities: [pose, contact]}",
         tmp_path)
     assert any("cross_modal_temporal" in n for n in trainable)
+    assert model.cross_modal_modalities == ["pose", "contact"]
+    # One pose token + the contact block sizes the slot embedding.
+    assert model.cross_modal_temporal.num_slots == 1 + model.total_contact_tokens
     batch = _gpu_batch(cfg, model)
 
     out_live = forward_model(model, batch)
@@ -311,55 +315,85 @@ def test_cross_modal_gpu_semantics(tmp_path):
     floor_c = (off_a["contact"]["joint_logits"] - off_b["contact"]["joint_logits"]).abs().max()
     diff_c = (out_live["contact"]["joint_logits"] - off_a["contact"]["joint_logits"]).abs().max()
     assert float(diff_c) <= _NOISE_MARGIN * float(floor_c) + _NOISE_FLOOR_EPS
+    # Zero-init must also leave the pose path exactly where the frozen model
+    # put it, even though 'pose' is written.
+    mhr_a, mhr_b = _mhr_floats(off_a), _mhr_floats(off_b)
+    mhr_live = _mhr_floats(out_live)
+    for key in ("body_pose", "global_rot", "pred_keypoints_3d"):
+        floor = (mhr_a[key] - mhr_b[key]).abs().max()
+        diff = (mhr_live[key] - mhr_a[key]).abs().max()
+        assert float(diff) <= _NOISE_MARGIN * float(floor) + _NOISE_FLOOR_EPS, key
 
     _heat_gammas(model.cross_modal_temporal)
     out_hot = forward_model(model, batch)
     moved = (out_hot["contact"]["joint_logits"] - off_a["contact"]["joint_logits"]).abs().max()
     assert float(moved) > 100.0 * (float(floor_c) + _NOISE_FLOOR_EPS)
-
-    # 'pose' IS a listed modality here — hot gammas must move the MHR outputs
-    # (that is the point of the pose modality)...
-    mhr_a, mhr_hot = _mhr_floats(off_a), _mhr_floats(out_hot)
+    mhr_hot = _mhr_floats(out_hot)
     assert float((mhr_hot["body_pose"] - mhr_a["body_pose"]).abs().max()) > 1e-3
 
 
 @pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.skipif(not os.path.exists(_CKPT), reason="checkpoint missing")
-def test_frame_attn_gpu_semantics(tmp_path):
-    """Zero-init == dropped module (noise floor); hot gammas move contact while
-    the frozen MHR outputs stay at the floor (contact is the only written
-    modality; the pose token is read-only context)."""
+def test_cross_modal_gpu_semantics_pose_not_listed(tmp_path):
+    """With 'pose' absent from the modality list the frozen MHR outputs must
+    stay at the CUDA repeat floor even with hot gammas (contact + force are the
+    only written blocks), and the contact logits must move."""
     from contact.engine import forward_model
 
     model, trainable, cfg = _gpu_build(
         "model:\n"
-        "  frame_attn: {enabled: true, modalities: [contact]}",
+        "  force_head: {enabled: true, force_keypoint_indices: [62, 41, 13, 14],"
+        " frame: root}\n"
+        "  cross_modal_temporal: {enabled: true, modalities: [contact, force]}",
         tmp_path)
-    assert any("frame_attn.contact" in n for n in trainable)
+    assert any("cross_modal_temporal" in n for n in trainable)
     batch = _gpu_batch(cfg, model)
 
-    out_live = forward_model(model, batch)
-    fa = model.frame_attn
-    del model.frame_attn
     off_a = forward_model(model, batch)
     off_b = forward_model(model, batch)
-    model.frame_attn = fa
-
     floor_c = (off_a["contact"]["joint_logits"] - off_b["contact"]["joint_logits"]).abs().max()
-    diff_c = (out_live["contact"]["joint_logits"] - off_a["contact"]["joint_logits"]).abs().max()
-    assert float(diff_c) <= _NOISE_MARGIN * float(floor_c) + _NOISE_FLOOR_EPS
+    mhr_a, mhr_b = _mhr_floats(off_a), _mhr_floats(off_b)
 
-    _heat_gammas(model.frame_attn["contact"])
+    _heat_gammas(model.cross_modal_temporal)
     out_hot = forward_model(model, batch)
     moved = (out_hot["contact"]["joint_logits"] - off_a["contact"]["joint_logits"]).abs().max()
     assert float(moved) > 100.0 * (float(floor_c) + _NOISE_FLOOR_EPS)
+    # (head_force is zero-init, so its OUTPUT cannot move at init however much
+    # the force tokens do — the contact logits above are the live-block probe.)
 
-    mhr_a, mhr_b, mhr_hot = _mhr_floats(off_a), _mhr_floats(off_b), _mhr_floats(out_hot)
+    mhr_hot = _mhr_floats(out_hot)
     for key in ("body_pose", "global_rot", "pred_keypoints_3d", "pred_vertices"):
         floor = (mhr_a[key] - mhr_b[key]).abs().max()
         diff = (mhr_hot[key] - mhr_a[key]).abs().max()
         assert float(diff) <= _NOISE_MARGIN * float(floor) + _NOISE_FLOOR_EPS, key
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.skipif(not os.path.exists(_CKPT), reason="checkpoint missing")
+def test_cross_modal_gpu_grad_flow(tmp_path):
+    """Every trainable param of the block receives a gradient from a contact
+    loss, and no frozen param does."""
+    from contact.engine import forward_model
+
+    model, trainable, cfg = _gpu_build(
+        "model:\n"
+        "  cross_modal_temporal: {enabled: true, modalities: [pose, contact]}",
+        tmp_path)
+    batch = _gpu_batch(cfg, model)
+    _heat_gammas(model.cross_modal_temporal)
+    forward_model(model, batch)["contact"]["joint_logits"].square().mean().backward()
+
+    block = dict(model.cross_modal_temporal.named_parameters())
+    assert "slot_embed" in block
+    missing = [n for n, p in block.items()
+               if p.grad is None or float(p.grad.abs().sum()) == 0.0]
+    assert missing == [], missing
+    for name, param in model.named_parameters():
+        if not param.requires_grad and param.grad is not None:
+            raise AssertionError(f"frozen param {name} received a gradient")
+    assert all("cross_modal" in n or "contact" in n for n in trainable)
 
 
 @pytest.mark.slow

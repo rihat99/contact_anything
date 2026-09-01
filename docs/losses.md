@@ -17,14 +17,14 @@ tokens across the frames of a video clip. Two structural rules make the gradient
 clean, and both are enforced by tests:
 
 1. **A name-based freeze filter.** Only parameters whose dotted name contains `contact`, `force`,
-   `motion`, `cross_modal`, `frame_attn` or `pose_temporal` have `requires_grad=True` (plus
-   `head_pose.proj` when `train.finetune_pose_head` is on). Everything else — backbone, decoder,
+   `motion`, `cross_modal` or `pose_temporal` have `requires_grad=True` (plus
+   `head_pose_ft_proj` when `train.finetune_pose_head` is on). Everything else — backbone, decoder,
    MHR head, camera head — is frozen and eval-pinned.
 2. **An asymmetric decoder attention mask.** Inside the promptable decoder, the original tokens
    never attend the appended contact/force/motion tokens. The frozen pose output therefore has an
    exactly-zero Jacobian with respect to every new parameter, so no loss on this page can move the
-   pose *unless* it is routed through the deliberate pose write paths (`pose_temporal`, a
-   cross-modal brick listing `pose`, or the pose-head fine-tune flag).
+   pose *unless* it is routed through the deliberate pose write paths (`pose_temporal`,
+   `cross_modal_temporal` listing `pose`, or the pose-head fine-tune flag).
 
 So "which gradient reaches what" is not a vague question here. It is decided by three things: the
 freeze filter, the attention mask, and the explicit `.detach()` calls inside each loss module.
@@ -42,7 +42,8 @@ Both are treated fully in [data.md](data.md) and the [glossary](glossary.md).)
 | Supervised force | `force_supervision.loss` | 3-D force per limb group vs kindyn GT, body-weight units | force tokens/head only |
 | Physics / RNEA residual | `physics.loss` | reconstructed motion's root wrench vs gravity + inertia + predicted forces (no labels) | force tokens/head only in regime (a); leaks into contact in regime (b) |
 | Motion supervision | `motion_supervision.loss` | standardized root-frame vel/acc (± angular) vs kindyn twist | motion tokens/head |
-| Pose supervision | `pose_supervision.loss` | 125 local MHR `q` channels vs kindyn-MHR pseudo-GT | pose write paths only (`pose_temporal`, cross-modal `pose`, `head_pose.proj`) |
+| Pose supervision | `pose_supervision.loss` | 125 local MHR `q` channels vs kindyn-MHR pseudo-GT | pose write paths only (`pose_temporal`, cross-modal `pose`, `head_pose_ft_proj`) |
+| Motion roll-out | `motion_rollout.loss` | the *predicted velocity integrated* over 3/10/30-frame horizons vs the kindyn root path (`gt`, `rot_gt`) and vs the predicted pose's path (`pose`, `rot_pose`) | motion tokens/head for the GT terms; pose write paths for the pose terms (the integral is detached) |
 | Motion consistency | `motion_consistency.loss` | the *predicted* pose, lifted to world and differentiated, vs kindyn GT / the detached motion head, plus absolute root anchors | pose write paths only (the motion head is detached) |
 
 ![Every training signal: its data inputs, its detached (gradient-free) inputs, and the single
@@ -178,13 +179,13 @@ Reduction rules, all mask-correct:
 ### Where the contact gradient goes
 
 Into contact-named parameters: the contact tokens, their positional/feature projections, the
-per-target heads, and `contact_temporal` if enabled. Under the default decoder mask
+per-target heads. Under the default decoder mask
 (`extra_token_attention: causal`) the contact tokens attend only the image and themselves, so the
 contact loss cannot touch force or motion parameters. Two deliberate exceptions relax that:
 `extra_token_attention: mutual` (contact tokens attend force/motion tokens inside the decoder) and
-the post-decoder bricks `cross_modal_temporal` / `frame_attn`, whose keys and values span the other
+the post-decoder `cross_modal_temporal` block, whose keys and values span the other listed
 modalities' tokens. With those on, the contact loss *does* train the listed modalities' parameters
-— that is the point of the bricks. (`mutual` is incompatible with `train.freeze_contact` for the
+— that is the point of the block. (`mutual` is incompatible with `train.freeze_contact` for the
 mirror-image reason: the *frozen* contact tokens would attend the trainable force/motion tokens,
 so the frozen contact outputs would drift during force training.)
 
@@ -294,8 +295,8 @@ confident is free receives almost no force gradient. The ungated tensor is kept 
 ### Gradient reach
 
 Predictions enter with gradients live; GT, contact mask, lever arms and validity bits are plain
-batch data. The only trainable parameters on the path are the force tokens, `force_temporal` and
-`head_force` — plus, through the gate, nothing at all, because of the detach. `force_mae` (mean
+batch data. The only trainable parameters on the path are the force tokens, `head_force` and
+`cross_modal_temporal` when `force` is a listed modality — plus, through the gate, nothing at all, because of the detach. `force_mae` (mean
 `‖pred − gt‖` over in-contact limb-frames, in bw) is computed detached and is the headline monitor
 for these runs.
 
@@ -429,6 +430,37 @@ rotated into root axes); BVR defines no linear twist for non-root joints. The tw
 differ by the Coriolis term `ω × v`, about 7% of `|a|` — small, but it is why the diagnostics
 re-apply that term when converting predictions and targets to world axes for correlation reporting.
 
+### The gravity-view frame
+
+A third convention, `gravity_view`, changes the axes the **linear** part is expressed in — not the
+motion it describes. It is GVHMR's Gravity-View frame: the vertical axis is the scene's gravity
+(down-positive) and the azimuth is the camera's view direction projected onto the horizontal plane,
+so the frame is gravity-aligned, defined per frame, and independent of both the arbitrary world
+azimuth and the body's pose. Two things follow, and they are the whole reason to use it:
+
+- **Pose error stops rotating the target.** In body axes the target is `R_root^T v_world`, so a
+  fifteen-degree pelvis orientation error scores a perfect world velocity as wrong — and the GT
+  rotation carries the fit's own orientation error into every label. In a gravity frame only the
+  azimuth matters; roll and pitch drop out.
+- **The vertical becomes a channel.** Gravity is the one direction where the dynamics is
+  asymmetric, and it is the direction the force and contact heads care about. In body axes
+  "she is descending" is smeared across all three components as a function of pelvis orientation.
+
+The target is the *same* body twist, re-expressed: `world = R_root (a_body + ω × v_body)` (velocity
+without the Coriolis term), then into gravity-view axes. It therefore keeps the 0.12 s smoothing
+below — rotating the raw central difference instead would silently drop it and inflate `|a|` about
+fourfold. The angular pair is the SE(3)-log body rate under every convention, untouched.
+
+Gravity comes from the scene's **fitted** `gravity_world` in `kindyn_1.npz`, not from a constant:
+over the 864 train scenes the tilt away from world-y has median 3.2°, p90 27.5° and a 61.4° maximum,
+and 163 scenes are past 15°. That measurement is also why the loss's world-vertical diagnostics now
+project onto that vector instead of taking the world-y component, as the pre-regeneration code did.
+
+Because the frame changes what each channel means, `standardize` is **frame-specific** and has to be
+recomputed when the convention changes (`output/gv_stats/motion_gv_standardize.json` holds the
+gravity-view table, over the same 273,039 rows as the body-frame one; its angular rows come out
+bit-identical, which is the cross-check that only the linear frame moved).
+
 ### σ = 0.12 s label smoothing
 
 The single most important design choice here is not in the loss at all — it is in the target. The
@@ -478,14 +510,16 @@ Diagnostics are de-standardized and returned as raw sufficient statistics (count
 squares, cross-products) so the trainer can all-reduce them into an exact global Pearson
 correlation and RMSE rather than averaging per-rank correlations, which is not a valid operation.
 
-Gradient reach: motion tokens, `motion_temporal`, `head_motion`.
+Gradient reach: motion tokens, `head_motion`, and `cross_modal_temporal` (which a
+motion-supervised config must enable with `motion` listed — a per-frame head cannot represent a
+derivative).
 
 ## Pose supervision
 
 Source: `contact/pose_supervision.py`.
 
 This is the only loss that deliberately moves the pose, and it exists because the pose write paths
-(`pose_temporal`, a cross-modal brick listing `pose`, `train.finetune_pose_head`) would otherwise
+(`pose_temporal`, `cross_modal_temporal` listing `pose`, `train.finetune_pose_head`) would otherwise
 have no objective at all — the config validator refuses to enable them without it.
 
 The pseudo-ground-truth is the kindyn SMPL-X trajectory refit as a world-frame MHR configuration
@@ -515,6 +549,40 @@ Two terms:
 The shape input to the parameter→`q` conversion is detached (`q` is shape-independent by the
 adapter's invariant, so the identity used for the conversion is irrelevant). Gradient reaches the
 pose write paths only.
+
+## Motion roll-out loss
+
+Source: `contact/motion_rollout.py`, config section `motion_rollout`. The mirror image of the
+motion-consistency loss below: that one differentiates the predicted pose and compares twists, this
+one **integrates** the predicted velocity and compares positions.
+
+The motivation is bandwidth. Differentiating amplifies exactly the frequencies where the pseudo-GT
+is worst — two thirds of raw pelvis acceleration variance is coherent camera-depth wobble.
+Integrating suppresses them, and asks a question no per-frame derivative loss can ask: *did the body
+actually travel this far over this second?* It is also what makes GVHMR world-grounded — it rolls
+its predicted per-frame displacement out into a trajectory and supervises the translation directly.
+
+**What is compared.** The predicted velocity is rotated to the world with `motion_lin_rot` (the
+frame the target itself lives in) and integrated with the trapezoid rule over the clip's real
+elapsed seconds. Only **displacements over a horizon** are compared — `path[t+H] − path[t]` — never
+absolute positions, so the constant of integration never enters the loss; absolute placement stays
+the job of the keypoint anchors. Several horizons run at once (default 3, 10 and 30 frames): short
+ones say roughly what the derivative loss says, long ones carry the low-frequency constraint that is
+the point of the exercise.
+
+**The four terms.** `gt` compares against the kindyn root path, with the gradient reaching the
+motion head — a low-frequency supervision signal the per-frame Huber cannot give. `pose` compares
+against the root path implied by the *predicted* pose; with `detach_head` (the default) the
+integrated side is detached, so the pose trajectory is pulled toward the head's smoother estimate
+and never the reverse. `rot_gt` and `rot_pose` are the same two comparisons for orientation: the
+predicted body rate composed over the horizon as `∏ exp(ω dt)` — body rates multiply on the right —
+against the GT or predicted relative rotation, compared geodesically.
+
+**Why it requires `gravity_view`.** Rolling out a body-frame velocity means rotating each step by
+the predicted body orientation, so the integral compounds the pose's orientation error — the very
+error the loss is trying to measure. A gravity-view velocity needs only the frame's azimuth, which
+comes from the camera, so the integral is independent of the predicted body orientation. The config
+validator enforces the pairing; the two ideas are one change, not two.
 
 ## Motion-consistency loss
 

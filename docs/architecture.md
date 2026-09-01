@@ -33,10 +33,11 @@ Concretely, for one training step on a clip of climbing video:
 5. Between decoder layers, each appended token re-samples backbone features at the 2D image
    location of "its" body keypoint, as currently predicted by the decoder's intermediate pose
    estimate. This is what "keypoint-anchored" means.
-6. After the decoder, the tokens are still per-frame. A stack of optional **post-decoder blocks**
-   mixes them across the clip's frames (temporal attention) and across modalities (cross-modal
-   attention, per-frame attention). Every one of these blocks is *zero-gated*: at initialization
-   it is an exact identity, so enabling it never perturbs a trained model on step 0.
+6. After the decoder, the tokens are still per-frame. ONE optional **post-decoder RoPE
+   transformer** mixes them across the clip's frames *and* across modalities at the same time
+   (its `dt = 0` diagonal is within-frame cross-modal attention). It is *zero-gated*: at
+   initialization it is an exact identity, so enabling it never perturbs a trained model on
+   step 0.
 7. The final tokens go to their heads: contact logits, 3D force vectors, motion (velocity /
    acceleration) vectors. The MHR pose head runs on token 0 as it always did.
 
@@ -299,7 +300,7 @@ always present.
 
 ### Isolation is tested, not asserted
 
-`tests/test_temporal_invariance.py`, `tests/test_force_invariance.py`,
+`tests/test_cross_modal_invariance.py`, `tests/test_force_invariance.py`,
 `tests/test_motion_invariance.py` and the GPU tests in `tests/test_cross_modal.py` all follow the
 same protocol, because a naive `torch.equal` check would fail for an uninteresting reason: the
 frozen SAM 3D Body forward is **not** run-to-run bit-deterministic on CUDA. Two identical passes of
@@ -406,54 +407,56 @@ A still image is simply `T = 1`. That is what lets image (per-vertex) datasets a
 datasets share a training run: the collate normalizes stills to length-1 clips, and at `T = 1` the
 temporal modules see a single frame with zero positional encoding and nothing to attend to.
 
-### The zero-gated temporal block
+### The zero-gated RoPE temporal block
 
-`ContactTemporalModule` (`sam_3d_body/models/modules/temporal.py`, used for *all* temporal blocks
-despite the historical name) reshapes `[B_clips*T, K, C]` to `[B_clips, T, K, C]` and runs
-self-attention across the `T` axis. Each layer is a pre-LN transformer block:
+`CrossModalRopeModule` (`sam_3d_body/models/modules/cross_modal_rope.py`) is the single
+post-decoder mixing brick. It takes the concatenation of the listed modality token blocks —
+`[B_clips*T, K, C]` — flattens each clip into ONE attention sequence of `T * K` tokens
+(frame-major: index `t * K + k`) and runs self-attention over it. Each layer is a pre-LN
+transformer block:
 
 ```
-x <- x + gamma_attn * MHA(LN(x) + pos_emb)
+x <- x + gamma_attn * Attn_RoPE(LN(x) + slot_emb)
 x <- x + gamma_ffn  * FFN(LN(x))
 ```
 
 with **`gamma_attn` and `gamma_ffn` initialized to zeros**. That is **zero-gating**: at
 initialization every branch contributes exactly nothing and the module is a bitwise identity
-(`torch.equal`-verified in `tests/test_temporal.py`). It matters for two reasons. First, you can add
-a temporal block to a trained per-frame checkpoint and the first step reproduces it exactly — no
-warm-up damage, no re-calibration. Second, an ablation "is the temporal block doing anything?" has a
-clean answer: look at how far the gammas moved off zero.
+(`torch.equal`-verified in `tests/test_cross_modal_rope.py`). It matters for two reasons. First,
+you can add the block to a trained per-frame checkpoint and the first step reproduces it exactly —
+no warm-up damage, no re-calibration. Second, an ablation "is the temporal block doing anything?"
+has a clean answer: look at how far the gammas moved off zero.
 
-Two further details preserve the exact-identity property:
+**Positions are rotary and time-valued.** RoPE is applied to q/k at position
+`frame_pos_sec * time_scale` (`time_scale = 25` calibrates one 25-fps step to ~1.0). Two
+consequences define the design:
 
-- The block runs at a **bottleneck width** (default 256, from 1024) through an in-projection and a
-  **bias-free** out-projection, and only the *delta* is added back: `residual +
-  token_out_proj(out - working)`. A bias on the out-projection would break exact identity at init.
-- The fork's own `LayerScale` wrapper turns `scale <= 0` into an `nn.Identity`, which would silently
-  drop the gate *and its gradient*. So these modules use explicit `nn.Parameter(zeros)` gates and
-  plain `nn.MultiheadAttention` instead of reusing the fork's wrappers. This is called out in the
-  module docstring because it is exactly the kind of thing that would produce a silently dead
-  experiment.
+- Attention logits depend only on the **relative** offset, so a model trained at `T = 60` runs
+  single-pass over a whole scene, and shifting every timestamp by a constant is a no-op
+  (test-enforced on the module and end-to-end on GPU).
+- Every token of a frame gets the **same** position, so within-frame pairs attend un-rotated
+  (`dt = 0`) — which is exactly what the retired per-frame `frame_attn` module used to do — and
+  across-frame pairs see real elapsed seconds, exact under the corpus's variable fps.
 
-**Positional encoding** is a sinusoidal encoding of `frame_pos_sec * position_scale`, added to the
-attention query/key branch only, never to the residual stream. Working in real elapsed seconds keeps
-the encoding stride- and fps-aware; every shipped climbing experiment sets `position_scale: 30.0`
-(the base default is 1.0 for all but `pose_temporal`), mapping 30-fps timestamps onto roughly
-integer frame offsets, which separates neighbouring frames well.
+**Token identity comes from a learned slot embedding**, not from the positions: RoPE cannot tell a
+contact token from a force token in the same frame. A `[K, dim]` parameter (trunc-normal, std 0.02)
+indexed by slot position is added to the **LayerNormed input inside the gated attention branch**,
+never to the residual stream — so a hot slot embedding still cannot move the output while the gates
+are zero. Slot `k` means whatever the canonical concatenation order (pose < contact < force <
+motion) puts there, which is why the modality list is part of the checkpoint arch signature.
 
-**Attention scope** is `attend: joint` (all `T*K` tokens of a clip attend jointly, so limbs can talk
-to each other across time) or `attend: per_token` (each token slot attends only over `T`, so each
-limb mixes only with itself). **`causal: true`** restricts each query frame to non-future keys.
-Invalid key frames are hidden from every query, except that a query may always see its own frame, so
-no softmax row is ever fully masked.
+**Masking is frame-level and then expanded to the token grid**, so all `K` tokens of a frame share
+one visibility row: keys further than `max_rel_sec` seconds away are hidden (GVHMR's
+never-see-unseen-offsets rule — inert on training-length clips, active on long inference
+sequences), and an invalid frame is hidden from every other frame while its own frame stays
+visible, so no softmax row is ever empty. When neither rule bites no mask is built at all.
 
-`window_frames` allows a checkpoint trained at `T = 5` to run inside a longer clip while seeing
-exactly its native centered window (positions re-zeroed to the window start); frames outside the
-window pass through unchanged.
+`RopeTemporalModule` (`temporal_rope.py`) is the same machinery restricted to one modality: slots
+attend independently, no slot embedding. It exists for `model.pose_temporal`, the pose-only path.
 
 ### Placement: post-decoder only
 
-Temporal modules run **after** the decoder, on token blocks sliced from its `norm_final` output. The
+Temporal mixing runs **after** the decoder, on token blocks sliced from its `norm_final` output. The
 in-decoder placements we tried — `between_layers`, `between_layers_cross`, `pre_decoder`, and a
 temporal-convolution variant — were all controlled negatives, and the code for them has been deleted
 rather than left as dead configuration. No kept checkpoint uses them. See
@@ -461,52 +464,37 @@ rather than left as dead configuration. No kept checkpoint uses them. See
 
 ### The post-decoder bricks, in order
 
-Three kinds of post-decoder module can be enabled. We call them **bricks**: independent, composable,
-each zero-gated, each nameable in config, each safe to add to an existing run. They always execute
-in this fixed order, regardless of how the config lists them:
-
-![The three post-decoder stages on a token-by-frame grid: cross-modal temporal pools
-everything, per-modality temporal pools each row across frames, frame attention pools each
-column within a frame](figures/post_decoder_bricks.png)
-
 ```mermaid
 flowchart TD
     D["decoder output (per frame)<br/>norm_final tokens"] --> XM
-    XM["1 · cross_modal_temporal<br/>ONE block over the CONCATENATION of the<br/>listed modality blocks, attend=joint<br/>→ across frames AND across modalities"] --> PM
-    PM["2 · per-modality temporal blocks<br/>pose_temporal · contact_temporal<br/>force_temporal · motion_temporal<br/>→ across frames, within one modality"] --> FA
-    FA["3 · frame_attn<br/>one own-weights module per listed modality<br/>keys/values span ALL modalities of that frame<br/>→ across modalities, NO temporal mixing"] --> H
+    XM["1 · cross_modal_temporal<br/>ONE RoPE block over the CONCATENATION of the<br/>listed modality blocks, T×K tokens per clip<br/>→ across frames AND across modalities<br/>(dt = 0 gives within-frame mixing for free)"] --> PT
+    PT["2 · pose_temporal (optional)<br/>RoPE block over the pose token alone<br/>→ across frames, pose only"] --> H
     H["heads: contact / force / motion<br/>(+ MHR recompute if pose was written)"]
 ```
 
-**1. `cross_modal_temporal`** — a *single* temporal block (`attend` fixed to `joint`) run over the
-**concatenation** of the chosen modality token blocks. `modalities` is any subset of
-`{pose, contact, force, motion}` with at least two entries; the blocks are concatenated in canonical
-sequence order (pose < contact < force < motion) regardless of how the config lists them. Every
-participating token attends every other participating token across every frame of the clip. In the
-all-modality configuration — **allmod**, `configs/old/climbing_corpus_allmod.yaml`, the run that trains
-pose, contact, force and motion together — that is 14 tokens (1 pose + 6 contact + 6 force +
-1 motion) attending jointly over `T = 7` frames, and it is the *only* cross-frame path in that
-build (every per-modality temporal block is off). Updated slices are scattered back into their
-original positions; everything between them is untouched. This brick relaxes D1 among its
-participants — deliberately.
+**1. `cross_modal_temporal`** — `modalities` is any subset of `{pose, contact, force, motion}` with
+at least two entries; the blocks are concatenated in canonical sequence order (pose < contact <
+force < motion) regardless of how the config lists them. Every participating token attends every
+other participating token across every frame of the clip. In the all-modality configuration —
+**allmod**, `configs/allmod_rope_t60.yaml`, the run that trains pose, contact, force and motion
+together — that is 14 tokens (1 pose + 6 contact + 6 force + 1 motion) over `T = 60` frames, i.e. a
+840-token sequence, and it is the *only* mixing path in that build. Updated slices are scattered
+back into their original positions; everything between them is untouched. This brick relaxes D1
+among its participants — deliberately.
 
-**2. Per-modality temporal blocks** — `contact_temporal`, `force_temporal`, `motion_temporal`,
-`pose_temporal`. Each is its own `ContactTemporalModule` over its own token block only, so
-information crosses frames but not modalities. `pose_temporal` is a special case discussed below.
+**2. `pose_temporal`** — the pose modality's own block, over the pose token only. Redundant when
+`cross_modal_temporal` already lists `pose`; it exists for pose-only builds (`configs/rope_t60*.yaml`).
 
-**3. `frame_attn`** — per-frame attention with **no** temporal mixing at all
-(`sam_3d_body/models/modules/frame_attention.py`). One own-weights `FrameAttentionModule` per listed
-modality; each module's queries are its own modality's tokens and its keys/values span **every**
-enabled modality's post-temporal tokens *of the same frame* (including the pose token, read-only
-unless `pose` is itself a listed modality). Frames are independent by construction — the batch
-dimension *is* the flattened frame dimension — so this brick behaves identically on clips and on
-single images and needs no `seq_len` plumbing at all.
+Heads run last, so every head reads a fully post-processed token.
 
-Order-independence is enforced explicitly: all modules read from **one consistent snapshot** taken
-before any of them run, and only then are the updates applied. Listing `[contact, force]` gives the
-same result as listing `[force, contact]`.
-
-Heads run last, after `frame_attn`, so every head reads a fully post-processed token.
+**Retired 2026-08-29.** The sliding-window `ContactTemporalModule`
+(`modules/temporal.py`) with its sinusoidal absolute-time encoding, bottleneck adapter, `attend`,
+`causal`, `position_scale` and `window_frames` knobs; its per-modality instances
+`model.temporal` / `force_temporal` / `motion_temporal`; and the per-frame
+`FrameAttentionModule` (`modules/frame_attention.py`, `model.frame_attn`). Both module files were
+deleted. Checkpoints written before the retirement still load: the arch-signature comparison
+defaults the vanished `temporal` / `force_temporal` / `motion_temporal` keys to their disabled
+state on both sides.
 
 ---
 
@@ -515,12 +503,12 @@ Heads run last, after `frame_attn`, so every head reads a fully post-processed t
 By default the frozen pose output cannot move. There are exactly **three** ways to let it, and each
 is an explicit, individually-named opt-in.
 
-1. **`model.pose_temporal`** — a zero-gated temporal module over the pose token (index 0) only,
-   run as the pose modality's per-modality temporal block. It mixes the pose token across the
-   clip's frames, i.e. it lets the single-image model borrow evidence from neighbouring frames.
-2. **The `pose` modality of a cross-modal brick** — listing `pose` in
-   `model.cross_modal_temporal.modalities` or `model.frame_attn.modalities` makes those bricks
-   *write* the pose token, not just read it.
+1. **`model.pose_temporal`** — a zero-gated RoPE temporal module over the pose token (index 0)
+   only, run after `cross_modal_temporal`. It mixes the pose token across the clip's frames,
+   i.e. it lets the single-image model borrow evidence from neighbouring frames.
+2. **The `pose` modality of the cross-modal block** — listing `pose` in
+   `model.cross_modal_temporal.modalities` makes that block *write* the pose token, not just
+   read it.
 3. **`train.finetune_pose_head` / `train.finetune_camera_head`** — SPLIT-HEAD fine-tune
    (2026-08-27). The original `head_pose` / `head_camera` stay entirely frozen and keep producing
    every in-decoder intermediate prediction; a trainable COPY of just the projection FFN
@@ -585,7 +573,7 @@ the dotted parameter name:
 
 ```python
 "contact" in name or "force" in name or "motion" in name
-    or "cross_modal" in name or "frame_attn" in name or "pose_temporal" in name
+    or "cross_modal" in name or "pose_temporal" in name
 ```
 
 This is blunt on purpose. It means any new trainable module must carry one of those substrings in
@@ -636,13 +624,14 @@ These are the properties every change to the decoder hooks has to preserve. They
 `CLAUDE.md` as the repository's non-negotiables and are all test-enforced.
 
 1. **Freeze filter is name-based.** New trainable modules must carry `contact`, `force`, `motion`,
-   `cross_modal`, `frame_attn` or `pose_temporal` in their attribute path — or be handled as an
+   `cross_modal` or `pose_temporal` in their attribute path — or be handled as an
    explicit exception like `head_pose.proj`.
 2. **Mask invariant.** Inside the decoder, original tokens never attend appended tokens. Pose/MHR
    outputs have an exactly-zero Jacobian with respect to every contact/force/motion parameter under
    either mask regime. Under `causal`, additionally, no earlier appended block attends a later one
-   (D1). The post-decoder bricks relax D1 among their listed modalities in the same deliberate way;
-   the frozen pose/MHR outputs stay isolated unless `pose` is a *written* modality.
+   (D1). The post-decoder `cross_modal_temporal` block relaxes D1 among its listed modalities in the
+   same deliberate way; the frozen pose/MHR outputs stay isolated unless `pose` is a *written*
+   modality.
 3. **Frozen modules are eval-pinned**, per the mechanism above.
 4. **MHR invariance is tested**, against the measured CUDA noise floor rather than against bitwise
    equality.
@@ -675,7 +664,7 @@ usable standalone.
 
 Primary code entry points: `contact/model.py` (build, freeze, eval-pin),
 `sam_3d_body/models/meta_arch/sam3d_body.py` (`_initialze_model` for construction, `forward_decoder`
-for the token sequence, masks, bricks and heads), `sam_3d_body/models/modules/temporal.py` and
-`frame_attention.py` (the bricks), `sam_3d_body/models/heads/` (the heads), and `configs/base.yaml`
+for the token sequence, masks, bricks and heads), `sam_3d_body/models/modules/cross_modal_rope.py`
+and `temporal_rope.py` (the bricks), `sam_3d_body/models/heads/` (the heads), and `configs/base.yaml`
 (commented defaults for most knobs on this page; the `motion_consistency` defaults live in
 `contact/config.py`).

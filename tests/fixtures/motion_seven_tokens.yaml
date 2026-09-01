@@ -8,14 +8,6 @@ model:
   motion_head:
     enabled: true
     motion_keypoint_indices: [62, 41, 15, 18, 17, 20, 9]   # pelvis token LAST (left hip anchor)
-  motion_temporal:
-    enabled: true
-    attend: joint                     # the seven slots see each other across time
-    num_layers: 2                     # one layer + zero-init gate is marginal for a difference
-    num_heads: 4
-    mlp_ratio: 2.0
-    bottleneck_dim: 256
-    position_scale: 30.0              # 30-fps seconds -> well-separated frame offsets
 
 contact:
   targets:

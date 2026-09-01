@@ -1,3 +1,6 @@
+# TEST FIXTURE — a copy of configs/old/climbing_corpus_force_supervised.yaml with the retired
+# sliding-window temporal / frame-attention sections stripped so it still
+# validates under the current schema. The archived original is unchanged.
 # Supervised force run #2 — corpus6_force_sup_t7_v2. Kindyn solver forces as labels
 # (six groups: L/R hand, L/R foot=big-toe, L/R ankle=heel — the kindyn column order),
 # body-weight units, body-root frame (GT world forces rotated by the kindyn root
@@ -41,11 +44,6 @@ model:
     enabled: true
     force_keypoint_indices: [62, 41, 15, 18, 17, 20]
     frame: root                       # body-root frame — no extrinsics in this experiment
-  force_temporal:
-    enabled: true
-    attend: joint                     # limbs see each other across time (allocation coupling)
-    position_scale: 30.0              # 30-fps seconds -> well-separated frame offsets
-
 contact:
   targets:
     vertex: {enabled: false}

@@ -4,9 +4,10 @@ Alphabetical reference for the project-specific terms used in these docs and in 
 Cross-references in *italics* point at other entries; file paths point at the defining code.
 
 **allmod** — shorthand for the all-modality experiment
-(`configs/old/climbing_corpus_allmod.yaml`): contact + force + motion + pose branches trained
-together on the climbing corpus with the *causal* decoder mask and the *cross-modal temporal* +
-*frame attention* bricks (per-modality temporal blocks off). The strongest all-modality recipe;
+(`configs/old/climbing_corpus_allmod.yaml`, archived; the current form is
+`configs/allmod_rope_t60.yaml`): contact + force + motion + pose branches trained
+together on the climbing corpus, all four listed in one *cross-modal temporal* block.
+The strongest all-modality recipe;
 the contact+force specialist `corpus6_jf_cond_sum1_postdec` still leads on those two tasks alone —
 see [experiments.md](experiments.md).
 
@@ -32,8 +33,9 @@ See [architecture.md](architecture.md).
 space of the climbing-corpus contact annotations.
 
 **brick** — informal name for one of the toggleable post-decoder modules
-(*cross-modal temporal*, per-modality temporal, *frame attention*, *pose temporal*). Each is
-zero-gated and independently enabled from config, like a Lego brick.
+(*cross-modal temporal*, *pose temporal*). Each is zero-gated and independently enabled from
+config, like a Lego brick. The retired bricks (per-modality temporal, *frame attention*) were
+deleted on 2026-08-29 — the one RoPE block subsumes both.
 
 **BVR** — the sibling video-reconstruction pipeline that produced the climbing corpus
 (person tracking, SMPL-X fitting, camera estimation, *kindyn* solve). Not part of this repo;
@@ -65,9 +67,13 @@ force solve was run under, and therefore the gate for the supervised force loss.
 pre-2026-08-27: 331 + 30) with frames,
 contacts, masks, camera geometry, and kindyn ground truth.
 
-**cross-modal temporal** — ONE zero-gated temporal attention block run over the concatenation
-of the chosen modality token blocks, across all frames of a clip
-(`model.cross_modal_temporal`). The only *brick* where different modalities mix across time.
+**cross-modal temporal** — ONE zero-gated **RoPE** transformer run over the concatenation of
+the chosen modality token blocks, over all frames of a clip
+(`model.cross_modal_temporal`, `sam_3d_body/models/modules/cross_modal_rope.py`). Rotary
+positions are the frame's real elapsed seconds, identical for every token of a frame, so
+within-frame pairs attend un-rotated and across-frame pairs see only relative time; a learned
+per-slot embedding (added inside the gated branch) carries token identity. Since 2026-08-29 it
+is the ONLY post-decoder mixing path for contact/force/motion.
 
 **D1** — the design invariant "contact outputs have an exactly-zero Jacobian with respect to
 every force and motion parameter", guaranteed by the *causal* mask and deliberately relaxed by
@@ -95,10 +101,10 @@ physics loss and the motion-consistency world lift; still images have none (`cam
 **focal loss** — binary cross-entropy reweighted to focus on hard, rare positives; the
 contact-classification loss (`alpha=0.6`, `gamma=2` in the shipped climbing experiments).
 
-**frame attention** — per-frame, cross-modality zero-gated attention run after every temporal
-block; one own-weights module per listed modality, whose keys/values span every enabled
-modality's tokens of that frame (`model.frame_attn`,
-`sam_3d_body/models/modules/frame_attention.py`). No temporal mixing.
+**frame attention** — *retired 2026-08-29* (`model.frame_attn`,
+`sam_3d_body/models/modules/frame_attention.py`, both deleted). Per-frame cross-modality
+attention with no temporal mixing; it is exactly the `dt = 0` diagonal of *cross-modal
+temporal*, which now does the job.
 
 **force_mae** — the force monitor (`test/force_sup/mae`): mean absolute error, in *bw*, between
 predicted and kindyn GT forces over the supervised rows.
@@ -108,7 +114,7 @@ predicted and kindyn GT forces over the supervised rows.
 measures; its pose channels are deliberately never supervised in q-space pose supervision.
 
 **freeze filter** — the name-based rule deciding what trains: only parameters whose dotted
-module path contains `contact`, `force`, `motion`, `cross_modal`, `frame_attn`, or
+module path contains `contact`, `force`, `motion`, `cross_modal`, or
 `pose_temporal` receive gradients (`contact/model.py`). Everything else is frozen.
 
 **grouped split** — train/val/test scenes are grouped by *source video*: two chunks of the same
@@ -156,12 +162,13 @@ to the pose path only. Full deep dive: [consistency.md](consistency.md).
 the remaining 8 body-22 joints are defined non-contact on reviewed frames.
 
 **pose path** — the set of trainable parameters that can move the pose output:
-`pose_temporal`, the pose-designated parts of *cross-modal temporal* / *frame attention*, and
-(if `train.finetune_pose_head`) the MHR head's projection `head_pose.proj`.
+`pose_temporal`, *cross-modal temporal* when `pose` is a listed modality, and
+(if `train.finetune_pose_head`) the fine-tuned head copy `head_pose_ft_proj`.
 
-**pose temporal** — the zero-gated temporal block on the pose token (`model.pose_temporal`);
-a deliberate, supervised exception to the frozen-pose rule. The final MHR output is recomputed
-from the updated token.
+**pose temporal** — the zero-gated RoPE block on the pose token alone (`model.pose_temporal`,
+`sam_3d_body/models/modules/temporal_rope.py`); a deliberate, supervised exception to the
+frozen-pose rule. The final MHR output is recomputed from the updated token. Redundant when
+*cross-modal temporal* already lists `pose`.
 
 **pred_cam_t** — the frozen model's predicted camera-space translation of the body root; the
 quantity whose collapse caused the *mutual* run failure and which the `cam_rail` now anchors.
@@ -202,9 +209,11 @@ acceleration; rows without full stencil support (clip boundaries) cannot be twis
 
 **T** — frames per clip (`frames_per_clip`); T=1 for still images, typically 7 for video.
 
-**temporal module** — the zero-gated pre-LN attention block over a clip's frames
-(`sam_3d_body/models/modules/temporal.py`), order-aware via sinusoidal encoding of real
-elapsed seconds. Post-decoder only.
+**temporal module** — the zero-gated pre-LN attention block over a clip's frames, order-aware
+via **rotary** encoding of real elapsed seconds (`cross_modal_rope.py` for all modalities,
+`temporal_rope.py` for the pose token). Post-decoder only. The sliding-window predecessor
+(`modules/temporal.py`, sinusoidal absolute time, bottleneck adapter, `attend`/`causal`/
+`window_frames`) was retired 2026-08-29.
 
 **twist (body twist)** — a rigid body's 6D velocity (3 linear + 3 angular) expressed in its
 own body frame; the motion targets are the root's twist velocity and acceleration computed

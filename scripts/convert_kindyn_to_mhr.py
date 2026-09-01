@@ -1,71 +1,75 @@
-"""Convert kindyn SMPL-X reconstructions to MHR pseudo-GT (``mhr_1.npz``).
+"""Fit MHR to the kindyn SMPL-X surface — the ``mhr_1.npz`` pose pseudo-GT (v2).
 
-The kindyn stage solved a smooth, physically-consistent SMPL-X trajectory per
-scene, but the frozen SAM-3D-Body model predicts MHR — so pose supervision
-needs the kindyn result re-expressed as an MHR trajectory. This script fits one
-world-frame MHR ``q`` trajectory per tracked person to the kindyn
-``joints_world`` targets and writes it next to the kindyn file.
+v1 matched 22 joint POSITIONS. A joint's own rotation is only observable through
+its fitted children, so head rotation, all finger channels and the foot
+intrinsics carried rest-prior/smoothing artifacts — which the pose q loss then
+imposed on the model (probe 2026-08-28: the head channel sat 26 deg from the
+frozen model and training converged onto the artifact). v2 is an exact
+mesh-to-mesh conversion instead:
 
-Method (validated on corpus scenes; per-joint median residual ~0.5 cm):
+1. **Target**: the kindyn body itself — BVR ``tools.body.load_body``
+   (better_human SMPLX, ``use_face=False``, ``q (211)``) posed at the stored
+   per-frame ``q``; world frame, metres. Reproduces kindyn ``joints_world`` to
+   0.00 cm, hands and head included.
+2. **Fit**: Meta's converter (``third_party/MHR/tools/mhr_smpl_conversion``),
+   ``convert_smpl2mhr(smpl_vertices=..., method="pytorch",
+   single_identity=True)``: every MHR vertex is a fixed barycentric point on the
+   SMPL-X surface (18439 exact correspondences), staged Adam over per-frame
+   root+pose (136) with shared identity (45) + scales (68).
+3. **q**: better_human ``MHR.from_classic(MHRClassic(identity, lbs_params))`` —
+   the SAME mapping the training-time pred path uses (``contact/pose_supervision``),
+   so GT and prediction q are consistent by construction. Root stays in the
+   kindyn world; ``POSE_SLOTS`` supervises only the 125 local channels.
 
-1. **Init**: the frozen model's own per-frame MHR predictions
-   (``features/sam3d/<scene>/params.npz``) lifted into the metric
-   reconstruction world with the dataset extrinsics, via the physics
-   :class:`~contact.physics.adapter.MHRAdapter` composition. One body is baked
-   per person from the mean valid-frame shape.
-2. **Pass 1**: Adam on the free-flyer root + 125 pose channels, Huber on the
-   matched-joint world positions (:data:`JOINT_MAP`), a rest prior toward the
-   init pose and a pose-acceleration smoothness term.
-3. **Offsets**: SMPL-X and MHR place anatomically-matched joints differently
-   (spine3 ~10 cm, head/collars/pelvis 4-6 cm). A constant per-joint offset in
-   the joint's LOCAL frame (median over valid frames of ``R^T (target - fk)``)
-   absorbs the rig mismatch without absorbing time-varying pose corrections.
-4. **Pass 2**: refit against the offset-corrected targets.
+Run with the **BVR venv** python (pymomentum + smplx + better_human)::
 
-The fitted trajectory inherits kindyn's smoothness (pose acceleration RMS
-drops ~10x vs the per-frame init on the validation scene).
+    /data3/rikhat.akizhanov/better/BetterVideoReconstruction/.venv/bin/python \
+        scripts/convert_kindyn_to_mhr.py --num-shards 10 --shard-index 0
 
-Output ``features/human_optim/<shard>/<scene>/mhr_1.npz``:
-
-* ``q_world (P, N, 132)`` float32 — ``[tx, ty, tz, qx, qy, qz, qw]`` (xyzw,
-  hemisphere-aligned along time) + 125 MHR pose channels, world frame.
-* ``identity (P, 45)`` float32 — the baked per-person identity coefficients.
-* ``valid_mask (P, N)`` bool — rows that were actually fitted (sam3d AND
-  kindyn valid AND finite sam3d params); other rows are only loosely
-  constrained (rest prior / smoothness) or, for skipped persons, identity-quat
-  zeros — never supervise on them.
-* ``object_ids (P,)``, ``num_frames``, ``fps``, ``converter_version``.
-* Diagnostics: ``residual_med_cm (P,)`` (vs the OFFSET-CORRECTED targets — the
-  retarget consistency), ``residual_vs_kindyn_med_cm (P,)`` (vs the raw kindyn
-  joints, i.e. including the constant rig offset), ``per_joint_residual_cm
-  (P, J)``, ``offsets_local (P, J, 3)`` (metres), ``joint_map (J, 2)``.
-
-Usage::
-
-    CUDA_VISIBLE_DEVICES=0 python scripts/convert_kindyn_to_mhr.py            # all scenes
-    python scripts/convert_kindyn_to_mhr.py --scenes MuVpoovQl2M_0001 --overwrite
+Output schema (per scene): ``q_world (P, N, 132)`` f32, ``valid_mask (P, N)``
+bool, ``identity (P, 45)``, ``lbs_params (P, N, 204)`` (the full fitted MHR
+``lbs_model_params`` row per frame — root+pose+proportions; NaN on unfitted
+rows; v3), ``object_ids (P,)``, ``num_frames``, ``fps``,
+``fit_err_cm (P, N)`` (MHR-vertex mesh error, NaN on unfitted rows),
+``joint_vs_kindyn_med_cm (P,)`` (FK cross-check), ``converter_version = 2``.
+The loader consumes q_world / valid_mask / object_ids / num_frames only.
 """
 from __future__ import annotations
 
-import argparse
+import os
 import sys
-import time
 from pathlib import Path
 
-import numpy as np
-import torch
-import torch.nn.functional as F
+BVR = Path("/data3/rikhat.akizhanov/better/BetterVideoReconstruction")
+_TOOL = BVR / "third_party" / "MHR" / "tools" / "mhr_smpl_conversion"
+sys.path.insert(0, str(BVR / "scripts"))
+import _pym_preload  # noqa: F401  (re-execs with the pymomentum libstdc++ preloaded)
 
-REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(BVR))                        # tools.body
+sys.path.insert(0, str(BVR / "third_party" / "MHR"))  # the mhr package
+sys.path.insert(0, str(_TOOL))                      # flat conversion imports
+os.chdir(_TOOL)                                     # ./assets/* are cwd-relative
 
-from contact.data.climbing_corpus import hemisphere_align
-from contact.physics.adapter import MHRAdapter
+import argparse   # noqa: E402
+import time       # noqa: E402
+from dataclasses import dataclass  # noqa: E402
 
-CONVERTER_VERSION = 1
+import numpy as np    # noqa: E402
+import torch          # noqa: E402
+import smplx as smplx_lib          # noqa: E402
+from conversion import Conversion  # noqa: E402
+from mhr.mhr import MHR as MetaMHR  # noqa: E402
 
-#: (SMPL-X kindyn joint, MHR native joint) pairs the fit matches. Fingers are
-#: excluded (kindyn hands are coarse); every pair was probed on real scenes.
+import better_human as bh                       # noqa: E402
+from better_human.bodies.mhr.body import MHRClassic  # noqa: E402
+from tools.body import load_body                # noqa: E402
+
+CONVERTER_VERSION = 3
+_MODELS = Path("/data3/rikhat.akizhanov/better/BetterHuman/models")
+#: Fit batch cap: ~13 MB GPU per frame in the fit -> ~6 GB at 450.
+MAX_FIT_BATCH = 450
+#: (kindyn SMPL-X joint, MHR native joint) name pairs for the FK cross-check
+#: diagnostic (v1's fit targets; diagnostics only in v2).
 JOINT_MAP = (
     ("pelvis", "root"), ("left_hip", "l_upleg"), ("right_hip", "r_upleg"),
     ("left_knee", "l_lowleg"), ("right_knee", "r_lowleg"),
@@ -79,178 +83,122 @@ JOINT_MAP = (
     ("left_wrist", "l_wrist"), ("right_wrist", "r_wrist"),
 )
 
-#: Fit hyperparameters (per pass). Huber delta in metres; the rest prior keeps
-#: target-unconstrained channels (fingers, twists) at their init; the
-#: acceleration term keeps them SMOOTH where the init is jittery.
-FIT_ITERS = 300
-FIT_LR = 2e-2
-HUBER_DELTA_M = 0.05
-W_REST = 1e-3
-W_SMOOTH = 0.1
+
+def hemisphere_align(quat: np.ndarray) -> np.ndarray:
+    """Flip quaternion signs for consecutive-row continuity. ``quat (N, 4)``."""
+    out = quat.copy()
+    for i in range(1, len(out)):
+        if float((out[i] * out[i - 1]).sum()) < 0.0:
+            out[i] = -out[i]
+    return out
 
 
-def _fit(body, mids: torch.Tensor, q_init: torch.Tensor, targets: torch.Tensor,
-         vmask: torch.Tensor) -> torch.Tensor:
-    """One Adam pass; ``q_init (1, N, 132)``, ``targets (1, N, J, 3)``.
+@dataclass
+class Ctx:
+    """Models shared across scenes (built once per process)."""
 
-    :param vmask: ``(1, N, 1, 1)`` float validity weights.
-    :returns: fitted ``q (1, N, 132)`` (detached).
-    """
+    body: object            # BVR Body (bh SMPLX q(211) + vertices)
+    smplx_model: object     # pip smplx (topology carrier for Conversion)
+    meta_mhr: object        # Meta MHR (cm, 18439 verts) — the fit model
+    bh_mhr: object          # better_human MHR — the q mapping + FK check
+    device: str
+
+
+def build_ctx(device: str) -> Ctx:
+    body = load_body(device=device)
+    smplx_model = smplx_lib.create(
+        model_path=str(_MODELS), model_type="smplx", gender="neutral",
+        use_pca=False, num_betas=10, batch_size=1)
+    faces_bh = body.faces.cpu().numpy().astype(np.int64)
+    faces_pip = smplx_model.faces.astype(np.int64)
+    if not np.array_equal(faces_bh, faces_pip):
+        raise RuntimeError("bh SMPLX and pip smplx topologies differ")
+    meta_mhr = MetaMHR.from_files(lod=1, device=torch.device(device))
+    bh_mhr = bh.MHR(_MODELS / "MHR" / "converted" / "mhr_lod1.npz", lod=1,
+                    use_expression=False, use_correctives=False,
+                    compute_mass=False, device=device)
+    return Ctx(body, smplx_model, meta_mhr, bh_mhr, device)
+
+
+def convert_scene(scene_dir: Path, ctx: Ctx) -> dict:
+    """Fit every tracked person of one scene; return the npz payload."""
     from better_robot import forward_kinematics
 
-    t = q_init[..., :3].clone().requires_grad_(True)
-    quat = q_init[..., 3:7].clone().requires_grad_(True)
-    pose = q_init[..., 7:].clone().requires_grad_(True)
-    pose0 = q_init[..., 7:].clone()
-    opt = torch.optim.Adam([t, quat, pose], lr=FIT_LR)
-    denom = vmask.sum().clamp(min=1.0) * len(JOINT_MAP) * 3
-    for _ in range(FIT_ITERS):
-        opt.zero_grad()
-        qn = torch.cat([t, F.normalize(quat, dim=-1), pose], -1)
-        fk = forward_kinematics(body.robot, qn)
-        r = fk.joint_pose_world[..., :3][:, :, mids] - targets
-        loss = (F.huber_loss(r, torch.zeros_like(r), delta=HUBER_DELTA_M,
-                             reduction="none") * vmask).sum() / denom
-        loss = loss + W_REST * ((pose - pose0) ** 2).mean()
-        acc = pose[:, 2:] - 2 * pose[:, 1:-1] + pose[:, :-2]
-        loss = loss + W_SMOOTH * (acc ** 2).mean()
-        loss.backward()
-        opt.step()
-    return torch.cat([t, F.normalize(quat, dim=-1), pose], -1).detach()
-
-
-def convert_scene(scene_dir: Path, features: Path, adapter: MHRAdapter,
-                  device: str) -> dict:
-    """Fit every tracked person of one scene; return the ``mhr_1.npz`` payload."""
-    from better_robot import forward_kinematics
-    from better_robot.lie import so3
-    from better_human.bodies import MHRClassic
-
-    scene = scene_dir.name
-    shard = scene_dir.parent.relative_to(features / "human_optim")
     kin = np.load(scene_dir / "kindyn_1.npz", allow_pickle=True)
-    sam = np.load(features / "sam3d" / shard / scene / "params.npz",
-                  allow_pickle=True)
-    tra = np.load(features / "geometry" / shard / scene / "transform.npz",
-                  allow_pickle=True)
+    q_s = np.asarray(kin["q"], np.float32)             # (P, N, 211)
+    vm = np.asarray(kin["valid_mask"], bool)           # (P, N)
+    betas = np.asarray(kin["betas"], np.float32)       # (P, 10)
+    ids = np.asarray(kin["object_ids"], np.int32)
+    n_people, n = vm.shape
 
-    kj_names = [str(x) for x in kin["joint_names"]]
-    kids = [kj_names.index(s) for s, _ in JOINT_MAP]
-    mhr_names = list(adapter.body.structure.joint_names)
-    npi = adapter.body.structure.native_pose_joint_indices
-    mids = torch.tensor([int(npi[mhr_names.index(m)]) for _, m in JOINT_MAP],
-                        device=device)
+    q_world = np.zeros((n_people, n, 132), np.float32)
+    q_world[..., 6] = 1.0                              # identity quat (xyzw)
+    identity = np.zeros((n_people, 45), np.float32)
+    lbs_params = np.full((n_people, n, 204), np.nan, np.float32)
+    fit_err = np.full((n_people, n), np.nan, np.float32)
+    joint_med = np.full((n_people,), np.nan, np.float32)
 
-    n = int(kin["num_frames"])
-    if int(np.asarray(sam["num_frames"])) != n:
-        raise ValueError(f"{scene}: sam3d has {int(np.asarray(sam['num_frames']))} "
-                         f"frames, kindyn {n}")
-    ext = np.asarray(tra["extrinsics"], np.float32)
-    if not np.isfinite(ext).all():
-        raise ValueError(f"{scene}: non-finite extrinsics")
-    cam = torch.tensor(ext, device=device)
-    kin_ids = [int(i) for i in np.asarray(kin["object_ids"]).ravel()]
-    sam_ids = [int(i) for i in np.asarray(sam["object_ids"]).ravel()]
+    kn = [str(x) for x in kin["joint_names"]]
+    # fk.joint_pose_world rows are the robot's BODY list, not structure joints.
+    mhr_names = list(ctx.bh_mhr.robot.body_names)
+    kids = [kn.index(s) for s, _ in JOINT_MAP]
+    mids = [mhr_names.index(m) for _, m in JOINT_MAP]
 
-    n_joints = len(JOINT_MAP)
-    q_default = np.zeros((len(kin_ids), n, 132), np.float32)
-    q_default[..., 6] = 1.0                # identity quat (xyzw) for unfitted rows
-    out = {
-        "q_world": q_default,
-        "identity": np.zeros((len(kin_ids), 45), np.float32),
-        "valid_mask": np.zeros((len(kin_ids), n), bool),
-        "residual_med_cm": np.full((len(kin_ids),), np.nan, np.float32),
-        "residual_vs_kindyn_med_cm": np.full((len(kin_ids),), np.nan, np.float32),
-        "per_joint_residual_cm": np.full((len(kin_ids), n_joints), np.nan, np.float32),
-        "offsets_local": np.zeros((len(kin_ids), n_joints, 3), np.float32),
-    }
-    for p_kin, oid in enumerate(kin_ids):
-        if oid not in sam_ids:
-            print(f"  {scene}: person {oid} missing from sam3d params — skipped")
+    for p in range(n_people):
+        rows = np.flatnonzero(vm[p])
+        if rows.size == 0:
             continue
-        p_sam = sam_ids.index(oid)
-        valid = (np.asarray(sam["valid_mask"], bool)[p_sam]
-                 & np.asarray(kin["valid_mask"], bool)[p_kin])
-
-        params = torch.tensor(sam["mhr_model_params"][p_sam], device=device)
-        shape = torch.tensor(sam["shape_params"][p_sam], device=device)
-        cam_t = torch.tensor(sam["pred_cam_t"][p_sam], device=device)
-        # Several corpus scenes carry NaN sam3d params on frames already flagged
-        # invalid. A NaN anywhere in the init would poison the rest-prior and
-        # smoothness means (0 * nan = nan) and one Adam step would NaN the whole
-        # trajectory — so non-finite rows are replaced by the nearest finite
-        # frame's values and excluded from validity.
-        finite = (torch.isfinite(params).all(-1) & torch.isfinite(shape).all(-1)
-                  & torch.isfinite(cam_t).all(-1)).cpu().numpy()
-        valid &= finite
-        if valid.sum() < 3:
-            print(f"  {scene}: person {oid} has {int(valid.sum())} valid frames — skipped")
-            continue
-        if not finite.all():
-            fin_idx = np.flatnonzero(finite)
-            near = fin_idx[np.abs(
-                np.arange(n)[:, None] - fin_idx[None, :]).argmin(1)]
-            fill = np.arange(n)
-            fill[~finite] = near[~finite]
-            sel = torch.tensor(fill, device=device)
-            params, shape, cam_t = params[sel], shape[sel], cam_t[sel]
-        vrow = torch.tensor(valid, device=device)
-
-        # One body from the mean valid-frame identity; per-frame native q from
-        # the full trajectory (from_classic's q is shape-independent).
-        shape_mean = shape[vrow].mean(0, keepdim=True)
-        body, _ = adapter.body.from_classic(MHRClassic(
-            identity_coeffs=shape_mean, model_parameters=params[:1]))
-        _, q_native = adapter.body.from_classic(MHRClassic(
-            identity_coeffs=shape, model_parameters=params))
-        q_native = q_native.view(1, n, -1)
-        root_world = adapter._root_to_world(
-            body.robot, q_native[..., :7], cam_t, cam, 1, n)
-        q0 = torch.cat([root_world, q_native[..., 7:]], -1)
-
-        from contact.physics.adapter import _with_time_axis
-        body = body._replace(values=body.values, robot=_with_time_axis(body.robot))
-
-        tgt = torch.tensor(np.asarray(kin["joints_world"], np.float32)[p_kin],
-                           device=device)[None, :, kids]
-        vmask = vrow[None, :, None, None].float()
-
-        q1 = _fit(body, mids, q0, tgt, vmask)
         with torch.no_grad():
-            fk1 = forward_kinematics(body.robot, q1)
-            rot_w = so3.to_matrix(fk1.joint_pose_world[..., 3:][:, :, mids])
-            delta_w = tgt - fk1.joint_pose_world[..., :3][:, :, mids]
-            local = torch.einsum("bnjxy,bnjx->bnjy", rot_w, delta_w)
-            off_local = local[0][vrow].median(dim=0).values             # [J, 3]
-            tgt2 = tgt - torch.einsum("bnjxy,jy->bnjx", rot_w, off_local)
-        q2 = _fit(body, mids, q1, tgt2, vmask)
+            verts = ctx.body.forward(
+                torch.tensor(betas[p], device=ctx.device),
+                torch.tensor(q_s[p, rows], device=ctx.device),
+            ).vertices                                  # (R, 10475, 3) m, world
+        conv = Conversion(
+            mhr_model=ctx.meta_mhr, smpl_model=ctx.smplx_model,
+            method="pytorch", batch_size=min(int(rows.size), MAX_FIT_BATCH))
+        res = conv.convert_smpl2mhr(
+            smpl_vertices=verts, single_identity=True, exclude_expression=True,
+            is_tracking=False, return_mhr_meshes=False, return_mhr_vertices=False,
+            return_mhr_parameters=True, return_fitting_errors=True)
+        params = res.result_parameters
+
+        def _t(x) -> torch.Tensor:
+            if isinstance(x, torch.Tensor):
+                return x.detach().to(device=ctx.device, dtype=torch.float32)
+            return torch.as_tensor(np.asarray(x), dtype=torch.float32,
+                                   device=ctx.device)
+
+        lbs = _t(params["lbs_model_params"])                            # (R, 204)
+        iden = _t(params["identity_coeffs"])                            # (R, 45)
+        _, q_fit = ctx.bh_mhr.from_classic(
+            MHRClassic(identity_coeffs=iden, model_parameters=lbs))     # (R, 132)
+        if not torch.isfinite(q_fit).all():
+            raise RuntimeError(f"{scene_dir.name}: person {int(ids[p])} "
+                               "fit produced non-finite q")
+        q_np = q_fit.detach().cpu().numpy().astype(np.float32)
+        q_np[:, 3:7] = hemisphere_align(q_np[:, 3:7])
+        q_world[p, rows] = q_np
+        identity[p] = iden[0].detach().cpu().numpy()
+        lbs_params[p, rows] = lbs.detach().cpu().numpy().astype(np.float32)
+        err = _t(res.result_errors).cpu().numpy().astype(np.float32).reshape(-1)
+        fit_err[p, rows] = err[: rows.size]
 
         with torch.no_grad():
-            fk2 = forward_kinematics(body.robot, q2)
-            fk2_pos = fk2.joint_pose_world[..., :3][:, :, mids]
-            resid = (fk2_pos - tgt2).norm(dim=-1)[0][vrow]              # [rows, J]
-            resid_kindyn = (fk2_pos - tgt).norm(dim=-1)[0][vrow]
-        if not torch.isfinite(q2).all():
-            raise RuntimeError(f"{scene}: person {oid} fit produced non-finite q")
-        q_out = q2[0].cpu().numpy()
-        q_out[:, 3:7] = hemisphere_align(q_out[:, 3:7].astype(np.float64))
-        out["q_world"][p_kin] = q_out
-        out["identity"][p_kin] = shape_mean[0].cpu().numpy()
-        out["valid_mask"][p_kin] = valid
-        out["residual_med_cm"][p_kin] = float(resid.median()) * 100.0
-        out["residual_vs_kindyn_med_cm"][p_kin] = float(resid_kindyn.median()) * 100.0
-        out["per_joint_residual_cm"][p_kin] = (
-            resid.median(dim=0).values.cpu().numpy() * 100.0)
-        out["offsets_local"][p_kin] = off_local.cpu().numpy()
+            fk = forward_kinematics(
+                ctx.bh_mhr.robot, torch.as_tensor(q_np, device=ctx.device)[None])
+            pred_j = fk.joint_pose_world[..., :3][0][:, mids].cpu().numpy()
+        gt_j = np.asarray(kin["joints_world"], np.float32)[p][rows][:, kids]
+        joint_med[p] = float(np.median(
+            np.linalg.norm(pred_j - gt_j, axis=-1))) * 100.0
 
-    out.update(
-        object_ids=np.asarray(kin_ids, np.int32),
-        num_frames=np.int32(n),
+    return dict(
+        q_world=q_world, valid_mask=vm, identity=identity,
+        lbs_params=lbs_params,
+        fit_err_cm=fit_err, joint_vs_kindyn_med_cm=joint_med,
+        object_ids=ids, num_frames=np.int32(n),
         fps=np.asarray(kin["fps"], np.float32),
-        joint_map=np.asarray([[s, m] for s, m in JOINT_MAP]),
         converter_version=np.int32(CONVERTER_VERSION),
     )
-    return out
 
 
 def main() -> int:
@@ -281,7 +229,7 @@ def main() -> int:
     if args.num_shards > 1:
         scene_dirs = scene_dirs[args.shard_index :: args.num_shards]
 
-    adapter = MHRAdapter(device=args.device)
+    ctx = build_ctx(args.device)
     done = skipped = failed = 0
     start = time.time()
     for i, scene_dir in enumerate(scene_dirs):
@@ -291,20 +239,23 @@ def main() -> int:
             continue
         tmp = target.with_name("mhr_1.tmp.npz")
         try:
-            payload = convert_scene(scene_dir, features, adapter, args.device)
+            payload = convert_scene(scene_dir, ctx)
             np.savez_compressed(tmp, **payload)
             tmp.rename(target)
         except Exception as exc:                       # keep the sweep alive
             failed += 1
             tmp.unlink(missing_ok=True)
-            print(f"[{i + 1}/{len(scene_dirs)}] {scene_dir.name} FAILED: {exc}")
+            print(f"[{i + 1}/{len(scene_dirs)}] {scene_dir.name} FAILED: {exc}",
+                  flush=True)
             continue
         done += 1
-        med = np.nanmedian(payload["residual_med_cm"])
+        med = np.nanmedian(payload["fit_err_cm"])
+        jmed = np.nanmedian(payload["joint_vs_kindyn_med_cm"])
         elapsed = time.time() - start
         print(f"[{i + 1}/{len(scene_dirs)}] {scene_dir.name}: "
-              f"P={len(payload['object_ids'])} med {med:.2f} cm "
-              f"({elapsed / max(done, 1):.0f}s/scene)", flush=True)
+              f"P={len(payload['object_ids'])} mesh {med:.2f} cm "
+              f"joints {jmed:.2f} cm ({elapsed / max(done, 1):.0f}s/scene)",
+              flush=True)
     print(f"done={done} skipped={skipped} failed={failed}")
     return 1 if failed else 0
 

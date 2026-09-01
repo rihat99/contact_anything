@@ -43,50 +43,31 @@ def test_defaults_disabled():
     assert mc["enabled"] is False
     assert mc["angular"] is True
     assert mc["loss"] == {
-        "gt": 1.0, "head": 0.5, "huber_delta": 1.0,
-        "pos": 0.0, "pos_huber_m": 0.1, "rot": 0.0, "rot_huber_rad": 0.1,
-        "cam_rail": 0.0, "cam_rail_margin_m": 0.5,
-        "rot_rail": 0.0, "rot_rail_margin_rad": 0.2}
+        "gt": 0.005, "head": 0.0025, "huber_delta": 1.0,
+        "pos": 0.0, "pos_huber_m": 0.1, "rot": 0.0, "rot_huber_rad": 0.1}
     assert mc["hip_offset_root"] == pytest.approx([-0.009, -0.060, -0.065])
+    assert mc["detach_head"] is True
 
 
-def test_shipped_allmod_mutual_validates():
-    cfg = load_config(REPO / "configs" / "old" / "climbing_corpus_allmod_mutual.yaml")
+def test_allmod_rope_fixture_validates():
+    # The shipped config was retired to the trash 2026-08-30 (pre-v3 cleanup);
+    # tests/fixtures/ keeps a verbatim copy so this coverage survives.
+    cfg = load_config(REPO / "tests" / "fixtures" / "allmod_rope_t60.yaml")
     assert cfg["motion_consistency"]["enabled"] is True
-    assert cfg["force_supervision"]["loss"]["noncontact"] == pytest.approx(0.2)
     assert cfg["model"]["extra_token_attention"] == "mutual"
-
-
-def test_shipped_allmod_consistency_validates():
-    cfg = load_config(
-        REPO / "configs" / "old" / "climbing_corpus_allmod_consistency.yaml")
-    mc = cfg["motion_consistency"]
-    assert mc["enabled"] is True
-    assert (mc["loss"]["pos"], mc["loss"]["rot"], mc["loss"]["cam_rail"]) == (
-        5.0, 2.0, 10.0)
-    # v3 goes back to the causal mask — the mutual mask is its own ablation.
-    assert cfg["model"]["extra_token_attention"] == "causal"
-    assert cfg["force_supervision"]["loss"]["noncontact"] == pytest.approx(0.2)
-
-
-def test_shipped_allmod_consistency_v4_validates():
-    cfg = load_config(
-        REPO / "configs" / "old" / "climbing_corpus_allmod_consistency_v4.yaml")
-    mc = cfg["motion_consistency"]
-    assert mc["enabled"] is True
-    # v4 = v3 + the two rot-collapse fixes: linear-only twist + rot rail.
-    assert mc["angular"] is False
-    assert (mc["loss"]["rot_rail"],
-            mc["loss"]["rot_rail_margin_rad"]) == (10.0, 0.2)
-    assert (mc["loss"]["pos"], mc["loss"]["rot"], mc["loss"]["cam_rail"]) == (
-        5.0, 2.0, 10.0)
-    assert cfg["model"]["extra_token_attention"] == "causal"
+    # The single all-modality RoPE block is the only temporal path, and it
+    # writes the pose token (so pose_supervision must be on).
+    xm = cfg["model"]["cross_modal_temporal"]
+    assert xm["enabled"] is True
+    assert xm["modalities"] == ["pose", "contact", "force", "motion"]
+    assert cfg["model"]["pose_temporal"]["enabled"] is False
+    assert cfg["pose_supervision"]["enabled"] is True
 
 
 def test_requires_motion_supervision(tmp_path):
     with pytest.raises(ValueError, match="requires motion_supervision"):
         load_config(_write(tmp_path, """
-base: configs/old/climbing_corpus_pose_temporal.yaml
+base: tests/fixtures/pose_temporal.yaml
 motion_consistency: {enabled: true}
 """))
 
@@ -94,7 +75,7 @@ motion_consistency: {enabled: true}
 def test_requires_a_trainable_pose_path(tmp_path):
     with pytest.raises(ValueError, match="trainable pose path"):
         load_config(_write(tmp_path, """
-base: configs/old/climbing_corpus_motion_pelvis12_angw05.yaml
+base: tests/fixtures/motion_pelvis12_angw05.yaml
 motion_consistency: {enabled: true}
 """))
 
@@ -119,7 +100,7 @@ motion_consistency: {enabled: true}
 def test_requires_three_frame_clips(tmp_path):
     with pytest.raises(ValueError, match="frames_per_clip >= 3"):
         load_config(_write(tmp_path, """
-base: configs/old/climbing_corpus_motion_pelvis12_angw05.yaml
+base: tests/fixtures/motion_pelvis12_angw05.yaml
 model:
   pose_temporal: {enabled: true}
 data:
@@ -132,20 +113,20 @@ motion_consistency: {enabled: true}
 def test_zero_weights_rejected(tmp_path):
     with pytest.raises(ValueError, match="does nothing"):
         load_config(_write(tmp_path, """
-base: configs/old/climbing_corpus_motion_pelvis12_angw05.yaml
+base: tests/fixtures/motion_pelvis12_angw05.yaml
 model:
   pose_temporal: {enabled: true}
 pose_supervision: {enabled: true}
 motion_consistency:
   enabled: true
-  loss: {gt: 0.0, head: 0.0, pos: 0.0, rot: 0.0, cam_rail: 0.0, rot_rail: 0.0}
+  loss: {gt: 0.0, head: 0.0, pos: 0.0, rot: 0.0}
 """))
 
 
 def test_negative_pos_weight_rejected(tmp_path):
     with pytest.raises(ValueError, match="loss.pos"):
         load_config(_write(tmp_path, """
-base: configs/old/climbing_corpus_motion_pelvis12_angw05.yaml
+base: tests/fixtures/motion_pelvis12_angw05.yaml
 model:
   pose_temporal: {enabled: true}
 pose_supervision: {enabled: true}
@@ -156,12 +137,36 @@ motion_consistency: {enabled: true, loss: {pos: -1.0}}
 def test_bad_hip_offset_rejected(tmp_path):
     with pytest.raises(ValueError, match="hip_offset_root"):
         load_config(_write(tmp_path, """
-base: configs/old/climbing_corpus_motion_pelvis12_angw05.yaml
+base: tests/fixtures/motion_pelvis12_angw05.yaml
 model:
   pose_temporal: {enabled: true}
 pose_supervision: {enabled: true}
 motion_consistency: {enabled: true, hip_offset_root: [0.0, 0.0]}
 """))
+
+
+def test_hip_offset_default_follows_root_source(tmp_path):
+    """The offset is a property of the GT rig, so its default follows
+    ``motion_supervision.root_source``: the kindyn pelvis sits ~9 cm from the
+    mean-hips, the MHR root IS the mean-hips. An explicit value still wins."""
+    kindyn = load_config(REPO / "configs" / "base.yaml")
+    assert kindyn["motion_supervision"]["root_source"] == "kindyn"
+    assert kindyn["motion_consistency"]["hip_offset_root"] == pytest.approx(
+        [-0.009, -0.060, -0.065])
+
+    mhr = load_config(_write(tmp_path, """
+base: configs/base.yaml
+motion_supervision: {root_source: mhr}
+"""))
+    assert mhr["motion_consistency"]["hip_offset_root"] == [0.0, 0.0, 0.0]
+
+    explicit = load_config(_write(tmp_path, """
+base: configs/base.yaml
+motion_supervision: {root_source: mhr}
+motion_consistency: {hip_offset_root: [0.02, -0.06, -0.07]}
+"""))
+    assert explicit["motion_consistency"]["hip_offset_root"] == pytest.approx(
+        [0.02, -0.06, -0.07])
 
 
 def test_no_arch_signature_key(tmp_path):
@@ -170,7 +175,7 @@ def test_no_arch_signature_key(tmp_path):
     from contact import checkpoint as ckpt_io
 
     sig = ckpt_io._arch_signature(
-        load_config(REPO / "configs" / "old" / "climbing_corpus_allmod_mutual.yaml"))
+        load_config(REPO / "tests" / "fixtures" / "allmod_rope_t60.yaml"))
     assert "motion_consistency" not in sig
 
 
@@ -255,9 +260,7 @@ def _toy_cfg() -> dict:
             "hip_offset_root": [0.0, 0.0, 0.0],
             "loss": {"gt": 1.0, "head": 0.5, "huber_delta": 1.0,
                      "pos": 1.0, "pos_huber_m": 0.1,
-                     "rot": 1.0, "rot_huber_rad": 0.1,
-                     "cam_rail": 1.0, "cam_rail_margin_m": 0.5,
-                     "rot_rail": 1.0, "rot_rail_margin_rad": 0.2},
+                     "rot": 1.0, "rot_huber_rad": 0.1},
         },
         "motion_supervision": {
             "enabled": True,
@@ -313,14 +316,27 @@ def test_gradients_reach_pose_path_only():
     loss_fn = MotionConsistencyLoss(_toy_cfg(), device="cpu")
     out, batch = _toy_out(), _toy_batch()
     total, parts = loss_fn(out, batch)
-    assert parts["terms"].keys() == {
-        "gt", "head", "pos", "rot", "cam_rail", "rot_rail"}
+    assert parts["terms"].keys() == {"gt", "head", "pos", "rot"}
     total.backward()
     for key in ("pred_keypoints_3d", "pred_cam_t", "global_rot"):
         grad = out["mhr"][key].grad
         assert grad is not None and float(grad.abs().sum()) > 0, key
     # The head term's target is detached: no gradient may reach the motion head.
     assert out["motion"]["joint_motion"].grad is None
+
+
+def test_detach_head_false_reaches_motion_head():
+    """``detach_head: false`` makes the head term bidirectional."""
+    cfg = _toy_cfg()
+    cfg["motion_consistency"]["detach_head"] = False
+    loss_fn = MotionConsistencyLoss(cfg, device="cpu")
+    out, batch = _toy_out(), _toy_batch()
+    total, _ = loss_fn(out, batch)
+    total.backward()
+    grad = out["motion"]["joint_motion"].grad
+    assert grad is not None and float(grad.abs().sum()) > 0
+    for key in ("pred_keypoints_3d", "pred_cam_t", "global_rot"):
+        assert out["mhr"][key].grad is not None, key
 
 
 def test_boundary_rows_are_never_supervised():
@@ -450,67 +466,6 @@ def test_rot_term_zero_when_aligned_and_active_when_not():
     assert parts["terms"]["rot"]["loss"] == pytest.approx(0.15, abs=1e-5)
 
 
-def test_cam_rail_zero_inside_margin_linear_beyond():
-    cfg = _toy_cfg()
-    for name in ("gt", "head", "pos", "rot"):
-        cfg["motion_consistency"]["loss"][name] = 0.0    # isolate the rail
-    loss_fn = MotionConsistencyLoss(cfg, device="cpu")
-    out, batch = _toy_out(n_clips=1, t=5), _toy_batch(n_clips=1, t=5)
-    out["mhr"]["pred_cam_t_frozen"] = (
-        out["mhr"]["pred_cam_t"].detach() + torch.tensor([0.0, 0.0, 0.4]))
-    total, parts = loss_fn(out, batch)
-    assert parts["terms"]["cam_rail"]["weight_mass"] == 5.0
-    assert parts["terms"]["cam_rail"]["loss"] == pytest.approx(0.0, abs=1e-7)
-    # 2 m past the frozen camera: relu(2.0 - 0.5) = 1.5 per row.
-    out["mhr"]["pred_cam_t_frozen"] = (
-        out["mhr"]["pred_cam_t"].detach() + torch.tensor([0.0, 0.0, 2.0]))
-    total, parts = loss_fn(out, batch)
-    assert parts["terms"]["cam_rail"]["loss"] == pytest.approx(1.5, abs=1e-6)
-    total.backward()
-    grad = out["mhr"]["pred_cam_t"].grad
-    assert grad is not None and float(grad.abs().sum()) > 0
-
-
-def test_missing_frozen_camera_disables_the_rail():
-    loss_fn = MotionConsistencyLoss(_toy_cfg(), device="cpu")
-    out, batch = _toy_out(n_clips=1, t=5), _toy_batch(n_clips=1, t=5)
-    assert "pred_cam_t_frozen" not in out["mhr"]
-    _, parts = loss_fn(out, batch)
-    assert parts["terms"]["cam_rail"]["weight_mass"] == 0.0
-
-
-def test_rot_rail_zero_inside_margin_linear_beyond():
-    cfg = _toy_cfg()
-    for name in ("gt", "head", "pos", "rot", "cam_rail"):
-        cfg["motion_consistency"]["loss"][name] = 0.0    # isolate the rot rail
-    loss_fn = MotionConsistencyLoss(cfg, device="cpu")
-    out, batch = _toy_out(n_clips=1, t=5), _toy_batch(n_clips=1, t=5)
-    with torch.no_grad():
-        out["mhr"]["global_rot"].zero_()
-    # 0.1 rad about x: geodesic 0.1 < margin 0.2 -> exactly zero.
-    out["mhr"]["global_rot_frozen"] = torch.tensor([0.1, 0.0, 0.0]).expand(5, 3)
-    total, parts = loss_fn(out, batch)
-    assert parts["terms"]["rot_rail"]["weight_mass"] == 5.0
-    assert parts["terms"]["rot_rail"]["loss"] == pytest.approx(0.0, abs=1e-7)
-    # 0.5 rad: relu(0.5 - 0.2) = 0.3 per row.
-    out["mhr"]["global_rot_frozen"] = torch.tensor([0.5, 0.0, 0.0]).expand(5, 3)
-    total, parts = loss_fn(out, batch)
-    assert parts["terms"]["rot_rail"]["loss"] == pytest.approx(0.3, abs=1e-6)
-    assert parts["rot_dev_deg"] == pytest.approx(0.5 * 180.0 / np.pi, abs=1e-3)
-    assert parts["rot_rail_frac"] == pytest.approx(1.0)
-    total.backward()
-    grad = out["mhr"]["global_rot"].grad
-    assert grad is not None and float(grad.abs().sum()) > 0
-
-
-def test_missing_frozen_rotation_disables_the_rot_rail():
-    loss_fn = MotionConsistencyLoss(_toy_cfg(), device="cpu")
-    out, batch = _toy_out(n_clips=1, t=5), _toy_batch(n_clips=1, t=5)
-    assert "global_rot_frozen" not in out["mhr"]
-    _, parts = loss_fn(out, batch)
-    assert parts["terms"]["rot_rail"]["weight_mass"] == 0.0
-
-
 def test_linear_only_mode_ignores_angular_rows():
     """``angular: false`` — garbage in the angular rows of the head/GT must not
     move the gt/head terms (they compare linear vel/acc only)."""
@@ -559,9 +514,9 @@ needs_corpus = pytest.mark.skipif(
 @needs_corpus
 def test_full_model_gradient_routing(tmp_path):
     """On a real corpus batch every consistency term reaches the pose path
-    (head_pose.proj + pose_temporal) and — head DETACHED — never the motion
+    (head_pose_ft_proj + pose_temporal) and — head DETACHED — never the motion
     branch, never anything frozen. The recompute hook must stash the frozen
-    camera, and at zero-gated init the rail must sit exactly on it."""
+    camera/rotation (the keypoint_supervision rails anchor there)."""
     from contact.data.climbing_corpus import ClimbingCorpusDataset
     from contact.data.collate import batch_to_device, make_collate
     from contact.engine import forward_model
@@ -570,7 +525,7 @@ def test_full_model_gradient_routing(tmp_path):
 
     torch.manual_seed(0)
     cfg = load_config(_write(tmp_path, """
-base: configs/old/climbing_corpus_motion_pelvis12_angw05.yaml
+base: tests/fixtures/motion_pelvis12_angw05.yaml
 model:
   pose_temporal: {enabled: true}
 train: {finetune_pose_head: true}
@@ -578,7 +533,7 @@ pose_supervision: {enabled: true}
 motion_consistency:
   enabled: true
   angular: false
-  loss: {pos: 5.0, rot: 2.0, cam_rail: 10.0, rot_rail: 10.0}
+  loss: {pos: 5.0, rot: 2.0}
 """))
     model, trainable = build_model(cfg, "cuda")
     model.eval()
@@ -597,8 +552,8 @@ motion_consistency:
     loss_fn = MotionConsistencyLoss(cfg, device="cuda")
     out = forward_model(model, batch)
     # The pose write path (pose_temporal) recomputed the final output — the
-    # frozen camera must be stashed, and the zero-gated recompute IS the
-    # frozen output, so the rail starts exactly on its anchor.
+    # frozen camera must be stashed (the keypoint_supervision rails and the
+    # renderer anchor on it), and the zero-gated recompute IS the frozen output.
     assert "pred_cam_t_frozen" in out["mhr"]
     assert torch.equal(
         out["mhr"]["pred_cam_t"], out["mhr"]["pred_cam_t_frozen"])
@@ -606,19 +561,18 @@ motion_consistency:
     assert torch.equal(
         out["mhr"]["global_rot"], out["mhr"]["global_rot_frozen"])
     total, parts = loss_fn(out, batch)
-    for name in ("gt", "head", "pos", "rot", "cam_rail", "rot_rail"):
+    for name in ("gt", "head", "pos", "rot"):
         assert parts["terms"][name]["weight_mass"] > 0, name
-    assert parts["terms"]["cam_rail"]["loss"] == pytest.approx(0.0, abs=1e-9)
-    assert parts["terms"]["rot_rail"]["loss"] == pytest.approx(0.0, abs=1e-9)
     assert parts["pos_err_m"] < 1.0, "frozen model should start near the GT root"
     total.backward()
 
     got = {n for n, p in model.named_parameters()
            if p.grad is not None and float(p.grad.abs().sum()) > 0}
-    assert any(n.startswith("head_pose.proj.") for n in got), "pose path missed"
+    # SPLIT-HEAD: the trainable copy is head_pose_ft_proj; head_pose.proj stays frozen.
+    assert any(n.startswith("head_pose_ft_proj.") for n in got), "pose path missed"
     assert any(n.startswith("pose_temporal.") for n in got), "pose brick missed"
     assert not any(n.startswith("head_motion.") for n in got), (
         "the detached head term leaked gradient into the motion head")
     for n in got:
-        assert n in set(trainable) or n.startswith("head_pose.proj."), (
+        assert n in set(trainable) or n.startswith("head_pose_ft_proj."), (
             f"frozen param {n} received a gradient")

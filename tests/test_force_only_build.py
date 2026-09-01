@@ -30,7 +30,7 @@ from sam_3d_body.models.meta_arch.sam3d_body import SAM3DBody
 
 REPO = Path(__file__).resolve().parents[1]
 _CKPT = load_config(REPO / "configs" / "base.yaml")["model"]["checkpoint_path"]
-_T7HINGE_CFG = REPO / "configs" / "old" / "climbing_videos_force_warmstart_t7hinge.yaml"
+_T7HINGE_CFG = REPO / "tests" / "fixtures" / "force_warmstart_t7hinge.yaml"
 _T7HINGE_BEST = REPO / "output" / "climb4_force_t7hinge_20260724_121450" / "best.pth"
 
 # Six-anchor list of the supervised force experiment, kindyn column order
@@ -50,7 +50,7 @@ model:
   force_head:
     enabled: true
     force_keypoint_indices: [62, 41, 15, 18, 17, 20]
-  force_temporal: {enabled: true}
+  cross_modal_temporal: {enabled: true, modalities: [pose, force]}
 contact:
   targets:
     vertex: {enabled: false}
@@ -80,7 +80,7 @@ def test_force_only_with_explicit_anchors_accepted(tmp_path):
     assert cfg["model"]["force_head"]["force_keypoint_indices"] == _SIX_ANCHORS
     assert cfg["contact"]["targets"]["vertex"]["enabled"] is False
     assert cfg["contact"]["targets"]["joint"]["enabled"] is False
-    assert cfg["model"]["force_temporal"]["enabled"] is True
+    assert cfg["model"]["cross_modal_temporal"]["enabled"] is True
 
 
 def test_force_only_without_anchors_rejected(tmp_path):
@@ -162,13 +162,16 @@ contact:
 """))
 
 
-def test_force_only_rejects_contact_temporal(tmp_path):
-    # The contact temporal module attends contact tokens, which do not exist.
-    with pytest.raises(ValueError, match="model.temporal.enabled requires an enabled contact target"):
+def test_force_only_rejects_the_contact_modality(tmp_path):
+    # The cross-modal block cannot list contact tokens that do not exist.
+    with pytest.raises(
+        ValueError,
+        match=r"model.cross_modal_temporal.modalities \['contact'\] have no token block"
+    ):
         load_config(_write(tmp_path, """
 base: configs/base.yaml
 model:
-  temporal: {enabled: true}
+  cross_modal_temporal: {enabled: true, modalities: [contact, force]}
   force_head:
     enabled: true
     force_keypoint_indices: [62, 41, 15, 18, 17, 20]
@@ -338,11 +341,15 @@ _NOISE_MARGIN = 8.0
 _NOISE_FLOOR_EPS = 1e-6
 
 
-def _build_force_only(tmp_path):
+def _build_force_only(tmp_path, temporal: bool = True):
     from contact.model import build_model
 
     torch.manual_seed(0)
-    cfg = load_config(_write(tmp_path, _FORCE_ONLY))
+    text = _FORCE_ONLY
+    if not temporal:
+        text = text.replace(
+            "  cross_modal_temporal: {enabled: true, modalities: [pose, force]}\n", "")
+    cfg = load_config(_write(tmp_path, text))
     model, trainable = build_model(cfg, "cuda")
     model.eval()
     return model, trainable, cfg
@@ -404,8 +411,11 @@ def test_force_only_build_forward_and_trainable_set(tmp_path):
 
     model, trainable, cfg = _build_force_only(tmp_path)
     try:
-        # Trainable set = exactly the force branch; no contact module exists.
-        assert trainable and all("force" in name.lower() for name in trainable)
+        # Trainable set = exactly the force branch + the shared temporal block;
+        # no contact module exists.
+        assert trainable and all(
+            "force" in name.lower() or "cross_modal" in name.lower()
+            for name in trainable)
         assert not any(
             "contact" in name.lower() for name, _ in model.named_parameters())
         assert not hasattr(model, "head_contact")
@@ -423,7 +433,7 @@ def test_force_only_build_forward_and_trainable_set(tmp_path):
         model.train(True)
         assert not model.backbone.training
         assert model.head_force.training
-        assert model.force_temporal.training
+        assert model.cross_modal_temporal.training
     finally:
         del model
         torch.cuda.empty_cache()
@@ -431,8 +441,11 @@ def test_force_only_build_forward_and_trainable_set(tmp_path):
 
 @_slow_gpu
 def test_force_only_mhr_within_noise_floor(tmp_path):
+    """No temporal block here: with 'pose' listed (the only second modality a
+    force-only build has) the pose token is deliberately WRITTEN, so the MHR
+    isolation claim only applies to the plain force branch."""
     _skip_unless_gpu_ckpt()
-    model, _, cfg = _build_force_only(tmp_path)
+    model, _, cfg = _build_force_only(tmp_path, temporal=False)
     try:
         batch = _batch(cfg, model, _synth_frames(2))
         with _force_disabled(model):

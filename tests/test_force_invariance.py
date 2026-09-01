@@ -1,6 +1,6 @@
 """GPU invariance tests: the force branch never perturbs frozen MHR or contact.
 
-Real SAM-3D-Body checkpoint required. Mirrors ``test_temporal_invariance.py``.
+Real SAM-3D-Body checkpoint required. Mirrors ``test_cross_modal_invariance.py``.
 
 The force tokens are appended *after* the contact tokens and the asymmetric mask
 blocks every earlier token block from attending them (D1), so both the frozen
@@ -30,7 +30,7 @@ from contact.model import build_model
 from contact.targets import NUM_BODY_22, TargetSpec
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-JOINT_CFG = os.path.join(REPO, "configs", "old", "climbing_videos_joint.yaml")
+JOINT_CFG = os.path.join(REPO, "tests", "fixtures", "climbing_videos_joint.yaml")
 _CKPT = load_config(os.path.join(REPO, "configs", "base.yaml"))["model"]["checkpoint_path"]
 
 _NOISE_MARGIN = 8.0
@@ -48,17 +48,23 @@ pytestmark = [
 _FORCE_SIGNAL = 1e-3
 
 
-def _cfg(force_temporal: bool = False) -> dict:
+def _cfg(temporal: bool = False) -> dict:
     cfg = load_config(JOINT_CFG)            # extremities_4, per_token joint target
     cfg["model"]["force_head"]["enabled"] = True
-    if force_temporal:
-        cfg["model"]["force_temporal"]["enabled"] = True
+    if temporal:
+        # The force branch's only cross-frame path is the shared block. 'pose' is
+        # deliberately NOT listed, so the frozen MHR outputs must keep their
+        # exactly-zero force Jacobian even with the block live.
+        cfg["model"]["cross_modal_temporal"] = {
+            "enabled": True, "modalities": ["contact", "force"], "num_layers": 2,
+            "num_heads": 16, "mlp_ratio": 2.0, "dropout": 0.0,
+            "time_scale": 25.0, "max_rel_sec": 2.5}
     return cfg
 
 
-def _build(force_temporal: bool = False):
+def _build(temporal: bool = False):
     torch.manual_seed(0)
-    cfg = _cfg(force_temporal)
+    cfg = _cfg(temporal)
     model, _ = build_model(cfg, "cuda")
     model.eval()
     return model, cfg
@@ -124,21 +130,21 @@ def _force_disabled(model):
 
 
 @contextlib.contextmanager
-def _force_temporal_disabled(model):
-    """Drop the ``force_temporal`` submodule so the post-decoder hook takes its
-    ``getattr(..., None)`` skip path — the exact code path of a disabled build."""
-    ft = model.force_temporal
-    del model.force_temporal
+def _temporal_disabled(model):
+    """Drop the ``cross_modal_temporal`` submodule so the post-decoder hook takes
+    its ``getattr(..., None)`` skip path — the code path of a disabled build."""
+    block = model.cross_modal_temporal
+    del model.cross_modal_temporal
     try:
         yield
     finally:
-        model.force_temporal = ft
+        model.cross_modal_temporal = block
 
 
-def _randomize_force_temporal_gammas(model, seed=13):
+def _randomize_temporal_gammas(model, seed=13):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     with torch.no_grad():
-        for name, p in model.force_temporal.named_parameters():
+        for name, p in model.cross_modal_temporal.named_parameters():
             if "gamma" in name:
                 p.copy_(torch.randn(p.shape, generator=gen, device="cuda"))
 
@@ -222,47 +228,51 @@ def test_force_params_have_no_mhr_or_contact_jacobian():
         torch.cuda.empty_cache()
 
 
-def test_force_temporal_moves_force_and_isolates_frozen():
-    """force_temporal enabled + gammas live: force moves across frames while MHR
-    and contact keep an exactly-zero Jacobian w.r.t. all force params (now
-    including ``force_temporal.*``)."""
-    model, cfg = _build(force_temporal=True)
+def test_cross_modal_moves_force_and_isolates_frozen():
+    """The shared block enabled over {contact, force} + gammas live: force moves
+    across frames, the frozen MHR outputs keep an exactly-zero Jacobian w.r.t.
+    every force-side param ('pose' is not a listed modality), and the contact
+    logits DO pick one up — the block deliberately relaxes contact/force
+    isolation (D1) among its listed modalities."""
+    model, cfg = _build(temporal=True)
     try:
         _randomize_force_head_final(model)          # nonzero forces to move
         batch = _batch(cfg, model, _synth_frames(4), seq_len=4)   # one T=4 clip
 
-        # Baseline forces with force_temporal an exact identity (module removed).
-        with _force_temporal_disabled(model):
+        # Baseline forces with the block an exact identity (module removed).
+        with _temporal_disabled(model):
             f_base = forward_model(model, batch)["force"]["joint_forces"]
             f_base = f_base.detach().float().clone()
 
         # Live temporal: cross-frame mixing changes the per-frame forces.
-        _randomize_force_temporal_gammas(model)
+        _randomize_temporal_gammas(model)
         out = forward_model(model, batch)           # grad enabled (no no_grad)
         f_live = out["force"]["joint_forces"]
         moved = _max_abs(f_live.detach().float(), f_base)
         assert moved > _FORCE_SIGNAL, (
-            f"force_temporal barely moved the forces across frames ({moved:.2e})")
+            f"the temporal block barely moved the forces across frames ({moved:.2e})")
 
         fparams = [p for _, p in _force_params(model)]
-        ft_params = [p for n, p in _force_params(model) if "force_temporal" in n]
-        assert ft_params, "no force_temporal params picked up by the 'force' filter"
+        xm_params = [p for _, p in model.cross_modal_temporal.named_parameters()]
+        assert xm_params
 
-        # Sanity: force output depends on the force_temporal params (graph is live).
-        gft = torch.autograd.grad(f_live.float().sum(), ft_params,
+        # Sanity: the force output depends on the block (the graph is live).
+        gft = torch.autograd.grad(f_live.float().sum(), xm_params,
                                   allow_unused=True, retain_graph=True)
         assert any(g is not None and float(g.abs().sum()) > 0 for g in gft), (
-            "force output has no gradient w.r.t. force_temporal params")
+            "force output has no gradient w.r.t. the cross-modal params")
 
-        # Contact logits: exactly-zero force Jacobian.
+        # Contact logits: the D1 relaxation is DELIBERATE and must be visible.
         contact = out["contact"]["joint_logits"].float().sum()
-        if contact.requires_grad:
-            gc = torch.autograd.grad(contact, fparams, allow_unused=True, retain_graph=True)
-            for g in gc:
-                assert g is None or float(g.abs().sum()) == 0.0, (
-                    "contact logits have a nonzero force Jacobian")
+        assert contact.requires_grad
+        gc = torch.autograd.grad(contact, fparams, allow_unused=True,
+                                 retain_graph=True)
+        assert any(g is not None and float(g.abs().sum()) > 0 for g in gc), (
+            "contact logits are still isolated from the force params — the "
+            "cross-modal block is meant to couple its listed modalities")
 
-        # Every MHR output: no grad required, or an exactly-zero force Jacobian.
+        # Every MHR output: no grad required, or an exactly-zero force Jacobian
+        # ('pose' is NOT a listed modality, so the pose token is never written).
         checked = 0
         for key, val in out["mhr"].items():
             if not (torch.is_tensor(val) and val.is_floating_point()):
@@ -329,7 +339,7 @@ def test_contact_gate_wires_final_force_output():
 
     torch.manual_seed(0)
     cfg = load_config(
-        os.path.join(REPO, "configs", "old", "climbing_corpus_joint_force_cond_sum1_postdec.yaml"))
+        os.path.join(REPO, "tests", "fixtures", "joint_force_cond_postdec.yaml"))
     model, _ = build_model(cfg, "cuda")
     model.eval()
     try:

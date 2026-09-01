@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import scripts.evaluate as ev
+from contact.targets import TargetSpec
 from scripts.evaluate import evaluate
 
 
@@ -198,3 +199,43 @@ def test_evaluate_physics_aggregates_sat_and_jerk(monkeypatch):
     assert res["physics_residual"] == pytest.approx(8.0 / 6.0)
     assert res["residual_sat_frac"] == pytest.approx((0.25 * 4 + 0.10 * 2) / 6.0)
     assert res["n_jerk_excluded_clips"] == 1
+
+
+def test_manual_test_loader_passes_auto_frame_stride_through(tmp_path, monkeypatch):
+    # Regression: `_manual_test_loader` int()-cast the stride, so every config
+    # using `frame_stride: auto` (all the T=60 ones) died with
+    # "invalid literal for int() with base 10: 'auto'" before scoring a batch.
+    from contact.config import load_config
+
+    cfg_path = tmp_path / "eval_auto.yaml"
+    cfg_path.write_text(
+        "base: configs/base.yaml\n"
+        "data:\n"
+        "  datasets:\n"
+        "    - {name: climbing_corpus, config: configs/datasets/climbing_corpus.yaml}\n"
+        "  eval_split: test\n"
+        "  sequence: {frames_per_clip: 8, frame_stride: auto}\n"
+        "contact:\n"
+        "  primary_target: joint\n"
+        "  targets:\n"
+        "    vertex: {enabled: false}\n"
+        "    joint: {enabled: true, joint_set: kindyn_6}\n"
+        # `frame_stride: auto` is only permitted alongside a motion/pose
+        # pipeline (see _validate_data), which is precisely the case that
+        # used to crash here.
+        "pose_supervision: {enabled: true}\n"
+        "train: {finetune_pose_head: true}\n")
+    cfg = load_config(cfg_path)
+
+    seen = {}
+
+    class _Stub:
+        def __init__(self, root, **kwargs):
+            seen.update(kwargs)
+
+        def __len__(self):
+            return 0
+
+    monkeypatch.setattr(ev, "ClimbingCorpusDataset", _Stub)
+    ev._manual_test_loader(cfg, (256, 256), TargetSpec.from_config(cfg))
+    assert seen["frame_stride"] == "auto"

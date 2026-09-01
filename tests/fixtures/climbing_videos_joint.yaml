@@ -1,3 +1,6 @@
+# TEST FIXTURE — a copy of configs/old/climbing_videos_joint.yaml with the retired
+# sliding-window temporal / frame-attention sections stripped so it still
+# validates under the current schema. The archived original is unchanged.
 # Four-extremity contact on the ClimbingVideos corpus — joint target only, vertex off.
 # Per-frame, confidence-weighted training (no temporal module). Each output has
 # one dedicated contact token anchored to its predicted MHR70 wrist or ankle:
@@ -6,8 +9,6 @@ base: configs/base.yaml
 
 model:
   extra_token_attention: causal   # pinned 2026-08-27: the repo default flipped to mutual
-  temporal:
-    enabled: false
   contact_head:
     contact_keypoint_indices: [62, 41, 13, 14]
     num_global_tokens: 0

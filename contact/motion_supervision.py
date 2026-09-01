@@ -3,7 +3,11 @@
 Reads ``out["motion"]["joint_motion"] (B, K, 6|12)`` — **standardized**
 root-frame linear velocity (``[..., 0:3]``) and acceleration (``[..., 3:6]``),
 plus the root body angular velocity/acceleration (``[..., 6:12]``) when
-``motion_supervision.angular`` is on — and the
+``motion_supervision.angular`` is on. "Root-frame" is the LINEAR frame the
+loader's ``motion_root_convention`` picked (body-root for ``twist`` /
+``rotated_world``, gravity + camera view for ``gravity_view``); ``motion_lin_rot``
+is its world-from-frame rotation and the angular pair is the body rate under
+every convention. Reads the
 collated ``motion_gt (B, K, 6|12)`` / ``motion_valid (B)`` / ``motion_outlier
 (B, K)`` / ``motion_rot (B, 3, 3)`` / ``motion_omega (B, 3)`` batch keys, whose
 slot order is ``motion_supervision.joint_names`` (default: all of
@@ -38,8 +42,10 @@ probe's protocol.
 
 Diagnostics are de-standardized: per-joint 3-D RMSE and pooled 3-component
 Pearson statistics in the **target** axes, plus the Pearson statistics of the
-**world-vertical** component (see :func:`to_world_linear`; vertical is world
-**y**, positive downward — kindyn's ``gravity_world`` is exactly ``[0, 1, 0]``).
+**world-vertical** component: the world vectors projected on the batch's
+``gravity_world`` (positive downward). The regenerated corpus fits gravity PER
+SCENE — it is no longer the ``[0, 1, 0]`` constant the v2 diagnostics assumed,
+so the projection, not a fixed axis index, is what "vertical" means here.
 They are returned as raw sums so the trainer can all-reduce them into an exact
 global correlation.
 """
@@ -183,7 +189,9 @@ class MotionSupervisedLoss:
         valid = (batch["motion_valid"] & batch["frame_valid"]).to(self.device)  # (B)
         outlier = batch["motion_outlier"].to(self.device)                 # (B, K)
         rot = batch["motion_rot"].to(self.device, self.dtype)             # (B, 3, 3)
+        lin_rot = batch["motion_lin_rot"].to(self.device, self.dtype)     # (B, 3, 3)
         omega = batch["motion_omega"].to(self.device, self.dtype)         # (B, 3)
+        gravity = batch["gravity_world"].to(self.device, self.dtype)      # (B, 3) unit down
 
         if self.target_frame == "center":
             seq_len = int(batch["seq_len"])
@@ -199,6 +207,7 @@ class MotionSupervisedLoss:
             pred, gt = _center(pred), _center(gt)
             valid, outlier = _center(valid), _center(outlier)
             rot, omega = _center(rot), _center(omega)
+            lin_rot, gravity = _center(lin_rot), _center(gravity)
         elif self.target_frame != "all":
             raise ValueError(
                 f"target_frame must be 'all' or 'center'; got {self.target_frame!r}")
@@ -218,7 +227,7 @@ class MotionSupervisedLoss:
         }
 
         diagnostics = self._diagnostics(
-            pred, gt, mask, rot, omega, n_outlier, int(valid.sum()))
+            pred, gt, mask, rot, lin_rot, omega, gravity, n_outlier, int(valid.sum()))
         return self._assemble(terms, zero_touch, diagnostics)
 
     @torch.no_grad()
@@ -228,7 +237,9 @@ class MotionSupervisedLoss:
         gt: Tensor,
         mask: Tensor,
         rot: Tensor,
+        lin_rot: Tensor,
         omega: Tensor,
+        gravity: Tensor,
         n_outlier: int,
         n_rows: int,
     ) -> dict[str, Any]:
@@ -236,16 +247,17 @@ class MotionSupervisedLoss:
 
         Two correlations per (quantity, slot): the pooled 3-component one in the
         **target** axes (what the head actually regresses) and the
-        **world-vertical** one (:func:`to_world_linear`, so a twist slot picks up
-        its Coriolis term). Both predictions and GT go through the same
-        conversion, so the comparison stays like-for-like.
+        **world-vertical** one (:func:`to_world_linear` with the LINEAR frame's
+        rotation, so a twist slot picks up its Coriolis term, projected on the
+        scene's fitted ``gravity_world``). Both predictions and GT go through the
+        same conversion, so the comparison stays like-for-like.
         """
         pred_phys = pred * self.std + self.mean                           # (rows, K, 6|12)
         weight = mask.to(torch.float64)                                   # (rows, K)
         pred_lin = to_world_linear(
-            pred_phys[..., 0:3], pred_phys[..., 3:6], rot, omega, self.twist_slots)
+            pred_phys[..., 0:3], pred_phys[..., 3:6], lin_rot, omega, self.twist_slots)
         gt_lin = to_world_linear(
-            gt[..., 0:3], gt[..., 3:6], rot, omega, self.twist_slots)
+            gt[..., 0:3], gt[..., 3:6], lin_rot, omega, self.twist_slots)
         world = {"vel": (pred_lin[0], gt_lin[0]), "acc": (pred_lin[1], gt_lin[1])}
         for j, name in enumerate(_ANGULAR_TERM_NAMES if self.angular else ()):
             sl = slice(6 + 3 * j, 9 + 3 * j)
@@ -259,9 +271,9 @@ class MotionSupervisedLoss:
             sl = slice(3 * i, 3 * i + 3)
             p = pred_phys[..., sl].to(torch.float64)                      # (rows, K, 3)
             g = gt[..., sl].to(torch.float64)
-            # World y (down-positive) of the converted vectors.
-            p_vert = world[name][0][..., 1].to(torch.float64)              # (rows, K)
-            g_vert = world[name][1][..., 1].to(torch.float64)
+            # Component along the scene's fitted gravity (down-positive).
+            p_vert = (world[name][0] * gravity[:, None, :]).sum(-1).to(torch.float64)
+            g_vert = (world[name][1] * gravity[:, None, :]).sum(-1).to(torch.float64)
             sq_err = ((p - g) ** 2).sum(dim=-1)                            # (rows, K)
             stats[i, :, 0] = weight.sum(dim=0)
             stats[i, :, 1] = (p_vert * weight).sum(dim=0)

@@ -1,3 +1,6 @@
+# TEST FIXTURE — a copy of configs/old/climbing_corpus_joint_force_cond_sum1_postdec.yaml with the retired
+# sliding-window temporal / frame-attention sections stripped so it still
+# validates under the current schema. The archived original is unchanged.
 # Joint contact+force production baseline — corpus6_jf_cond_sum1_postdec (the
 # best force run; the retired cond/cond_sum1 A/B ladder's winning arm).
 #
@@ -29,15 +32,6 @@ model:
     contact_keypoint_indices: [62, 41, 15, 18, 17, 20]   # = the force anchors (1:1 groups)
     num_global_tokens: 0
     pool_mode: per_token
-  temporal:
-    enabled: true
-    bottleneck_dim: 256
-    num_layers: 1
-    num_heads: 4
-    mlp_ratio: 2.0
-    attend: per_token                 # each group mixes only with itself through time
-    causal: false
-    position_scale: 30.0              # 30-fps seconds -> well-separated frame offsets
   force_head:
     enabled: true
     force_keypoint_indices: [62, 41, 15, 18, 17, 20]
@@ -45,10 +39,6 @@ model:
     contact_gate:
       enabled: true                   # f = f_raw * sigmoid(sharpness * detached contact logit)
       sharpness: 4.0
-  force_temporal:
-    enabled: true
-    attend: joint                     # groups see each other across time (allocation coupling)
-    position_scale: 30.0
   cond_input:
     enabled: true
     features_path: output/motion_probe_geom/cond_features.npz

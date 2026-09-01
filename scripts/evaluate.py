@@ -387,7 +387,10 @@ def _manual_test_loader(cfg: dict, image_size: tuple[int, int], spec: TargetSpec
         dataset_cfg["root"],
         split="test",
         frames_per_clip=int(sequence["frames_per_clip"]),
-        frame_stride=int(sequence["frame_stride"]),
+        # "auto" = per-scene max(1, round(fps / 25)); the loader takes the string
+        # verbatim, so it must NOT be int()-cast (as in collate.make_loaders).
+        frame_stride=(sequence["frame_stride"] if sequence["frame_stride"] == "auto"
+                      else int(sequence["frame_stride"])),
         jitter=False,
         seed=int(cfg["data"]["seed"]),
         contact_level=int(dataset_cfg.get("contact_level", 1)),

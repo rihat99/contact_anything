@@ -77,7 +77,7 @@ def test_item_collates_with_zero_supervision(out_tree):
     assert frame["mask"].shape == (64, 48)
     assert frame["key"] == "scene#0@0"
 
-    cfg = load_config(REPO / "configs" / "old" / "climbing_videos_joint_temporal_center_v2.yaml")
+    cfg = load_config(REPO / "tests" / "fixtures" / "joint_temporal_center_v2.yaml")
     collate = make_collate((256, 256), TargetSpec.from_config(cfg))
     batch = collate([clip])
     assert batch["img"].shape == (1, 1, 3, 256, 256)

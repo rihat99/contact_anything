@@ -28,11 +28,11 @@ class _Tiny(nn.Module):
 
 
 class _TinyPlus(_Tiny):
-    """``_Tiny`` with an *extra* trainable contact param (a temporal-like head)."""
+    """``_Tiny`` with an *extra* trainable param (the cross-modal temporal block)."""
 
     def __init__(self, dim: int = 4):
         super().__init__(dim)
-        self.contact_temporal = nn.Linear(dim, dim)
+        self.cross_modal_temporal = nn.Linear(dim, dim)
 
 
 class _TinyForce(_Tiny):
@@ -94,17 +94,16 @@ def _joint_cfg(joint_set: str) -> dict:
     }
 
 
-def _temporal_cfg(enabled: bool, position_scale: float = 30.0,
+def _temporal_cfg(enabled: bool, time_scale: float = 30.0,
                   force_enabled: bool = False) -> dict:
     cfg = {
         "model": {"checkpoint_path": "snap/model.ckpt",
                   "contact_head": {"grid_size": 5}},
         "contact": {"topology": "smpl", "targets": {}},
     }
-    cfg["model"]["temporal"] = (
-        {"enabled": True, "placement": "post_decoder", "attend": "per_token",
-         "causal": False, "bottleneck_dim": 2, "num_layers": 1, "num_heads": 1,
-         "mlp_ratio": 2.0, "position_scale": position_scale}
+    cfg["model"]["cross_modal_temporal"] = (
+        {"enabled": True, "modalities": ["contact", "force"], "num_layers": 1,
+         "num_heads": 1, "mlp_ratio": 2.0, "time_scale": time_scale}
         if enabled else {"enabled": False})
     if force_enabled:
         cfg["model"]["force_head"] = {
@@ -234,15 +233,15 @@ def test_temporal_warm_start_loads_common_params_only(tmp_path):
     path = tmp_path / "frame.pth"
     source_cfg = {
         "model": {"checkpoint_path": "snap/model.ckpt", "contact_head": {},
-                  "temporal": {"enabled": False}},
+                  "cross_modal_temporal": {"enabled": False}},
         "contact": {"topology": "smpl", "targets": {}},
     }
     target_cfg = {
         "model": {"checkpoint_path": "snap/model.ckpt", "contact_head": {},
-                  "temporal": {"enabled": True, "placement": "post_decoder",
-                               "bottleneck_dim": 2, "num_layers": 1,
-                               "num_heads": 1, "mlp_ratio": 2.0,
-                               "attend": "joint", "causal": False}},
+                  "cross_modal_temporal": {
+                      "enabled": True, "modalities": ["contact", "force"],
+                      "num_layers": 1, "num_heads": 1, "mlp_ratio": 2.0,
+                      "time_scale": 25.0}},
         "contact": {"topology": "smpl", "targets": {}},
     }
     opt, sched = _opt_sched(source)
@@ -251,14 +250,14 @@ def test_temporal_warm_start_loads_common_params_only(tmp_path):
                  monitor="val/vertex_f1", config=source_cfg)
 
     target = _TinyPlus()
-    before_temporal = target.contact_temporal.weight.detach().clone()
+    before_temporal = target.cross_modal_temporal.weight.detach().clone()
     state = ckpt_io.initialize_common_contact(path, target, config=target_cfg)
     assert torch.equal(target.contact_head.weight, source.contact_head.weight)
-    assert torch.equal(target.contact_temporal.weight, before_temporal)
+    assert torch.equal(target.cross_modal_temporal.weight, before_temporal)
     assert state["warm_start_new_names"] == [
-        "contact_temporal.bias", "contact_temporal.weight"]
+        "cross_modal_temporal.bias", "cross_modal_temporal.weight"]
     # the diff must name the unmatched trainable param
-    with pytest.raises(RuntimeError, match="contact_temporal"):
+    with pytest.raises(RuntimeError, match="cross_modal_temporal"):
         ckpt_io.load(path, _TinyPlus(dim=4))
 
 
@@ -329,7 +328,8 @@ def test_force_warm_start_requires_temporal_or_force_target(tmp_path):
     ckpt_io.save(path, source, _trainable_names(source), opt, sched,
                  epoch=0, global_step=1, best_metric=0.0, monitor="val/joint_f1",
                  config=_force_cfg(force_enabled=False))
-    with pytest.raises(RuntimeError, match="temporal module or the force branch"):
+    with pytest.raises(RuntimeError,
+                       match="cross-modal temporal block or the force branch"):
         ckpt_io.initialize_common_contact(
             path, _Tiny(), config=_force_cfg(force_enabled=False))
 
@@ -475,23 +475,25 @@ def test_partial_contact_state_raises_not_recovers(tmp_path):
 
 # ------------------------------------------ warm start from a temporal source (FIX 2)
 
-def test_temporal_source_warm_start_loads_contact_temporal(tmp_path):
-    # A temporal source is allowed when the target's temporal architecture is
-    # identical: contact_temporal.* then LOADS (not left fresh).
+def test_temporal_source_warm_start_loads_the_block(tmp_path):
+    # A temporal source is allowed when the target's block is architecturally
+    # identical: cross_modal_temporal.* then LOADS (not left fresh).
     source = _TinyPlus()
     path = tmp_path / "t5.pth"
     opt, sched = _opt_sched(source)
     ckpt_io.save(path, source, _trainable_names(source), opt, sched,
                  epoch=0, global_step=1, best_metric=0.0, monitor="test/joint_f1",
-                 config=_temporal_cfg(enabled=True, position_scale=30.0))
+                 config=_temporal_cfg(enabled=True, time_scale=30.0))
 
     target = _TinyPlus()
-    assert not torch.allclose(target.contact_temporal.weight, source.contact_temporal.weight)
+    assert not torch.allclose(
+        target.cross_modal_temporal.weight, source.cross_modal_temporal.weight)
     state = ckpt_io.initialize_common_contact(
-        path, target, config=_temporal_cfg(enabled=True, position_scale=30.0))
-    assert torch.equal(target.contact_temporal.weight, source.contact_temporal.weight)  # LOADED
+        path, target, config=_temporal_cfg(enabled=True, time_scale=30.0))
+    assert torch.equal(target.cross_modal_temporal.weight,
+                       source.cross_modal_temporal.weight)          # LOADED
     assert torch.equal(target.contact_head.weight, source.contact_head.weight)
-    assert state["warm_start_new_names"] == []   # nothing missing — contact_temporal loaded
+    assert state["warm_start_new_names"] == []   # nothing missing — the block loaded
 
 
 def test_temporal_source_mismatched_temporal_raises(tmp_path):
@@ -500,11 +502,11 @@ def test_temporal_source_mismatched_temporal_raises(tmp_path):
     opt, sched = _opt_sched(source)
     ckpt_io.save(path, source, _trainable_names(source), opt, sched,
                  epoch=0, global_step=1, best_metric=0.0, monitor="test/joint_f1",
-                 config=_temporal_cfg(enabled=True, position_scale=30.0))
-    with pytest.raises(RuntimeError, match="temporal architecture differs"):
+                 config=_temporal_cfg(enabled=True, time_scale=30.0))
+    with pytest.raises(RuntimeError, match="target's block differs"):
         ckpt_io.initialize_common_contact(
             path, _TinyPlus(),
-            config=_temporal_cfg(enabled=True, position_scale=1.0))
+            config=_temporal_cfg(enabled=True, time_scale=1.0))
 
 
 def test_temporal_source_disabled_target_raises(tmp_path):
@@ -515,8 +517,8 @@ def test_temporal_source_disabled_target_raises(tmp_path):
     opt, sched = _opt_sched(source)
     ckpt_io.save(path, source, _trainable_names(source), opt, sched,
                  epoch=0, global_step=1, best_metric=0.0, monitor="test/joint_f1",
-                 config=_temporal_cfg(enabled=True, position_scale=30.0))
-    with pytest.raises(RuntimeError, match="temporal architecture differs"):
+                 config=_temporal_cfg(enabled=True, time_scale=30.0))
+    with pytest.raises(RuntimeError, match="target's block differs"):
         ckpt_io.initialize_common_contact(
             path, _TinyForce(),
             config=_temporal_cfg(enabled=False, force_enabled=True))
@@ -534,22 +536,19 @@ def test_same_shape_semantic_mismatch_raises(tmp_path):
         ckpt_io.load(path, _Tiny(), config=_CFG_B)
 
 
-def test_temporal_position_scale_is_checkpointed_semantics(tmp_path):
+def test_temporal_time_scale_is_checkpointed_semantics(tmp_path):
     def cfg(scale):
         return {
             "model": {
                 "checkpoint_path": "snap/model.ckpt",
                 "contact_head": {"grid_size": 5},
-                "temporal": {
+                "cross_modal_temporal": {
                     "enabled": True,
-                    "placement": "post_decoder",
-                    "attend": "per_token",
-                    "causal": False,
-                    "bottleneck_dim": 256,
+                    "modalities": ["contact", "force"],
                     "num_layers": 1,
                     "num_heads": 4,
                     "mlp_ratio": 2.0,
-                    "position_scale": scale,
+                    "time_scale": scale,
                 },
             },
             "contact": {"topology": "smpl", "targets": {}},

@@ -35,18 +35,6 @@ model:
                                       # features + 2D posemb) never runs, so they see only
                                       # the sam3d body tokens via self-attention. Drops
                                       # contact_posemb_linear / contact_feat_linear.
-  temporal:                           # Phase 3: ContactTemporalModule (zero-gated, no-op off;
-    enabled: false                    # post_decoder — attends the decoder's contact-token outputs)
-    bottleneck_dim: 256               # lightweight 1024 -> 256 -> 1024 token adapter
-    num_layers: 1
-    num_heads: 4
-    mlp_ratio: 2.0
-    attend: joint                     # joint (T*K tokens per clip) | per_token (T per token-slot)
-    causal: false                     # frame-level causal mask when true
-    dropout: 0.0
-    position_scale: 1.0               # multiply elapsed seconds before sinusoidal time encoding
-    window_frames: null               # null | odd >= 3: attend only the central window (lets a
-                                      # T=5-native checkpoint run inside longer clips)
   force_head:                         # Step 04: per-extremity 3D force regression (zero-init head)
     enabled: false                    # requires the extremities_4 per_token joint target,
                                       # OR explicit force_keypoint_indices (decoupled/force-only)
@@ -59,7 +47,7 @@ model:
     mlp_depth: 2
     mlp_channel_div_factor: 4
     dropout: 0.0
-    contact_gate:                     # gate the FINAL force output (post force_temporal) by the
+    contact_gate:                     # gate the FINAL force output (post temporal mixing) by the
       enabled: false                  # DETACHED per-group contact logits: f = f_raw *
                                       # sigmoid(sharpness * logit), identity map — the kindyn_6
                                       # contact outputs match the six force groups 1:1 (heel force
@@ -67,16 +55,6 @@ model:
                                       # kindyn_6 joint target + 6 explicit force anchors; the
                                       # ungated output stays as joint_forces_raw.
       sharpness: 4.0                  # logit 1.0 -> p 0.73 -> gate 0.982 (nearly 1 in contact)
-  force_temporal:                     # Step 05: temporal attention over force tokens (post_decoder)
-    enabled: false                    # requires force_head.enabled; second ContactTemporalModule
-    bottleneck_dim: 256               # lightweight 1024 -> 256 -> 1024 token adapter
-    num_layers: 1
-    num_heads: 4
-    mlp_ratio: 2.0
-    attend: per_token                 # per_token (T per token-slot) | joint (T*K tokens per clip)
-    causal: false                     # frame-level causal mask when true
-    dropout: 0.0
-    position_scale: 1.0               # multiply elapsed seconds before sinusoidal time encoding
   motion_head:                        # Motion tokens v2: per-joint linear velocity + acceleration
     enabled: false                    # motion-only builds are legal (no contact/force branch)
     # Always explicit — motion tokens never inherit the contact anchors and there
@@ -96,61 +74,48 @@ model:
     mlp_depth: 2
     mlp_channel_div_factor: 4
     dropout: 0.0
-  motion_temporal:                    # temporal attention over motion tokens (post_decoder)
-    enabled: false                    # requires motion_head.enabled; third ContactTemporalModule.
-                                      # Mandatory in practice: a per-frame head cannot represent
-                                      # a finite difference.
-    bottleneck_dim: 256               # lightweight 1024 -> 256 -> 1024 token adapter
-    num_layers: 1
-    num_heads: 4
+  pose_temporal:                      # RoPE temporal attention over the POSE token (E2) — a
+    enabled: false                    # DELIBERATE exception to the frozen-pose rule: the final
+                                      # MHR output is recomputed from the temporally-mixed pose
+                                      # token (zero-init gates = frozen behavior at init). Needs
+                                      # pose_supervision. Redundant when cross_modal_temporal
+                                      # already lists 'pose'.
+    type: rope                        # the only value (the sliding-window module is retired)
+    time_scale: 25.0                  # seconds -> RoPE positions (one 25-fps step ~= 1.0)
+    max_rel_sec: 2.5                  # attention half-window in SECONDS (= training clip span).
+                                      # Inert on short clips; on longer inference sequences it
+                                      # hides never-trained relative offsets. null = no window
+    num_layers: 4
+    num_heads: 16                     # decoder dim / num_heads must be even (1024/16 = 64)
     mlp_ratio: 2.0
-    attend: per_token                 # per_token (T per token-slot) | joint (T*K tokens per clip)
-    causal: false                     # frame-level causal mask when true
     dropout: 0.0
-    position_scale: 1.0               # multiply elapsed seconds before sinusoidal time encoding
-  pose_temporal:                      # temporal attention over the POSE token (E2) — a DELIBERATE
-    enabled: false                    # exception to the frozen-pose rule: the final MHR output is
-                                      # recomputed from the temporally-mixed pose token (zero-init
-                                      # gates = frozen behavior at init). Needs pose_supervision.
-    bottleneck_dim: 256
-    num_layers: 2
-    num_heads: 4
-    mlp_ratio: 2.0
-    attend: per_token                 # one pose token: per_token == joint
-    causal: false
-    dropout: 0.0
-    position_scale: 30.0              # ~frame-offset scale for 30-fps elapsed-second stamps
-  cross_modal_temporal:               # ONE temporal block over ALL chosen modality token blocks:
-    enabled: false                    # the concatenation attends jointly (attend fixed to
-                                      # 'joint'), so e.g. force tokens see the pose token across
-                                      # the clip and vice versa. Alternative to the per-modality
-                                      # temporal blocks above (both may be enabled; this runs
-                                      # first, the per-modality blocks refine after).
+  cross_modal_temporal:               # THE post-decoder mixing brick: ONE temporal transformer
+    enabled: false                    # over the CONCATENATION of the chosen modality token
+                                      # blocks. Per clip the attention sequence is T frames x
+                                      # K tokens; every token of a frame shares that frame's
+                                      # position, so within-frame pairs attend position-free and
+                                      # across-frame pairs see time. Zero-gated: enabling it
+                                      # changes no output at init.
+    type: rope                        # rope = native-dim block, relative-time rotary positions,
+                                      # learned per-slot identity embedding; single-pass
+                                      # long-sequence inference. window = the revived sinusoidal
+                                      # ContactTemporalModule (attend=joint): bottleneck adapter,
+                                      # absolute in-clip positions, NO slot embedding — eval must
+                                      # window scenes (data.sequence.eval_full_scenes: false)
     modalities: [contact, force]      # >= 2 of pose|contact|force|motion, each branch enabled.
                                       # 'pose' WRITES the pose token — the final MHR output is
                                       # recomputed from it (needs pose_supervision for training).
-    bottleneck_dim: 256
-    num_layers: 1
-    num_heads: 4
-    mlp_ratio: 2.0
-    causal: false
-    dropout: 0.0
-    position_scale: 1.0
-  frame_attn:                         # per-frame attention AFTER every temporal block — NO
-    enabled: false                    # temporal mixing: tokens attend within their own frame
-                                      # only (identical for clips and stills). One own-weights
-                                      # zero-gated module per listed modality; all updates are
-                                      # computed from one consistent post-temporal snapshot.
-    modalities: [contact]             # of pose|contact|force|motion, each branch enabled;
-                                      # keys/values always span EVERY enabled modality's tokens
-                                      # of the frame (pose token included; read-only for
-                                      # non-listed modalities); 'pose' WRITES the pose token
-                                      # (same rule as above)
-    bottleneck_dim: 256
-    num_layers: 1
-    num_heads: 4
+                                      # The list also sizes the rope slot embedding, so it is
+                                      # part of the checkpoint arch signature.
+    num_layers: 4
+    num_heads: 16                     # decoder dim / num_heads must be even (1024/16 = 64)
     mlp_ratio: 2.0
     dropout: 0.0
+    time_scale: 25.0                  # rope: seconds -> RoPE positions (one 25-fps step ~= 1.0)
+    max_rel_sec: 2.5                  # rope: attention half-window in SECONDS; null = no window
+    bottleneck_dim: 256               # window: attention width adapter; null = native dim
+    position_scale: 25.0              # window: seconds -> sinusoidal positions
+    causal: false                     # window: frame-causal attention mask
   cond_input:                         # feed smoothed pelvis vel/acc INTO the tokens
     enabled: false                    # zero-init projections added to the INITIAL contact and
                                       # force token embeddings (10-d feature per frame:
@@ -169,7 +134,7 @@ model:
     injection: pre_decoder            # pre_decoder = added to the INITIAL contact/force token
                                       # embeddings (feature integrates with image evidence over
                                       # all decoder layers); post_decoder = added to the
-                                      # decoder's token OUTPUTS, before the temporal modules
+                                      # decoder's token OUTPUTS, before the heads
     clip: 5.0                         # clamp on the standardized v/a components (heavy tails
                                       # survive smoothing: |a| reaches 183 m/s^2)
     standardize:                      # pinned literals, root axes xyz; required when enabled
@@ -210,11 +175,42 @@ data:
   # Frame JPEGs are then not pixel-decoded (batch["img"] is a zero crop — the
   # model reads only its shape/dtype); masks still decode for mask conditioning.
   embedding_cache: false
+  # Train-time corruption of the cached embedding (contact/embedding_augment.py),
+  # to make a frame's own features an unreliable answer and reward reading its
+  # neighbours. Corrupting the embedding — the SHARED source of every token of a
+  # frame — is what stops the temporal blocks routing around it via a clean
+  # same-frame modality, and the frozen decoder keeps the result on-manifold. The
+  # cutmix box is applied to batch["mask"] as well, because the SAM3 person mask
+  # is a second clean per-frame input the model adds onto these same features.
+  # Requires embedding_cache + an all-climbing_corpus dataset list, >= 2 clips per
+  # batch, and at least one non-annealed epoch (all validated).
+  # TRAIN ONLY: eval/demo/render never see it.
+  embedding_augment:
+    enabled: false
+    gaussian_alpha: 0.1               # always-on additive noise, sigma = alpha * per-channel std;
+                                      # undetectable, so the model cannot gate its response on it.
+                                      # Appearance only — it has no mask counterpart
+    cutmix_prob: 0.5                  # per-frame chance of pasting a patch from a frame of ANOTHER
+                                      # CLIP (a same-clip source would paste a near-identical
+                                      # neighbour — the very content the block should go and fetch)
+    cutmix_area: [0.1, 0.4]           # that patch's area as a fraction of the frame
+    anneal_start_frac: 0.8            # full strength until this fraction of epochs is done, then a
+                                      # cosine ramp to exactly 0 (finish clean); 1.0 = never anneal
   # target_frame: all supervises every temporal row; center supervises only the
   # middle row (and therefore requires an odd frames_per_clip).
   # frame_stride: an integer, or `auto` = per-scene max(1, round(fps / 25)) so a
   # clip covers the same PHYSICAL span at every corpus frame rate.
-  sequence: {frames_per_clip: 8, frame_stride: 2, jitter: true, target_frame: all}
+  sequence:
+    frames_per_clip: 8
+    frame_stride: 2
+    jitter: true
+    target_frame: all
+    eval_full_scenes: false           # eval/test as ONE single-pass clip per (scene, person):
+                                      # the longest valid run, strided; batch = 1 clip. The
+                                      # long-sequence (rope) inference protocol
+    eval_max_frames: null             # cap that clip's length (strided frames). The frozen
+                                      # per-frame path measures ~0.11 GiB/frame no-grad, so
+                                      # ~400+ frame scenes OOM a 48 GB card uncapped
 
 physics:                              # Step 06: RNEA root-wrench physics loss on the forces
   enabled: false                      # requires force_head.enabled + a climbing_corpus dataset
@@ -289,6 +285,19 @@ motion_supervision:
                                       #  left_ankle, right_ankle, pelvis]; otherwise an
                                       # ordered duplicate-free subset. K = len(this list)
                                       # and it must match motion_keypoint_indices.
+  root_source: kindyn                 # rig the targets are differentiated from:
+                                      #   kindyn — SMPL-X joints_world + the kindyn q root
+                                      #     (the v1/v2 targets)
+                                      #   mhr    — mhr_sup_1's MHR70 limb keypoints + the
+                                      #     mhr_1 q_world root: the SAME rig as the
+                                      #     prediction, so the pose-derived twist
+                                      #     motion_consistency compares against carries no
+                                      #     cross-rig offset.
+                                      # The two have DIFFERENT target distributions — the MHR
+                                      # free-flyer root is not the kindyn pelvis — so
+                                      # `standardize` below and
+                                      # motion_consistency.hip_offset_root are source-specific
+                                      # and MUST be recomputed when this flag changes.
   root_convention: twist              # how the `pelvis` slot is expressed:
                                       #   twist          — BVR's own body twist,
                                       #     d[t]=se3_log(T_t^-1 T_t+1), v=(d[t-1]+d[t])/2dt,
@@ -298,6 +307,14 @@ motion_supervision:
                                       #   rotated_world  — R^T of the world central difference
                                       #     (motion-tokens v1/v2); differs from the twist by
                                       #     the Coriolis term omega x v (~7% of |a|).
+                                      #   gravity_view   — GVHMR's Gravity-View frame: vertical
+                                      #     axis = the scene's FITTED gravity (down-positive),
+                                      #     azimuth = the camera view direction projected on the
+                                      #     horizontal plane. Gravity-aligned and free of body
+                                      #     roll/pitch, so a pose orientation error no longer
+                                      #     rotates the linear target, and the vertical (the axis
+                                      #     forces and contact care about) is its own channel.
+                                      #     Required by motion_rollout.
                                       # The six LIMB slots are always rotated_world: BVR
                                       # defines no linear twist for non-root joints.
   target_smooth_sec: 0.12             # Gaussian width in SECONDS applied to the root
@@ -327,7 +344,7 @@ motion_supervision:
                                       # Eval is NEVER filtered.
 
 # Kindyn-MHR pseudo-GT pose loss (E2 pose_temporal / pose-head fine-tune / the
-# 'pose' modality of the cross-modal bricks). Compares the 125 local MHR q
+# 'pose' modality of cross_modal_temporal). Compares the 125 local MHR q
 # channels (the free-flyer root is never supervised) against per-scene
 # mhr_1.npz (scripts/convert_kindyn_to_mhr.py).
 pose_supervision:
@@ -336,19 +353,52 @@ pose_supervision:
     pose: 1.0                         # Huber weight on the 125 local q channels (radians)
     acc: 0.0                          # Huber weight on clip-wise q second differences (pred vs
                                       # GT) — the explicit smoothness term; 0 = off
+    shape: 0.0                        # L2 on the 45 blendshape outputs vs the mhr_1 GT
+                                      # identity, PER-CHANNEL MEAN (divide a pre-2026-08-29
+                                      # weight by 45 to reproduce its magnitude)
+    bones: 0.0                        # Huber on the 6 flexible bone-geometry slots
+                                      # (lbs_params 130..135: spine_length, neck_length,
+                                      # shoulder_width, arm_length, hip_width, leg_length) vs
+                                      # the mhr_1 v3 GT. Per-channel mean. These slots are
+                                      # the tail of the pose head's own 136-dim pose block;
+                                      # the audit found them neither supervised NOR railed,
+                                      # carrying 98% of the body-size drift
+    scale: 0.0                        # Huber on the 68 per-person scale slots (lbs_params
+                                      # 136..203) vs the same GT, per-channel mean. The head's
+                                      # 28 PCA coefficients are already expanded through
+                                      # scale_mean + coeffs @ scale_comps inside
+                                      # mhr_model_params, so this compares 1:1 with no
+                                      # conversion. Mutually exclusive with scale_rail
+    huber_delta_bones: 0.05           # smooth-L1 transition for bones/scale (slot units;
+                                      # both GTs are per-person constants, so the residual
+                                      # is reachable and this delta is a real transition)
     shape_rail: 0.0                   # L2 pinning the 45 blendshape outputs to the FROZEN
-                                      # readout's own values (nothing else supervises them —
-                                      # the pose/keypoint losses are girth-blind)
-    scale_rail: 0.0                   # same L2 for the 28 bone-scale outputs
+                                      # readout's own values — the fallback for when nothing
+                                      # else supervises them (the q/keypoint losses are
+                                      # girth-blind). Redundant once `shape` is on
+    scale_rail: 0.0                   # same L2 for the 28 bone-scale outputs. REJECTED by the
+                                      # validator together with a positive `scale`: the rail
+                                      # pins to the frozen value the GT term is correcting
     huber_delta: 0.1                  # smooth-L1 transition (radians)
+  fit_err_confidence: false           # weight the bones/scale rows by the mhr_1 mesh-fit
+                                      # residual — 1 / (1 + (fit_err_cm / ref)^2), i.e. a
+                                      # badly fitted frame is a badly known target
+  fit_err_ref_cm: 2.0                 # residual at which the row weight is 0.5 (the corpus
+                                      # mean fit_err_cm is 0.68)
   mhr:                                # BetterHuman archive for q <-> params conversion
     model_path: null                  # null resolves like the physics adapter
     lod: 1
 
-keypoint_supervision:                 # SAM3D-style keypoint losses from kindyn joints_world —
-  enabled: false                      # the pose/camera fine-tune stabilizers (video scenes only;
-                                      # requires a trainable pose path or train.finetune_camera_head
-                                      # + a climbing_corpus dataset)
+keypoint_supervision:                 # SAM3D-style keypoint + vertex losses from the MHR-native
+  enabled: false                      # GT (mhr_sup_1.npz = the model's OWN MHR module evaluated
+                                      # at the mhr_1 GT parameters — same rig, same 70-keypoint
+                                      # regressor, same mesh as the prediction). The pose/camera
+                                      # fine-tune stabilizers (video scenes only; requires a
+                                      # trainable pose path or train.finetune_camera_head + a
+                                      # climbing_corpus dataset).
+                                      # SCALE CHANGE (2026-08-29): every joint term is now a
+                                      # weighted MEAN over the 70 keypoints; it used to be a SUM
+                                      # over 13. Multiply a historical weight by 13.
   loss:
     kp2d: 1.0                         # Huber on crop-normalized 2D reprojection (the CLIFF-style
                                       # term; the ONLY loss constraining the camera head)
@@ -359,6 +409,15 @@ keypoint_supervision:                 # SAM3D-style keypoint losses from kindyn 
                                       # over the clip's real elapsed seconds; extrinsics used in
                                       # the loss only) vs finite-differenced kindyn joints_world
     kp_acc: 0.0                       # same for acceleration — the explicit smoothness term
+    vert: 0.0                         # Huber on the mean-hips-relative camera-frame vertex
+                                      # subset (metres, 384 template vertices): body SHAPE,
+                                      # which 70 sparse landmarks barely constrain. Shares
+                                      # kp3d's mean-hips root so the two compose
+    vert_abs: 0.0                     # same ABSOLUTE — the body-SIZE + depth anchor. The
+                                      # audit's regression channel: size drifted +3.9% ->
+                                      # -3.3% under the scale/depth ambiguity while the
+                                      # keypoint error looked fine. Free to compute: the
+                                      # keypoint regressor already backprops every vertex
     huber_delta_2d: 0.05              # crop-normalized units (the crop spans [-0.5, 0.5])
     huber_delta_3d: 0.1               # metres
     huber_delta_vel: 0.5              # m/s
@@ -372,6 +431,59 @@ keypoint_supervision:                 # SAM3D-style keypoint losses from kindyn 
     rot_rail: 0.0                     # same trust region on global_rot (geodesic radians)
     cam_rail_margin_m: 0.5            # rail margin (metres)
     rot_rail_margin_rad: 0.2          # rail margin (radians, ~11.5 deg)
+  joint_weights:                      # per-MHR70-joint weights; body joints are fixed at 1.0.
+                                      # The terms are MEANS under these, so changing them shifts
+                                      # relative pull, not overall scale.
+    fingers: 0.1                      # the 40 finger/thumb keypoints (21..40 right, 42..61
+                                      # left; the wrists 41/62 are body joints and excluded).
+                                      # Least reliable part of the mesh fit, negligible lever
+                                      # arm on the body pose
+    face: 1.0                         # nose/eyes/ears (0..4). The audit found the head GT bad
+                                      # in 4 of 6 inspected scenes, inherited from kindyn's own
+                                      # SMPL-X fit — turn this down if the head misbehaves
+  fit_err_confidence: false           # weight rows by the mhr_1 mesh-fit residual:
+                                      # 1 / (1 + (fit_err_cm / ref)^2)
+  fit_err_ref_cm: 2.0                 # residual at which the row weight is 0.5
+
+# Jerk + snap of the PREDICTED motion pushed toward ZERO — a smoothness PRIOR on
+# the temporal block, not a fit to any target (velocity and acceleration are left
+# alone; real motion has them, jerk/snap at the reconstruction's own scale is
+# mostly per-frame noise). Requires a trainable pose path, a climbing_corpus
+# dataset (the world lift needs the extrinsics) and frames_per_clip >= 5.
+pose_smoothness:
+  enabled: false
+  loss:
+    # Weights; 0 = off. Set them per run from a gradient probe — the shipped
+    # experiment (configs/rope_t60_mhrsup_temponly_jerksnap.yaml) equalises the
+    # six terms' gradient norms on the trainable params and scales the group to
+    # ~20% of the summed per-term gradient energy (same order as kp_vel +
+    # kp_acc, far from the 90%-domination failures this repo has been burned
+    # by). The right value depends on what else is in the objective.
+    joint_jerk: 0.0                   # world-lifted MHR70 keypoints (m/s^3)
+    joint_snap: 0.0                   # ... (m/s^4)
+    root_pos_jerk: 0.0                # predicted world pelvis position (m/s^3)
+    root_pos_snap: 0.0                # ... (m/s^4)
+    root_rot_jerk: 0.0                # BVR body angular jerk of the world-from-root
+                                      # rotation — successive differences of the
+                                      # staggered so3 increments, never of Euler
+                                      # triples (rad/s^3)
+    root_rot_snap: 0.0                # ... (rad/s^4)
+    # Huber transitions: smooth_l1(x, 0, beta) per element, so beta caps the
+    # per-element gradient and the heavy tails (GT |coord| p95/p75 ~ 4x) cannot
+    # own the direction. Each value is the GT's own weighted |coordinate| p75
+    # over 40 train scenes (mhr_sup_1 keypoints, mean-hips, mhr_1 root
+    # quaternion), measured AT THE CLIP SAMPLER'S dt: frame_stride auto =
+    # max(1, round(fps/25)) puts every scene at 24-30 Hz, and at the native
+    # 24-60 Hz the 1/dt^3, 1/dt^4 Jacobians inflate the p75 by 1.3-2.1x.
+    huber_delta_joint_jerk: 62.0      # m/s^3   (GT p50 24, p75 62, p95 238)
+    huber_delta_joint_snap: 4000.0    # m/s^4   (GT p50 1.5e3, p75 4.0e3, p95 1.6e4)
+    huber_delta_root_pos_jerk: 40.0   # m/s^3   (GT p50 19, p75 40, p95 114)
+    huber_delta_root_pos_snap: 2700.0 # m/s^4   (GT p50 1.2e3, p75 2.7e3, p95 8.6e3)
+    huber_delta_root_rot_jerk: 320.0  # rad/s^3 (GT p50 141, p75 321, p95 1.5e3)
+    huber_delta_root_rot_snap: 39000.0 # rad/s^4 (GT p50 1.6e4, p75 3.9e4, p95 1.8e5)
+  joint_weights:                      # as in keypoint_supervision; the joint terms are
+    fingers: 0.1                      # weighted MEANS under these
+    face: 1.0
 
 loss: {dice_eps: 1.0e-5, grad_clip: 1.0}
 
@@ -394,8 +506,8 @@ train:                               # Phase 4: narrow the autograd graph (grad-
 optim: {lr: 1.0e-4, weight_decay: 1.0e-4, epochs: 20, warmup_epochs: 1, lr_min: 1.0e-5}
 
 logging:
-  # This box is logged into wandb (rihat99/Rikhat) -> default mode "online".
-  wandb: {enabled: true, project: contact-anything, entity: null, tags: [], mode: online}
+  # wandb off by default (user 2026-08-28: "Turn off wandb, I don't use it").
+  wandb: {enabled: false, project: contact-anything, entity: null, tags: [], mode: online}
   tensorboard: true
   tensorboard_metrics: null           # null logs every scalar; otherwise exact tag allowlist
 

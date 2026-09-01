@@ -222,10 +222,37 @@ def sliding_window_requests(
     return dict(requests)
 
 
+def full_scene_requests(
+    valid_mask: np.ndarray, stride: int, max_frames: int,
+) -> dict[int, list[tuple[int, tuple[int, ...], tuple[int, ...]]]]:
+    """Single-pass whole-run requests (the long-sequence/RoPE protocol).
+
+    Every maximal contiguous valid run yields ``stride`` offset passes (so every
+    valid frame is predicted exactly once, boundary-free within a pass), each
+    split into chunks of at most ``max_frames`` (GPU-memory cap). Same return
+    shape as ``sliding_window_requests``. Mirrors
+    ``render_climbing_pose_video.full_scene_requests`` (kept local: that script
+    imports this one).
+    """
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+    requests: dict[int, list] = {}
+    for person, row in enumerate(valid_mask):
+        padded = np.concatenate([[False], row, [False]])
+        edges = np.flatnonzero(np.diff(padded.astype(np.int8)))
+        for run_start, run_end in zip(edges[::2], edges[1::2]):
+            for offset in range(min(stride, run_end - run_start)):
+                positions = np.arange(run_start + offset, run_end, stride)
+                for lo in range(0, len(positions), max_frames):
+                    seg = tuple(int(x) for x in positions[lo:lo + max_frames])
+                    requests.setdefault(len(seg), []).append(
+                        (person, seg, tuple(range(len(seg)))))
+    return requests
+
+
 def _frame_index_map(ds: ClimbingCorpusDataset, scene: str) -> dict[tuple[int, int], int]:
     """Map valid ``(person, frame_position)`` rows to the dataset's T=1 items."""
     result = {}
-    for index, (item_scene, person, frame_position, _) in enumerate(ds._items):
+    for index, (item_scene, person, frame_position, *_rest) in enumerate(ds._items):
         if item_scene == scene:
             result[(person, frame_position)] = index
     return result
@@ -370,6 +397,8 @@ def _predict_scene(
     require_labels: bool = False,
     collect_force: bool = False,
     force_frame: str | None = None,
+    full_scene: bool = False,
+    max_frames: int = 360,
 ) -> tuple[ClimbingCorpusDataset, np.ndarray, np.ndarray, dict | None]:
     """Return dataset, ``probs[P,N,K]``, keypoints ``[P,N,K,2]`` and force data.
 
@@ -460,8 +489,15 @@ def _predict_scene(
     collate = make_collate(tuple(model.cfg.MODEL.IMAGE_SIZE), spec)
 
     seq = cfg["data"]["sequence"]
-    requests_by_t = sliding_window_requests(
-        data["valid_mask"], int(seq["frames_per_clip"]), int(seq["frame_stride"]))
+    if full_scene:
+        stride = seq["frame_stride"]
+        if stride == "auto":
+            stride = max(1, int(round(float(data["fps"]) / 25.0)))
+        requests_by_t = full_scene_requests(
+            data["valid_mask"], int(stride), max_frames)
+    else:
+        requests_by_t = sliding_window_requests(
+            data["valid_mask"], int(seq["frames_per_clip"]), int(seq["frame_stride"]))
     for seq_len in sorted(requests_by_t):
         _predict_requests(
             model, ds, scene, requests_by_t[seq_len], seq_len, batch_size,
@@ -729,6 +765,14 @@ def main() -> int:
              "(T = data.sequence.frames_per_clip)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument(
+        "--full-scene", action="store_true",
+        help="single whole-run pass per parity instead of sliding windows "
+             "(the long-sequence/RoPE protocol); resolves frame_stride 'auto' "
+             "per scene from its fps")
+    parser.add_argument(
+        "--max-frames", type=int, default=360,
+        help="--full-scene GPU cap: chunk whole-run passes to at most this many frames")
     args = parser.parse_args()
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -793,6 +837,8 @@ def main() -> int:
         ds, probs, points, force_data = _predict_scene(
             model, cfg, root, scene, args.batch_size, device,
             split=args.split,
+            full_scene=args.full_scene,
+            max_frames=args.max_frames,
             contact_level=contact_level,
             require_labels=args.overlay_labels,
             collect_force=collect_force,
@@ -823,7 +869,7 @@ def main() -> int:
     if rank == 0:
         seq = cfg["data"]["sequence"]
         seq_len = int(seq["frames_per_clip"])
-        stride = int(seq["frame_stride"])
+        stride = seq["frame_stride"]  # int, or 'auto' under --full-scene
         summary = {
             "checkpoint": str(checkpoint),
             "checkpoint_epoch": int(state["epoch"]),
@@ -832,6 +878,8 @@ def main() -> int:
             "seed": args.seed,
             "selection": "one seeded-random scene chunk per distinct source video",
             "inference": (
+                f"single whole-run pass per stride parity (stride {stride}, "
+                f"chunks <= {args.max_frames} frames)" if args.full_scene else
                 f"per-frame T=1" if seq_len == 1 and stride == 1 else
                 f"centered sliding windows of T={seq_len} sampled frames "
                 f"(stride {stride}); every source frame predicted exactly once"

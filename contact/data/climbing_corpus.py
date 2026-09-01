@@ -80,14 +80,25 @@ v1 camera-0-derived direction, and ``load_forces=True`` adds per-frame GT forces
   Unlike ``motion_valid`` it needs no stencil support or edge trim: an
   absolute pose is per-frame.
 
-``load_keypoints=True`` adds the kindyn GT keypoints the SAM3D-style keypoint
-losses are supervised by:
+``load_keypoints=True`` adds the MHR-native GT the SAM3D-style keypoint and
+vertex losses are supervised by, read from ``mhr_sup_1.npz`` (the SAM3D model's
+OWN MHR module evaluated at the ``mhr_1`` GT parameters — same rig and same
+keypoint regressor as the predictions, so there is no cross-rig bias):
 
-* ``kp3d_world`` ``[13, 3]`` float32 — the :data:`KP_JOINT_NAMES` columns of
-  ``joints_world``, metres in kindyn's metric WORLD frame (the losses map them
-  into the camera with the frame's ``cam_from_world``, which video items always
-  carry). Exactly zero on rows the solve did not cover.
-* ``kp_valid`` bool — frame valid, covered by the kindyn solve, and finite.
+* ``kp3d_world`` ``[70, 3]`` float32 — all MHR70 keypoints, metres in the metric
+  WORLD frame (the losses map them into the camera with the frame's
+  ``cam_from_world``, which video items always carry). Exactly zero on rows the
+  fit did not cover.
+* ``kp_valid`` bool — frame valid and the GT row finite.
+* ``vert_gt_world`` ``[V, 3]`` float32 — the ``V`` = :data:`NUM_SUP_VERTICES`
+  template-subset vertices, same frame and masking rule.
+* ``vert_valid`` bool — frame valid and the GT vertex row finite.
+* ``vert_indices`` ``[V]`` int64 — the subset's indices into the model's
+  ``pred_vertices``; scene-constant (identical corpus-wide).
+
+``load_pose`` / ``load_keypoints`` additionally emit ``mhr_fit_err_cm`` float —
+the ``mhr_1`` mesh-fit residual of that row (cm), the optional row-confidence
+weight of the MHR-native metric losses.
 
 ``cond_features_path`` adds ``cond_feat`` ``[10]`` float32, the *input*-side
 conditioning feature (``model.cond_input``): standardized root-frame smoothed
@@ -176,6 +187,39 @@ KP_JOINT_NAMES = (
     "left_wrist", "right_wrist", "left_hip", "right_hip",
     "left_knee", "right_knee", "left_ankle", "right_ankle", "neck",
 )
+
+#: MHR70 keypoint count. Since the MHR-native supervision swap the keypoint
+#: losses supervise ALL 70 (from ``mhr_sup_1.npz``) rather than the 13
+#: name-matched kindyn joints above: the GT is the SAM3D model's own MHR module
+#: evaluated at the GT parameters, so the ~12 cm cross-rig bias that
+#: ``joints_world`` carried against MHR70 is gone by construction.
+NUM_MHR70 = 70
+#: Vertex-subset size stored per frame in ``mhr_sup_1.npz`` (farthest-point
+#: sampled on the MHR template for full-body coverage).
+NUM_SUP_VERTICES = 384
+#: Pinned ``mhr_sup_1.npz`` schema (``scripts/precompute_mhr_supervision.py``).
+MHR_SUP_SCHEMA = 1
+#: Minimum ``mhr_1.npz`` converter version. v3 is the first to store
+#: ``lbs_params``, which the bone/scale supervision needs.
+MHR_CONVERTER_VERSION = 3
+#: ``lbs_params`` slices. Slots 130..135 are the flexible bone-geometry
+#: params (spine/neck/shoulder-width/arm/hip-width/leg lengths) — the tail of the
+#: pose head's own 136-dim pose block; slots 136..203 are the 68 per-person scale
+#: slots the head reaches through ``scale_mean + coeffs @ scale_comps``. Both are
+#: the SAME vector as ``out["mhr"]["mhr_model_params"]``, so they compare
+#: directly with no unit conversion.
+MHR_BONE_SLOTS = slice(130, 136)
+MHR_SCALE_SLOTS = slice(136, 204)
+NUM_MHR_BONES = 6
+NUM_MHR_SCALES = 68
+#: MHR70 keypoint index of each non-pelvis :data:`MOTION_JOINT_NAMES` slot —
+#: wrists, big-toe tips (kindyn "foot") and heels (kindyn "ankle"), i.e. the same
+#: anchors the contact/force tokens use. Read when ``motion_root_source='mhr'``.
+MOTION_MHR70_INDICES = (62, 41, 15, 18, 17, 20)
+#: MHR70 left/right hip keypoints. Their mean is the body placement the pose
+#: predictions are lifted from (``contact.motion_consistency._HIP_KPS``), so it
+#: is also the position half of the ``mhr`` motion root.
+_MHR70_HIP_KPS = (9, 10)
 
 #: Width of the ``cond_feat`` input-conditioning vector (``model.cond_input``):
 #: standardized root-frame velocity (3) + acceleration (3) + the gravity
@@ -449,6 +493,58 @@ def smooth_root_trajectory(
     return out
 
 
+def gravity_view_basis(gravity: np.ndarray, extrinsics: np.ndarray) -> np.ndarray:
+    """World-from-gravity-view rotations, ``(3,) | (N, 3)`` + ``(N, 4, 4) -> (N, 3, 3)``.
+
+    GVHMR's Gravity-View frame: the vertical axis is gravity (column 1, DOWN
+    positive — the sign convention the world-vertical diagnostics already use)
+    and the azimuth is the camera's view direction projected onto the horizontal
+    plane. The frame is therefore gravity-aligned, uniquely defined per frame,
+    and independent of both the arbitrary world azimuth and the body's pose — so
+    a pelvis roll/pitch error no longer rotates the linear target. Columns are
+    ``[forward, down, right]``, right-handed.
+
+    :param gravity: unit DOWN direction in world axes (per scene or per frame).
+    :param extrinsics: ``(N, 4, 4)`` cam-from-world; row 2 of the rotation block
+        is the camera's +z (forward) axis expressed in world axes.
+    """
+    n = extrinsics.shape[0]
+    down = np.broadcast_to(
+        np.asarray(gravity, np.float64).reshape(-1, 3), (n, 3)).copy()
+    down /= np.linalg.norm(down, axis=-1, keepdims=True)
+    view = np.asarray(extrinsics[:, 2, :3], np.float64)              # camera +z in world
+    fwd = view - (view * down).sum(-1, keepdims=True) * down
+    # Degenerate only when the camera looks along gravity: fall back to the world
+    # axis least parallel to it so the basis stays defined and deterministic.
+    fallback = np.eye(3)[np.argmin(np.abs(down), axis=-1)]
+    fallback = fallback - (fallback * down).sum(-1, keepdims=True) * down
+    fwd = np.where(
+        np.linalg.norm(fwd, axis=-1, keepdims=True) > 1e-6, fwd, fallback)
+    fwd /= np.linalg.norm(fwd, axis=-1, keepdims=True)
+    return np.stack([fwd, down, np.cross(fwd, down)], axis=-1)
+
+
+def fitted_gravity_world(scene: str, human_dir: Path) -> np.ndarray:
+    """The scene's FITTED unit down direction, from ``kindyn_1.npz``.
+
+    The corpus regeneration made ``gravity_world`` a per-scene FIT (tilts of tens
+    of degrees), not the old ``[0, 1, 0]`` constant. The gravity-view frame must
+    use the fitted vector: a wrong gravity rotates every target in the scene by a
+    constant the network cannot possibly infer.
+    """
+    path = human_dir / "kindyn_1.npz"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{scene}: {path} missing — the gravity_view frame needs kindyn's gravity")
+    gravity = np.asarray(
+        np.load(path, allow_pickle=True)["gravity_world"], np.float64).reshape(3)
+    norm = float(np.linalg.norm(gravity))
+    if not np.isfinite(gravity).all() or not 0.9 < norm < 1.1:
+        raise ValueError(
+            f"{scene}: kindyn gravity_world {gravity.tolist()} is not a unit vector")
+    return gravity / norm
+
+
 def root_body_twist(q_root: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """BVR's body-twist velocity/acceleration of the free-flyer root.
 
@@ -610,6 +706,85 @@ def _rows_by_object_id(
     return np.asarray(array)[[source.index(oid) for oid in wanted]]
 
 
+#: Free-flyer root of an uncovered frame: origin + identity ``xyzw`` quaternion.
+#: Keeps the smoothing/twist stencils finite; those rows are masked out anyway.
+_IDENTITY_ROOT = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], np.float32)
+
+
+def _check_source_fps(scene: str, what: str, src_fps: float, fps: float) -> None:
+    """Reject a motion source whose frame rate disagrees with the contacts."""
+    if not np.isfinite(src_fps) or src_fps <= 0:
+        raise ValueError(f"{scene}: bad {what} fps {src_fps}")
+    if abs(src_fps - fps) > 1e-6:
+        raise ValueError(f"{scene}: {what} fps {src_fps} != contacts fps {fps}")
+
+
+def _mhr_lbs_targets(
+    mhr, mhr_ids: np.ndarray, object_ids: np.ndarray, scene: str,
+    pose_valid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Bone / scale / fit-error targets from an open ``mhr_1.npz`` (converter v3).
+
+    ``lbs_params`` is the exact vector the MHR module is called with, so its
+    slots line up 1:1 with ``out["mhr"]["mhr_model_params"]``:
+
+    * bones — the flexible geometry slots (:data:`MHR_BONE_SLOTS`), the
+      person's MEDIAN over valid rows served on every frame. The converter
+      re-fits them per frame, but a body's proportions do not change within a
+      scene: the frame-to-frame spread (per-slot std 0.07-0.14, ~70 % of the
+      between-person spread) is fit freedom, not signal, so the median is the
+      target and the per-frame jitter is not chased;
+    * scale — the 68 :data:`MHR_SCALE_SLOTS`, per-person CONSTANT (verified
+      exactly constant across every fitted row), taken from the person's first
+      valid row; a person with no valid row gets zeros and is masked by
+      ``pose_valid`` being False everywhere anyway;
+    * ``fit_err_cm`` — the mesh-fit residual per row, the optional
+      row-confidence weight of the metric losses. Non-finite entries (the
+      NaN-padded invalid rows) become 0.
+
+    :param mhr: an open ``mhr_1.npz``.
+    :param pose_valid: ``(P, N)`` per-person validity, already id-aligned.
+    """
+    version = int(mhr["converter_version"])
+    if version < MHR_CONVERTER_VERSION or "lbs_params" not in mhr:
+        raise ValueError(
+            f"{scene}: mhr_1.npz converter_version {version} lacks lbs_params — "
+            f"regenerate with scripts/convert_kindyn_to_mhr.py (v{MHR_CONVERTER_VERSION})")
+    lbs = _rows_by_object_id(
+        np.asarray(mhr["lbs_params"], np.float32), mhr_ids, object_ids,
+        scene, "mhr_1")                                          # [P, N, 204]
+    if lbs.shape[:2] != pose_valid.shape or lbs.shape[2] != MHR_SCALE_SLOTS.stop:
+        raise ValueError(
+            f"{scene}: mhr_1 lbs_params {lbs.shape} does not match "
+            f"{pose_valid.shape} x {MHR_SCALE_SLOTS.stop}")
+    bones = np.zeros(pose_valid.shape + (NUM_MHR_BONES,), np.float32)
+    scales = np.zeros((lbs.shape[0], NUM_MHR_SCALES), np.float32)
+    for person in range(lbs.shape[0]):
+        rows = np.flatnonzero(pose_valid[person])
+        if len(rows):
+            bones[person] = np.median(lbs[person, rows, MHR_BONE_SLOTS], axis=0)
+            scales[person] = lbs[person, rows[0], MHR_SCALE_SLOTS]
+    fit_err = np.asarray(
+        _rows_by_object_id(np.asarray(mhr["fit_err_cm"], np.float32), mhr_ids,
+                           object_ids, scene, "mhr_1"), np.float32)
+    fit_err = np.where(np.isfinite(fit_err), fit_err, 0.0).astype(np.float32)
+    return bones.astype(np.float32), scales, fit_err
+
+
+def _longest_valid_run(valid: np.ndarray) -> tuple[int, int]:
+    """Start and length of the longest True run in a 1-D bool mask (0 if none)."""
+    best_start = best_len = 0
+    start = None
+    for i, v in enumerate(valid.tolist() + [False]):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            if i - start > best_len:
+                best_start, best_len = start, i - start
+            start = None
+    return best_start, best_len
+
+
 class ClimbingCorpusDataset(Dataset):
     """Windowed per-joint contact (+ force) clips straight from the corpus.
 
@@ -667,8 +842,14 @@ class ClimbingCorpusDataset(Dataset):
     :param motion_angular: append the root slot's body angular velocity and
         acceleration to ``motion_gt`` (``[K, 12]``). Requires the ``twist``
         convention and a pelvis-only joint list.
-    :param load_keypoints: read ``kindyn_1.npz`` and emit ``kp3d_world`` /
-        ``kp_valid`` per frame — the 13 :data:`KP_JOINT_NAMES` world joints the
+    :param motion_root_source: rig the motion targets are differentiated from —
+        ``"kindyn"`` (SMPL-X ``joints_world`` + kindyn root) or ``"mhr"``
+        (``mhr_sup_1`` MHR70 limbs + the ``mhr_1`` ``q_world`` root). The two
+        have different target distributions; ``motion_supervision.standardize``
+        is source-specific.
+    :param load_keypoints: read ``mhr_sup_1.npz`` and emit ``kp3d_world`` /
+        ``kp_valid`` / ``vert_gt_world`` / ``vert_valid`` / ``vert_indices`` per
+        frame — the MHR70 world keypoints and vertex subset the
         keypoint losses reproject.
     :param cond_features_path: ``cond_features.npz`` to read the input-side
         conditioning feature from (``None`` = no ``cond_feat`` emitted). Entries
@@ -717,6 +898,7 @@ class ClimbingCorpusDataset(Dataset):
         motion_target_smooth_sec: float = MOTION_TARGET_SMOOTH_SEC,
         motion_outlier_acc_ms2: float = MOTION_OUTLIER_ACC_MS2,
         motion_angular: bool = False,
+        motion_root_source: str = "kindyn",
         load_pose: bool = False,
         load_keypoints: bool = False,
         cond_features_path: Optional[str] = None,
@@ -724,10 +906,18 @@ class ClimbingCorpusDataset(Dataset):
         cond_clip: float = 5.0,
         load_images: bool = True,
         embedding_dir: Optional[str | Path] = None,
+        full_scenes: bool = False,
+        eval_max_frames: Optional[int] = None,
     ):
         super().__init__()
         if split not in ("train", "val", "test"):
             raise ValueError(f"split must be 'train', 'val' or 'test'; got {split!r}")
+        if full_scenes and split == "train":
+            raise ValueError("full_scenes is an eval protocol; split must be val/test")
+        self.full_scenes = bool(full_scenes)
+        self.eval_max_frames = None if eval_max_frames is None else int(eval_max_frames)
+        if self.eval_max_frames is not None and self.eval_max_frames < 1:
+            raise ValueError("eval_max_frames must be a positive int or None")
         if contact_level not in (1, 2):
             raise ValueError(f"contact_level must be 1 or 2; got {contact_level!r}")
         self.corpus_root = Path(corpus_root)
@@ -761,10 +951,10 @@ class ClimbingCorpusDataset(Dataset):
             raise ValueError(
                 f"motion_joint_names must be a duplicate-free subset of "
                 f"{list(MOTION_JOINT_NAMES)}; got {list(self.motion_joints)}")
-        if motion_root_convention not in ("twist", "rotated_world"):
+        if motion_root_convention not in ("twist", "rotated_world", "gravity_view"):
             raise ValueError(
-                "motion_root_convention must be 'twist' or 'rotated_world'; got "
-                f"{motion_root_convention!r}")
+                "motion_root_convention must be 'twist', 'rotated_world' or "
+                f"'gravity_view'; got {motion_root_convention!r}")
         self.motion_root_convention = str(motion_root_convention)
         self.motion_target_smooth_sec = float(motion_target_smooth_sec)
         if not np.isfinite(self.motion_target_smooth_sec) or self.motion_target_smooth_sec < 0:
@@ -773,17 +963,30 @@ class ClimbingCorpusDataset(Dataset):
                 f"{motion_target_smooth_sec!r}")
         self.motion_outlier_acc_ms2 = float(motion_outlier_acc_ms2)
         self.motion_angular = bool(motion_angular)
+        if motion_root_source not in ("kindyn", "mhr"):
+            raise ValueError(
+                f"motion_root_source must be 'kindyn' or 'mhr'; got {motion_root_source!r}")
+        self.motion_root_source = str(motion_root_source)
         self.load_pose = bool(load_pose)
         self.load_keypoints = bool(load_keypoints)
         # Angular twist targets exist for the root slot only; mirroring the
         # config validator keeps the class safe for direct construction.
+        # The GV frame is applied to the ROOT slot only (the limbs keep root axes
+        # under every convention), and the loss de-rotates all slots with one
+        # matrix — so a mixed slot list would report the limbs in the wrong frame.
+        if self.motion_root_convention == "gravity_view" and self.motion_joints != ("pelvis",):
+            raise ValueError(
+                "motion_root_convention='gravity_view' is implemented for the "
+                "pelvis slot only (the limb slots stay in root axes); got "
+                f"motion_joint_names={list(self.motion_joints)}")
         if self.motion_angular and (
-                self.motion_root_convention != "twist"
+                self.motion_root_convention not in ("twist", "gravity_view")
                 or self.motion_joints != ("pelvis",)):
             raise ValueError(
-                "motion_angular requires motion_root_convention='twist' and "
-                f"motion_joint_names=['pelvis']; got {self.motion_root_convention!r}, "
-                f"{list(self.motion_joints)}")
+                "motion_angular requires motion_root_convention 'twist' or "
+                "'gravity_view' (the angular pair is the SE3-log body rate under "
+                "both) and motion_joint_names=['pelvis']; got "
+                f"{self.motion_root_convention!r}, {list(self.motion_joints)}")
         self.cond_features_path = (
             None if cond_features_path is None else str(cond_features_path))
         if self.cond_features_path is not None:
@@ -819,7 +1022,9 @@ class ClimbingCorpusDataset(Dataset):
             None if self.cond_features_path is None
             else np.load(self.cond_features_path, allow_pickle=True))
         self._scenes: dict[str, dict] = {}
-        self._items: list[tuple[str, int, int, int]] = []   # (scene, person, base_start, jitter_range)
+        # (scene, person, base_start, jitter_range, t_frames); t_frames == self.T
+        # for tiled windows, per-item for full_scenes.
+        self._items: list[tuple[str, int, int, int, int]] = []
         for scene in scenes:
             data = self._load_scene(scene)
             self._scenes[scene] = data
@@ -828,6 +1033,22 @@ class ClimbingCorpusDataset(Dataset):
             step = self.T * stride
             num_frames = len(data["frame_indices"])
             valid_mask = data["valid_mask"]                 # [P, N] bool
+            if self.full_scenes:
+                # One clip per (scene, person): the longest contiguous valid
+                # run, strided like training. Single-pass whole-scene protocol
+                # for the long-sequence (RoPE) temporal module.
+                for person in range(valid_mask.shape[0]):
+                    base, run_len = _longest_valid_run(valid_mask[person])
+                    if run_len < 1:
+                        continue
+                    t_frames = (run_len - 1) // stride + 1
+                    # GPU-memory cap: the frozen per-frame path costs ~0.1 GiB
+                    # per frame at inference, so uncapped 500-frame scenes OOM
+                    # a 48 GB card. Truncation keeps the run's head.
+                    if self.eval_max_frames is not None:
+                        t_frames = min(t_frames, self.eval_max_frames)
+                    self._items.append((scene, person, base, 1, t_frames))
+                continue
             max_start = num_frames - 1 - span
             if max_start < 0:
                 continue                                    # scene too short for one window
@@ -843,7 +1064,7 @@ class ClimbingCorpusDataset(Dataset):
                     if not valid_mask[person, positions].all():
                         continue  # every temporal row needs a real bbox/camera crop
                     jitter_range = max(1, min(step, max_start - base + 1))
-                    self._items.append((scene, person, base, jitter_range))
+                    self._items.append((scene, person, base, jitter_range, self.T))
         if self._cond_npz is not None:
             self._cond_npz.close()
             self._cond_npz = None
@@ -961,8 +1182,15 @@ class ClimbingCorpusDataset(Dataset):
         if self.load_forces:
             data.update(self._load_forces(scene, human_dir, object_ids, n))
         if self.load_motion:
+            # The motion diagnostics project the world vectors on this vector and
+            # the gravity_view frame is built from it, so it must be the FITTED
+            # one whether or not `load_forces` (which sets it too) is on. The
+            # corpus tilt reaches 61 deg, so the GRAVITY_WORLD constant above
+            # would silently mis-report every vertical statistic.
+            data["gravity_world"] = fitted_gravity_world(scene, human_dir).astype(
+                np.float32)
             data.update(self._load_motion(
-                scene, human_dir, object_ids, n, float(contacts["fps"])))
+                scene, human_dir, object_ids, n, float(contacts["fps"]), extrinsics))
         if self.load_pose:
             data.update(self._load_pose(scene, human_dir, object_ids, n))
         if self.load_keypoints:
@@ -995,41 +1223,93 @@ class ClimbingCorpusDataset(Dataset):
         pose_valid = _rows_by_object_id(
             np.asarray(mhr["valid_mask"], bool), mhr_ids, object_ids,
             scene, "mhr_1")                                     # [P, N]
-        return {"pose_gt_q": q_world, "pose_valid_mask": pose_valid}
+        if "identity" not in mhr:
+            raise ValueError(
+                f"{scene}: mhr_1.npz lacks 'identity' — regenerate with "
+                f"scripts/convert_kindyn_to_mhr.py (converter v2)")
+        identity = _rows_by_object_id(
+            np.asarray(mhr["identity"], np.float32), mhr_ids, object_ids,
+            scene, "mhr_1")                                     # [P, 45]
+        bones, scales, fit_err = _mhr_lbs_targets(mhr, mhr_ids, object_ids, scene,
+                                                  pose_valid)
+        return {"pose_gt_q": q_world, "pose_valid_mask": pose_valid,
+                "pose_identity": identity, "pose_gt_bones": bones,
+                "pose_gt_scale": scales, "mhr_fit_err_cm": fit_err}
 
     def _load_keypoints(
         self, scene: str, human_dir: Path, object_ids: np.ndarray, n: int,
     ) -> dict:
-        """Kindyn world keypoints for the SAM3D-style reprojection losses.
+        """MHR-native keypoint + vertex GT from ``mhr_sup_1.npz``.
 
-        The :data:`KP_JOINT_NAMES` columns of ``joints_world``, resolved BY NAME
-        once per scene (the same rule the force lever arms use). Rows the kindyn
-        solve did not cover — or that carry a non-finite coordinate — come back
-        as exact zeros with ``kp_valid`` False; the loss masks on the bit.
+        Written by ``scripts/precompute_mhr_supervision.py``: the SAM3D model's
+        OWN MHR module evaluated at the ``mhr_1`` GT ``(lbs_params, identity)``,
+        so the GT keypoints/vertices come from the same rig and the same
+        sapiens-308-sliced-to-70 regressor as the predictions. That kills the
+        cross-rig bias the kindyn ``joints_world`` GT carried (the audit measured
+        it at 69-75 % of the keypoint MSE); the losses lift these world-frame
+        arrays into the camera with the frame's ``cam_from_world``.
+
+        ``mhr_sup_1.npz`` stores no ``object_ids`` — its person rows are the
+        ``mhr_1`` rows by construction — so the person axis is resolved with
+        ``mhr_1``'s ids, which are checked against the array shape. NaN rows (the
+        frames the fit did not cover) come back as exact zeros with the validity
+        bit False; the loss masks on the bit.
         """
-        kindyn = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
-        kindyn_ids = np.asarray(kindyn["object_ids"])
-        joint_names = [str(x) for x in kindyn["joint_names"]]
-        missing = [name for name in KP_JOINT_NAMES if name not in joint_names]
-        if missing:
-            raise ValueError(f"{scene}: kindyn joint_names is missing {missing}")
-        cols = [joint_names.index(name) for name in KP_JOINT_NAMES]
-        kp3d = _rows_by_object_id(
-            np.asarray(kindyn["joints_world"], np.float32),
-            kindyn_ids, object_ids, scene, "kindyn")[:, :, cols]   # [P, N, 13, 3] m, world
-        kp_valid = _rows_by_object_id(
-            np.asarray(kindyn["valid_mask"], bool),
-            kindyn_ids, object_ids, scene, "kindyn")               # [P, N]
-        n_people = len(object_ids)
-        if kp3d.shape != (n_people, n, len(KP_JOINT_NAMES), 3):
+        mhr_path = human_dir / "mhr_1.npz"
+        if not mhr_path.is_file():
+            raise FileNotFoundError(
+                f"{scene}: {mhr_path} missing — run scripts/convert_kindyn_to_mhr.py")
+        mhr = np.load(mhr_path, allow_pickle=True)
+        mhr_ids = np.asarray(mhr["object_ids"])
+        path = human_dir / "mhr_sup_1.npz"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"{scene}: {path} missing — run scripts/precompute_mhr_supervision.py")
+        sup = np.load(path, allow_pickle=True)
+        schema = int(sup["schema_version"])
+        if schema != MHR_SUP_SCHEMA:
             raise ValueError(
-                f"{scene}: keypoint joints_world {kp3d.shape} does not match "
-                f"({n_people}, {n}, {len(KP_JOINT_NAMES)}, 3)")
-        kp_valid = kp_valid & np.isfinite(kp3d).all(axis=(2, 3))
+                f"{scene}: mhr_sup_1 schema {schema} != {MHR_SUP_SCHEMA} — "
+                f"regenerate with scripts/precompute_mhr_supervision.py")
+        if int(sup["num_frames"]) != n:
+            raise ValueError(
+                f"{scene}: mhr_sup_1 has {int(sup['num_frames'])} frames, contacts has {n}")
+        n_people = len(object_ids)
+        kp_raw = np.asarray(sup["kp_world"], np.float32)
+        vert_raw = np.asarray(sup["verts_world"], np.float32)
+        if kp_raw.shape[0] != len(mhr_ids) or vert_raw.shape[0] != len(mhr_ids):
+            raise ValueError(
+                f"{scene}: mhr_sup_1 person axis {kp_raw.shape[0]}/{vert_raw.shape[0]} "
+                f"does not match mhr_1's {len(mhr_ids)} object ids")
+        kp3d = _rows_by_object_id(kp_raw, mhr_ids, object_ids, scene, "mhr_sup_1")
+        verts = _rows_by_object_id(vert_raw, mhr_ids, object_ids, scene, "mhr_sup_1")
+        vert_indices = np.asarray(sup["vert_indices"], np.int64).reshape(-1)
+        if kp3d.shape != (n_people, n, NUM_MHR70, 3):
+            raise ValueError(
+                f"{scene}: mhr_sup_1 kp_world {kp3d.shape} does not match "
+                f"({n_people}, {n}, {NUM_MHR70}, 3)")
+        if verts.shape != (n_people, n, NUM_SUP_VERTICES, 3) or len(
+                vert_indices) != NUM_SUP_VERTICES:
+            raise ValueError(
+                f"{scene}: mhr_sup_1 verts_world {verts.shape} / vert_indices "
+                f"{vert_indices.shape} do not match ({n_people}, {n}, "
+                f"{NUM_SUP_VERTICES}, 3)")
+        kp_valid = np.isfinite(kp3d).all(axis=(2, 3))                  # [P, N]
+        vert_valid = np.isfinite(verts).all(axis=(2, 3))               # [P, N]
+        _, _, fit_err = _mhr_lbs_targets(
+            mhr, mhr_ids, object_ids, scene,
+            _rows_by_object_id(np.asarray(mhr["valid_mask"], bool), mhr_ids,
+                               object_ids, scene, "mhr_1"))
         return {
             "kp3d_world": np.where(kp_valid[:, :, None, None], kp3d, 0.0).astype(
-                np.float32),                                       # [P, N, 13, 3] world
-            "kp_valid": kp_valid,                                  # [P, N] bool
+                np.float32),                                      # [P, N, 70, 3] world
+            "kp_valid": kp_valid,                                 # [P, N] bool
+            "vert_gt_world": np.where(
+                vert_valid[:, :, None, None], verts, 0.0).astype(
+                    np.float32),                                  # [P, N, V, 3] world
+            "vert_valid": vert_valid,                             # [P, N] bool
+            "vert_indices": vert_indices,                         # [V] into pred_vertices
+            "mhr_fit_err_cm": fit_err,                            # [P, N] cm
         }
 
     def _load_test_labels(
@@ -1229,55 +1509,154 @@ class ClimbingCorpusDataset(Dataset):
             "gravity_world": gravity,                    # [3] FITTED unit down direction
         }
 
+    def _motion_sources(
+        self, scene: str, human_dir: Path, object_ids: np.ndarray, n: int, fps: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        """Raw trajectories the motion targets are differentiated from.
+
+        Returns ``(joints_world (P, N, 7, 3), root7 (P, N, 7), valid (P, N),
+        fps)`` — world-frame positions of :data:`MOTION_JOINT_NAMES` (pelvis
+        LAST) and the free-flyer root configuration (position + ``xyzw``
+        quaternion) the body twist is taken from.
+
+        ``motion_root_source`` picks the rig:
+
+        * ``kindyn`` — kindyn's SMPL-X ``joints_world`` and its 211-dim ``q``
+          root (the v1/v2 targets).
+        * ``mhr`` — the MHR-native source: the six limb slots are the
+          :data:`MOTION_MHR70_INDICES` columns of ``mhr_sup_1``'s ``kp_world``,
+          and the root is the (MEAN-HIPS position, ``q_world`` root quaternion)
+          pair — the same free-flyer ``motion_consistency`` builds from the
+          PREDICTION, so the two twists are the same construction on the same
+          rig and ``hip_offset_root`` is exactly zero. It is deliberately NOT
+          ``q_world[..., :7]``: the MHR free-flyer root sits ~0.93 m from the
+          hips with a leg-pose-dependent 0.28 m spread, so its twist is a
+          different physical quantity. Rows the fit did not cover are
+          NaN in the archives; they are zeroed (root: identity) and reported
+          invalid, and no supervised row ever reads one (the central-difference
+          stencil needs three consecutive valid frames).
+
+        NOTE the two sources have DIFFERENT target distributions — the MHR root
+        is not the kindyn pelvis — so ``motion_supervision.standardize`` is
+        source-specific and must be recomputed when this flag changes.
+        """
+        if self.motion_root_source == "kindyn":
+            kindyn = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
+            kindyn_ids = np.asarray(kindyn["object_ids"])
+            joint_names = [str(x) for x in kindyn["joint_names"]]
+            missing = [name for name in MOTION_JOINT_NAMES if name not in joint_names]
+            if missing:
+                raise ValueError(f"{scene}: kindyn joint_names is missing {missing}")
+            if int(kindyn["num_frames"]) != n:
+                raise ValueError(
+                    f"{scene}: kindyn has {int(kindyn['num_frames'])} frames, contacts "
+                    f"has {n} — the derivative frame indexing would be misaligned")
+            src_fps = float(np.asarray(kindyn["fps"]).item())
+            _check_source_fps(scene, "kindyn", src_fps, fps)
+            cols = [joint_names.index(name) for name in MOTION_JOINT_NAMES]
+            joints_world = _rows_by_object_id(
+                np.asarray(kindyn["joints_world"], np.float32),
+                kindyn_ids, object_ids, scene, "kindyn")[:, :, cols]
+            root7 = _rows_by_object_id(
+                np.asarray(kindyn["q"], np.float32),
+                kindyn_ids, object_ids, scene, "kindyn")[..., :7]
+            valid = _rows_by_object_id(
+                np.asarray(kindyn["valid_mask"], bool),
+                kindyn_ids, object_ids, scene, "kindyn")
+            return joints_world, root7, valid, src_fps
+
+        mhr_path = human_dir / "mhr_1.npz"
+        sup_path = human_dir / "mhr_sup_1.npz"
+        for path, maker in ((mhr_path, "scripts/convert_kindyn_to_mhr.py"),
+                            (sup_path, "scripts/precompute_mhr_supervision.py")):
+            if not path.is_file():
+                raise FileNotFoundError(f"{scene}: {path} missing — run {maker}")
+        mhr = np.load(mhr_path, allow_pickle=True)
+        sup = np.load(sup_path, allow_pickle=True)
+        if int(sup["schema_version"]) != MHR_SUP_SCHEMA:
+            raise ValueError(
+                f"{scene}: mhr_sup_1 schema {int(sup['schema_version'])} != "
+                f"{MHR_SUP_SCHEMA} — regenerate with {sup_path.name}'s script")
+        for name, archive in (("mhr_1", mhr), ("mhr_sup_1", sup)):
+            if int(archive["num_frames"]) != n:
+                raise ValueError(
+                    f"{scene}: {name} has {int(archive['num_frames'])} frames, "
+                    f"contacts has {n} — the derivative frame indexing would be "
+                    f"misaligned")
+        src_fps = float(np.asarray(mhr["fps"]).item())
+        _check_source_fps(scene, "mhr_1", src_fps, fps)
+        mhr_ids = np.asarray(mhr["object_ids"])
+        q_world = _rows_by_object_id(
+            np.asarray(mhr["q_world"], np.float32), mhr_ids, object_ids,
+            scene, "mhr_1")                                        # [P, N, 132]
+        valid = _rows_by_object_id(
+            np.asarray(mhr["valid_mask"], bool), mhr_ids, object_ids,
+            scene, "mhr_1")                                        # [P, N]
+        kp_raw = np.asarray(sup["kp_world"], np.float32)
+        if kp_raw.shape[0] != len(mhr_ids):
+            raise ValueError(
+                f"{scene}: mhr_sup_1 person axis {kp_raw.shape[0]} does not match "
+                f"mhr_1's {len(mhr_ids)} object ids")
+        kp = _rows_by_object_id(kp_raw, mhr_ids, object_ids, scene, "mhr_sup_1")
+        if kp.shape[1:] != (n, NUM_MHR70, 3):
+            raise ValueError(
+                f"{scene}: mhr_sup_1 kp_world {kp.shape} does not match "
+                f"(P, {n}, {NUM_MHR70}, 3)")
+        # The free-flyer trajectory is (MEAN-HIPS position, ROOT orientation) —
+        # NOT q_world[..., :7]. The MHR free-flyer root is anchored ~0.93 m from
+        # the hips (measured: |root - mean_hips| = 0.933 m, and the residual is
+        # leg-pose dependent with a 0.28 m spread, so it is NOT a rigid body
+        # offset). Using it directly would make the "pelvis" slot the twist of a
+        # foot-level frame — a different physical quantity from the kindyn
+        # pelvis, and from what the motion head is anchored to.
+        #
+        # This pairing is exactly what motion_consistency builds on the
+        # PREDICTION side (``p_w = mean(kp[9,10]) + pred_cam_t`` lifted by the
+        # extrinsics, ``R_w`` from ``global_rot``), so GT and prediction are the
+        # same construction on the same rig and ``hip_offset_root`` is exactly
+        # zero for this source.
+        hips = kp[:, :, _MHR70_HIP_KPS].mean(axis=2)               # [P, N, 3]
+        root7 = np.concatenate([hips, q_world[..., 3:7]], axis=-1)  # [P, N, 7]
+        valid = (valid & np.isfinite(kp).all(axis=(2, 3))
+                 & np.isfinite(root7).all(axis=-1))
+        joints_world = np.concatenate(
+            [kp[:, :, list(MOTION_MHR70_INDICES)], hips[:, :, None]], axis=2)
+        joints_world = np.where(valid[:, :, None, None], joints_world, 0.0)
+        root7 = np.where(valid[:, :, None], root7, _IDENTITY_ROOT)
+        return (joints_world.astype(np.float32), root7.astype(np.float32),
+                valid, src_fps)
+
     def _load_motion(
         self, scene: str, human_dir: Path, object_ids: np.ndarray, n: int, fps: float,
+        extrinsics: np.ndarray,
     ) -> dict:
-        """Linear vel/acc of the motion joints in body-root axes.
+        """Linear vel/acc of the motion joints in the configured linear frame.
 
         Computed once per scene over the FULL trajectory (never per clip) in
         float64. The six limb slots are world central differences rotated with
         the SAME einsum the forces use; the ``pelvis`` slot follows
-        ``motion_root_convention`` (see :func:`root_body_twist`). With
-        ``motion_angular`` the root slot appends the body angular velocity and
+        ``motion_root_convention`` (see :func:`root_body_twist`): ``twist`` and
+        ``rotated_world`` keep body-root axes, ``gravity_view`` expresses the
+        root's linear vel/acc in the gravity + camera-view frame instead (see
+        :func:`gravity_view_basis`) — the angular pair is the SE3-log body rate
+        under every convention. ``motion_lin_rot`` is the world-from-LINEAR-frame
+        rotation, which is what turns the linear target back into world axes.
+        With ``motion_angular`` the root slot appends the body angular velocity and
         acceleration (``[..., 6:12]``). Only the derived ``[N, K, 6|12]`` arrays
         are cached (~25 MB corpus-wide); the raw 52-joint positions are not.
         """
-        kindyn = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
-        kindyn_ids = np.asarray(kindyn["object_ids"])
-        joint_names = [str(x) for x in kindyn["joint_names"]]
-        missing = [name for name in MOTION_JOINT_NAMES if name not in joint_names]
-        if missing:
-            raise ValueError(f"{scene}: kindyn joint_names is missing {missing}")
-        if int(kindyn["num_frames"]) != n:
-            raise ValueError(
-                f"{scene}: kindyn has {int(kindyn['num_frames'])} frames, contacts "
-                f"has {n} — the derivative frame indexing would be misaligned")
-        kindyn_fps = float(np.asarray(kindyn["fps"]).item())
-        if not np.isfinite(kindyn_fps) or kindyn_fps <= 0:
-            raise ValueError(f"{scene}: bad kindyn fps {kindyn_fps}")
-        if abs(kindyn_fps - fps) > 1e-6:
-            raise ValueError(
-                f"{scene}: kindyn fps {kindyn_fps} != contacts fps {fps}")
-
-        cols = [joint_names.index(name) for name in MOTION_JOINT_NAMES]
-        joints_world = _rows_by_object_id(
-            np.asarray(kindyn["joints_world"], np.float32),
-            kindyn_ids, object_ids, scene, "kindyn")[:, :, cols]   # [P, N, 7, 3] m, world
-        q = _rows_by_object_id(
-            np.asarray(kindyn["q"], np.float32),
-            kindyn_ids, object_ids, scene, "kindyn")               # [P, N, 211]
-        kindyn_valid = _rows_by_object_id(
-            np.asarray(kindyn["valid_mask"], bool),
-            kindyn_ids, object_ids, scene, "kindyn")               # [P, N]
         n_people = len(object_ids)
+        joints_world, root7, src_valid, src_fps = self._motion_sources(
+            scene, human_dir, object_ids, n, fps)
         if joints_world.shape != (n_people, n, NUM_MOTION_JOINTS, 3):
             raise ValueError(
                 f"{scene}: motion joints_world {joints_world.shape} does not match "
                 f"({n_people}, {n}, {NUM_MOTION_JOINTS}, 3)")
-        if not np.isfinite(joints_world[kindyn_valid]).all():
+        if not np.isfinite(joints_world[src_valid]).all():
             raise ValueError(
-                f"{scene}: non-finite motion joint position on a kindyn-valid frame")
+                f"{scene}: non-finite motion joint position on a valid frame")
 
+        kindyn_fps = src_fps
         dt = 1.0 / kindyn_fps
         pos = joints_world.astype(np.float64)
         vel = np.zeros_like(pos)
@@ -1291,7 +1670,7 @@ class ClimbingCorpusDataset(Dataset):
         # and the world conversion all describe the same motion.
         q_root = np.stack([
             smooth_root_trajectory(
-                q[person, :, :7].astype(np.float64), kindyn_valid[person],
+                root7[person].astype(np.float64), src_valid[person],
                 self.motion_target_smooth_sec * kindyn_fps)
             for person in range(n_people)])                        # [P, N, 7]
 
@@ -1306,10 +1685,28 @@ class ClimbingCorpusDataset(Dataset):
         # back into world axes under either convention.
         twist_vel, twist_acc, omega, ang_acc = root_body_twist(q_root, dt)
         pelvis = MOTION_JOINT_NAMES.index("pelvis")
+        lin_rot = rot
         if self.motion_root_convention == "twist":
             vel_out[:, :, pelvis] = twist_vel
             acc_out[:, :, pelvis] = twist_acc
             acc_mag[:, :, pelvis] = np.linalg.norm(twist_acc, axis=-1)
+        elif self.motion_root_convention == "gravity_view":
+            # A pure RE-EXPRESSION of the same body twist, so the target keeps the
+            # smoothed trajectory the twist is derived from (the raw central
+            # difference of the root would silently drop `target_smooth_sec`, and
+            # its acceleration runs ~4x larger). World first — a_world =
+            # R (a_body + omega x v_body), the Coriolis relation
+            # `contact.motion_supervision.to_world_linear` pins — then into the
+            # gravity-view frame.
+            world_vel = np.einsum("pnij,pnj->pni", rot, twist_vel)
+            world_acc = np.einsum(
+                "pnij,pnj->pni", rot, twist_acc + np.cross(omega, twist_vel))
+            lin_rot = np.broadcast_to(
+                gravity_view_basis(fitted_gravity_world(scene, human_dir), extrinsics),
+                (n_people, n, 3, 3))
+            vel_out[:, :, pelvis] = np.einsum("pnji,pnj->pni", lin_rot, world_vel)
+            acc_out[:, :, pelvis] = np.einsum("pnji,pnj->pni", lin_rot, world_acc)
+            acc_mag[:, :, pelvis] = np.linalg.norm(world_acc, axis=-1)
 
         # Validity: v1's rule verbatim (build_targets.py) — the eval rows depend
         # on it. Central-diff support (n-1, n, n+1 inside the scene AND
@@ -1317,7 +1714,7 @@ class ClimbingCorpusDataset(Dataset):
         # and on both sides of every validity gap.
         target_valid = np.zeros((n_people, n), bool)
         for person in range(n_people):
-            valid = kindyn_valid[person]
+            valid = src_valid[person]
             diff_ok = np.zeros(n, bool)
             if n >= 3:
                 diff_ok[1:n - 1] = valid[2:] & valid[1:-1] & valid[:-2]
@@ -1357,9 +1754,11 @@ class ClimbingCorpusDataset(Dataset):
             "motion_valid": target_valid,                           # [P, N] bool
             "motion_outlier": outlier[:, :, cols_out],              # [P, N, K] bool
             "motion_rot": rot.astype(np.float32),                   # [P,N,3,3] world-from-root
+            "motion_lin_rot": np.ascontiguousarray(                  # [P,N,3,3] world-from-
+                lin_rot, np.float32),                                # LINEAR frame
             "motion_omega": omega.astype(np.float32),               # [P,N,3] body angular vel
             "motion_root_pos": q_root[..., :3].astype(np.float32),  # [P,N,3] world (smoothed)
-            "motion_root_valid": kindyn_valid.copy(),               # [P, N] bool (no stencil)
+            "motion_root_valid": src_valid.copy(),                  # [P, N] bool (no stencil)
         }
 
     # ------------------------------------------------------------------ epoch / jitter
@@ -1380,16 +1779,16 @@ class ClimbingCorpusDataset(Dataset):
         return len(self._items)
 
     def __getitem__(self, index: int) -> list[dict]:
-        scene, person, base, jitter_range = self._items[index]
+        scene, person, base, jitter_range, t_frames = self._items[index]
         data = self._scenes[scene]
         stride = self.scene_stride(scene)
         start = self._window_start(base, jitter_range, index)
-        positions = start + np.arange(self.T) * stride
+        positions = start + np.arange(t_frames) * stride
         # The indexed base window is all-valid. If jitter crosses a tracking gap,
         # fall back deterministically so invalid-frame bboxes never reach the crop.
         if start != base and not data["valid_mask"][person, positions].all():
             start = base
-            positions = base + np.arange(self.T) * stride
+            positions = base + np.arange(t_frames) * stride
 
         oid = int(data["object_ids"][person])
         frame_indices = data["frame_indices"]
@@ -1475,6 +1874,8 @@ class ClimbingCorpusDataset(Dataset):
                     data["motion_outlier"][person, pos])                          # [K] bool
                 frame["motion_rot"] = torch.from_numpy(
                     data["motion_rot"][person, pos])                              # [3, 3]
+                frame["motion_lin_rot"] = torch.from_numpy(
+                    data["motion_lin_rot"][person, pos])                          # [3, 3]
                 frame["motion_omega"] = torch.from_numpy(
                     data["motion_omega"][person, pos])                            # [3]
                 frame["motion_valid"] = valid and bool(data["motion_valid"][person, pos])
@@ -1487,10 +1888,27 @@ class ClimbingCorpusDataset(Dataset):
                     data["pose_gt_q"][person, pos])                           # [132]
                 frame["pose_valid"] = valid and bool(
                     data["pose_valid_mask"][person, pos])
+                frame["pose_identity"] = torch.from_numpy(
+                    data["pose_identity"][person])                            # [45] static
+                frame["pose_gt_bones"] = torch.from_numpy(
+                    data["pose_gt_bones"][person, pos])                       # [6]
+                frame["pose_gt_scale"] = torch.from_numpy(
+                    data["pose_gt_scale"][person])                            # [68] static
             if self.load_keypoints:
                 frame["kp3d_world"] = torch.from_numpy(
-                    data["kp3d_world"][person, pos])                          # [13, 3]
+                    data["kp3d_world"][person, pos])                          # [70, 3]
                 frame["kp_valid"] = valid and bool(data["kp_valid"][person, pos])
+                frame["vert_gt_world"] = torch.from_numpy(
+                    data["vert_gt_world"][person, pos])                       # [V, 3]
+                frame["vert_valid"] = valid and bool(data["vert_valid"][person, pos])
+                # Scene-constant view (no copy); the collate keeps one row.
+                frame["vert_indices"] = torch.from_numpy(data["vert_indices"])  # [V]
+            if self.load_pose or self.load_keypoints:
+                # Mesh-fit residual of the mhr_1 row — the optional confidence
+                # weight of the MHR-native metric losses. Both branches read the
+                # same mhr_1 array, so one key serves either.
+                frame["mhr_fit_err_cm"] = float(
+                    data["mhr_fit_err_cm"][person, pos])
             if self.cond_features_path is not None:
                 frame["cond_feat"] = torch.from_numpy(data["cond_feat"][person, pos])  # [10]
             clip.append(frame)

@@ -38,7 +38,7 @@ from contact.physics.loss import PhysicsLoss
 from contact.targets import NUM_BODY_22, TargetSpec
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-JOINT_CFG = os.path.join(REPO, "configs", "old", "climbing_videos_joint.yaml")
+JOINT_CFG = os.path.join(REPO, "tests", "fixtures", "climbing_videos_joint.yaml")
 _CKPT = load_config(os.path.join(REPO, "configs", "base.yaml"))["model"]["checkpoint_path"]
 
 pytestmark = [

@@ -1,3 +1,6 @@
+# TEST FIXTURE — a copy of configs/old/climbing_corpus_motion_pelvis12_angw05.yaml with the retired
+# sliding-window temporal / frame-attention sections stripped so it still
+# validates under the current schema. The archived original is unchanged.
 # Motion E0b — corpus_motion_pelvis12_angw05, the PRODUCTION motion model.
 # Identical to the retired 12-dim equal-weight baseline (E0) except the ANGULAR
 # loss weights drop to 0.5: the 4-way equal split cost the linear velocity ~0.03 r3d vs the
@@ -11,15 +14,6 @@ model:
   motion_head:
     enabled: true
     motion_keypoint_indices: [9]      # one token: pelvis (left-hip anchor)
-  motion_temporal:
-    enabled: true
-    attend: joint                     # K=1: identical to per_token, kept for continuity
-    num_layers: 2
-    num_heads: 4
-    mlp_ratio: 2.0
-    bottleneck_dim: 256
-    position_scale: 30.0              # 30-fps seconds -> well-separated frame offsets
-
 contact:
   targets:
     vertex: {enabled: false}

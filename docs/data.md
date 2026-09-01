@@ -145,16 +145,22 @@ Each scene carries a per-frame camera in `features/geometry/transform.npz`:
   reconstruction in arbitrary units cannot produce metres, and forces in body weights depend on
   metric geometry upstream.
 
-The world frame is the reconstruction's own static world, and **gravity in it is exactly
-`[0, 1, 0]`** — world *y points down*. This is kindyn's convention, and the loader hard-codes the
-exact vector rather than deriving it, because the retired v1 export derived gravity from camera 0
-and the two are not interchangeable.
+The world frame is the reconstruction's own static world, and world *y points approximately down*
+— but only approximately. Since the 2026-08-27 regeneration each kindyn solve stores its own
+**fitted** `gravity_world`, one unit `(3,)` vector per scene, and the loader reads that vector
+rather than the `[0, 1, 0]` constant. Measured over all 864 train scenes it tilts away from +y by
+median **3.2°**, p90 **27.5°**, p99 29.9°, max **61.4°** — 519 scenes past 1°, 368 past 5°, 163
+past 15°. Treat "world y is down" as a rough orientation cue only; every quantity that needs the
+vertical (physics, force consistency, the motion diagnostics, the `gravity_view` frame) must
+project on the scene's own vector. It is *not* the first camera's down axis either — that was the
+retired v1 export's derivation, and the two are not interchangeable.
 
 From the extrinsics the loader also precomputes world camera centres `C = -R^T t`, and emits
 `cam_jump_m`: how far the camera moved between two *sampled* frames of a clip. It exists so the
 physics loss can discard clips whose reconstruction jumped.
 
-![The three coordinate frames: the static metric world (y down, gravity = [0,1,0]), the
+![The three coordinate frames: the static metric world (y approximately down; the exact down
+direction is kindyn's fitted per-scene gravity_world), the
 per-frame OpenCV camera reached via cam_from_world, and the body-root frame the kindyn GT
 forces are expressed in](figures/corpus_coordinate_frames.png)
 
@@ -364,8 +370,8 @@ The file's own conventions, all verified in `contact/data/climbing_corpus.py` an
   position `[0:3]` plus an **`xyzw`** quaternion `[3:7]` whose rotation matrix is
   **world-from-root** (checked numerically against the stored axis-angle `global_orient`).
 - `joints_world [P, N, 52, 3]` — metric world joint positions.
-- `total_mass [P]` kg, `gravity_world` exactly `[0, 1, 0]`, `fps` per scene (fractional, e.g.
-  23.976).
+- `total_mass [P]` kg, `gravity_world` `(3,)` — the solve's **fitted** unit down direction, near
+  but generally not equal to `[0, 1, 0]` (see above), `fps` per scene (fractional, e.g. 23.976).
 
 ### Forces
 

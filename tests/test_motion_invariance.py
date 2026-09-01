@@ -2,7 +2,7 @@
 
 Real SAM-3D-Body checkpoint required. Mirrors ``test_force_invariance.py`` for the
 motion-only builds (``tests/fixtures/motion_seven_tokens.yaml``
-with seven motion tokens and ``configs/old/climbing_corpus_motion_pelvis_t7.yaml``
+with seven motion tokens and ``tests/fixtures/motion_pelvis_t7.yaml``
 with one: no contact tokens, no force tokens, K motion tokens appended last).
 
 The motion tokens are appended *after* every other token block and the asymmetric
@@ -35,7 +35,7 @@ from contact.targets import TargetSpec
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MOTION_CFG = os.path.join(REPO, "tests", "fixtures", "motion_seven_tokens.yaml")
-PELVIS_CFG = os.path.join(REPO, "configs", "old", "climbing_corpus_motion_pelvis_t7.yaml")
+PELVIS_CFG = os.path.join(REPO, "tests", "fixtures", "motion_pelvis_t7.yaml")
 #: Both shipped motion builds: seven anchored tokens (v2) and one (v3, pelvis).
 MOTION_CFGS = (MOTION_CFG, PELVIS_CFG)
 _CKPT = load_config(os.path.join(REPO, "configs", "base.yaml"))["model"]["checkpoint_path"]
@@ -53,15 +53,22 @@ pytestmark = [
 
 # ---------------------------------------------------------------- helpers
 
-def _cfg(motion_temporal: bool = True, config_path: str = MOTION_CFG) -> dict:
+def _cfg(temporal: bool = True, config_path: str = MOTION_CFG) -> dict:
     cfg = load_config(config_path)              # motion-only build, K anchored tokens
-    cfg["model"]["motion_temporal"]["enabled"] = motion_temporal
+    if temporal:
+        # A motion-only build has exactly one other modality available, so its
+        # temporal window necessarily lists 'pose' — which WRITES the pose token
+        # (the deliberate exception; the frozen MHR readout is recomputed).
+        cfg["model"]["cross_modal_temporal"] = {
+            "enabled": True, "modalities": ["pose", "motion"], "num_layers": 2,
+            "num_heads": 16, "mlp_ratio": 2.0, "dropout": 0.0,
+            "time_scale": 25.0, "max_rel_sec": 2.5}
     return cfg
 
 
-def _build(motion_temporal: bool = True, config_path: str = MOTION_CFG):
+def _build(temporal: bool = True, config_path: str = MOTION_CFG):
     torch.manual_seed(0)
-    cfg = _cfg(motion_temporal, config_path)
+    cfg = _cfg(temporal, config_path)
     model, trainable = build_model(cfg, "cuda")
     model.eval()
     return model, trainable, cfg
@@ -120,25 +127,23 @@ def _motion_disabled(model):
 
 
 @contextlib.contextmanager
-def _motion_temporal_disabled(model):
-    """Drop the ``motion_temporal`` submodule(s) so the hooks take their
+def _temporal_disabled(model):
+    """Drop the ``cross_modal_temporal`` submodule so the hook takes its
     ``getattr(..., None)`` skip paths — the exact code path of a disabled build."""
-    mt = model.motion_temporal
-    del model.motion_temporal
+    block = model.cross_modal_temporal
+    del model.cross_modal_temporal
     try:
         yield
     finally:
-        model.motion_temporal = mt
+        model.cross_modal_temporal = block
 
 
-def _randomize_motion_temporal_gammas(model, seed=13):
+def _randomize_temporal_gammas(model, seed=13):
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    modules = [model.motion_temporal]
     with torch.no_grad():
-        for module in modules:
-            for name, p in module.named_parameters():
-                if "gamma" in name:
-                    p.copy_(torch.randn(p.shape, generator=gen, device="cuda"))
+        for name, p in model.cross_modal_temporal.named_parameters():
+            if "gamma" in name:
+                p.copy_(torch.randn(p.shape, generator=gen, device="cuda"))
 
 
 def _motion_params(model):
@@ -175,7 +180,9 @@ def test_motion_only_build_forward_and_trainable_set(config_path):
     anchors = cfg["model"]["motion_head"]["motion_keypoint_indices"]
     n_tokens = len(anchors)
     try:
-        assert trainable and all("motion" in name.lower() for name in trainable)
+        assert trainable and all(
+            "motion" in name.lower() or "cross_modal" in name.lower()
+            for name in trainable)
         assert not any("contact" in name.lower() or "force" in name.lower()
                        for name, _ in model.named_parameters())
         assert not hasattr(model, "head_contact")
@@ -198,7 +205,7 @@ def test_motion_only_build_forward_and_trainable_set(config_path):
         model.train(True)
         assert not model.backbone.training
         assert model.head_motion.training
-        assert model.motion_temporal.training
+        assert model.cross_modal_temporal.training
     finally:
         del model
         torch.cuda.empty_cache()
@@ -209,7 +216,7 @@ def test_motion_only_build_forward_and_trainable_set(config_path):
 @pytest.mark.parametrize("config_path", MOTION_CFGS)
 def test_motion_params_have_no_mhr_jacobian(config_path):
     """Randomised motion head: MHR has a zero motion Jacobian; motion moves."""
-    model, _, cfg = _build(motion_temporal=False, config_path=config_path)
+    model, _, cfg = _build(temporal=False, config_path=config_path)
     try:
         _randomize_motion_head_final(model)         # upstream motion params now live
         batch = _batch(cfg, model, _synth_frames(4))
@@ -243,50 +250,44 @@ def test_motion_params_have_no_mhr_jacobian(config_path):
         torch.cuda.empty_cache()
 
 
-def test_motion_temporal_moves_motion_and_isolates_mhr():
-    """motion_temporal enabled + gammas live: motion moves across frames while MHR
-    keeps an exactly-zero Jacobian w.r.t. all motion params (now including
-    ``motion_temporal.*``)."""
-    model, _, cfg = _build(motion_temporal=True)
+def test_cross_modal_moves_motion_and_writes_pose():
+    """The shared block over {pose, motion} + gammas live: the motion outputs move
+    across frames, and — because 'pose' IS a listed modality — the frozen MHR
+    readout is connected to the block. The motion-token isolation itself is
+    proved on the per-frame build by ``test_motion_params_have_no_mhr_jacobian``.
+    """
+    model, _, cfg = _build(temporal=True)
     try:
         _randomize_motion_head_final(model)         # nonzero motion to move
         batch = _batch(cfg, model, _synth_frames(4), seq_len=4)   # one T=4 clip
 
-        # Baseline with motion_temporal an exact identity (module removed).
-        with _motion_temporal_disabled(model):
+        # Baseline with the block an exact identity (module removed).
+        with _temporal_disabled(model):
             m_base = forward_model(model, batch)["motion"]["joint_motion"]
             m_base = m_base.detach().float().clone()
 
         # Live temporal: cross-frame mixing changes the per-frame outputs.
-        _randomize_motion_temporal_gammas(model)
+        _randomize_temporal_gammas(model)
         out = forward_model(model, batch)           # grad enabled (no no_grad)
         m_live = out["motion"]["joint_motion"]
         moved = _max_abs(m_live.detach().float(), m_base)
         assert moved > _MOTION_SIGNAL, (
-            f"motion_temporal barely moved the outputs across frames ({moved:.2e})")
+            f"the temporal block barely moved the outputs across frames ({moved:.2e})")
 
-        mparams = [p for _, p in _motion_params(model)]
-        mt_params = [p for n, p in _motion_params(model) if "motion_temporal" in n]
-        assert mt_params, "no motion_temporal params picked up by the 'motion' filter"
-
-        gmt = torch.autograd.grad(m_live.float().sum(), mt_params,
+        xm_params = [p for _, p in model.cross_modal_temporal.named_parameters()]
+        assert xm_params
+        gmt = torch.autograd.grad(m_live.float().sum(), xm_params,
                                   allow_unused=True, retain_graph=True)
         assert any(g is not None and float(g.abs().sum()) > 0 for g in gmt), (
-            "motion output has no gradient w.r.t. motion_temporal params")
+            "motion output has no gradient w.r.t. the cross-modal params")
 
-        checked = 0
-        for key, val in out["mhr"].items():
-            if not (torch.is_tensor(val) and val.is_floating_point()):
-                continue
-            checked += 1
-            if not val.requires_grad:
-                continue
-            grads = torch.autograd.grad(val.float().sum(), mparams,
-                                        allow_unused=True, retain_graph=True)
-            for g in grads:
-                assert g is None or float(g.abs().sum()) == 0.0, (
-                    f"MHR output {key!r} has a nonzero motion Jacobian")
-        assert checked > 0
+        # 'pose' is listed -> the recomputed final MHR output depends on the block.
+        body_pose = out["mhr"]["body_pose"]
+        assert body_pose.requires_grad
+        gp = torch.autograd.grad(body_pose.float().sum(), xm_params,
+                                 allow_unused=True, retain_graph=True)
+        assert any(g is not None and float(g.abs().sum()) > 0 for g in gp), (
+            "listing 'pose' did not connect the block to the MHR readout")
     finally:
         del model
         torch.cuda.empty_cache()
@@ -294,7 +295,7 @@ def test_motion_temporal_moves_motion_and_isolates_mhr():
 
 def test_zero_init_motion_head_final_layer_gets_grad_upstream_does_not():
     """At zero-init only the final linear drives the motion output; upstream is dead."""
-    model, _, cfg = _build(motion_temporal=False)   # zero-init head, NOT randomized
+    model, _, cfg = _build(temporal=False)   # zero-init head, NOT randomized
     try:
         batch = _batch(cfg, model, _synth_frames(4))
         out = forward_model(model, batch)
@@ -321,7 +322,7 @@ def test_zero_init_motion_head_final_layer_gets_grad_upstream_does_not():
 # ---------------------------------------------------------------- (c) noise floor
 
 def test_motion_branch_within_noise_floor():
-    model, _, cfg = _build(motion_temporal=True)
+    model, _, cfg = _build(temporal=False)
     try:
         batch = _batch(cfg, model, _synth_frames(4), seq_len=4)
         disabled, floor = _noise_floor(model, batch)

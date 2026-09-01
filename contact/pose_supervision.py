@@ -5,11 +5,29 @@ recomputed final pose output when ``model.pose_temporal`` is enabled — and the
 collated ``pose_gt_q (B, 132)`` / ``pose_valid (B)`` / ``frame_valid (B)`` batch
 keys (``scripts/convert_kindyn_to_mhr.py`` targets, world-frame MHR ``q``).
 
+``loss.bones`` / ``loss.scale`` supervise the body's PROPORTIONS against the
+GT ``lbs_params`` (``mhr_1`` converter v3): the flexible geometry slots 130..135
+and the 68 per-person scale slots. ``out["mhr"]["mhr_model_params"]``
+IS that same 204-vector — the head's 28 scale coefficients have already been
+expanded through ``scale_mean + coeffs @ scale_comps`` inside it — so the
+comparison needs no unit conversion. It does need a REACHABILITY projection on
+the scale side (:func:`_scale_subspace`): that expansion spans a rank-24
+subspace of the 68 slots, and half of the GT deviation lies outside it. The
+audit named these the drift channel: the 68 fitted proportions were never
+stored, slots 130..135 were neither supervised nor railed, and 98 % of the
+body-size regression lived there.
+
 Optional ``loss.shape_rail`` / ``loss.scale_rail`` terms pin the head's
 45 blendshape / 28 bone-scale outputs to the FROZEN readout's own values
 (``shape_frozen`` / ``scale_frozen``, stashed by the final-recompute hook)
-with a plain L2 — the pose/keypoint objectives are girth-blind, so without
-the rail a fine-tuned head warps the unsupervised channels freely.
+with a plain L2 — the fallback for when nothing else supervises them. With
+``loss.scale`` on they are redundant AND opposed (the rail pins to the frozen
+value the scale GT is trying to correct), so the new-era configs run
+``scale_rail: 0``.
+
+Channel normalization: ``shape``, ``bones`` and ``scale`` are per-channel MEANS,
+so their configured weights are comparable across the 45 / 6 / 68 channel counts
+(``shape`` used to be a 45-channel SUM — divide a historical weight by 45).
 
 The comparison runs in **q space** (the rig's 125 local pose channels): the
 prediction's ``mhr_model_params`` go through the BetterHuman body's
@@ -42,6 +60,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from .data.climbing_corpus import MHR_BONE_SLOTS, MHR_SCALE_SLOTS
+from .keypoint_supervision import row_confidence
+
 #: Slots of the float64 stats vector (all-reduced with SUM under DDP).
 STAT_NAMES = ("sum_abs_err", "n_channel_rows", "sum_acc2_pred", "sum_acc2_gt",
               "n_acc_rows")
@@ -54,6 +75,31 @@ N_POSE_CHANNELS = 125
 def _wrap(diff: Tensor) -> Tensor:
     """Wrap channel differences to ``(-pi, pi]`` (euler-like channels)."""
     return torch.remainder(diff + math.pi, 2.0 * math.pi) - math.pi
+
+
+def _scale_subspace(
+    checkpoint_path: str, device: torch.device, dtype: torch.dtype,
+) -> tuple[Tensor, Tensor]:
+    """Mean and orthogonal projector of the head's REACHABLE bone-scale set.
+
+    The pose head emits 28 coefficients and expands them as
+    ``scale_mean + coeffs @ scale_comps``, so the 68 scale slots it can produce
+    form an affine subspace of rank 24 (``scale_comps`` is (28, 68) and rank
+    deficient). Measured on the corpus, 49.8 % of the GT slot deviation from
+    ``scale_mean`` lies OUTSIDE that image — a residual of ~0.23 per channel the
+    head can never remove, i.e. a permanent linear-regime Huber gradient
+    (``huber_delta_bones`` 0.05) pulling on directions that move no geometry.
+    Projecting the GT onto the subspace first makes the residual reachable
+    (~0 at the projected target) at a ~1 mm cost in GT mesh geometry.
+
+    :returns: ``(scale_mean (68,), projector (68, 68))`` on ``device``.
+    """
+    state = torch.load(checkpoint_path, map_location="cpu", mmap=True,
+                       weights_only=False)
+    state = state.get("state_dict", state)
+    mean = state["head_pose.scale_mean"].to(device=device, dtype=dtype)
+    comps = state["head_pose.scale_comps"].to(device=device, dtype=torch.float32)
+    return mean, (torch.linalg.pinv(comps) @ comps).to(dtype)
 
 
 class PoseSupervisedLoss:
@@ -76,11 +122,20 @@ class PoseSupervisedLoss:
         ps = cfg["pose_supervision"]
         self.weight = float(ps["loss"]["pose"])
         self.acc_weight = float(ps["loss"].get("acc", 0.0))
+        self.shape_w = float(ps["loss"].get("shape", 0.0))
+        self.bones_w = float(ps["loss"]["bones"])
+        self.scale_w = float(ps["loss"]["scale"])
+        self.huber_delta_bones = float(ps["loss"]["huber_delta_bones"])
+        self.fit_err_confidence = bool(ps["fit_err_confidence"])
+        self.fit_err_ref_cm = float(ps["fit_err_ref_cm"])
         self.shape_rail_w = float(ps["loss"].get("shape_rail", 0.0))
         self.scale_rail_w = float(ps["loss"].get("scale_rail", 0.0))
         self.huber_delta = float(ps["loss"]["huber_delta"])
         self.device = torch.device(device)
         self.dtype = dtype
+        if self.scale_w > 0.0:
+            self.scale_mean, self.scale_proj = _scale_subspace(
+                cfg["model"]["checkpoint_path"], self.device, dtype)
         lod = int(ps["mhr"]["lod"])
         self.body = bh.MHR(
             _resolve_model_path(ps["mhr"]["model_path"], lod),
@@ -139,6 +194,57 @@ class PoseSupervisedLoss:
                 acc_mass = float(v3.sum())
             terms["acc"] = (self.acc_weight * acc_raw, acc_mass)
 
+        # Shape vs GT identity (mhr_1 v2): the mesh-to-mesh converter exports
+        # the fitted 45 identity coefficients per person, so the blendshape
+        # outputs are directly supervisable. The GT is constant per person and
+        # broadcast over the clip rows — the per-frame L2 also acts as a
+        # temporal-consistency prior on the shape channel. Independent of the
+        # q term (the q construction detaches shape; q is shape-independent).
+        if self.shape_w > 0.0:
+            sv = (batch["pose_valid"].to(self.device)
+                  & batch["frame_valid"].to(self.device))
+            sv_mask = sv.to(self.dtype)
+            sv_mass = float(sv.sum())
+            dev_gt = (out["mhr"]["shape"].to(self.device, self.dtype)
+                      - batch["pose_identity"].to(self.device, self.dtype))
+            terms["shape"] = (
+                self.shape_w * (dev_gt.square().mean(dim=-1) * sv_mask).sum(),
+                sv_mass)
+
+        # Bone geometry (slots 130..135) and the 68 scale slots, both read
+        # straight off the prediction's own 204-vector and both per-person
+        # constant on the GT side. Huber, per-channel mean, optionally weighted
+        # by the row's mesh-fit residual.
+        prop_diag: dict[str, float] = {}
+        if self.bones_w > 0.0 or self.scale_w > 0.0:
+            pv = (batch["pose_valid"].to(self.device)
+                  & batch["frame_valid"].to(self.device))
+            conf = row_confidence(
+                batch["mhr_fit_err_cm"].to(self.device, self.dtype),
+                self.fit_err_ref_cm, self.fit_err_confidence)
+            pv_mask = pv.to(self.dtype) * conf
+            pv_mass = float(pv_mask.sum())
+            for name, weight, slots, gt_key in (
+                    ("bones", self.bones_w, MHR_BONE_SLOTS, "pose_gt_bones"),
+                    ("scale", self.scale_w, MHR_SCALE_SLOTS, "pose_gt_scale")):
+                if weight <= 0.0:
+                    continue
+                gt_slots = batch[gt_key].to(self.device, self.dtype)
+                if name == "scale":
+                    # Only the head's rank-24 image is reachable (_scale_subspace).
+                    gt_slots = self.scale_mean + (
+                        gt_slots - self.scale_mean) @ self.scale_proj
+                dev = params[:, slots] - gt_slots
+                huber = F.smooth_l1_loss(
+                    dev, torch.zeros_like(dev), reduction="none",
+                    beta=self.huber_delta_bones)
+                terms[name] = (
+                    weight * (huber.mean(dim=-1) * pv_mask).sum(), pv_mass)
+                with torch.no_grad():
+                    prop_diag[f"{name}_mae"] = float(
+                        (dev.abs().mean(dim=-1) * pv_mask).sum()
+                        / max(pv_mass, 1.0))
+
         # Shape/scale rail: L2 against the FROZEN readout's own coefficients
         # (stashed by the final-recompute hook). The stage-1 objectives cover
         # rotations and 13 joint positions only — girth-blind — so a pose
@@ -188,6 +294,7 @@ class PoseSupervisedLoss:
             "n_supervised_rows": int(valid.sum()),
         }
         parts.update(rail_diag)
+        parts.update(prop_diag)
         return total, parts
 
     @torch.no_grad()

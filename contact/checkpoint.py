@@ -3,9 +3,9 @@
 The frozen SAM-3D-Body weights live in the original checkpoint — re-saving them
 every epoch would be ~600 MB of nothing new. Here we serialise only the params
 named in ``saved_names`` (contact tokens, contact head(s), the contact
-posemb/feat projections, the contact temporal module, and — when enabled — the
-force tokens / ``head_force`` / ``force_temporal``), plus the optimiser,
-scheduler, run state, resolved config, wandb run id and RNG states.
+posemb/feat projections, the shared ``cross_modal_temporal`` block, and — when
+enabled — the force tokens / ``head_force``), plus the optimiser, scheduler, run
+state, resolved config, wandb run id and RNG states.
 
 **Self-contained regime (a).** In regime (a) (``train.freeze_contact``) the
 warm-started contact branch is frozen, so it is *not* in the ``requires_grad``
@@ -51,8 +51,8 @@ def _current_trainable_spec(model: nn.Module) -> list[tuple[str, tuple[int, ...]
 
     Computed from the live model, independent of any name list stored in a
     checkpoint, so a current model with **extra** trainable params (e.g. the
-    temporal module) or **missing** ones is detected on load — not silently
-    accepted.
+    cross-modal temporal block) or **missing** ones is detected on load — not
+    silently accepted.
     """
     spec = [
         (name, tuple(p.shape))
@@ -78,21 +78,22 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
 
     Captures semantics that leave the trainable param **shapes** unchanged yet
     change what the head learns — reordered anchor indices, grid params, temporal
-    placement/attend/causal, mask conditioning, and the frozen base checkpoint —
-    so a same-shape but different-architecture checkpoint is rejected on load.
+    hyperparameters, mask conditioning, and the frozen base checkpoint — so a
+    same-shape but different-architecture checkpoint is rejected on load.
     Returns ``None`` when ``config`` is ``None`` (signature comparison skipped).
 
-    The ``motion``/``motion_temporal`` and ``cond_input`` keys appear only when
-    their branch is enabled: checkpoints written before they existed store
-    signatures without them, and this comparison is an exact dict equality.
+    The ``motion``, ``cond_input``, ``cross_modal_temporal`` and ``pose_temporal``
+    keys appear only when their branch is enabled: checkpoints written before they
+    existed store signatures without them, and this comparison is an exact dict
+    equality. The retired sliding-window sections (``temporal``,
+    ``force_temporal``, ``motion_temporal``, ``frame_attn``) are no longer emitted
+    at all; :func:`_check_schema` defaults the first three to their disabled state
+    on BOTH sides so pre-retirement checkpoints still load.
 
-    Known, deliberate gap: the ``temporal``/``force_temporal`` sub-signatures omit
-    ``dropout``. Every shipped artifact uses ``0.0``, and adding the key now would
-    orphan existing checkpoints whose stored signatures lack it (their comparison
-    would spuriously mismatch). Absorb it at the next signature-version bump. The
-    ``temporal`` sub-signature also omits ``window_frames`` on purpose: it is an
-    inference attention-window choice (like ``frames_per_clip``), not a weight-shape
-    or head-semantic key, so a windowed run must load its non-windowed checkpoint.
+    Known, deliberate gap: the RoPE sub-signatures omit ``dropout`` and
+    ``max_rel_sec``. ``max_rel_sec`` is an inference attention-window choice (like
+    ``frames_per_clip``), not a weight-shape or head-semantic key, so a
+    long-sequence eval must load its training checkpoint.
     """
     if config is None:
         return None
@@ -118,25 +119,6 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
                     "names": list(names),
                     "dim": len(names),
                 }
-
-    tcfg = model_cfg.get("temporal", {}) or {}
-    if tcfg.get("enabled", False):
-        temporal = {
-            "enabled": True,
-            # The placement key left the config (post_decoder is the only
-            # placement now) but stays in the signature: stored signatures of
-            # existing checkpoints contain it, and the comparison is exact.
-            "placement": str(tcfg.get("placement", "post_decoder")),
-            "attend": str(tcfg.get("attend", "joint")),
-            "causal": bool(tcfg.get("causal", False)),
-            "bottleneck_dim": int(tcfg.get("bottleneck_dim", 256)),
-            "num_layers": int(tcfg.get("num_layers", 1)),
-            "num_heads": int(tcfg.get("num_heads", 4)),
-            "mlp_ratio": float(tcfg.get("mlp_ratio", 2.0)),
-            "position_scale": float(tcfg.get("position_scale", 1.0)),
-        }
-    else:
-        temporal = {"enabled": False}
 
     # Force head (step 04): same shape-invariant-but-semantic capture as the
     # contact head. `frame` changes what the head learns (LWA vs joint-local
@@ -168,27 +150,10 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
     else:
         force = {"enabled": False}
 
-    # Force temporal module (step 05): mirrors the contact `temporal` capture but
-    # has no placement key (post_decoder only, D11).
-    ftcfg = model_cfg.get("force_temporal", {}) or {}
-    if ftcfg.get("enabled", False):
-        force_temporal = {
-            "enabled": True,
-            "attend": str(ftcfg.get("attend", "per_token")),
-            "causal": bool(ftcfg.get("causal", False)),
-            "bottleneck_dim": int(ftcfg.get("bottleneck_dim", 256)),
-            "num_layers": int(ftcfg.get("num_layers", 1)),
-            "num_heads": int(ftcfg.get("num_heads", 4)),
-            "mlp_ratio": float(ftcfg.get("mlp_ratio", 2.0)),
-            "position_scale": float(ftcfg.get("position_scale", 1.0)),
-        }
-    else:
-        force_temporal = {"enabled": False}
-
-    # Motion head + motion temporal (motion tokens v2). Added to the returned
-    # signature ONLY when the motion branch is enabled, so every checkpoint
-    # written before it existed keeps a byte-identical stored signature (the
-    # comparison in `_check_schema` is an exact dict equality).
+    # Motion head (motion tokens v2). Added to the returned signature ONLY when
+    # the motion branch is enabled, so every checkpoint written before it existed
+    # keeps a byte-identical stored signature (the comparison in `_check_schema`
+    # is an exact dict equality).
     sig_extra: dict = {}
     mhcfg = model_cfg.get("motion_head", {}) or {}
     if mhcfg.get("enabled", False):
@@ -206,57 +171,39 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
         # stored signature (same rule as `force_keypoint_indices`).
         if not mhcfg.get("anchored", True):
             sig_extra["motion"]["anchored"] = False
-        mtcfg = model_cfg.get("motion_temporal", {}) or {}
-        if mtcfg.get("enabled", False):
-            sig_extra["motion_temporal"] = {
-                "enabled": True,
-                "attend": str(mtcfg.get("attend", "per_token")),
-                "causal": bool(mtcfg.get("causal", False)),
-                "bottleneck_dim": int(mtcfg.get("bottleneck_dim", 256)),
-                "num_layers": int(mtcfg.get("num_layers", 1)),
-                "num_heads": int(mtcfg.get("num_heads", 4)),
-                "mlp_ratio": float(mtcfg.get("mlp_ratio", 2.0)),
-                "position_scale": float(mtcfg.get("position_scale", 1.0)),
-            }
-        else:
-            sig_extra["motion_temporal"] = {"enabled": False}
 
-    # Cross-modal temporal / per-frame attention bricks. Enabled-only, like
-    # `motion`: absent from every checkpoint written before they existed. The
-    # modality list changes which token slices the weights were trained on, so
-    # it is semantic.
+    # The all-modality RoPE temporal block. Enabled-only, like `motion`: absent
+    # from every checkpoint written before it existed. The modality list changes
+    # which token slices the weights were trained on AND sizes the learned slot
+    # embedding, so it is semantic; `time_scale` changes what the rotary
+    # positions mean.
     xmcfg = model_cfg.get("cross_modal_temporal", {}) or {}
     if xmcfg.get("enabled", False):
+        xm_type = str(xmcfg.get("type", "rope"))
         sig_extra["cross_modal_temporal"] = {
             "enabled": True,
+            "type": xm_type,
             "modalities": sorted(str(m) for m in (xmcfg.get("modalities") or [])),
-            "causal": bool(xmcfg.get("causal", False)),
-            "bottleneck_dim": int(xmcfg.get("bottleneck_dim", 256)),
-            "num_layers": int(xmcfg.get("num_layers", 1)),
-            "num_heads": int(xmcfg.get("num_heads", 4)),
+            "num_layers": int(xmcfg.get("num_layers", 4)),
+            "num_heads": int(xmcfg.get("num_heads", 16)),
             "mlp_ratio": float(xmcfg.get("mlp_ratio", 2.0)),
-            "position_scale": float(xmcfg.get("position_scale", 1.0)),
         }
+        if xm_type == "window":
+            # Weight-shape keys of the sinusoidal block; position_scale changes
+            # what the encoded positions mean (like time_scale for rope).
+            _bneck = xmcfg.get("bottleneck_dim", 256)
+            sig_extra["cross_modal_temporal"]["bottleneck_dim"] = (
+                None if _bneck is None else int(_bneck))
+            sig_extra["cross_modal_temporal"]["position_scale"] = float(
+                xmcfg.get("position_scale", 25.0))
+        else:
+            sig_extra["cross_modal_temporal"]["time_scale"] = float(
+                xmcfg.get("time_scale", 25.0))
     # The mutual decoder mask changes what every appended token was trained to
     # read (contact attends force/motion and vice versa) — semantic. Emitted
     # only when set, so pre-existing causal signatures stay byte-identical.
     if model_cfg.get("extra_token_attention", "mutual") == "mutual":
         sig_extra["extra_token_attention"] = "mutual"
-
-    facfg = model_cfg.get("frame_attn", {}) or {}
-    if facfg.get("enabled", False):
-        sig_extra["frame_attn"] = {
-            "enabled": True,
-            "modalities": sorted(str(m) for m in (facfg.get("modalities") or [])),
-            # frame_attn always spans every modality's tokens now; the config
-            # key was removed, but stored signatures compare by exact equality,
-            # so keep emitting the constant every attend_all checkpoint carries.
-            "attend_all": True,
-            "bottleneck_dim": int(facfg.get("bottleneck_dim", 256)),
-            "num_layers": int(facfg.get("num_layers", 1)),
-            "num_heads": int(facfg.get("num_heads", 4)),
-            "mlp_ratio": float(facfg.get("mlp_ratio", 2.0)),
-        }
 
     # Pose/camera-head fine-tune (train.finetune_pose_head /
     # train.finetune_camera_head). Enabled-only: the checkpoint then carries
@@ -276,13 +223,11 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
     if ptcfg.get("enabled", False):
         sig_extra["pose_temporal"] = {
             "enabled": True,
-            "attend": str(ptcfg.get("attend", "per_token")),
-            "causal": bool(ptcfg.get("causal", False)),
-            "bottleneck_dim": int(ptcfg.get("bottleneck_dim", 256)),
-            "num_layers": int(ptcfg.get("num_layers", 2)),
-            "num_heads": int(ptcfg.get("num_heads", 4)),
+            "type": "rope",
+            "num_layers": int(ptcfg.get("num_layers", 4)),
+            "num_heads": int(ptcfg.get("num_heads", 16)),
             "mlp_ratio": float(ptcfg.get("mlp_ratio", 2.0)),
-            "position_scale": float(ptcfg.get("position_scale", 30.0)),
+            "time_scale": float(ptcfg.get("time_scale", 25.0)),
         }
 
     # Input conditioning (model.cond_input). Same enabled-only rule as `motion`:
@@ -324,9 +269,7 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
         "topology": str(topology),
         "targets": {k: int(v) for k, v in sorted(targets_layout.items())},
         "joint_layout": joint_layout,
-        "temporal": temporal,
         "force": force,
-        "force_temporal": force_temporal,
         "mask_embed_type": model_cfg.get("mask_embed_type", None),
         "base_checkpoint": Path(str(model_cfg.get("checkpoint_path", ""))).name,
     }
@@ -479,12 +422,20 @@ def _check_schema(
     want_sig = ckpt.get("arch_signature")
     got_sig = _arch_signature(config)
     if config is not None and want_sig is not None:
-        # Pre-force contact checkpoints (schema v2, saved before the force branch)
-        # have no `force`/`force_temporal` signature keys. Default their absence to
-        # the disabled state on both sides so such a checkpoint still loads into a
-        # contact-only run; a force-enabled run correctly mismatches (enabled vs
-        # disabled).
-        disabled = {"force": {"enabled": False}, "force_temporal": {"enabled": False}}
+        # Keys that may be ABSENT on one side purely for historical reasons are
+        # defaulted to the disabled state on BOTH sides, so such a checkpoint
+        # still loads; an enabled-vs-disabled difference correctly mismatches.
+        #   * `force`/`force_temporal`: pre-force contact checkpoints (schema v2,
+        #     saved before the force branch) have neither key.
+        #   * `temporal`/`force_temporal`/`motion_temporal`: the retired
+        #     sliding-window sections. Checkpoints written before the retirement
+        #     carry them at `{"enabled": False}`; the current signature omits them.
+        disabled = {
+            "force": {"enabled": False},
+            "temporal": {"enabled": False},
+            "force_temporal": {"enabled": False},
+            "motion_temporal": {"enabled": False},
+        }
         want_sig = {**disabled, **want_sig}
         got_sig = {**disabled, **(got_sig or {})}
     if config is not None and want_sig is not None and want_sig != got_sig:
@@ -644,21 +595,20 @@ def initialize_common_contact(
 
     This is deliberately narrower than :func:`load`: it does not restore the
     optimiser, scheduler, epoch, or RNG. The only trainable parameters that may be
-    absent from the source checkpoint are ``contact_temporal.*`` (temporal
-    fine-tuning from a per-frame checkpoint), any param whose name contains
-    ``"force"`` (the force branch — force tokens/linears, ``head_force``,
-    ``force_temporal``) or ``"motion"``, and the ``*_cond_linear`` input-conditioning
-    projections. Everything else must match exactly: those keys are exempted from
-    the arch-signature comparison symmetrically (like ``temporal``), and the
-    precondition is that the target enables the temporal module OR the force
-    branch. It starts a temporal fine-tune, or a regime-(a) force warm-start, from a
-    per-frame contact checkpoint without weakening the strict resume checks.
+    absent from the source checkpoint are ``cross_modal_temporal.*`` (adding the
+    all-modality temporal block to a per-frame checkpoint), any param whose name
+    contains ``"force"`` (the force branch — force tokens/linears, ``head_force``)
+    or ``"motion"``, and the ``*_cond_linear`` input-conditioning projections.
+    Everything else must match exactly: those keys are exempted from the
+    arch-signature comparison symmetrically, and the precondition is that the
+    target enables the cross-modal temporal block OR the force branch. It starts a
+    temporal fine-tune, or a regime-(a) force warm-start, from a per-frame contact
+    checkpoint without weakening the strict resume checks.
 
-    The source may itself be *temporal* provided the target's temporal architecture
-    is identical (same signature dict): its ``contact_temporal.*`` params then load
-    like any other contact param — no longer "allowed missing", they simply load.
-    This lets a regime-(a) force run warm-start from a trained temporal contact
-    checkpoint. A temporal source with a differing/disabled target temporal raises.
+    The source may itself carry the temporal block provided the target's block is
+    architecturally identical (same signature dict): its ``cross_modal_temporal.*``
+    params then load like any other param — no longer "allowed missing", they
+    simply load. A temporal source with a differing/disabled target block raises.
     """
     path = Path(path)
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
@@ -671,15 +621,21 @@ def initialize_common_contact(
     source_sig = dict(ckpt.get("arch_signature") or {})
     target_sig = dict(_arch_signature(config) or {})
     # Exempt the modules a warm start may introduce from the signature comparison,
-    # symmetrically on both sides: temporal (temporal fine-tune) and the force
-    # branch (regime (a)). A contact-only source has no force keys; a force-enabled
-    # target does — popping both keeps the remaining semantics an exact match.
-    source_temporal = source_sig.pop("temporal", {"enabled": False})
-    target_temporal = target_sig.pop("temporal", {"enabled": False})
-    source_sig.pop("force", None)
-    source_sig.pop("force_temporal", None)
+    # symmetrically on both sides: the cross-modal temporal block (temporal
+    # fine-tune) and the force branch (regime (a)). A contact-only source has no
+    # force keys; a force-enabled target does — popping both keeps the remaining
+    # semantics an exact match. The retired sliding-window keys are popped too, so
+    # a pre-retirement source still warm-starts.
+    source_temporal = source_sig.pop(
+        "cross_modal_temporal", {"enabled": False})
+    target_temporal = target_sig.pop(
+        "cross_modal_temporal", {"enabled": False})
+    for key in ("force", "temporal", "force_temporal", "motion_temporal",
+                "frame_attn"):
+        source_sig.pop(key, None)
     target_force = target_sig.pop("force", {"enabled": False})
-    target_sig.pop("force_temporal", None)
+    for key in ("temporal", "force_temporal", "motion_temporal", "frame_attn"):
+        target_sig.pop(key, None)
     # Same treatment for the two later branches a warm start may introduce (or
     # drop): the motion tokens and the input conditioning. Both are absent from
     # every earlier checkpoint's signature, and their params are allowed-missing
@@ -697,7 +653,7 @@ def initialize_common_contact(
             f"injection={src_injection!r} but the target uses "
             f"injection={tgt_injection!r}; the weights are shape-compatible yet "
             "semantically different")
-    for key in ("motion", "motion_temporal", "cond_input", "pose_temporal"):
+    for key in ("motion", "cond_input", "pose_temporal"):
         source_sig.pop(key, None)
         target_sig.pop(key, None)
     if source_sig != target_sig:
@@ -711,19 +667,19 @@ def initialize_common_contact(
             f"{path}: warm-start architecture mismatch outside the temporal/force/"
             f"motion/cond_input modules:\n" + "\n".join(diffs))
     # A temporal source is allowed IFF the target's temporal architecture is
-    # identical: then its ``contact_temporal.*`` params simply load like any other
-    # contact param. A differing (or disabled) target temporal still raises — the
-    # temporal weights would be shape-compatible yet semantically wrong.
+    # identical: then its ``cross_modal_temporal.*`` params simply load like any
+    # other param. A differing (or disabled) target block still raises — the
+    # weights would be shape-compatible yet semantically wrong.
     if source_temporal.get("enabled", False) and source_temporal != target_temporal:
         raise RuntimeError(
-            f"{path}: warm-start source has temporal enabled but the target's temporal "
-            "architecture differs (or is disabled); a temporal source may only warm-start "
-            "an identical temporal architecture. Source temporal="
-            f"{source_temporal!r} target temporal={target_temporal!r}")
+            f"{path}: warm-start source has cross_modal_temporal enabled but the "
+            "target's block differs (or is disabled); a temporal source may only "
+            "warm-start an identical temporal architecture. Source="
+            f"{source_temporal!r} target={target_temporal!r}")
     if not (target_temporal.get("enabled", False) or target_force.get("enabled", False)):
         raise RuntimeError(
             "initialize_common_contact is only valid when the target enables the "
-            "temporal module or the force branch")
+            "cross-modal temporal block or the force branch")
 
     current = dict(model.named_parameters())
     source_state = ckpt["trainable_state_dict"]
@@ -741,7 +697,7 @@ def initialize_common_contact(
     missing = sorted(current_trainable - set(source_state))
     invalid_missing = [
         name for name in missing
-        if not name.startswith("contact_temporal.")
+        if "cross_modal" not in name.lower()
         and "force" not in name.lower()
         and "motion" not in name.lower()
         and "cond_linear" not in name

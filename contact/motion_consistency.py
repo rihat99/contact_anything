@@ -30,16 +30,10 @@ close it:
 - ``rot`` — geodesic residual ``so3_log(R_pred^T R_gt)`` vs zero, Huber in
   radians (probe: constant frame offset ≈ 1.4°, i.e. none; per-frame model
   error ≈ 7°).
-- ``cam_rail`` — trust region on the camera translation: zero inside
-  ``cam_rail_margin_m`` of the frozen model's own ``pred_cam_t`` (stashed by
-  the recompute hook as ``pred_cam_t_frozen``), linear beyond. Inert for a
-  healthy model; makes the collapse optimum unreachable.
-- ``rot_rail`` — the same trust region on the global orientation: zero inside
-  ``rot_rail_margin_rad`` of the frozen model's own ``global_rot``
-  (``global_rot_frozen``), linear beyond. corpus_allmod_consistency (v3)
-  proved the necessity: with only the camera railed, the twist terms pinned
-  the world orientation near-constant (per-clip spread 0.21° vs GT 2.85°),
-  parking it ~55° from GT — the rotation channel was the one open escape.
+
+The cam/rot trust regions ("rails") against the frozen model's own outputs
+live ONLY in ``keypoint_supervision`` since 2026-08-29 — this loss carried an
+identical copy, and configs enabling both applied the rails at double weight.
 
 ``angular: false`` (the v4 default stance) restricts the ``gt``/``head`` twist
 comparison to the LINEAR vel/acc rows even when ``motion_supervision.angular``
@@ -242,14 +236,10 @@ class MotionConsistencyLoss:
         self.weights = {"gt": float(mc["loss"]["gt"]),
                         "head": float(mc["loss"]["head"]),
                         "pos": float(mc["loss"]["pos"]),
-                        "rot": float(mc["loss"]["rot"]),
-                        "cam_rail": float(mc["loss"]["cam_rail"]),
-                        "rot_rail": float(mc["loss"]["rot_rail"])}
+                        "rot": float(mc["loss"]["rot"])}
         self.huber_delta = float(mc["loss"]["huber_delta"])
         self.pos_huber_m = float(mc["loss"]["pos_huber_m"])
         self.rot_huber_rad = float(mc["loss"]["rot_huber_rad"])
-        self.cam_rail_margin_m = float(mc["loss"]["cam_rail_margin_m"])
-        self.rot_rail_margin_rad = float(mc["loss"]["rot_rail_margin_rad"])
         self.hip_offset_root = torch.tensor(
             [float(v) for v in mc["hip_offset_root"]], dtype=dtype)
         names = tuple(ms.get("joint_names") or MOTION_JOINT_NAMES)
@@ -258,6 +248,7 @@ class MotionConsistencyLoss:
         # is trained on them and the consistency config opts in.
         ms_angular = bool(ms.get("angular", False))
         self.angular = bool(mc["angular"]) and ms_angular
+        self.detach_head = bool(mc.get("detach_head", True))
         self.groups = ("vel", "acc") + (("ang_vel", "ang_acc") if self.angular else ())
         n_ms_groups = 2 + (2 if ms_angular else 0)
         # Per-3-component-group weights, shared with motion_supervision so the
@@ -293,8 +284,7 @@ class MotionConsistencyLoss:
         """Return ``(total, parts)``.
 
         :param out: forward output — reads ``out["mhr"]`` (pose path, grads
-            live; ``pred_cam_t_frozen`` for the rail when a pose write path
-            exists) and ``out["motion"]["joint_motion"]`` (motion head,
+            live) and ``out["motion"]["joint_motion"]`` (motion head,
             DETACHED — the head term never trains the motion head).
         :param batch: reads ``cam_from_world``/``cam_valid``, ``frame_valid``,
             ``frame_pos_sec``, ``seq_len`` and the motion GT keys (incl.
@@ -304,13 +294,20 @@ class MotionConsistencyLoss:
             term (training); evaluation never filters.
         """
         width = self.mean.shape[1]
-        head = out["motion"]["joint_motion"][:, self.pelvis_slot, :width].detach(
-            ).to(self.device, self.dtype)                             # (B, 3G)
+        head = out["motion"]["joint_motion"][:, self.pelvis_slot, :width]  # (B, 3G)
+        if self.detach_head:
+            head = head.detach()
+        head = head.to(self.device, self.dtype)
         zero_touch = sum(
             out["mhr"][k].sum() * 0.0
             for k in ("pred_keypoints_3d", "pred_cam_t", "global_rot"))
+        if not self.detach_head:
+            # The motion head is now on this loss's graph: keep its params
+            # reachable on early-out/zero-mass batches too (DDP
+            # find_unused_parameters=False).
+            zero_touch = zero_touch + out["motion"]["joint_motion"].sum() * 0.0
 
-        term_names = ("gt", "head", "pos", "rot", "cam_rail", "rot_rail")
+        term_names = ("gt", "head", "pos", "rot")
         seq_len = int(batch.get("seq_len", 1))
         batch_rows = head.shape[0]
         if seq_len < 3 or batch_rows % seq_len:
@@ -378,39 +375,6 @@ class MotionConsistencyLoss:
             beta=self.rot_huber_rad).sum(dim=-1)
         terms["rot"] = ((rot_huber * pose_ok).sum(), float(pose_ok.sum()))
 
-        # Camera trust region: pure linear penalty beyond the margin around the
-        # frozen model's own translation — exactly zero inside it. Absent
-        # pred_cam_t_frozen means no pose write path, so nothing can drift.
-        frozen = out["mhr"].get("pred_cam_t_frozen")
-        if frozen is not None:
-            cam_dev = (out["mhr"]["pred_cam_t"].to(self.device, self.dtype)
-                       - frozen.to(self.device, self.dtype)).norm(dim=-1)  # (B,)
-            rail = F.relu(cam_dev - self.cam_rail_margin_m)
-            rail_mask = batch["frame_valid"].to(self.device)
-            terms["cam_rail"] = ((rail * rail_mask).sum(), float(rail_mask.sum()))
-        else:
-            cam_dev = None
-            terms["cam_rail"] = (zero_touch, 0.0)
-
-        # Rotation trust region — the native-axes relative rotation between the
-        # predicted and frozen ``global_rot`` (extrinsics cancel in a geodesic
-        # distance, so this needs no camera validity).
-        frozen_rot = out["mhr"].get("global_rot_frozen")
-        if frozen_rot is not None:
-            r_pred = roma.euler_to_rotmat(
-                "xyz", out["mhr"]["global_rot"].to(torch.float64))
-            r_frz = roma.euler_to_rotmat(
-                "xyz", frozen_rot.to(self.device, torch.float64))
-            rot_dev = so3_log_xyzw(quat_xyzw_from_matrix(
-                r_pred.transpose(-1, -2) @ r_frz)).norm(dim=-1).to(self.dtype)
-            rot_rail = F.relu(rot_dev - self.rot_rail_margin_rad)
-            rot_rail_mask = batch["frame_valid"].to(self.device)
-            terms["rot_rail"] = (
-                (rot_rail * rot_rail_mask).sum(), float(rot_rail_mask.sum()))
-        else:
-            rot_dev = None
-            terms["rot_rail"] = (zero_touch, 0.0)
-
         with torch.no_grad():
             # pose_twist is already physical (clip_body_twist output) — compare
             # raw against the raw GT; only the loss terms are standardized.
@@ -433,22 +397,6 @@ class MotionConsistencyLoss:
                 "n_head_rows": int(support.sum()),
                 "n_pose_rows": int(pose_ok.sum()),
             }
-            if cam_dev is not None:
-                nf = batch["frame_valid"].to(self.device, torch.float64)
-                diagnostics["cam_dev_m"] = float(
-                    (cam_dev.to(torch.float64) * nf).sum()
-                    / nf.sum().clamp(min=1.0))
-                diagnostics["rail_frac"] = float(
-                    (((cam_dev > self.cam_rail_margin_m).to(torch.float64))
-                     * nf).sum() / nf.sum().clamp(min=1.0))
-            if rot_dev is not None:
-                nf = batch["frame_valid"].to(self.device, torch.float64)
-                diagnostics["rot_dev_deg"] = float(
-                    (rot_dev.to(torch.float64) * nf).sum()
-                    / nf.sum().clamp(min=1.0) * 180.0 / torch.pi)
-                diagnostics["rot_rail_frac"] = float(
-                    (((rot_dev > self.rot_rail_margin_rad).to(torch.float64))
-                     * nf).sum() / nf.sum().clamp(min=1.0))
         return self._assemble(terms, zero_touch, diagnostics)
 
     def _assemble(

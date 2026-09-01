@@ -1,3 +1,6 @@
+# TEST FIXTURE — a copy of configs/old/climbing_videos_force_warmstart_t7hinge.yaml with the retired
+# sliding-window temporal / frame-attention sections stripped so it still
+# validates under the current schema. The archived original is unchanged.
 # Regime (a) force run #4 — t7hinge. Successor to climbing_videos_force_warmstart_t7mid
 # (stopped at epoch 11: monitored test residual stuck at 1.479 since epoch 1, and the
 # rendered forces showed the measured ridge equilibrium — ‖f‖ smoothly increasing with
@@ -61,16 +64,6 @@ model:
   # (the former configs/climbing_videos_joint_temporal_center.yaml) or the warm
   # start hard-fails. window_frames is NOT part of the arch signature (an
   # attention-window choice, like frames_per_clip).
-  temporal:
-    enabled: true
-    bottleneck_dim: 256
-    num_layers: 1
-    num_heads: 4
-    mlp_ratio: 2.0
-    attend: per_token                 # t5mid: each limb mixes only with itself through time
-    causal: false
-    position_scale: 30.0              # 30-fps seconds -> well-separated frame offsets
-    window_frames: 5                  # central-5 window inside the T=7 clip (t5mid native T)
   force_head:
     enabled: true
     frame: local_world_aligned        # per-frame camera y-up axes (D6)
@@ -78,11 +71,6 @@ model:
   # across the four limbs: forces trade off against each other (the torque
   # balance couples them), so per-limb-only mixing withholds exactly the
   # cross-limb context the allocation problem needs.
-  force_temporal:
-    enabled: true
-    attend: joint                     # limbs see each other across time
-    position_scale: 30.0
-
 contact:
   primary_target: joint
   targets:

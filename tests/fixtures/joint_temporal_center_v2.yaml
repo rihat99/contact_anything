@@ -1,15 +1,15 @@
-# Ablation of climb4_t5mid_v2: identical recipe, but the contact tokens are
-# BLIND to the image. Both image paths are cut — the decoder's image
-# cross-attention is gated off for the contact-token rows, and the
-# keypoint-anchored update (5x5 grid-sampled features + the 2D keypoint posemb)
-# never runs. The four tokens are then pure learned queries whose only input is
-# self-attention over the frozen SAM-3D-Body tokens, so whatever F1 this reaches
-# is what the pose/keypoint representation alone carries about contact.
+# TEST FIXTURE — a copy of configs/old/climbing_videos_joint_temporal_center_v2.yaml with the retired
+# sliding-window temporal / frame-attention sections stripped so it still
+# validates under the current schema. The archived original is unchanged.
+# Retrain of climb4_t5mid on the re-exported ClimbingVideos_v1 (dataset schema
+# v3: improved auto contacts + confidence, cameras restored). Model, data and
+# optimiser recipe are byte-identical to the original run — only the length
+# changes: 17 epochs x 893 steps = 15,181 steps, so the cosine schedule
+# completes at the ~15k-step budget instead of running to 20 epochs (17,860).
 #
 # Self-contained override of base.yaml (flattened from the former include chain
-# climbing_videos_joint.yaml -> _joint_temporal.yaml -> _joint_temporal_center.yaml
-# -> _joint_temporal_center_v2.yaml, now in legacy/configs/ except the kept v2).
-# Inlined design rationale from that chain:
+# climbing_videos_joint.yaml -> _joint_temporal.yaml -> _joint_temporal_center.yaml,
+# now in legacy/configs/). Inlined design rationale from that chain:
 # - Four-extremity contact — joint target only, vertex off. Per-frame training is
 #   confidence-weighted; each output has one dedicated contact token anchored to
 #   its predicted MHR70 wrist or ankle: left hand, right hand, left foot, right foot.
@@ -17,26 +17,15 @@
 #   T=5 contact-token clips after the decoder.
 # - Center supervision: non-causal T=5 — all five frames provide context, but only
 #   the middle frame contributes to the training loss, metrics, and test F1.
-# - v2 length: 17 epochs x 893 steps = 15,181 steps (cosine completes at ~15k).
 base: configs/base.yaml
 
 model:
   extra_token_attention: causal   # pinned 2026-08-27: the repo default flipped to mutual
   init_contact_checkpoint: null       # train the complete contact stack from scratch
-  temporal:
-    enabled: true
-    bottleneck_dim: 256
-    num_layers: 1
-    num_heads: 4
-    mlp_ratio: 2.0
-    attend: per_token                 # each limb mixes only with itself through time
-    causal: false
-    position_scale: 30.0              # 30-fps seconds -> well-separated frame offsets
   contact_head:
     contact_keypoint_indices: [62, 41, 13, 14]
     num_global_tokens: 0
     pool_mode: per_token
-    blind_to_image: true
 
 contact:
   primary_target: joint
@@ -79,5 +68,5 @@ logging:
     - test/joint/f1
 
 output:
-  exp_name: climb4_t5mid_blind
+  exp_name: climb4_t5mid_v2
   monitor: test/joint_f1

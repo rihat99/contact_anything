@@ -9,7 +9,8 @@ Fork of **SAM 3D Body** (Meta) — single-image 3D human mesh recovery — exten
 only contact- and force-named parameters train.
 Contact can be predicted **per-vertex** (SMPL 6890 / SMPL-X 10475; MHR not implemented) and/or
 **per-joint** (SMPL-X body-22 or four climbing extremities), on single images or on **video clips** via an optional
-temporal attention module that provably does not change the frozen model's pose (MHR) predictions.
+temporal attention block that provably does not change the frozen model's pose (MHR) predictions
+unless `pose` is an explicitly listed modality.
 The force head regresses one 3D vector per climbing extremity, supervised by **physics** (an RNEA
 root-wrench residual over reconstructed motion) instead of labels — see `docs/forces.md`.
 
@@ -35,34 +36,35 @@ All commands run from the repo root.
 
 ```bash
 # Train (config = experiment yaml; resume: --resume auto | --resume path/to/last.pth)
-python scripts/train.py --config configs/old/climbing_videos_joint.yaml
-python scripts/train.py --config configs/old/climbing_videos_joint_temporal_center_v2.yaml
+python scripts/train.py --config configs/allmod_rope_t60_v3_gv_rollout.yaml
 # Two-GPU DDP (`data.frames_per_batch` is per GPU):
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
-  scripts/train.py --config configs/old/climbing_videos_joint.yaml
+  scripts/train.py --config configs/allmod_rope_t60_v3_gv_rollout.yaml
+# NOTE: every pre-v3 experiment yaml (and every run that produced) was retired to the trash on
+# 2026-08-30 — they predate the gravity-view motion target and are not directly comparable.
+# Stripped copies of the ones tests need live in `tests/fixtures/`.
 
-# Force training. Physics (RNEA) regime (a) needs the editable better-robot / better-human from
-# the sibling ../BetterRobot / ../BetterHuman checkouts (step-01 env wiring); the MHR archive
-# resolves via that checkout, or set $BETTERHUMAN_MODELS_DIR. See docs/forces.md.
-python scripts/train.py --config configs/old/climbing_videos_force_warmstart_t7hinge.yaml
-# Supervised kindyn forces (force-only build, six groups, no physics/extrinsics):
-python scripts/train.py --config configs/old/climbing_corpus_force_supervised.yaml
+# Force training (new era): the supervised kindyn force loss + Newton force consistency are part
+# of the all-modality configs above. The physics (RNEA) regime's code survives in
+# `contact/physics/` (needs the sibling ../BetterRobot / ../BetterHuman checkouts and the MHR
+# archive, or $BETTERHUMAN_MODELS_DIR — see docs/forces.md) but ships no current experiment yaml
+# since that retirement.
 
 # Evaluate on grouped val or the manually annotated corpus test split (31 scenes).
 # Reports P/R/F1/F2/IoU, per-extremity metrics and a threshold curve.
 python scripts/evaluate.py --checkpoint output/<run>/best.pth --config configs/<experiment>.yaml
 python scripts/evaluate.py --checkpoint output/<run>/last.pth \
-  --config configs/old/climbing_videos_joint.yaml --split test --threshold 0.3
+  --config configs/allmod_rope_t60_v3_gv_rollout.yaml --split test --threshold 0.3
 # Force runs add physics-consistency metrics (physics_residual, per-extremity force magnitudes
 # split by predicted contact, gate-violation rates, vertical-force-sum). Lacking a trained force
 # checkpoint, --warm-start builds the untrained force branch from the config's init_contact_checkpoint.
-python scripts/evaluate.py --config configs/old/climbing_videos_force_warmstart_t7hinge.yaml --warm-start --split test
+python scripts/evaluate.py --config configs/<force experiment>.yaml --warm-start --split test
 
 # Qualitative demo (GT vs predicted contacts; force arrows when the checkpoint has a force head)
 python scripts/demo.py --checkpoint output/<run>/best.pth --config configs/<experiment>.yaml --num_samples 10
 # Rendered corpus videos (contact disks + force arrows; shards over torchrun ranks)
 python scripts/render_climbing_video_contacts.py --checkpoint output/<run>/best.pth \
-  --config configs/old/climbing_videos_joint_temporal_center_v2.yaml --split test --overlay-labels
+  --config configs/allmod_rope_t60_v3_gv_rollout.yaml --split test --overlay-labels
 
 # Tests (fast CPU suite ~15s; add --runslow-style GPU tests via -m slow)
 python -m pytest tests/ -q -m "not slow"
@@ -86,11 +88,11 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
 
 | Path | Purpose |
 |---|---|
-| `sam_3d_body/` | Vendored SAM 3D Body fork. Upstream code untouched; our additions are the contact head/tokens, `models/modules/temporal.py`, `models/modules/frame_attention.py`, and hooks delimited by `# --- contact temporal hook ---` / efficiency-flag comments. |
+| `sam_3d_body/` | Vendored SAM 3D Body fork. Upstream code untouched; our additions are the contact head/tokens, `models/modules/temporal_rope.py` (pose token) + `models/modules/cross_modal_rope.py` (the all-modality block), and hooks delimited by `# --- <name> hook ---` / efficiency-flag comments. |
 | `contact/` | Our library: `config.py` (yaml + `base:` include + strict validation), `model.py` (build/freeze/eval-pin), `targets.py`, `losses.py`, `metrics.py`, `engine.py` (shared forward), `checkpoint.py` (schema v2), `tracking.py` (wandb+TB), `data/` (loaders, collate, splits), `physics/` (`adapter.py` MHR bridge + `loss.py` RNEA residual). |
 | `scripts/` | Thin CLIs: train, evaluate, demo, build_climbing_images, precompute_*, render_results_table. |
-| `configs/` | `base.yaml` (all defaults, commented) + new-era experiment overrides; `configs/datasets/*.yaml` = dataset paths/options. Pre-2026-08-27 experiment yamls are archived in `configs/old/` (self-contained, causal mask pinned; their runs live in `output/old/`), v1-era yamls in `legacy/configs/`. |
-| `tests/` | pytest suite (`-m slow` = GPU integration: temporal invariance, grad flow). |
+| `configs/` | `base.yaml` (all defaults, commented) + new-era experiment overrides; `configs/datasets/*.yaml` = dataset paths/options. All pre-v3 experiment yamls were retired to the trash 2026-08-30 (stripped test copies in `tests/fixtures/`), v1-era yamls in `legacy/configs/`. Only `allmod_rope_t60_v3_gv_rollout.yaml` remains, self-contained on `base.yaml`. |
+| `tests/` | pytest suite (`-m slow` = GPU integration: temporal/force/motion invariance, grad flow). Fixture configs under `tests/fixtures/` are stripped copies of the retired `configs/old/` experiments (the retired temporal sections removed) so they still validate. |
 | `viewer/` | Standalone FastAPI dataset inspector with frame/sequence video skeleton views and still-image contact meshes. |
 | `tools/` | Legacy `view_dataset.py` browser and `climbing_contact_stats.py` (source-tree stats, SMPL-X). |
 | `legacy/` | Superseded code kept for reference — see `legacy/README.md` for why each item is there and what functionality it still uniquely has. |
@@ -117,15 +119,15 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
    `vertex` → `[B, 6890|10475]` or body-22 joint logits. `pool_mode: per_token` applies one
    shared classifier independently to each token; ClimbingVideos uses four tokens → `[B,4]`.
    Output: `out["contact"]["<target>_logits"]`.
-4. **Temporal module** (`model.temporal`, optional) — zero-init-gated pre-LN attention blocks over
-   the frames of a clip, order-aware via sinusoidal encoding of real elapsed seconds
-   (`frame_pos_sec`), optional frame-level causal mask. Post-decoder only (the in-decoder
-   placements — between_layers, between_layers_cross, temporal conv, pre_decoder — were
-   controlled negatives and are retired). Batches are homogeneous-T flattened clips
-   (`[B_clips*T, ...]` + `seq_len`/`frame_pos_sec`/`frame_valid`); single images are T=1.
+4. **Temporal mixing** — ONE post-decoder block, `model.cross_modal_temporal` (item 8).
+   The per-modality sliding-window modules (`model.temporal`, `force_temporal`,
+   `motion_temporal`) and the per-frame `frame_attn` module are RETIRED (2026-08-29);
+   `sam_3d_body/models/modules/temporal.py` and `frame_attention.py` are gone. Batches are
+   homogeneous-T flattened clips (`[B_clips*T, ...]` + `seq_len`/`frame_pos_sec`/
+   `frame_valid`); single images are T=1 (the block then does within-frame mixing only).
 5. **Force head** (`model.force_head`, optional) — K force tokens → `head_force` (zero-init)
-   regressing `out["force"]["joint_forces"] [B,K,3]`, dimensionless (units of body weight); an
-   optional `model.force_temporal` block mirrors the contact temporal module (post_decoder only).
+   regressing `out["force"]["joint_forces"] [B,K,3]`, dimensionless (units of body weight);
+   its temporal window comes from listing `force` in `cross_modal_temporal`.
    Two mutually exclusive supervision signals:
    - **Physics** (`physics.enabled`, K=4 inheriting the extremity contact anchors, order
      `left_hand,right_hand,left_foot,right_foot`): no labels — `contact/physics/` supervises.
@@ -141,31 +143,48 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
    Full formulation, frames, and conventions: `docs/forces.md`.
 6. **Motion head** (`model.motion_head`, optional) — anchored motion tokens regressing
    standardized root-frame vel/acc per slot, `out["motion"]["joint_motion"] [B,K,6|12]`
-   (12 with `motion_supervision.angular`: + the root twist's angular vel/acc). The
-   `model.motion_temporal` module is post-decoder self-attention over the motion tokens
-   (mandatory in practice — a per-frame head cannot represent a derivative). Supervision:
+   (12 with `motion_supervision.angular`: + the root twist's angular vel/acc). A temporal
+   window is mandatory in practice (a per-frame head cannot represent a derivative), so a
+   motion-supervised config MUST list `motion` in `cross_modal_temporal`. Supervision:
    `motion_supervision` (kindyn twist targets, σ0.12 s label smoothing, pelvis-only for
    angular).
 7. **Pose temporal** (`model.pose_temporal`, optional; E2) — a deliberate exception to
-   the frozen-pose rule: the pose modality's per-modality temporal block — a zero-gated
-   temporal module on the pose token (index 0), run with the contact/force/motion temporal
-   blocks (after `cross_modal_temporal`); the FINAL MHR output is recomputed from the updated
-   token (interm preds and all other token blocks see the untouched one). Supervised by `pose_supervision` against
+   the frozen-pose rule: a zero-gated RoPE temporal module on the pose token (index 0) alone,
+   run AFTER `cross_modal_temporal`; the FINAL MHR output is recomputed from the updated
+   token (interm preds and all other token blocks see the untouched one). Redundant when
+   `cross_modal_temporal` already lists `pose`. Supervised by `pose_supervision` against
    kindyn-MHR pseudo-GT (`scripts/convert_kindyn_to_mhr.py` writes `mhr_1.npz` per scene —
    the kindyn SMPL-X trajectory refit as a world-frame MHR `q`, ~0.5 cm joint residual),
    compared in q space (125 local channels; the free-flyer root is never supervised).
-8. **Cross-modal temporal** (`model.cross_modal_temporal`, optional) — ONE zero-gated temporal
-   block (attend=joint) over the CONCATENATION of the chosen modality token blocks
-   (`modalities` ⊆ {pose, contact, force, motion}, ≥ 2, canonical sequence order), run
-   post-decoder BEFORE the per-modality temporal blocks: every participating token attends
-   every other across the clip's frames. Deliberately relaxes D1 among the participants;
-   listing `pose` writes the pose token (final MHR recomputed — needs `pose_supervision`).
-9. **Frame attention** (`model.frame_attn`, optional) — per-frame (NO temporal mixing)
-   zero-gated attention run AFTER every temporal block, one own-weights module per listed
-   modality (`sam_3d_body/models/modules/frame_attention.py`). Each module's keys/values
-   always span every enabled modality's post-temporal tokens of that frame (pose token
-   included, read-only unless `pose` is listed). All updates come from one consistent
-   snapshot, then apply — order-independent.
+   `type: rope` is the only value: the long-sequence
+   **RoPE temporal transformer** (`sam_3d_body/models/modules/temporal_rope.py`,
+   GVHMR-informed): pre-LN blocks at the native decoder dim (no bottleneck),
+   per-head RoPE on q/k with **time-valued positions** (`frame_pos_sec x
+   time_scale` — exact under the corpus's variable fps), zero-init gates
+   (identity at init), bidirectional only, and a seconds-based local window
+   (`max_rel_sec` = training clip span) so a T=60-trained model runs
+   **single-pass on whole scenes** without exposing untrained relative offsets.
+   Eval protocol: `data.sequence.eval_full_scenes` emits ONE clip per test
+   (scene, person) — the longest valid run, `eval_max_frames`-capped
+   (~0.06-0.1 GiB/frame no-grad). Experiment config: `configs/rope_t60.yaml`.
+8. **Cross-modal temporal** (`model.cross_modal_temporal`, optional) — THE post-decoder
+   mixing brick: ONE zero-gated **RoPE temporal transformer**
+   (`sam_3d_body/models/modules/cross_modal_rope.py`, sharing `_RopeBlock` with
+   `temporal_rope.py`) over the CONCATENATION of the chosen modality token blocks
+   (`modalities` ⊆ {pose, contact, force, motion}, ≥ 2, always reordered into the canonical
+   sequence order pose < contact < force < motion). Per clip the attention sequence is
+   `T` frames × `K` tokens, frame-major; the RoPE position of a token is its frame's real
+   elapsed seconds (`frame_pos_sec × time_scale`), IDENTICAL for every token of the frame —
+   so within-frame pairs attend un-rotated (this subsumes the retired `frame_attn`) and
+   across-frame pairs see only relative time. Token identity comes from a learned
+   `[K, dim]` slot embedding added to the LayerNormed input INSIDE each block's gated
+   attention branch (never to the residual stream), so the block is still an exact identity
+   at init. Frame-level masking: `max_rel_sec` seconds window + `frame_valid` (an invalid
+   frame is hidden from every other frame, its own stays visible). Deliberately relaxes D1
+   among the participants; listing `pose` writes the pose token (final MHR recomputed —
+   needs `pose_supervision`). Runs BEFORE `pose_temporal`.
+9. *(retired)* The per-frame `model.frame_attn` module — its within-frame cross-modal
+   attention is the `dt = 0` diagonal of item 8.
 10. **Pose/camera-head fine-tune** (`train.finetune_pose_head` / `train.finetune_camera_head`) —
    SPLIT-HEAD since 2026-08-27: the ORIGINAL heads stay frozen and keep producing every
    in-decoder intermediate prediction (whose per-layer keypoint-token refresh feeds back into
@@ -209,11 +228,11 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
 ### Invariants (do not break)
 
 - **Freeze filter is name-based**: only params whose dotted name contains `"contact"`, `"force"`,
-  `"motion"`, `"cross_modal"`, `"frame_attn"` **or** `"pose_temporal"` train (tokens, heads,
-  posemb/feat linears, `contact_temporal*`, `force_*`, `motion_*`, `cross_modal_temporal`,
-  `frame_attn.*`, `pose_temporal`). Any new trainable module must carry one of those in its
-  attribute path. The pose outputs move only via `pose_temporal`, the `pose` modality of the
-  cross-modal bricks, or the explicit `train.finetune_pose_head`/`finetune_camera_head`
+  `"motion"`, `"cross_modal"` **or** `"pose_temporal"` train (tokens, heads,
+  posemb/feat linears, `force_*`, `motion_*`, `cross_modal_temporal`,
+  `pose_temporal`). Any new trainable module must carry one of those in its
+  attribute path. The pose outputs move only via `pose_temporal`, the `pose` modality of
+  `cross_modal_temporal`, or the explicit `train.finetune_pose_head`/`finetune_camera_head`
   flags (which build trainable head COPIES `head_pose_ft_proj`/`head_camera_ft_proj` outside
   the name filter — train.py adds them to the saved-name set).
 - **Mask invariant**: inside the decoder the original tokens NEVER attend the appended blocks —
@@ -224,8 +243,8 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
   outputs have an exactly-zero Jacobian w.r.t. every force **and motion** param (D1); `mutual`
   deliberately opens full inter-attention among the appended blocks (D1 gone between them —
   incompatible with `train.freeze_contact`, and captured in the arch signature). The
-  POST-decoder bricks `cross_modal_temporal` and `frame_attn` relax D1 the same way **among
-  their listed modalities**; the frozen pose/MHR outputs remain isolated unless `pose` is a
+  POST-decoder block `cross_modal_temporal` relaxes D1 the same way **among its listed
+  modalities**; the frozen pose/MHR outputs remain isolated unless `pose` is a
   listed (written) modality.
 - **Frozen modules are eval-pinned** (`contact/model.py::pin_frozen_eval`): `model.train(True)`
   re-pins backbone/decoder/MHR+camera heads to eval (the backbone has DROP_PATH_RATE 0.1 — train
@@ -233,8 +252,10 @@ python -m viewer --port 8765                      # Contact Atlas dataset browse
   name list): a fully-trainable subtree follows the mode in full (incl. its param-less dropout),
   a fully-frozen subtree (e.g. a contact head frozen by `train.freeze_contact`) stays eval, a
   mixed container is descended into.
-- **MHR invariance**: `tests/test_temporal_invariance.py` (temporal) and
-  `tests/test_force_invariance.py` (force) prove pose/MHR + contact outputs stay within the frozen
+- **MHR invariance**: `tests/test_cross_modal_invariance.py` (the temporal block; also proves
+  the exactly-zero MHR Jacobian and the RoPE time-shift property end-to-end),
+  `tests/test_force_invariance.py` (force) and `tests/test_motion_invariance.py` (motion)
+  prove pose/MHR + contact outputs stay within the frozen
   model's CUDA noise floor while the new branch's outputs move. Run after any change to decoder
   hooks.
 - **Physics-loss gradient isolation (regime (a))**: the physics loss consumes the frozen model's
@@ -255,20 +276,21 @@ Key sections (see `configs/base.yaml` for full commented defaults):
 | Section | Controls |
 |---|---|
 | `model.contact_head` | anchor indices, global tokens, pooling (`concat`/`attention`/`per_token`), MLP, grid sampling |
-| `model.temporal` | enabled, placement, layers/heads, `attend: joint|per_token`, `causal` |
-| `model.force_head` / `model.force_temporal` | force branch: enabled, `frame: local_world_aligned|local|root`, `force_keypoint_indices` (null = inherit contact anchors; explicit list enables force-only builds), MLP; force temporal (post_decoder only) |
+| `model.force_head` | force branch: enabled, `frame: local_world_aligned|local|root`, `force_keypoint_indices` (null = inherit contact anchors; explicit list enables force-only builds), MLP |
 | `physics` | RNEA loss: enabled, MHR `model_path`/`lod`, `gravity`, `min_frames`, `smoothing_kernel`, per-term `loss.*` weights (all dimensionless) |
 | `force_supervision` | supervised kindyn GT-force loss (exclusive with `physics`): `target_frame` (center\|all rows), `gt_frame` (root\|world), `units` (bw\|newtons), `confidence` (weight rows by kindyn force_confidence), Huber `force`/`huber_delta_bw`, `outlier_bw` cut, `noncontact` L1 |
-| `model.motion_head` / `model.motion_temporal` | motion tokens: explicit anchors + post-decoder temporal self-attention; `anchored: false` = pure learned queries (no in-decoder keypoint-anchored update; the index list only names/counts slots) |
-| `model.cross_modal_temporal` | ONE temporal block over the chosen modality blocks (`modalities` ≥ 2 of pose/contact/force/motion) — cross-modality mixing across frames |
-| `model.frame_attn` | per-frame attention after the temporal blocks: per-modality own-weights blocks whose keys/values span every modality's tokens of the frame |
+| `model.motion_head` | motion tokens: explicit anchors; `anchored: false` = pure learned queries (no in-decoder keypoint-anchored update; the index list only names/counts slots). Needs `motion` listed in `cross_modal_temporal` to see across frames |
+| `model.cross_modal_temporal` | THE post-decoder mixing brick: ONE RoPE temporal transformer over the chosen modality blocks (`modalities` ≥ 2 of pose/contact/force/motion), `num_layers`/`num_heads`/`mlp_ratio`/`dropout`/`time_scale`/`max_rel_sec`. Cross-modality AND cross-frame; within-frame mixing is its `dt = 0` diagonal |
 | `model.extra_token_attention` | decoder mask among the appended blocks: `mutual` (contact/force/motion inter-attend, default since 2026-08-27) \| `causal` (block-triangular, legacy) |
 | `motion_supervision` | kindyn twist vel/acc loss: `joint_names`, `root_convention`, `angular` (12-dim root target), `target_smooth_sec`, standardize `[K][2|4][3]` |
-| `motion_consistency` | pose→motion consistency + absolute anchors: the PREDICTED pose lifted to world (extrinsics) and differentiated (BVR body twist) — pelvis vel/acc Huber vs kindyn GT (`loss.gt`) and vs the DETACHED motion head (`loss.head`), both grad → pose path only; plus `loss.pos`/`loss.rot` (absolute world root pose vs kindyn + `hip_offset_root`), `loss.cam_rail`/`loss.rot_rail` (trust regions vs the frozen `pred_cam_t`/`global_rot`) closing the constant-camera/-orientation null spaces, and `angular: false` restricting the twist comparison to the linear rows; requires `motion_supervision` + a trainable pose path + T ≥ 3 |
-| `model.pose_temporal` / `pose_supervision` | E2 pose branch: zero-gated pose-token temporal module + kindyn-MHR pseudo-GT q-space Huber (`mhr_1.npz` via `scripts/convert_kindyn_to_mhr.py`); `loss.shape_rail`/`scale_rail` = L2 pinning the head's 45 blendshape / 28 bone-scale outputs to the FROZEN readout's stashed `shape_frozen`/`scale_frozen` (nothing else supervises them — the pose/keypoint losses are girth-blind, and the s1 probe showed the ft head warping them to \|x\|~5) |
+| `motion_consistency` | pose→motion consistency + absolute anchors: the PREDICTED pose lifted to world (extrinsics) and differentiated (BVR body twist) — pelvis vel/acc Huber vs kindyn GT (`loss.gt`) and vs the DETACHED motion head (`loss.head`), both grad → pose path only; plus `loss.pos`/`loss.rot` (absolute world root pose vs kindyn + `hip_offset_root`), `loss.cam_rail`/`loss.rot_rail` (trust regions vs the frozen `pred_cam_t`/`global_rot`) closing the constant-camera/-orientation null spaces, and `angular: false` restricting the twist comparison to the linear rows; `detach_head: false` un-detaches the head term (bidirectional); requires `motion_supervision` + a trainable pose path + T ≥ 3 |
+| `contact_consistency` | predicted-contact-gated zero-velocity: world-frame velocity of the six extremity MHR70 keypoints ([62,41,15,18,17,20], kindyn_6 order) from the predicted pose + extrinsics, weighted by the predicted contact prob (`detach_gate`, default true → grad reaches the pose path only); requires the kindyn_6 joint target + a trainable pose path + T ≥ 3 |
+| `force_consistency` | linear Newton residual in bw units (mass cancels): `a_root_world/g − gravity_world − R_root→world·Σf_pred` Huber, acceleration from the smoothed predicted world root (motion_consistency lifting), rotation = GT kindyn `motion_rot`; grad → pose + force head; `ramp.{start_epoch,epochs}` warm-up (unstable early); requires force_supervision (bw/root) + motion_supervision + T ≥ 3 |
+| `model.pose_temporal` / `pose_supervision` | E2 pose branch: zero-gated pose-token RoPE temporal module (`type: rope` is the only value; `time_scale`/`max_rel_sec`) + kindyn-MHR pseudo-GT q-space Huber (`mhr_1.npz` via `scripts/convert_kindyn_to_mhr.py`); `loss.shape` = L2 on the 45 blendshapes vs the mhr_1 v2 per-person GT `identity` (batch `pose_identity`); `loss.shape_rail`/`scale_rail` = L2 pinning the head's 45 blendshape / 28 bone-scale outputs to the FROZEN readout's stashed `shape_frozen`/`scale_frozen` (nothing else supervises them — the pose/keypoint losses are girth-blind, and the s1 probe showed the ft head warping them to \|x\|~5) |
 | `train.freeze_contact` | regime (a): freeze contact, train force only (requires `model.init_contact_checkpoint`) |
 | `train.finetune_pose_head` / `finetune_camera_head` | split-head fine-tune: trainable COPY of `head_pose.proj`/`head_camera.proj` applied to the FINAL readout only (in-decoder interm preds keep the frozen originals) at `lr × pose_head_lr_scale`; pose needs `pose_supervision` or `keypoint_supervision`, camera needs `keypoint_supervision` (kp2d) or `motion_consistency` |
 | `keypoint_supervision` | SAM3D-style stabilizers from kindyn `joints_world` (13 joints ↔ MHR70 by name): `kp2d` crop-normalized reprojection (constrains the camera), `kp3d` hips-relative camera-frame, `kp3d_abs` absolute metric anchor; `kp_vel`/`kp_acc` WORLD-frame keypoint velocity/acceleration (central stencil over the clip's real elapsed seconds, predictions lifted with the GT extrinsics — loss-only use; camera-frame differences would bury body motion under camera egomotion) vs finite-differenced `joints_world`, GT-acc outlier rows dropped; corpus loader flag `load_keypoints` |
+| `pose_smoothness` | jerk + snap of the PREDICTED motion minimised toward ZERO (no target — a smoothness prior; acceleration is untouched): 5-point central stencils on the world-lifted MHR70 keypoints (`joint_jerk`/`joint_snap`) and the predicted world pelvis (`root_pos_*`), plus BVR body angular jerk/snap of the world-from-root rotation (`root_rot_*`, successive differences of the staggered `so3_log` increments). Per-term `huber_delta_*` = the GT's own |coord| p75 at the clip sampler's dt; grad → pose path only; requires a trainable pose path + climbing_corpus + T ≥ 5 |
 | `contact.topology` | `smpl` / `smplx` (`mhr` → NotImplementedError) |
 | `contact.targets.vertex/joint` | enabled, weight, loss params, `joint_set`, subset masking, `derive_from_vertex`, confidence weights |
 | `data.datasets` | list of `{name, config, split}`; `frames_per_batch` (memory-flat batch budget), `sequence.{frames_per_clip,frame_stride,jitter}`; `embedding_cache` (corpus loaders emit precomputed bf16 backbone embeddings from `features/embedding` — built by `scripts/precompute_embeddings.py` — and the model skips the frozen backbone; missing files hard-error; frame JPEGs are not pixel-decoded — `img` is a zero crop, masks still decode) |
@@ -288,8 +310,8 @@ Key sections (see `configs/base.yaml` for full commented defaults):
 
 ClimbingVideos corpus label semantics (important):
 - The corpus is read **directly** from `/data3/.../better/data/ClimbingVideos`
-  (`scenes/scenes.db` curated split: 864 train / 108 test scenes, 31 test scenes annotated so
-  far; pre-extracted `frames/` JPEG tree; `features/` contacts, sam3 masks/bboxes, geometry,
+  (`scenes/scenes.db` curated split: 864 train / 108 test scenes, 61 test scenes annotated as
+  of 2026-08-28; pre-extracted `frames/` JPEG tree; `features/` contacts, sam3 masks/bboxes, geometry,
   kindyn). The exported ClimbingVideos_v1 dataset is redundant and its loader is legacy.
   **2026-08-27 corpus regeneration**: better contact/force/pose GT under a new archive schema
   (`contact_label_schema` 2; kindyn stores forces on 35 named contact frames, world-frame
@@ -312,8 +334,14 @@ ClimbingVideos corpus label semantics (important):
   labels (D8). The **supervised** force loss instead gates on kindyn's own contact mask
   (= contacts_2, the mask the forces were solved under).
 - Video scenes also carry **per-frame camera extrinsics** (`cam_from_world`, OpenCV, metric) and
-  `gravity_world` = exactly `[0, 1, 0]` (kindyn convention, world y down — not v1's camera-0
-  derivation) for the physics loss (still images carry `cam_valid=False`). See `docs/forces.md`.
+  `gravity_world` — since the 2026-08-27 regeneration a **per-scene FITTED unit down vector** read
+  from `kindyn_1.npz` (one `(3,)` vector per scene), NOT the `[0, 1, 0]` constant and NOT v1's
+  camera-0 derivation. Measured over the 864 train scenes it tilts from +y by median 3.2°, p90
+  27.5°, max 61.4° (519 scenes > 1°, 163 > 15°), so anything treating world y as "up" is wrong for
+  hundreds of scenes. The loader emits the fitted vector whenever `load_forces` **or** `load_motion`
+  is on (the `[0, 1, 0]` constant survives only as the fallback for scenes loaded with neither);
+  consumers are the physics/force-consistency losses, the motion diagnostics' vertical projection,
+  and the `gravity_view` motion frame. Still images carry `cam_valid=False`. See `docs/forces.md`.
 - Train/val split is grouped by **source video** (chunks of one video never straddle splits).
 - The four-output target order is `left_hand, right_hand, left_foot, right_foot`; each foot is
   `ankle OR foot`. A known positive wins under partial annotation, while a known negative needs

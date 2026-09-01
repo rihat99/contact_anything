@@ -1,0 +1,212 @@
+# TEST FIXTURE — a verbatim copy of configs/rope_t60_mhrsup_temponly_jerksnap.yaml, which was retired to the
+# trash on 2026-08-30 with every other pre-v3 experiment yaml. Kept here only because
+# tests pin its resolved values; the archived original is unchanged.
+# rope_t60_mhrsup_temponly + the jerk/snap pose-smoothness penalty. The ONLY
+# difference from configs/rope_t60_mhrsup_temponly.yaml is the `pose_smoothness`
+# section (and the run name / TB tags): an additive A/B against
+# output/rope_t60_mhrsup_temponly_20260829_182549, same 40-epoch LR schedule so
+# the arms are comparable epoch for epoch.
+#
+# The new signal PENALISES the 3rd and 4th time derivatives of the model's own
+# motion — no target, pure minimisation. kp_vel/kp_acc (which MATCH velocity and
+# acceleration to the GT) stay exactly as they are; acceleration itself is never
+# penalised, since real climbing has plenty of it. What jerk and snap pick up at
+# a per-frame reconstruction's scale is mostly frame-to-frame noise, which is
+# what the temporal block should be removing.
+base: configs/base.yaml
+
+model:
+  init_contact_checkpoint: null       # pure pose build: nothing to warm-start
+  pose_temporal:
+    enabled: true
+    type: rope
+    num_layers: 4
+    num_heads: 16                     # head_dim 64
+    mlp_ratio: 2.0
+    dropout: 0.1
+    time_scale: 25.0
+    max_rel_sec: 2.5
+
+contact:
+  targets:
+    vertex: {enabled: false}
+    joint: {enabled: false}           # no contact branch at all
+
+data:
+  num_workers: 8                      # two concurrent runs on this host (host-RAM OOM lesson)
+  datasets:
+    - {name: climbing_corpus, config: configs/datasets/climbing_corpus_pose.yaml}
+  eval_split: test
+  embedding_cache: true               # bf16 backbone cache; frame JPEGs never decoded
+  frames_per_batch: 240               # per GPU -> 4 clips x T=60 (rope_t60 measured 15.5 GiB;
+                                      # the vert/bones/scale terms add little — smoke-check)
+  sequence:
+    frames_per_clip: 60
+    frame_stride: auto
+    jitter: true
+    target_frame: all
+    eval_full_scenes: true
+    eval_max_frames: 360
+
+pose_supervision:
+  enabled: true
+  loss:
+    pose: 0.5                         # raised from 0.1 (2026-08-29 rebalance): at 0.1 the
+                                      # monitored objective was 0.5% of the gradient
+                                      # direction — the RoPE blocks were steered by
+                                      # everything except pose_mae
+    acc: 0.0                          # smoothness lives in kp_vel/kp_acc
+    huber_delta: 0.1                  # radians
+    shape: 0.05                       # 45 blendshapes vs mhr_1 GT identity, per-channel mean
+    bones: 1.0                        # lbs slots 130..135 vs per-person-median GT
+    scale: 1.0                        # 68 per-person scale slots vs subspace-projected GT
+    huber_delta_bones: 0.05
+    shape_rail: 0.0                   # replaced by the GT terms (validator rejects both)
+    scale_rail: 0.0
+  fit_err_confidence: false
+  fit_err_ref_cm: 2.0
+
+keypoint_supervision:
+  enabled: true
+  # Weighted MEAN over the 70 MHR70 keypoints; weights are 13x the run-B values
+  # so each term keeps its previous magnitude (see allmod_rope_t60_mhrsup).
+  loss:
+    kp2d: 13.0
+    kp3d: 6.5
+    kp3d_abs: 0.8                     # rebalanced 2026-08-29 (was 3.25): the abs anchors
+                                      # held 77% of the gradient energy, ~all into the
+                                      # camera head copy; 0.8 ~= parity with kp3d/vert
+    kp_vel: 3.9                       # velocity matching (world frame, real seconds)
+    kp_acc: 0.026                     # acceleration matching (mild: 1/dt^2 Jacobian)
+    vert: 6.5                         # root-relative vertex subset — body shape
+    vert_abs: 0.8                     # absolute vertex subset — body size + depth
+                                      # (rebalanced 2026-08-29, was 3.25 — see kp3d_abs)
+    cam_rail: 10.0
+    rot_rail: 10.0
+  joint_weights:
+    fingers: 0.1
+    face: 1.0
+  fit_err_confidence: false
+  fit_err_ref_cm: 2.0
+
+# THE experiment. Weights from the 2026-08-29 gradient probe: fresh init, 8 real
+# T=60 corpus batches, every term backwarded ALONE and its gradient over the
+# 33.6M trainable pose_temporal params recorded (a 19x19 Gram matrix, so any
+# weight vector's exact energy is w^T G w). At unit weight the six terms' norms
+# were 319 / 5.3e4 / 371 / 6.3e4 / 131 / 2.2e4; they are equalised against each
+# other and the group scaled so it holds 19.8% of the summed per-term gradient
+# energy (target 15-25%) — half of kp_vel + kp_acc's 44.8% and below
+# pose/pose's 30.9%, i.e. nowhere near the >90% domination this repo has been
+# burned by (motion_consistency.gt).
+# CAVEAT for the reviewer: the six terms are mutually correlated (they all push
+# "smoother trajectory"), so in the CORRELATED decomposition of ||g_total||^2
+# they account for 38%, not 20%; their cosine with the rest of the objective is
+# +0.59, i.e. they reinforce it rather than fight it. Halving all six (scale
+# 0.478) would put the correlated share at 20% instead.
+# Deltas are the GT's own weighted |coordinate| p75 over 40 train scenes,
+# measured at the clip sampler's own dt (auto stride -> 24-30 Hz).
+pose_smoothness:
+  enabled: true
+  loss:
+    joint_jerk: 5.0e-4          # world-lifted MHR70 keypoints (m/s^3)
+    joint_snap: 3.0e-6          # ... (m/s^4)
+    root_pos_jerk: 4.3e-4       # predicted world pelvis position (m/s^3)
+    root_pos_snap: 2.6e-6       # ... (m/s^4)
+    root_rot_jerk: 1.2e-3       # BVR body angular jerk (rad/s^3)
+    root_rot_snap: 7.2e-6       # ... (rad/s^4)
+    huber_delta_joint_jerk: 62.0       # m/s^3   GT |coord| p75 (24-30 Hz clips)
+    huber_delta_joint_snap: 4000.0     # m/s^4
+    huber_delta_root_pos_jerk: 40.0    # m/s^3
+    huber_delta_root_pos_snap: 2700.0  # m/s^4
+    huber_delta_root_rot_jerk: 320.0   # rad/s^3
+    huber_delta_root_rot_snap: 39000.0 # rad/s^4
+  joint_weights:
+    fingers: 0.1
+    face: 1.0
+
+loss:
+  grad_clip: 300.0                    # was 1.0, which bound on 100% of steps (raw med 75,
+                                      # p99 228) — degenerated into per-step normalization
+
+train:
+  compile_backbone: false             # backbone never runs (embedding cache)
+  finetune_pose_head: false           # HEADS FROZEN — this arm trains ONLY the RoPE
+  finetune_camera_head: false         # pose_temporal block (36.2M -> 33.6M trainable)
+
+optim:
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  epochs: 40
+  warmup_epochs: 1
+  lr_min: 1.0e-6
+
+logging:
+  tensorboard_metrics:
+  - train/loss
+  - train/lr
+  - train/grad_norm
+  - train/grad_norm_raw
+  - train/frames_per_sec
+  - train/epoch_time_sec
+  - train/skipped_batches
+  - train/pose/loss
+  - train/pose/mae
+  - train/pose/shape
+  - train/pose/bones
+  - train/pose/scale
+  - train/pose/bones_mae
+  - train/pose/scale_mae
+  - train/keypoint/loss
+  - train/keypoint/kp2d_err_crop
+  - train/keypoint/kp3d_err_m
+  - train/keypoint/depth_err_m
+  - train/keypoint/kp_vel_err_ms
+  - train/keypoint/kp_acc_err_ms2
+  - train/keypoint/vert
+  - train/keypoint/vert_abs
+  - train/keypoint/vert_err_m
+  - train/keypoint/vert_size_ratio
+  - train/keypoint/cam_dev_m
+  - train/keypoint/rot_dev_deg
+  - train/pose_smooth/loss
+  - train/pose_smooth/joint_jerk
+  - train/pose_smooth/joint_snap
+  - train/pose_smooth/root_pos_jerk
+  - train/pose_smooth/root_pos_snap
+  - train/pose_smooth/root_rot_jerk
+  - train/pose_smooth/root_rot_snap
+  - train/pose_smooth/jerk_rms
+  - train/pose_smooth/snap_rms
+  - train/pose_smooth/gt_jerk_rms
+  - train/pose_smooth/gt_snap_rms
+  - train/pose_smooth/root_pos_jerk_rms
+  - train/pose_smooth/root_rot_jerk_rms
+  - test/loss
+  - test/pose/mae
+  - test/pose/acc_rms_pred
+  - test/pose/acc_rms_gt
+  - test/pose/acc_ratio
+  - test/keypoint/kp2d_err_crop
+  - test/keypoint/kp3d_err_m
+  - test/keypoint/depth_err_m
+  - test/keypoint/kp_vel_err_ms
+  - test/keypoint/kp_acc_err_ms2
+  - test/keypoint/vert_err_m
+  - test/keypoint/vert_size_ratio
+  - test/keypoint/cam_dev_m
+  - test/keypoint/rot_dev_deg
+  - test/pose_smooth/jerk_rms
+  - test/pose_smooth/snap_rms
+  - test/pose_smooth/gt_jerk_rms
+  - test/pose_smooth/gt_snap_rms
+  - test/pose_smooth/root_pos_jerk_rms
+  - test/pose_smooth/root_pos_snap_rms
+  - test/pose_smooth/root_rot_jerk_rms
+  - test/pose_smooth/root_rot_snap_rms
+
+output:
+  exp_name: rope_t60_mhrsup_temponly_jerksnap
+  monitor: test/pose_mae              # minimised; kept comparable with rope_t60 and with the
+                                      # no-penalty arm. Honest read: test/keypoint/{kp3d_err_m,
+                                      # depth_err_m, vert_err_m, vert_size_ratio} plus
+                                      # test/pose_smooth/{jerk,snap}_rms vs their gt_* twins

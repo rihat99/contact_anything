@@ -180,6 +180,39 @@ def test_resume_diff_normalizes_historical_physics_configs():
     assert any("physics" in d for d in tm._resume_config_diffs(changed, current))
 
 
+def test_resume_diff_ignores_retired_sections_and_dormant_modules():
+    """The reverse direction of the normalization: a saved config carrying keys
+    the CURRENT schema no longer defines (the retired sliding-window sections)
+    must not block a resume, and neither must a disabled module whose dormant
+    defaults have since changed."""
+    import copy
+
+    tm = _train_module()
+    current = _resume_base()
+    current["model"] = {"cross_modal_temporal": {
+        "enabled": False, "modalities": ["contact", "force"], "num_layers": 4,
+        "num_heads": 16, "mlp_ratio": 2.0, "dropout": 0.0, "time_scale": 25.0,
+        "max_rel_sec": 2.5}}
+
+    saved = copy.deepcopy(current)
+    saved["model"]["temporal"] = {"enabled": True, "attend": "joint",
+                                  "bottleneck_dim": 256, "position_scale": 30.0}
+    saved["model"]["frame_attn"] = {"enabled": True, "modalities": ["contact"]}
+    saved["model"]["cross_modal_temporal"] = {
+        "enabled": False, "modalities": ["contact", "force"], "num_layers": 1,
+        "num_heads": 4, "mlp_ratio": 2.0, "causal": False, "dropout": 0.0,
+        "position_scale": 1.0}
+    assert tm._resume_config_diffs(saved, current) == []
+
+    # An ENABLED module whose hyperparameters differ must still flag.
+    changed = copy.deepcopy(current)
+    changed["model"]["cross_modal_temporal"]["enabled"] = True
+    enabled_saved = copy.deepcopy(changed)
+    enabled_saved["model"]["cross_modal_temporal"]["num_layers"] = 2
+    assert any("model" in d for d in
+               tm._resume_config_diffs(enabled_saved, changed))
+
+
 def test_ensure_resume_identity_shared_by_both_resume_paths():
     # The helper the explicit --resume PATH branch now calls (Trainer.__init__)
     # and the auto path already called: silent on identical, RuntimeError on diff.

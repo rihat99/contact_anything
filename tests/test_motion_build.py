@@ -1,7 +1,7 @@
 """Motion tokens v2: config matrix, token mask, head sizing, model-cfg patching.
 
 Fast CPU coverage for the motion branch — the config accept/reject matrix
-(motion-only builds are legal; motion_temporal needs the head; the standardize
+(motion-only builds are legal; the cross-modal block gives the temporal window; the standardize
 table must match the anchor list; native-rate targets forbid a strided clip), the
 three-block token attention mask, ``MotionHead`` sizing/zero-init, the
 ``_patch_model_cfg`` wiring, and stability of the checkpoint arch signature (the
@@ -25,8 +25,8 @@ from sam_3d_body.models.meta_arch.sam3d_body import SAM3DBody
 
 REPO = Path(__file__).resolve().parents[1]
 _MOTION_CFG = REPO / "tests" / "fixtures" / "motion_seven_tokens.yaml"
-_PELVIS_CFG = REPO / "configs" / "old" / "climbing_corpus_motion_pelvis_t7.yaml"
-_T7HINGE_CFG = REPO / "configs" / "old" / "climbing_videos_force_warmstart_t7hinge.yaml"
+_PELVIS_CFG = REPO / "tests" / "fixtures" / "motion_pelvis_t7.yaml"
+_T7HINGE_CFG = REPO / "tests" / "fixtures" / "force_warmstart_t7hinge.yaml"
 
 #: Seven motion anchors: the six kindyn force anchors + MHR70 9 (left hip) for pelvis.
 _SEVEN_ANCHORS = [62, 41, 15, 18, 17, 20, 9]
@@ -47,7 +47,7 @@ model:
   motion_head:
     enabled: true
     motion_keypoint_indices: [62, 41, 15, 18, 17, 20, 9]
-  motion_temporal: {enabled: true}
+  cross_modal_temporal: {enabled: true, modalities: [pose, motion]}
 contact:
   targets:
     vertex: {enabled: false}
@@ -61,7 +61,7 @@ def test_motion_only_build_accepted(tmp_path):
     cfg = load_config(_write(tmp_path, _MOTION_ONLY))
     assert cfg["model"]["motion_head"]["enabled"] is True
     assert cfg["model"]["motion_head"]["motion_keypoint_indices"] == _SEVEN_ANCHORS
-    assert cfg["model"]["motion_temporal"]["enabled"] is True
+    assert cfg["model"]["cross_modal_temporal"]["enabled"] is True
     assert cfg["contact"]["targets"]["vertex"]["enabled"] is False
     assert cfg["contact"]["targets"]["joint"]["enabled"] is False
 
@@ -99,7 +99,9 @@ def test_shipped_motion_experiment_validates():
     assert cfg["motion_supervision"]["enabled"] is True
     assert cfg["motion_supervision"]["target_frame"] == "all"
     assert cfg["data"]["sequence"] == {
-        "frames_per_clip": 7, "frame_stride": 1, "jitter": True, "target_frame": "all"}
+        "frames_per_clip": 7, "frame_stride": 1, "jitter": True,
+        "target_frame": "all", "eval_full_scenes": False,
+        "eval_max_frames": None}
     assert len(cfg["motion_supervision"]["standardize"]["mean"]) == len(_SEVEN_ANCHORS)
     # Monitored on the quantity the pre-registered v1 bars use (pelvis, not the
     # 7-joint mean, and not val/loss — ~31% of val loss entries are outlier rows
@@ -118,14 +120,14 @@ contact:
 """))
 
 
-def test_motion_temporal_requires_motion_head_enabled(tmp_path):
+def test_cross_modal_temporal_requires_the_motion_branch(tmp_path):
     with pytest.raises(
-        ValueError, match="motion_temporal.enabled requires model.motion_head.enabled"
+        ValueError, match=r"model.cross_modal_temporal.modalities \['motion'\] have no"
     ):
         load_config(_write(tmp_path, """
 base: configs/base.yaml
 model:
-  motion_temporal: {enabled: true}
+  cross_modal_temporal: {enabled: true, modalities: [pose, motion]}
 """))
 
 
@@ -145,15 +147,15 @@ contact:
 """))
 
 
-def test_motion_temporal_bad_divisibility_rejected(tmp_path):
+def test_cross_modal_temporal_bad_num_layers_rejected(tmp_path):
     with pytest.raises(
-        ValueError, match="model.motion_temporal.bottleneck_dim must be divisible"
+        ValueError, match="model.cross_modal_temporal.num_layers must be positive"
     ):
         load_config(_write(
             tmp_path,
             _MOTION_ONLY.replace(
-                "motion_temporal: {enabled: true}",
-                "motion_temporal: {enabled: true, bottleneck_dim: 256, num_heads: 7}"),
+                "modalities: [pose, motion]}",
+                "modalities: [pose, motion], num_layers: 0}"),
         ))
 
 
@@ -250,7 +252,7 @@ model:
 def test_anchor_count_must_match_the_joint_name_subset(tmp_path):
     with pytest.raises(ValueError, match="requires exactly 1 .*pelvis"):
         load_config(_write(tmp_path, """
-base: configs/old/climbing_corpus_motion_pelvis_t7.yaml
+base: tests/fixtures/motion_pelvis_t7.yaml
 model:
   motion_head:
     motion_keypoint_indices: [9, 62]
@@ -263,7 +265,7 @@ model:
 def test_bad_joint_names_rejected(tmp_path, names):
     with pytest.raises(ValueError, match="joint_names must be null"):
         load_config(_write(tmp_path, f"""
-base: configs/old/climbing_corpus_motion_pelvis_t7.yaml
+base: tests/fixtures/motion_pelvis_t7.yaml
 motion_supervision:
   joint_names: {names}
 """))
@@ -274,7 +276,7 @@ def test_limb_slots_with_label_smoothing_rejected(tmp_path):
     # expressed in a SMOOTHED frame. Must fail loudly, not ship silently.
     with pytest.raises(ValueError, match="pelvis slot only"):
         load_config(_write(tmp_path, """
-base: configs/old/climbing_corpus_motion_pelvis_t7.yaml
+base: tests/fixtures/motion_pelvis_t7.yaml
 model:
   motion_head:
     motion_keypoint_indices: [9, 62]
@@ -297,7 +299,7 @@ def test_auto_stride_rejected_without_motion_supervision(tmp_path):
     # evaluate.py / demo.py / the renderers read frame_stride as a plain int.
     with pytest.raises(ValueError, match="frame_stride: auto requires"):
         load_config(_write(tmp_path, """
-base: configs/old/climbing_videos_joint.yaml
+base: tests/fixtures/climbing_videos_joint.yaml
 data:
   sequence: {frames_per_clip: 7, frame_stride: auto, jitter: true, target_frame: center}
 """))
@@ -306,7 +308,7 @@ data:
 def test_bad_root_convention_rejected(tmp_path):
     with pytest.raises(ValueError, match="root_convention must be one of"):
         load_config(_write(tmp_path, """
-base: configs/old/climbing_corpus_motion_pelvis_t7.yaml
+base: tests/fixtures/motion_pelvis_t7.yaml
 motion_supervision:
   root_convention: world
 """))
@@ -325,7 +327,8 @@ def test_shipped_pelvis_experiment_validates():
     # `auto` stride = fixed PHYSICAL clip span at every corpus frame rate.
     assert cfg["data"]["sequence"] == {
         "frames_per_clip": 7, "frame_stride": "auto", "jitter": True,
-        "target_frame": "all"}
+        "target_frame": "all", "eval_full_scenes": False,
+        "eval_max_frames": None}
     assert cfg["output"]["monitor"] == "test/motion_acc_r3d_pelvis"
     assert cfg["optim"]["epochs"] == 10
 
@@ -349,21 +352,25 @@ def test_motion_defaults_load():
         "mlp_channel_div_factor": 4,
         "dropout": 0.0,
     }
-    assert cfg["model"]["motion_temporal"] == {
+    assert cfg["model"]["cross_modal_temporal"] == {
         "enabled": False,
-        "bottleneck_dim": 256,
-        "num_layers": 1,
-        "num_heads": 4,
+        "type": "rope",
+        "modalities": ["contact", "force"],
+        "num_layers": 4,
+        "num_heads": 16,
         "mlp_ratio": 2.0,
-        "attend": "per_token",
-        "causal": False,
         "dropout": 0.0,
-        "position_scale": 1.0,
+        "time_scale": 25.0,
+        "max_rel_sec": 2.5,
+        "bottleneck_dim": 256,
+        "position_scale": 25.0,
+        "causal": False,
     }
     assert cfg["motion_supervision"] == {
         "enabled": False,
         "target_frame": "all",
         "joint_names": None,
+        "root_source": "kindyn",
         "root_convention": "twist",
         "angular": False,
         "target_smooth_sec": 0.12,
@@ -592,7 +599,7 @@ def test_patch_model_cfg_motion_only(tmp_path):
     assert model_cfg.MODEL.DECODER.DO_FORCE_TOKENS is False
     assert model_cfg.MODEL.DECODER.DO_MOTION_TOKENS is True
     assert model_cfg.MODEL.MOTION_HEAD.KEYPOINT_INDICES == _SEVEN_ANCHORS
-    assert model_cfg.MODEL.MOTION_TEMPORAL.ENABLED is True
+    assert model_cfg.MODEL.CROSS_MODAL_TEMPORAL.ENABLED is True
     assert len(model_cfg.MODEL.CONTACT_HEAD.TARGETS) == 0
 
 
@@ -615,14 +622,14 @@ def test_patch_model_cfg_motion_disabled_is_still_self_describing():
     assert model_cfg.MODEL.DECODER.DO_MOTION_TOKENS is False
     assert model_cfg.MODEL.MOTION_HEAD.KEYPOINT_INDICES == _SEVEN_ANCHORS
     assert model_cfg.MODEL.MOTION_HEAD.ANCHORED is True
-    assert model_cfg.MODEL.MOTION_TEMPORAL.ENABLED is False
+    assert model_cfg.MODEL.CROSS_MODAL_TEMPORAL.ENABLED is False
 
 
 def test_motion_params_pass_the_trainable_filter():
     from contact.model import _trainable_name_filter
 
     for name in ("motion_embedding.weight", "head_motion.proj.layers.0.0.weight",
-                 "motion_temporal.blocks.0.gamma_attn", "motion_feat_linear.bias"):
+                 "cross_modal_temporal.blocks.0.gamma_attn", "motion_feat_linear.bias"):
         assert _trainable_name_filter(name), name
     assert not _trainable_name_filter("backbone.blocks.0.attn.qkv.weight")
 
@@ -634,10 +641,10 @@ def test_arch_signature_omits_motion_keys_when_disabled():
     # keys, and the comparison in `_check_schema` is an exact dict equality.
     sig = ckpt_io._arch_signature(load_config(_T7HINGE_CFG))
     assert "motion" not in sig
-    assert "motion_temporal" not in sig
+    assert "cross_modal_temporal" not in sig
 
 
-def test_arch_signature_carries_motion_keys_when_enabled():
+def test_arch_signature_carries_motion_keys_when_enabled(tmp_path):
     sig = ckpt_io._arch_signature(load_config(_MOTION_CFG))
     assert sig["motion"] == {
         "enabled": True,
@@ -646,10 +653,23 @@ def test_arch_signature_carries_motion_keys_when_enabled():
         "mlp_channel_div_factor": 4,
         "dropout": 0.0,
     }
-    assert sig["motion_temporal"]["enabled"] is True
-    assert sig["motion_temporal"]["attend"] == "joint"
-    assert sig["motion_temporal"]["num_layers"] == 2
-    assert sig["motion_temporal"]["position_scale"] == pytest.approx(30.0)
+    # The per-frame fixture carries no temporal block; adding one enters the
+    # signature (its modality list sizes the learned slot embedding).
+    with_block = load_config(_write(tmp_path, f"""
+base: {_MOTION_CFG}
+model:
+  cross_modal_temporal: {{enabled: true, modalities: [pose, motion],
+                         num_layers: 2, num_heads: 16}}
+"""))
+    assert ckpt_io._arch_signature(with_block)["cross_modal_temporal"] == {
+        "enabled": True,
+        "type": "rope",
+        "modalities": ["motion", "pose"],
+        "num_layers": 2,
+        "num_heads": 16,
+        "mlp_ratio": 2.0,
+        "time_scale": 25.0,
+    }
 
 
 def test_arch_signature_records_only_the_non_default_anchoring(tmp_path):
@@ -772,10 +792,9 @@ def test_unanchored_build_drops_the_anchored_projections():
     assert not hasattr(model, "motion_feat_linear")
     assert not any("motion_posemb" in name or "motion_feat" in name
                    for name in trainable)
-    # Tokens, head and the temporal block must still train.
+    # Tokens and head must still train.
     assert any("motion_embedding" in name for name in trainable)
     assert any("head_motion" in name for name in trainable)
-    assert any("motion_temporal" in name for name in trainable)
 
 
 @pytest.mark.slow

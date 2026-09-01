@@ -146,6 +146,7 @@ def build_test_dataset(cfg: dict, ms: dict) -> ClimbingCorpusDataset:
         motion_target_smooth_sec=float(ms["target_smooth_sec"]),
         motion_outlier_acc_ms2=float(ms["loss"]["outlier_acc_ms2"]),
         motion_angular=bool(ms.get("angular", False)),
+        motion_root_source=str(ms["root_source"]),
     )
 
 
@@ -164,7 +165,7 @@ def canonical_rows(dataset: ClimbingCorpusDataset) -> list[tuple[str, int, int]]
 
 def centered_items(
     dataset: ClimbingCorpusDataset, rows: list[tuple[str, int, int]],
-) -> list[tuple[str, int, int, int]]:
+) -> list[tuple[str, int, int, int, int]]:
     """One centred clip per canonical row, in row order (jitter is off on test).
 
     Under the ``auto`` stride a clip reaches ``(T // 2) * stride`` frames either
@@ -186,27 +187,36 @@ def centered_items(
         if not dataset._scenes[scene]["valid_mask"][person, positions].all():
             raise ValueError(
                 f"{scene}#{person}@{frame}: centred clip crosses an invalid frame")
-        items.append((scene, person, base, 1))
+        # (scene, person, base, jitter_range, t_frames) — the dataset's own
+        # item tuple; jitter_range 1 pins the centred window.
+        items.append((scene, person, base, 1, dataset.T))
     return items
 
 
 def gather_targets(
     dataset: ClimbingCorpusDataset, rows: list[tuple[str, int, int]],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """GT motion / world-from-root rotation / body angular velocity, in row order.
+) -> tuple[torch.Tensor, ...]:
+    """GT motion / world-from-root / world-from-LINEAR-frame / omega / gravity.
+
+    The linear frame is the root frame under ``twist``/``rotated_world`` and the
+    gravity-view frame under ``gravity_view``, so the world lift of the linear
+    half must use ``motion_lin_rot``, not ``motion_rot``. "Vertical" likewise
+    means the scene's FITTED gravity, not world y (the corpus tilt reaches
+    61 deg).
 
     Read straight from the scene arrays the loader caches — the same values
     ``__getitem__`` hands the collate, without paying for a second image pass.
     """
-    gt, rot, omega = [], [], []
+    gt, rot, lin_rot, omega, gravity = [], [], [], [], []
     for scene, person, frame in rows:
         data = dataset._scenes[scene]
         gt.append(data["motion_gt"][person, frame])
         rot.append(data["motion_rot"][person, frame])
+        lin_rot.append(data["motion_lin_rot"][person, frame])
         omega.append(data["motion_omega"][person, frame])
-    return (torch.from_numpy(np.stack(gt)),
-            torch.from_numpy(np.stack(rot)),
-            torch.from_numpy(np.stack(omega)))
+        gravity.append(data["gravity_world"])
+    return tuple(torch.from_numpy(np.stack(part))
+                 for part in (gt, rot, lin_rot, omega, gravity))
 
 
 @torch.no_grad()
@@ -275,7 +285,8 @@ def _ls_slope(pred: np.ndarray, gt: np.ndarray) -> float:
 
 
 def score(
-    pred: torch.Tensor, gt: torch.Tensor, rot: torch.Tensor, omega: torch.Tensor,
+    pred: torch.Tensor, gt: torch.Tensor, rot: torch.Tensor, lin_rot: torch.Tensor,
+    omega: torch.Tensor, gravity: torch.Tensor,
     twist_slots: torch.Tensor, names: tuple[str, ...],
     rows: list[tuple[str, int, int]],
 ) -> dict:
@@ -287,8 +298,9 @@ def score(
     its ``omega x v`` term; the angular pair converts with the plain rotation
     (:func:`to_world_angular` — no Coriolis).
     """
-    pred_lin = to_world_linear(pred[..., 0:3], pred[..., 3:6], rot, omega, twist_slots)
-    gt_lin = to_world_linear(gt[..., 0:3], gt[..., 3:6], rot, omega, twist_slots)
+    pred_lin = to_world_linear(
+        pred[..., 0:3], pred[..., 3:6], lin_rot, omega, twist_slots)
+    gt_lin = to_world_linear(gt[..., 0:3], gt[..., 3:6], lin_rot, omega, twist_slots)
     terms = ("vel", "acc") if pred.shape[-1] == 6 else ("vel", "acc",
                                                         "ang_vel", "ang_acc")
     world = {"vel": (pred_lin[0], gt_lin[0]), "acc": (pred_lin[1], gt_lin[1])}
@@ -298,6 +310,8 @@ def score(
                        to_world_angular(gt[..., sl], rot))
     pred_np = pred.numpy().astype(np.float64)
     gt_np = gt.numpy().astype(np.float64)
+    # "Vertical" is the component along the scene's fitted gravity (down-positive).
+    grav_np = gravity.numpy().astype(np.float64)                      # (R, 3)
     scenes = np.array([row[0] for row in rows])
     report: dict = {"n_rows": len(rows), "n_scenes": int(len(set(scenes)))}
     for q, quantity in enumerate(terms):
@@ -306,8 +320,10 @@ def score(
         for k, name in enumerate(names):
             p = pred_np[:, k, sl]
             g = gt_np[:, k, sl]
-            p_vert = world[quantity][0].numpy().astype(np.float64)[:, k, 1]
-            g_vert = world[quantity][1].numpy().astype(np.float64)[:, k, 1]
+            p_vert = (world[quantity][0].numpy().astype(np.float64)[:, k]
+                      * grav_np).sum(-1)
+            g_vert = (world[quantity][1].numpy().astype(np.float64)[:, k]
+                      * grav_np).sum(-1)
             per_scene_vert, per_scene_3d = [], []
             for s in sorted(set(scenes)):
                 sel = scenes == s
@@ -381,7 +397,7 @@ def _smoothed_derivatives(
 
 def trajectory_baselines(
     dataset: ClimbingCorpusDataset, rows: list[tuple[str, int, int]],
-    rot: torch.Tensor, omega: torch.Tensor, twist: bool, source: str,
+    lin_rot: torch.Tensor, omega: torch.Tensor, twist: bool, source: str,
     sigma_sec: float,
 ) -> torch.Tensor:
     """Pelvis vel/acc ``(R, 1, 6)`` from a smoothed world trajectory, target axes.
@@ -425,7 +441,9 @@ def trajectory_baselines(
     picked = np.asarray(picked)
 
     # World -> target axes: v_t = R^T v_w; a_t = R^T a_w - omega x v_t (twist only).
-    rot_np = rot.numpy().astype(np.float64)
+    # R is the LINEAR frame's rotation, which is the gravity-view basis under
+    # `gravity_view` — scoring these against the GT in root axes would be void.
+    rot_np = lin_rot.numpy().astype(np.float64)
     v_t = np.einsum("rji,rj->ri", rot_np, vel_w[picked])
     a_t = np.einsum("rji,rj->ri", rot_np, acc_w[picked])
     if twist:
@@ -434,7 +452,8 @@ def trajectory_baselines(
         np.concatenate([v_t, a_t], -1)[:, None, :].astype(np.float32))
 
 
-def run_baselines(dataset, rows, gt, rot, omega, ms: dict, oracle: bool) -> dict:
+def run_baselines(dataset, rows, gt, rot, lin_rot, omega, gravity, ms: dict,
+                  oracle: bool) -> dict:
     """Zero/mean priors + smoothed pred-pelvis (+ smoothed kindyn), pelvis only.
 
     :param oracle: include the ``gtsmooth`` (kindyn GT trajectory) rows. They are
@@ -456,7 +475,8 @@ def run_baselines(dataset, rows, gt, rot, omega, ms: dict, oracle: bool) -> dict
     # CONSTRUCTION — a constant prediction has zero variance — which is why the
     # mean prior below is the row to read a learned r3d against.
     out["rows"]["zero_prior"] = score(
-        torch.zeros_like(gt_p), gt_p, rot, omega, twist_slots, ("pelvis",), rows)
+        torch.zeros_like(gt_p), gt_p, rot, lin_rot, omega, gravity, twist_slots,
+        ("pelvis",), rows)
     print_report(out["rows"]["zero_prior"], ("pelvis",), "zero_prior")
     # Mean prior: predict the training mean of every component, forever. This is
     # the NULL for `r3d`, which pools the three components without centring them
@@ -471,7 +491,7 @@ def run_baselines(dataset, rows, gt, rot, omega, ms: dict, oracle: bool) -> dict
         ms["standardize"]["mean"], dtype=torch.float32).reshape(-1, width)[k]
     out["rows"]["mean_prior"] = score(
         mean_row.view(1, 1, width).expand(len(rows), 1, width).contiguous(),
-        gt_p, rot, omega, twist_slots, ("pelvis",), rows)
+        gt_p, rot, lin_rot, omega, gravity, twist_slots, ("pelvis",), rows)
     print_report(out["rows"]["mean_prior"], ("pelvis",), "mean_prior")
     sources = [("smooth", "pred_pelvis_world")]
     if oracle:
@@ -481,10 +501,11 @@ def run_baselines(dataset, rows, gt, rot, omega, ms: dict, oracle: bool) -> dict
             # Trajectory baselines are linear-only (the store has no root quats):
             # score them against the linear half of an angular target.
             pred = trajectory_baselines(
-                dataset, rows, rot, omega, twist, source, sigma)
+                dataset, rows, lin_rot, omega, twist, source, sigma)
             key = f"{prefix}_sigma{sigma:g}"
             out["rows"][key] = score(
-                pred, gt_p[..., :6], rot, omega, twist_slots, ("pelvis",), rows)
+                pred, gt_p[..., :6], rot, lin_rot, omega, gravity, twist_slots,
+                ("pelvis",), rows)
             acc = out["rows"][key]["acc"]["pelvis"]
             vel = out["rows"][key]["vel"]["pelvis"]
             print(f"{key:<20s} acc r3d {acc['r3d']:+.4f} vert_r {acc['vert_r']:+.4f} "
@@ -528,7 +549,7 @@ def main() -> int:
     if args.rows_only:
         return 0
 
-    gt, rot, omega = gather_targets(dataset, rows)
+    gt, rot, lin_rot, omega, gravity = gather_targets(dataset, rows)
     # Secondary view: the RAW (unsmoothed) twist target, for comparability with
     # the v1/v2 numbers. Its rows are the same — smoothing does not touch the
     # validity rule — which is asserted rather than assumed.
@@ -543,11 +564,13 @@ def main() -> int:
     if args.baselines:
         print(f"\n=== primary task: target_smooth_sec={ms['target_smooth_sec']} ===")
         report = {"primary": run_baselines(
-            dataset, rows, gt, rot, omega, ms, oracle=float(ms["target_smooth_sec"]) == 0.0)}
+            dataset, rows, gt, rot, lin_rot, omega, gravity, ms,
+            oracle=float(ms["target_smooth_sec"]) == 0.0)}
         if raw is not None:
             print("\n=== secondary: RAW targets (v1/v2-comparable) ===")
             report["raw"] = run_baselines(
-                raw[0], rows, raw[1], raw[2], raw[3], raw_ms, oracle=True)
+                raw[0], rows, raw[1], raw[2], raw[3], raw[4], raw[5], raw_ms,
+                oracle=True)
     else:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -584,7 +607,8 @@ def main() -> int:
         report = {
             "motion_supervision_source": ms_note,
             "target_smooth_sec": float(ms["target_smooth_sec"]),
-            "primary": score(pred, gt, rot, omega, twist_slots, names, rows),
+            "primary": score(pred, gt, rot, lin_rot, omega, gravity, twist_slots,
+                             names, rows),
         }
         print(f"\n=== primary task: target_smooth_sec={ms['target_smooth_sec']} ===")
         print_report(report["primary"], names)
@@ -592,7 +616,7 @@ def main() -> int:
             # Same predictions, scored against the RAW twist target: the number
             # that lines up with the v1/v2 tables (which had no label smoothing).
             report["raw"] = score(
-                pred, raw[1], raw[2], raw[3], twist_slots, names, rows)
+                pred, raw[1], raw[2], raw[3], raw[4], raw[5], twist_slots, names, rows)
             print("\n=== secondary: RAW targets (v1/v2-comparable) ===")
             print_report(report["raw"], names)
 

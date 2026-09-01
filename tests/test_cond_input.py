@@ -28,8 +28,8 @@ from contact.config import load_config
 from contact.data.climbing_corpus import COND_FEATURE_DIM, cond_feature_rows
 
 REPO = Path(__file__).resolve().parents[1]
-_POSTDEC_CFG = REPO / "configs" / "old" / "climbing_corpus_joint_force_cond_sum1_postdec.yaml"
-_T7HINGE_CFG = REPO / "configs" / "old" / "climbing_videos_force_warmstart_t7hinge.yaml"
+_POSTDEC_CFG = REPO / "tests" / "fixtures" / "joint_force_cond_postdec.yaml"
+_T7HINGE_CFG = REPO / "tests" / "fixtures" / "force_warmstart_t7hinge.yaml"
 _FEATURES = REPO / "output" / "motion_probe_geom" / "cond_features.npz"
 
 requires_features = pytest.mark.skipif(
@@ -46,7 +46,7 @@ _STD = """
 # Bare-linear pre_decoder conditioning on the kept force-only corpus config
 # (no cond in the base, so the removal-based reject tests below stay honest).
 _COND_ON = """
-base: configs/old/climbing_corpus_force_supervised.yaml
+base: tests/fixtures/force_supervised.yaml
 model:
   cond_input:
     enabled: true
@@ -105,7 +105,7 @@ def test_clip_must_be_positive(tmp_path):
 
 def test_enabled_requires_a_corpus_dataset(tmp_path):
     text = """
-base: configs/old/climbing_videos_joint.yaml
+base: tests/fixtures/climbing_videos_joint.yaml
 data:
   eval_split: val
   datasets:
@@ -121,7 +121,7 @@ model:
 
 def test_enabled_requires_tokens_to_condition(tmp_path):
     text = """
-base: configs/old/climbing_corpus_motion_pelvis_t7.yaml
+base: tests/fixtures/motion_pelvis_t7.yaml
 model:
   cond_input:
     enabled: true
