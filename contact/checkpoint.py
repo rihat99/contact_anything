@@ -13,9 +13,8 @@ trainable set — yet it is not part of the base checkpoint either. ``save`` tak
 ``saved_names`` superset (every ``contact``/``force`` param, whether or not it is
 currently trainable) so those frozen contact weights ride along; the arch
 fingerprint stays computed over the ``requires_grad`` trainable set only, so the
-hard-fail identity check is unchanged. ``load`` restores every saved param and, for
-*legacy* regime-(a) checkpoints written before this (force tensors only, no contact
-weights), recovers the contact branch from the config's ``init_contact_checkpoint``.
+hard-fail identity check is unchanged. ``load`` restores every saved param and
+hard-fails if the frozen contact branch is incomplete.
 
 **Hard-fail loading.** Every checkpoint carries ``schema_version`` and an *arch
 fingerprint* — a sha256 over the sorted ``(trainable name, shape)`` pairs. Loading
@@ -35,13 +34,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .targets import joint_set_names, joint_set_num_outputs, topology_num_vertices
+from .targets import joint_set_names, joint_set_num_outputs
 
 SCHEMA_VERSION = 2
-
-# Repo root — used to resolve a legacy regime-(a) checkpoint's relative
-# ``init_contact_checkpoint`` when recovering its dropped contact branch.
-_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 # -------------------------------------------------------------------- fingerprint
@@ -83,12 +78,8 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
     Returns ``None`` when ``config`` is ``None`` (signature comparison skipped).
 
     The ``motion``, ``cond_input``, ``cross_modal_temporal`` and ``pose_temporal``
-    keys appear only when their branch is enabled: checkpoints written before they
-    existed store signatures without them, and this comparison is an exact dict
-    equality. The retired sliding-window sections (``temporal``,
-    ``force_temporal``, ``motion_temporal``, ``frame_attn``) are no longer emitted
-    at all; :func:`_check_schema` defaults the first three to their disabled state
-    on BOTH sides so pre-retirement checkpoints still load.
+    keys appear only when their branch is enabled, and the comparison is an exact
+    dict equality.
 
     Known, deliberate gap: the RoPE sub-signatures omit ``dropout`` and
     ``max_rel_sec``. ``max_rel_sec`` is an inference attention-window choice (like
@@ -102,23 +93,18 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
     kp = chead.get("contact_keypoint_indices")
     if kp is None:
         kp = list(range(21))
-    topology = config.get("contact", {}).get("topology", "smpl")
     tgts = config.get("contact", {}).get("targets", {}) or {}
     targets_layout = {}
     joint_layout = None
-    for name in ("vertex", "joint"):
-        if tgts.get(name, {}).get("enabled", False):
-            if name == "vertex":
-                targets_layout[name] = topology_num_vertices(topology)
-            else:
-                joint_set = str(tgts[name].get("joint_set", "smplx_body_22"))
-                names = joint_set_names(joint_set)
-                targets_layout[name] = joint_set_num_outputs(joint_set)
-                joint_layout = {
-                    "joint_set": joint_set,
-                    "names": list(names),
-                    "dim": len(names),
-                }
+    if tgts.get("joint", {}).get("enabled", False):
+        joint_set = str(tgts["joint"].get("joint_set", "smplx_body_22"))
+        names = joint_set_names(joint_set)
+        targets_layout["joint"] = joint_set_num_outputs(joint_set)
+        joint_layout = {
+            "joint_set": joint_set,
+            "names": list(names),
+            "dim": len(names),
+        }
 
     # Force head (step 04): same shape-invariant-but-semantic capture as the
     # contact head. `frame` changes what the head learns (LWA vs joint-local
@@ -179,26 +165,15 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
     # positions mean.
     xmcfg = model_cfg.get("cross_modal_temporal", {}) or {}
     if xmcfg.get("enabled", False):
-        xm_type = str(xmcfg.get("type", "rope"))
         sig_extra["cross_modal_temporal"] = {
             "enabled": True,
-            "type": xm_type,
+            "type": str(xmcfg.get("type", "rope")),
             "modalities": sorted(str(m) for m in (xmcfg.get("modalities") or [])),
             "num_layers": int(xmcfg.get("num_layers", 4)),
             "num_heads": int(xmcfg.get("num_heads", 16)),
             "mlp_ratio": float(xmcfg.get("mlp_ratio", 2.0)),
+            "time_scale": float(xmcfg.get("time_scale", 25.0)),
         }
-        if xm_type == "window":
-            # Weight-shape keys of the sinusoidal block; position_scale changes
-            # what the encoded positions mean (like time_scale for rope).
-            _bneck = xmcfg.get("bottleneck_dim", 256)
-            sig_extra["cross_modal_temporal"]["bottleneck_dim"] = (
-                None if _bneck is None else int(_bneck))
-            sig_extra["cross_modal_temporal"]["position_scale"] = float(
-                xmcfg.get("position_scale", 25.0))
-        else:
-            sig_extra["cross_modal_temporal"]["time_scale"] = float(
-                xmcfg.get("time_scale", 25.0))
     # The mutual decoder mask changes what every appended token was trained to
     # read (contact attends force/motion and vice versa) — semantic. Emitted
     # only when set, so pre-existing causal signatures stay byte-identical.
@@ -266,7 +241,6 @@ def _arch_signature(config: Optional[dict]) -> Optional[dict]:
         "grid_size": int(chead.get("grid_size", 5)),
         "grid_radius": float(chead.get("grid_radius", 0.1)),
         "dropout": float(chead.get("dropout", 0.1)),
-        "topology": str(topology),
         "targets": {k: int(v) for k, v in sorted(targets_layout.items())},
         "joint_layout": joint_layout,
         "force": force,
@@ -422,20 +396,9 @@ def _check_schema(
     want_sig = ckpt.get("arch_signature")
     got_sig = _arch_signature(config)
     if config is not None and want_sig is not None:
-        # Keys that may be ABSENT on one side purely for historical reasons are
-        # defaulted to the disabled state on BOTH sides, so such a checkpoint
-        # still loads; an enabled-vs-disabled difference correctly mismatches.
-        #   * `force`/`force_temporal`: pre-force contact checkpoints (schema v2,
-        #     saved before the force branch) have neither key.
-        #   * `temporal`/`force_temporal`/`motion_temporal`: the retired
-        #     sliding-window sections. Checkpoints written before the retirement
-        #     carry them at `{"enabled": False}`; the current signature omits them.
-        disabled = {
-            "force": {"enabled": False},
-            "temporal": {"enabled": False},
-            "force_temporal": {"enabled": False},
-            "motion_temporal": {"enabled": False},
-        }
+        # `force` is absent from a contact-only signature on either side;
+        # default it to disabled on BOTH so such a pair still compares equal.
+        disabled = {"force": {"enabled": False}}
         want_sig = {**disabled, **want_sig}
         got_sig = {**disabled, **(got_sig or {})}
     if config is not None and want_sig is not None and want_sig != got_sig:
@@ -451,72 +414,27 @@ def _check_schema(
             + "\n".join(diffs))
 
 
-def _recover_legacy_frozen_contact(
-    ckpt: dict,
-    model: nn.Module,
-    path: str | Path,
-    config: Optional[dict],
-    map_location: str,
-) -> None:
-    """Recover the frozen contact branch of a *legacy* regime-(a) checkpoint.
+def _check_frozen_contact_complete(ckpt: dict, model: nn.Module, path: str | Path) -> None:
+    """Reject a regime-(a) checkpoint whose frozen contact branch is incomplete.
 
-    Regime-(a) checkpoints written before contact weights became self-contained
-    hold only the force tensors; the warm-started, then frozen, contact branch was
-    dropped and would be left at random init here. Detect that case — the stored
-    config marks ``train.freeze_contact`` true yet no ``contact``-named tensor was
-    restored — and re-warm-start the contact params from the config's
-    ``init_contact_checkpoint`` (resolved relative to the repo root). Self-contained
-    checkpoints (contact tensors present) and all non-regime-(a) checkpoints return
-    immediately. Raises when the recovery source is unavailable so the caller never
-    silently proceeds with a contact-less model.
+    A regime-(a) checkpoint (``train.freeze_contact``) is self-contained: it
+    carries the warm-started, then frozen, contact weights alongside the trainable
+    force ones. It must hold the model's FULL contact-named set — a partial (or
+    absent) contact branch would leave the rest at random init, the exact silent
+    failure the hard-fail guarantee forbids.
     """
     ckpt_config = ckpt.get("config") or {}
     if not bool((ckpt_config.get("train") or {}).get("freeze_contact", False)):
         return
-    saved_contact = {
-        name for name in ckpt["trainable_state_dict"] if "contact" in name.lower()}
-    if saved_contact:
-        # SOME contact tensors present: this claims to be self-contained, so it must
-        # hold the model's FULL contact-named set — a partial contact branch would
-        # leave the missing tensors at random init (the exact silent failure the
-        # hard-fail guarantee forbids). All-or-nothing: full set -> restored above;
-        # empty -> legacy recovery below; partial -> corrupt, raise.
-        model_contact = {
-            name for name, _ in model.named_parameters() if "contact" in name.lower()}
-        partial_missing = sorted(model_contact - saved_contact)
-        if partial_missing:
-            raise RuntimeError(
-                f"{path}: regime-(a) checkpoint holds a PARTIAL contact branch — "
-                f"{len(partial_missing)} contact param(s) of the model are absent from "
-                f"its state (e.g. {partial_missing[:5]}). The checkpoint is corrupt or "
-                f"was written by an incompatible saver; refusing to load with a "
-                f"partially random contact head.")
-        return   # self-contained: the frozen contact weights are already restored
-
-    init_ckpt = (ckpt_config.get("model") or {}).get("init_contact_checkpoint")
-    if not init_ckpt:
+    saved = {name for name in ckpt["trainable_state_dict"] if "contact" in name.lower()}
+    wanted = {name for name, _ in model.named_parameters() if "contact" in name.lower()}
+    missing = sorted(wanted - saved)
+    if missing:
         raise RuntimeError(
-            f"{path}: legacy regime-(a) checkpoint (train.freeze_contact) holds only "
-            f"force weights and its config has no model.init_contact_checkpoint to "
-            f"recover the frozen contact branch from — the contact head would be "
-            f"randomly initialised. Retrain to write a self-contained checkpoint.")
-    init_path = Path(init_ckpt)
-    if not init_path.is_absolute():
-        init_path = _REPO_ROOT / init_path
-    if not init_path.is_file():
-        raise RuntimeError(
-            f"{path}: legacy regime-(a) checkpoint holds only force weights; its "
-            f"contact branch must be recovered from init_contact_checkpoint "
-            f"{init_ckpt!r} but that file is missing/unreadable (resolved to "
-            f"{init_path}). Restore that checkpoint or retrain to write a "
-            f"self-contained one.")
-    print(
-        f"WARNING: {path} is a legacy regime-(a) checkpoint with no contact weights; "
-        f"recovering the frozen contact branch from {init_path}")
-    initialize_common_contact(
-        init_path, model,
-        config=config if config is not None else ckpt_config,
-        map_location=map_location)
+            f"{path}: regime-(a) checkpoint is missing {len(missing)} contact "
+            f"param(s) of the model (e.g. {missing[:5]}). Loading it would leave "
+            f"them randomly initialised; retrain to write a self-contained "
+            f"checkpoint.")
 
 
 def load(
@@ -538,9 +456,8 @@ def load(
         python RNG so the next epoch's data ordering matches an uninterrupted run.
     :raises RuntimeError: if the checkpoint is not schema v2 or its trainable-param
         fingerprint / architecture signature does not match ``model`` (never
-        silently random-inits). Also raised by the legacy regime-(a) recovery
-        (:func:`_recover_legacy_frozen_contact`) when a contact-less checkpoint's
-        ``init_contact_checkpoint`` source is unavailable.
+        silently random-inits), or if a regime-(a) checkpoint's frozen contact
+        branch is incomplete (:func:`_check_frozen_contact_complete`).
     :returns: the loaded checkpoint dict (metadata + state).
     """
     ckpt = torch.load(Path(path), map_location=map_location, weights_only=False)
@@ -573,7 +490,7 @@ def load(
     if trainable_missing:
         raise RuntimeError(f"{path}: trainable params missing from checkpoint: {trainable_missing}")
 
-    _recover_legacy_frozen_contact(ckpt, model, path, config, map_location)
+    _check_frozen_contact_complete(ckpt, model, path)
 
     if optimizer is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -624,18 +541,13 @@ def initialize_common_contact(
     # symmetrically on both sides: the cross-modal temporal block (temporal
     # fine-tune) and the force branch (regime (a)). A contact-only source has no
     # force keys; a force-enabled target does — popping both keeps the remaining
-    # semantics an exact match. The retired sliding-window keys are popped too, so
-    # a pre-retirement source still warm-starts.
+    # semantics an exact match.
     source_temporal = source_sig.pop(
         "cross_modal_temporal", {"enabled": False})
     target_temporal = target_sig.pop(
         "cross_modal_temporal", {"enabled": False})
-    for key in ("force", "temporal", "force_temporal", "motion_temporal",
-                "frame_attn"):
-        source_sig.pop(key, None)
+    source_sig.pop("force", None)
     target_force = target_sig.pop("force", {"enabled": False})
-    for key in ("temporal", "force_temporal", "motion_temporal", "frame_attn"):
-        target_sig.pop(key, None)
     # Same treatment for the two later branches a warm start may introduce (or
     # drop): the motion tokens and the input conditioning. Both are absent from
     # every earlier checkpoint's signature, and their params are allowed-missing

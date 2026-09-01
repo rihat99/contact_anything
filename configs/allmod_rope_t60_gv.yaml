@@ -1,37 +1,25 @@
-# allmod v3 — GRAVITY-VIEW + ROLL-OUT + EMBEDDING AUGMENT (2026-08-30).
+# allmod — all-modality RoPE, T=60, gravity-view motion (new era, 2026-09-01).
 #
-# SELF-CONTAINED (base = configs/base.yaml). Every pre-v3 experiment yaml was archived on
-# 2026-08-30 to /data3/rikhat.akizhanov/trash/contact_anything_dev_20260830/, together with
-# their runs: those predate the gravity-view target and are not directly comparable. The
-# numbers quoted below come from the archived v2 nocons arm (test/pose_mae 0.0985 @ ep14),
-# whose settings this file inlines verbatim so the deltas are the only difference.
+# SELF-CONTAINED (base = configs/base.yaml). ONE cross-modal RoPE transformer over the
+# 14 tokens/frame x 60 frames of a clip mixes pose + contact + force + motion; the pose
+# and camera readout heads are split-head fine-tuned. Supervision: kindyn_6 contact
+# (focal), kindyn GT forces (root frame, bw units), MHR-native pose + keypoints
+# (mhr_1 / mhr_sup_1), and the gravity-view pelvis twist.
 #
-# FOUR changes over that arm:
+# GRAVITY-VIEW linear frame (motion_supervision.root_convention: gravity_view) —
+# GVHMR's frame: vertical = the scene's FITTED gravity (kindyn_1.npz gravity_world, one
+# fitted vector per scene — NOT a world axis and NOT derived from frame 0), azimuth =
+# the per-frame camera view direction. The corpus gravity is genuinely tilted (median
+# 3.2 deg, p90 27.5, max 61.4 over the 864 train scenes). Body roll/pitch no longer
+# rotates the linear target, and the vertical is its own channel. The angular pair is
+# the SE3-log body rate under both conventions. Acceleration is dropped from the motion
+# objective by weight (channels and metrics KEPT so acc_r3d stays comparable).
 #
-#   1. ACCELERATION DROPPED from the motion objective (weights 0, channels and metrics
-#      KEPT so acc_r3d stays comparable with every earlier run). The acc rows are the
-#      noisiest part of the pseudo-GT and GVHMR predicts displacement only.
-#   2. GRAVITY-VIEW linear frame (motion_supervision.root_convention: gravity_view) —
-#      GVHMR's frame: vertical = the scene's FITTED gravity (kindyn_1.npz gravity_world,
-#      one fitted vector per scene — NOT a world axis and NOT derived from frame 0),
-#      azimuth = the per-frame camera view direction. The corpus gravity is genuinely
-#      tilted (median 3.2 deg, p90 27.5, max 61.4 over the 864 train scenes). Body
-#      roll/pitch no longer rotates the linear target, and the vertical is its own
-#      channel. The angular pair is the SE3-log body rate under both conventions.
-#   3. ROLL-OUT consistency (motion_rollout) — integrate the predicted velocity and
-#      compare horizon DISPLACEMENTS with the GT root path (grad -> head) and with the
-#      PREDICTED pose path (grad -> pose, head detached). The mirror of
-#      motion_consistency, which differentiates the pose instead.
-#   4. EMBEDDING AUGMENT (data.embedding_augment) — train-time Gaussian + patch-CutMix
-#      corruption of the cached frozen-backbone embedding, so a frame's own features are
-#      an unreliable answer and the temporal brick is rewarded for reading its
-#      neighbours. Never trained with before; train-only (eval/render never see it).
+# The consistency losses (contact/force) stay OFF.
 #
-# The consistency losses (motion/contact/force) stay OFF, as in the v2 nocons arm.
-#
-# Launch (when instructed):
+# Launch:
 #   CUDA_VISIBLE_DEVICES=<2 free> torchrun --standalone --nproc-per-node=2 \
-#     scripts/train.py --config configs/allmod_rope_t60_v3_gv_rollout.yaml
+#     scripts/train.py --config configs/allmod_rope_t60_gv.yaml
 base: configs/base.yaml
 
 model:
@@ -66,7 +54,6 @@ model:
 contact:
   primary_target: joint
   targets:
-    vertex: {enabled: false}
     joint:
       enabled: true
       joint_set: kindyn_6             # LH, RH, L/R foot (big-toe), L/R ankle (heel)
@@ -116,31 +103,6 @@ data:
                                       # from the 61 the v2 arm ran against)
   embedding_cache: true
   frames_per_batch: 240               # per GPU -> 4 clips x T=60 (rope_t60 measured 15.5 GiB;
-                                      # the extra 13 tokens/frame + losses add some — smoke-check)
-  # NEW in v3. Corrupts the cached embedding — the SHARED source of every token of a frame —
-  # so no per-frame path can recover it while a cross-frame one can. Both components are
-  # per frame; CutMix pastes from ANOTHER clip of the batch (4 clips here, >= 2 required)
-  # and the box is applied to batch["mask"] too (the person mask is a second clean
-  # per-frame input). TRAIN ONLY.
-  #
-  # MEASURED COST at these (shipped-default) values, first logged step of two smokes with
-  # identical state and batch order, augment the only difference: everything independent of
-  # the image path is bit-identical (force_sup, joint/focal, motion/*, rollout/{gt,rot_gt},
-  # disp_err_m, rot_err_deg — a clean control), while everything downstream of the frozen
-  # pose readout jumps: kp3d_err 0.160 -> 0.486 m (3.0x), depth_err 0.127 -> 0.392 (3.1x),
-  # kp_vel_err 0.51 -> 6.66 m/s (13x), kp_acc_err 24.8 -> 633 m/s^2 (26x), keypoint/loss
-  # 3.33 -> 57.3 (17x), train/loss 15.9 -> 71.0 (4.5x), grad_norm_raw 153 -> 766 (5x, i.e.
-  # clipped at 300 from step 1 where the clean run was not). The derivative terms take it
-  # worst, as expected: a corrupted frame is an isolated outlier inside a temporal stencil.
-  # That IS the intended signal (only the temporal brick can bridge it) but it means the
-  # early gradient direction is dominated by corrupted frames. If the run stalls or the
-  # clean-image test metrics degrade, cutmix_prob is the first knob to halve.
-  embedding_augment:
-    enabled: true
-    gaussian_alpha: 0.1               # sigma = 0.1 x per-channel feature std, on every frame
-    cutmix_prob: 0.5                  # per-frame chance of a pasted patch
-    cutmix_area: [0.1, 0.4]           # its area as a fraction of the 32x32 feature grid
-    anneal_start_frac: 0.8            # full strength through ep31, cosine to exactly 0 by ep39
   sequence:
     frames_per_clip: 60
     frame_stride: auto
@@ -172,21 +134,21 @@ motion_supervision:
                                       # pelvis slot alone; the validator enforces this)
   root_source: mhr                    # MHR-native root: the (MEAN-HIPS position, mhr_1
                                       # q_world root quaternion) free-flyer — exactly the
-                                      # construction motion_consistency builds from the
-                                      # PREDICTION, so GT and prediction are one rig.
+                                      # construction the pose path is lifted to, so GT and
+                                      # prediction are one rig.
                                       # NOT q_world[:7]: the MHR free-flyer root sits
                                       # ~0.93 m from the hips with a leg-pose-dependent
                                       # 0.28 m spread, so its twist is a different quantity.
-  root_convention: gravity_view       # v3: LINEAR rows in [forward, down, right] built from
+  root_convention: gravity_view       # LINEAR rows in [forward, down, right] built from
                                       # kindyn's fitted gravity + the camera view direction.
                                       # The angular pair stays the SE3-log body rate.
   angular: true                       # 12-dim pelvis target
   target_smooth_sec: 0.12
   loss:
     vel: 1.0
-    acc: 0.0                          # DROPPED in v3 (channel + metrics kept)
+    acc: 0.0                          # DROPPED (channel + metrics kept)
     ang_vel: 0.5
-    ang_acc: 0.0                      # DROPPED in v3
+    ang_acc: 0.0                      # DROPPED
     huber_delta: 1.0
     outlier_acc_ms2: 50.0
   # RECOMPUTED 2026-08-30 for root_convention: gravity_view over the same 864 train
@@ -204,23 +166,6 @@ motion_supervision:
       - [[ 0.26948,  0.35277,  0.29150], [ 1.00716,  1.24530,  0.88707],
          [ 0.43395,  0.68250,  0.48678], [ 1.86908,  3.21502,  2.74308]]  # pelvis
 
-motion_rollout:
-  enabled: true
-  horizons: [3, 10, 30]                 # ~0.12 s / 0.4 s / 1.2 s at the stride-normalized
-                                        # ~25 fps `frame_stride: auto` produces
-  detach_head: true                     # pose pulled toward the head's trajectory, never
-                                        # the reverse (the head is anchored by the GT term)
-  loss:
-    gt: 0.5                             # displacement vs the GT root path (grad -> head)
-    pose: 0.25                          # displacement vs the PREDICTED pose path
-    rot_gt: 0.25                        # composed body rate vs the GT relative rotation
-    rot_pose: 0.1                       # ... vs the predicted relative rotation
-    huber_m: 0.1                        # metres  — quadratic below 10 cm
-    huber_rad: 0.1                      # radians — quadratic below 5.7 deg
-    # NOTE the four weights above are UNMEASURED first guesses. Before a long run, check
-    # train/grad_norm and the per-term train/rollout/* scalars over the first epoch: the
-    # v2 rebalancing lesson was that a new metric term can silently own most of the
-    # gradient direction (motion_consistency.gt at weight 1.0 was 91%).
 
 pose_supervision:
   enabled: true
@@ -248,7 +193,7 @@ pose_supervision:
                                       # rejects both: the rail pins to the frozen value
                                       # the GT is correcting). Machinery stays in code.
   fit_err_confidence: false           # row weighting by the mesh-fit residual: OFF, so the
-  fit_err_ref_cm: 2.0                 # v3 deltas are the only variables
+  fit_err_ref_cm: 2.0                 # (inert while fit_err_confidence is false)
 
 keypoint_supervision:
   enabled: true
@@ -278,23 +223,6 @@ keypoint_supervision:
   fit_err_confidence: false
   fit_err_ref_cm: 2.0
 
-motion_consistency:
-  enabled: false
-  angular: true                       # angular twist rows ON (user call; v4 had them off)
-  detach_head: false                  # bidirectional head term (user call: no stop-gradients)
-  hip_offset_root: [0.0, 0.0, 0.0]    # EXACTLY zero under root_source: mhr — the GT root
-                                      # position IS the MHR mean-hips, the same point the
-                                      # prediction is lifted from (measured residual 1.1 cm,
-                                      # i.e. the target smoothing). The 9 cm kindyn offset
-                                      # would be wrong here. Inert while enabled: false.
-  loss:                               # /200 recalibration (2026-08-29): at gt 1.0 this block
-    gt: 0.005                           # was 91% of the total gradient energy; the rails moved
-    head: 0.0025                        # to keypoint_supervision (both modules carried copies
-    huber_delta: 1.0                    # -> double weight)
-    pos: 0.025
-    pos_huber_m: 0.1
-    rot: 0.01
-    rot_huber_rad: 0.1
 
 contact_consistency:
   enabled: false
@@ -350,13 +278,6 @@ logging:
   - train/motion/acc_rmse
   - train/motion/ang_vel_rmse
   - train/motion/ang_acc_rmse
-  - train/rollout/loss
-  - train/rollout/gt
-  - train/rollout/pose
-  - train/rollout/rot_gt
-  - train/rollout/rot_pose
-  - train/rollout/disp_err_m
-  - train/rollout/rot_err_deg
   - train/pose/loss
   - train/pose/mae
   - train/pose/shape
@@ -390,8 +311,6 @@ logging:
   - test/motion/ang_acc_r3d_mean
   - test/motion/ang_vel_rmse_mean
   - test/motion/ang_acc_rmse_mean
-  - test/rollout/disp_err_m
-  - test/rollout/rot_err_deg
   - test/pose/mae
   - test/pose/acc_rms_pred
   - test/pose/acc_rms_gt
@@ -407,7 +326,7 @@ logging:
   - test/keypoint/rot_dev_deg
 
 output:
-  exp_name: allmod_rope_t60_v3_gv_rollout
+  exp_name: allmod_rope_t60_gv
   monitor: test/pose_mae              # minimised; kept for comparability with runs A/B.
                                       # NOTE it is a KNOWN-imperfect monitor: the audit
                                       # showed q-space MAE falling while camera-frame

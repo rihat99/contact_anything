@@ -1,41 +1,20 @@
-"""Contact targets: topologies, joint sets, and vertex->joint ownership.
+"""Contact targets: the joint sets the contact head predicts over.
 
-The model may expose independent heads over the configured contact-token bank:
-
-* ``vertex`` — per-vertex contact in the body-model topology (SMPL 6890 or
-  SMPL-X 10475).
-* ``joint`` — contact over the 22-joint SMPL-X body set or a reduced set
-  (four extremities, or the six kindyn force groups) selected by
-  ``contact.targets.joint.joint_set``.
-
-Vertex labels come from the still-image datasets; joint labels come from the
-ClimbingVideos dataset.
-
-.. warning::
-
-   **Video joint labels and still-image derived joint labels are different
-   tasks.** ClimbingVideos joint labels are motion-gated *stable* contact
-   (stillness + hysteresis + min-duration + gap-merge, see
-   ``BetterVideoReconstruction/scripts/stages/estimate_contacts.py``). A joint
-   label obtained by lifting a *still* image's per-vertex contact
-   (:func:`derive_joint_contact`) is instantaneous *surface* contact — it has no
-   temporal gating. Mixing the two supervises one head with two different label
-   semantics, so ``joint.derive_from_vertex`` defaults **off**; enabling it is a
-   deliberate per-experiment choice.
+``joint`` is the only target: contact over the 22-joint SMPL-X body set or a
+reduced set (four extremities, or the six kindyn force groups) selected by
+``contact.targets.joint.joint_set``. Labels come from the ClimbingVideos
+corpus, where they are motion-gated *stable* contact (stillness + hysteresis +
+min-duration + gap-merge, see
+``BetterVideoReconstruction/scripts/stages/estimate_contacts.py``) — not
+instantaneous surface contact.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional, Sequence
+from typing import Sequence
 
-import numpy as np
 import torch
 from torch import Tensor
-
-# Body-model vertex counts. "mhr" (18439) is the model's native topology but is
-# not a supported *training* target yet -> NotImplementedError at config time.
-TOPOLOGY_VERTS = {"smpl": 6890, "smplx": 10475}
 
 # SMPL-X body-22 joint set (copied from ClimbingVideos_v1/dataset_info.json).
 SMPLX_BODY_22 = [
@@ -83,89 +62,6 @@ OBSERVABLE_14 = [1, 2, 4, 5, 7, 8, 10, 11, 16, 17, 18, 19, 20, 21]
 # The manual test protocol does not expose these joints. On a reviewed frame the
 # dataset schema defines them as non-contact rather than unknown.
 ALWAYS_NON_CONTACT_8 = [0, 3, 6, 9, 12, 13, 14, 15]
-
-# SMPL joints 22/23 are the hands; fold them onto the wrists (20/21) so a
-# 24-joint SMPL ownership map lands in the 22-joint body set.
-_SMPL_HAND_TO_WRIST = {22: 20, 23: 21}
-
-SMPL_NEUTRAL_NPZ = "/data3/rikhat.akizhanov/better/BetterHuman/models/smpl/SMPL_NEUTRAL.npz"
-
-_OWNER_CACHE: dict[str, Tensor] = {}
-
-
-def topology_num_vertices(topology: str) -> int:
-    """Return the vertex count for a topology name.
-
-    :param topology: ``"smpl"`` or ``"smplx"``.
-    :raises NotImplementedError: for ``"mhr"`` (native topology, not a target yet).
-    :raises ValueError: for any other name.
-    """
-    if topology == "mhr":
-        raise NotImplementedError(
-            "topology 'mhr' (18439 native verts) is not a supported training target")
-    if topology not in TOPOLOGY_VERTS:
-        raise ValueError(f"unknown topology {topology!r}; choose from {sorted(TOPOLOGY_VERTS)}")
-    return TOPOLOGY_VERTS[topology]
-
-
-def compute_vertex_joint_owner(
-    betas: Optional[Sequence[float]] = None,
-    smpl_npz: str = SMPL_NEUTRAL_NPZ,
-) -> Tensor:
-    """Nearest-joint vertex ownership for the SMPL rest pose ``(6890,)`` long, values in ``[0, 22)``.
-
-    Ports ``BetterVideoReconstruction/tools/human_optim/contacts.py::vertex_to_joint``:
-    each vertex is assigned to the spatially closest joint center of the *shaped
-    rest pose* (NOT the LBS-argmax joint that deforms it). Shaped rest pose is
-    ``v = v_template + shapedirs @ betas`` and ``J = J_regressor @ v``. SMPL's 24
-    joints are folded to 22 by mapping the hand joints (22/23) onto the wrists
-    (20/21).
-
-    :param betas: Optional shape coefficients; ``None`` uses the neutral shape.
-    :param smpl_npz: Path to the SMPL ``.npz`` (needs ``v_template``,
-        ``shapedirs``, ``J_regressor``).
-    """
-    if betas is None:
-        cached = _OWNER_CACHE.get(smpl_npz)
-        if cached is not None:
-            return cached
-
-    data = np.load(smpl_npz, allow_pickle=True)
-    v_template = torch.as_tensor(np.asarray(data["v_template"]), dtype=torch.float32)   # [6890, 3]
-    shapedirs = torch.as_tensor(np.asarray(data["shapedirs"]), dtype=torch.float32)     # [6890, 3, n]
-    j_regressor = torch.as_tensor(np.asarray(data["J_regressor"]), dtype=torch.float32)  # [24, 6890]
-
-    verts = v_template
-    if betas is not None:
-        beta = torch.as_tensor(np.asarray(betas), dtype=torch.float32).reshape(-1)
-        n = min(beta.shape[0], shapedirs.shape[2])
-        verts = verts + torch.einsum("vcn,n->vc", shapedirs[:, :, :n], beta[:n])
-
-    joints = j_regressor @ verts                                    # [24, 3]
-    owner = torch.cdist(verts[None], joints[None])[0].argmin(dim=1)  # [6890] in [0, 24)
-    for hand, wrist in _SMPL_HAND_TO_WRIST.items():
-        owner[owner == hand] = wrist
-
-    owner = owner.long()
-    if betas is None:
-        _OWNER_CACHE[smpl_npz] = owner
-    return owner
-
-
-def derive_joint_contact(vertex_contact: Tensor, owner: Tensor) -> Tensor:
-    """Lift per-vertex contact to per-joint by max over each joint's vertices.
-
-    :param vertex_contact: ``(..., 6890)`` float/bool per-vertex contact.
-    :param owner: ``(6890,)`` long vertex->joint owner in ``[0, 22)``.
-    :returns: ``(..., 22)`` float per-joint contact (1 if any owned vertex touches).
-    """
-    lead = vertex_contact.shape[:-1]
-    flat = vertex_contact.reshape(-1, vertex_contact.shape[-1]).to(torch.float32)  # [N, V]
-    idx = owner[None].expand(flat.shape[0], -1).to(flat.device)                    # [N, V]
-    out = torch.zeros(flat.shape[0], NUM_BODY_22, dtype=torch.float32, device=flat.device)
-    out.scatter_reduce_(1, idx, flat, reduce="amax", include_self=True)
-    return out.reshape(*lead, NUM_BODY_22)
-
 
 def joint_set_names(joint_set: str) -> tuple[str, ...]:
     """Return ordered output names for a supported joint-contact set."""
@@ -287,100 +183,49 @@ def _joint_subset_mask(supervise_subset, joint_set: str) -> Tensor:
 class TargetSpec:
     """Resolved supervision-target spec, built once per run from the config.
 
-    :param enabled: Enabled target names in canonical order (``vertex`` before ``joint``).
-    :param topology: Vertex topology name (``"smpl"`` / ``"smplx"``).
-    :param vertex_dims: Vertex head output size (topology vertex count).
+    :param enabled: Enabled target names (``["joint"]`` or empty).
     :param joint_set: Semantic joint-contact output set.
     :param joint_names: Ordered semantic output names.
     :param joint_dims: Joint head output size (22, 4 or 6).
-    :param derive_from_vertex: Lift vertex labels to joint labels for image data.
     :param joint_subset_mask: Output-space mask restricting supervised joints.
-    :param owner: ``(6890,)`` vertex->joint owner, present iff ``derive_from_vertex``.
     """
 
     enabled: list[str]
-    topology: str
-    vertex_dims: int
     joint_set: str = "smplx_body_22"
     joint_names: tuple[str, ...] = tuple(SMPLX_BODY_22)
     joint_dims: int = NUM_BODY_22
-    derive_from_vertex: bool = False
     use_confidence_weights: bool = False
     joint_subset_mask: Tensor = field(default_factory=lambda: torch.ones(NUM_BODY_22))
-    owner: Optional[Tensor] = None
-    #: Bounded cache of per-``betas`` ownership maps (key = rounded-betas bytes).
-    _betas_owner_cache: dict = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_config(cls, cfg: dict) -> "TargetSpec":
-        topology = cfg["contact"]["topology"]
         targets = cfg["contact"]["targets"]
-        enabled = [name for name in ("vertex", "joint") if targets[name]["enabled"]]
+        enabled = ["joint"] if targets["joint"]["enabled"] else []
         jcfg = targets["joint"]
         joint_set = str(jcfg.get("joint_set", "smplx_body_22"))
         names = joint_set_names(joint_set)
-        derive = bool(jcfg["derive_from_vertex"])
-        owner = compute_vertex_joint_owner() if (derive and "joint" in enabled) else None
         return cls(
             enabled=enabled,
-            topology=topology,
-            vertex_dims=topology_num_vertices(topology),
             joint_set=joint_set,
             joint_names=names,
             joint_dims=len(names),
-            derive_from_vertex=derive,
             use_confidence_weights=bool(jcfg.get("use_confidence_weights", False)),
             joint_subset_mask=_joint_subset_mask(jcfg["supervise_subset"], joint_set),
-            owner=owner,
         )
 
     def output_dims(self) -> dict[str, int]:
         """``{target_name: head_output_size}`` for the enabled targets."""
-        dims = {"vertex": self.vertex_dims, "joint": self.joint_dims}
-        return {name: dims[name] for name in self.enabled}
-
-    def _owner_for_frame(self, frame: dict) -> Tensor:
-        """Vertex->joint ownership for a frame: shaped by its ``betas`` if present.
-
-        ClimbingImages supplies per-sample SMPL ``betas``; a contacted boundary
-        vertex whose nearest joint moves with body shape would otherwise be lifted
-        to the wrong joint. Falls back to the neutral :attr:`owner` when a frame
-        carries no betas (e.g. DAMON). Maps are cached by rounded betas to bound
-        recompute; the cache is capped so a large, varied corpus cannot grow it
-        without limit.
-        """
-        smpl = frame.get("smpl")
-        betas = smpl.get("betas") if isinstance(smpl, dict) else None
-        if betas is None:
-            return self.owner
-        arr = np.asarray(betas, dtype=np.float32).reshape(-1)
-        key = np.round(arr, 3).tobytes()
-        cached = self._betas_owner_cache.get(key)
-        if cached is None:
-            cached = compute_vertex_joint_owner(betas=arr)
-            if len(self._betas_owner_cache) < 4096:
-                self._betas_owner_cache[key] = cached
-        return cached
+        return {name: self.joint_dims for name in self.enabled}
 
     def assemble_batch(self, frames: list[dict]) -> dict[str, dict[str, Tensor]]:
         """Build ``{target: {'gt': [B, D], 'mask': [B, D]}}`` from per-frame dicts.
 
-        A frame carries native labels: image frames a ``contact`` ``[V]`` vertex
-        tensor; video frames carry raw body-22 contact, supervision and confidence.
-        Targets a frame does not supervise get all-zero masks (ignored by the loss).
+        Video frames carry raw body-22 contact, supervision and confidence.
+        A frame that does not supervise the target gets an all-zero mask
+        (ignored by the loss).
         """
         batch_size = len(frames)
         out: dict[str, dict[str, Tensor]] = {}
-
-        if "vertex" in self.enabled:
-            gt = torch.zeros(batch_size, self.vertex_dims, dtype=torch.float32)
-            mask = torch.zeros(batch_size, self.vertex_dims, dtype=torch.float32)
-            for i, frame in enumerate(frames):
-                contact = frame.get("contact")
-                if contact is not None:
-                    gt[i] = torch.as_tensor(contact, dtype=torch.float32)
-                    mask[i] = 1.0
-            out["vertex"] = {"gt": gt, "mask": mask}
 
         if "joint" in self.enabled:
             gt = torch.zeros(batch_size, self.joint_dims, dtype=torch.float32)
@@ -411,50 +256,28 @@ class TargetSpec:
                         gt[i] = reduced_gt
                         mask[i] = reduced_supervised * (
                             reduced_confidence if self.use_confidence_weights else 1.0)
-                elif self.derive_from_vertex and frame.get("contact") is not None:
-                    contact = torch.as_tensor(frame["contact"], dtype=torch.float32)
-                    body22 = derive_joint_contact(contact, self._owner_for_frame(frame))
-                    if self.joint_set == "smplx_body_22":
-                        gt[i] = body22
-                        mask[i] = subset
-                    else:
-                        gt[i], mask[i], _ = reduce_body22_to_groups(
-                            body22, torch.ones_like(body22), torch.ones_like(body22),
-                            JOINT_SET_GROUPS[self.joint_set])
             out["joint"] = {"gt": gt, "mask": mask}
 
         return out
 
 
-def _dataset_supervised(native: set[str], enabled: set[str], derive: bool) -> set[str]:
-    """Enabled targets a dataset supervises, natively or via enabled derivation."""
-    supervised = set(native) & enabled
-    if derive and "vertex" in native and "joint" in enabled:
-        supervised.add("joint")
-    return supervised
-
-
 def validate_targets(cfg: dict, datasets: Sequence) -> None:
     """Reject configs whose enabled targets cannot be supervised by the datasets.
 
-    Every enabled target must be supervised by at least one dataset, **and every
-    configured dataset must supervise at least one enabled target** (natively or
-    via enabled ``joint.derive_from_vertex``) — otherwise that dataset's batches
-    are all-masked yet still take optimiser steps. A dataset supplying GT forces
-    (``force_supervision``) or GT motion (``motion_supervision``) counts as
-    supervising: those builds have no contact target at all. Every dataset that
-    supplies vertex labels must also match ``contact.topology``.
+    The joint target, when enabled, must be supervised by at least one dataset,
+    **and every configured dataset must supervise it** — otherwise that dataset's
+    batches are all-masked yet still take optimiser steps. A dataset supplying GT
+    forces (``force_supervision``) or GT motion (``motion_supervision``) counts as
+    supervising: those builds have no contact target at all.
 
     :param cfg: Resolved run config.
     :param datasets: Built dataset objects exposing ``supervised_targets``
-        (set of names) and ``topology`` (str or ``None``).
-    :raises ValueError: on any unsatisfiable (dataset, target, topology) combo, or
-        a dataset that supervises none of the enabled targets.
+        (set of names).
+    :raises ValueError: on any unsatisfiable (dataset, target) combo, or a dataset
+        that supervises none of the enabled targets.
     """
-    topology = cfg["contact"]["topology"]
     targets = cfg["contact"]["targets"]
-    enabled = {name for name in ("vertex", "joint") if targets[name]["enabled"]}
-    derive = bool(targets["joint"]["derive_from_vertex"])
+    enabled = {"joint"} if targets["joint"]["enabled"] else set()
     # A supervised-force run (force_supervision.enabled) counts a dataset that
     # supplies GT forces as supervising — force-only configs have no contact
     # target at all, and mixed configs may include a forces-only dataset.
@@ -473,18 +296,12 @@ def validate_targets(cfg: dict, datasets: Sequence) -> None:
     supplied: set[str] = set()
     for ds in datasets:
         native = set(getattr(ds, "supervised_targets", set()))
-        ds_supervised = _dataset_supervised(native, enabled, derive)
+        ds_supervised = native & enabled
         ds_forces = force_supervised and bool(getattr(ds, "load_forces", False))
         ds_motion = motion_supervised and bool(getattr(ds, "load_motion", False))
         ds_pose = pose_supervised and bool(getattr(ds, "load_pose", False))
         ds_kp = kp_supervised and bool(getattr(ds, "load_keypoints", False))
         supplied |= ds_supervised
-        if "vertex" in native:
-            ds_topology = getattr(ds, "topology", None)
-            if ds_topology != topology:
-                raise ValueError(
-                    f"dataset {getattr(ds, 'name', ds)!r} supplies vertex labels in "
-                    f"topology {ds_topology!r} but contact.topology is {topology!r}")
         if (not ds_supervised and not ds_forces and not ds_motion
                 and not ds_pose and not ds_kp):
             raise ValueError(
@@ -499,5 +316,4 @@ def validate_targets(cfg: dict, datasets: Sequence) -> None:
     missing = enabled - supplied
     if missing:
         raise ValueError(
-            f"enabled target(s) {sorted(missing)} are not supervised by any dataset "
-            f"(set joint.derive_from_vertex, or add a dataset that supplies them)")
+            f"enabled target(s) {sorted(missing)} are not supervised by any dataset")

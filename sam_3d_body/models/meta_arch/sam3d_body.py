@@ -494,35 +494,18 @@ class SAM3DBody(BaseModel):
             self.cross_modal_modalities = [
                 m for m in ("pose", "contact", "force", "motion")
                 if m in requested]
-            if xmcfg.get("TYPE", "rope") == "window":
-                # The revived sinusoidal block: bottleneck adapter, absolute
-                # in-clip positions (a checkpoint only generalizes to clip
-                # lengths it trained on — eval must window long scenes).
-                from ..modules.temporal import ContactTemporalModule
-                self.cross_modal_temporal = ContactTemporalModule(
-                    dim=self.cfg.MODEL.DECODER.DIM,
-                    num_layers=xmcfg.get("NUM_LAYERS", 2),
-                    num_heads=xmcfg.get("NUM_HEADS", 4),
-                    mlp_ratio=xmcfg.get("MLP_RATIO", 2.0),
-                    attend="joint",
-                    causal=xmcfg.get("CAUSAL", False),
-                    dropout=xmcfg.get("DROPOUT", 0.0),
-                    bottleneck_dim=xmcfg.get("BOTTLENECK_DIM", 256),
-                    position_scale=xmcfg.get("POSITION_SCALE", 25.0),
-                )
-            else:
-                from ..modules.cross_modal_rope import CrossModalRopeModule
-                self.cross_modal_temporal = CrossModalRopeModule(
-                    dim=self.cfg.MODEL.DECODER.DIM,
-                    num_slots=sum(self._modality_token_count(m)
-                                  for m in self.cross_modal_modalities),
-                    num_layers=xmcfg.get("NUM_LAYERS", 4),
-                    num_heads=xmcfg.get("NUM_HEADS", 16),
-                    mlp_ratio=xmcfg.get("MLP_RATIO", 2.0),
-                    dropout=xmcfg.get("DROPOUT", 0.0),
-                    time_scale=xmcfg.get("TIME_SCALE", 25.0),
-                    max_rel_sec=xmcfg.get("MAX_REL_SEC", 2.5),
-                )
+            from ..modules.cross_modal_rope import CrossModalRopeModule
+            self.cross_modal_temporal = CrossModalRopeModule(
+                dim=self.cfg.MODEL.DECODER.DIM,
+                num_slots=sum(self._modality_token_count(m)
+                              for m in self.cross_modal_modalities),
+                num_layers=xmcfg.get("NUM_LAYERS", 4),
+                num_heads=xmcfg.get("NUM_HEADS", 16),
+                mlp_ratio=xmcfg.get("MLP_RATIO", 2.0),
+                dropout=xmcfg.get("DROPOUT", 0.0),
+                time_scale=xmcfg.get("TIME_SCALE", 25.0),
+                max_rel_sec=xmcfg.get("MAX_REL_SEC", 2.5),
+            )
         # --- end cross-modal temporal hook ---
 
         self.keypoint_posemb_linear = FFN(

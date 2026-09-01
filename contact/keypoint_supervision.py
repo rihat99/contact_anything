@@ -85,7 +85,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .data.climbing_corpus import KP_JOINT_NAMES, NUM_MHR70
-from .motion_consistency import quat_xyzw_from_matrix, so3_log_xyzw
+from .root_world import quat_xyzw_from_matrix, so3_log_xyzw
 
 #: MHR70 keypoint index for each :data:`KP_JOINT_NAMES` entry (name-matched:
 #: shoulders 5/6, elbows 7/8, wrists 62/41, hips 9/10, knees 11/12, ankles
@@ -103,7 +103,7 @@ MHR70_FINGER_INDICES = tuple(range(21, 41)) + tuple(range(42, 62))
 MHR70_FACE_INDICES = (0, 1, 2, 3, 4)
 #: Positions of left_hip / right_hip in MHR70 (the centering root for the
 #: relative 3D terms; MHR70 has no pelvis keypoint). Matches
-#: ``contact.motion_consistency._HIP_KPS``.
+#: ``contact.root_world._HIP_KPS``.
 _HIP_POSITIONS = (9, 10)
 #: Minimum camera-frame depth (metres) for a projectable GT row.
 _MIN_DEPTH_M = 0.25
@@ -359,9 +359,9 @@ class KeypointSupervisedLoss:
                 if frozen_r is None:
                     terms["rot_rail"] = (kp3d.new_zeros(()), 0.0)
                 else:
-                    # Native-axes relative rotation, the motion_consistency
-                    # formulation exactly (so3 log is Taylor-smooth at I —
-                    # a geodesic acos would have an exploding gradient there).
+                    # Native-axes relative rotation via the so3 log, which is
+                    # Taylor-smooth at I — a geodesic acos would have an
+                    # exploding gradient there.
                     r_pred = roma.euler_to_rotmat(
                         "xyz", out["mhr"]["global_rot"].to(torch.float64))
                     r_frz = roma.euler_to_rotmat(

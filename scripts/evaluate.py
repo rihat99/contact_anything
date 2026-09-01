@@ -3,9 +3,8 @@
 Builds the model + val loader from ``--config`` (the same
 ``contact.data.collate.make_loaders`` the trainer uses), runs the frozen base +
 loaded contact weights over the val split, and reports micro-averaged per-target
-precision / recall / F1 / F2 / IoU via ``contact.metrics``. Works for both a
-vertex config (e.g. DAMON) and a joint config. ``--split test`` is supported for
-the ClimbingVideos corpus and reads the manually annotated DB test scenes.
+precision / recall / F1 / F2 / IoU via ``contact.metrics``. ``--split test``
+reads the manually annotated DB test scenes of the ClimbingVideos corpus.
 
 When the run enables the force branch + the RNEA physics loss, a second
 **physics-consistency** section is reported (headline ``physics_residual``,
@@ -17,7 +16,7 @@ from the config's ``model.init_contact_checkpoint`` to exercise the pipeline.
 Usage::
 
     CUDA_VISIBLE_DEVICES=0 python scripts/evaluate.py \
-        --config configs/climbing_videos_joint.yaml \
+        --config configs/allmod_rope_t60_gv.yaml \
         --checkpoint output/<run>/best.pth --out output/eval.jsonl
 """
 from __future__ import annotations
@@ -485,7 +484,7 @@ def main() -> int:
                     "checkpoint was trained on")
         _, val_loader, _ = make_loaders(
             cfg, tuple(model.cfg.MODEL.IMAGE_SIZE), manifest=manifest)
-    targets = [t for t in ("vertex", "joint") if cfg["contact"]["targets"][t]["enabled"]]
+    targets = ["joint"] if cfg["contact"]["targets"]["joint"]["enabled"] else []
     curve_thresholds = tuple(
         float(value) for value in args.curve_thresholds.split(",") if value.strip())
     output_names = {"joint": spec.joint_names} if "joint" in targets else {}

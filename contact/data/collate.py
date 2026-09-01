@@ -1,16 +1,15 @@
-"""Batch assembly — datasets -> SAM-3D-Body batch, images and clips alike.
+"""Batch assembly — corpus clips -> SAM-3D-Body batch.
 
-Each dataset item is either a single frame-dict (still-image datasets) or a
-**clip** (list of ``T`` frame-dicts, from :class:`ClimbingCorpusDataset`). The
-collate normalises stills to length-1 clips, asserts the batch is homogeneous in
+Each dataset item is a **clip**: a list of ``T`` frame-dicts from
+:class:`ClimbingCorpusDataset`. The collate asserts the batch is homogeneous in
 ``T``, flattens ``[B_clips, T, ...]`` to a model batch ``[B_clips*T, ...]``, runs
 the SAM-3D-Body top-down transform per frame, and builds the per-target
 ``{name: {"gt": [B, D], "mask": [B, D]}}`` supervision from
 :meth:`contact.targets.TargetSpec.assemble_batch`.
 
-Mixed image+video training uses **batch-level interleaving**: one DataLoader per
-T-group, interleaved by remaining length (:class:`InterleavedLoader`) — never a
-mixed-T batch.
+Several datasets with different ``T`` are combined by **batch-level
+interleaving**: one DataLoader per T-group, interleaved by remaining length
+(:class:`InterleavedLoader`) — never a mixed-T batch.
 """
 from __future__ import annotations
 
@@ -21,7 +20,7 @@ from typing import Tuple
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import ConcatDataset, DataLoader, Sampler, Subset
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.transforms import ToTensor
 
@@ -42,9 +41,7 @@ from .climbing_corpus import (
     list_annotated_test_scenes,
     list_corpus_scenes,
 )
-from .climbing_images import ClimbingImagesDataset
-from .damon import DamonDataset
-from .splits import group_train_val_split, train_val_indices, video_id_from_scene
+from .splits import group_train_val_split, video_id_from_scene
 
 
 class DistributedEvalSampler(Sampler[int]):
@@ -382,9 +379,9 @@ class InterleavedLoader:
     """Interleave whole batches from several DataLoaders (one per T-group).
 
     Batches are drawn proportionally to each loader's remaining length, seeded
-    per epoch, so image (T=1) and video (T) batches mix without ever forming a
-    mixed-T batch. :meth:`set_epoch` reseeds the interleave order and forwards to
-    any child dataset exposing ``set_epoch`` (the video jitter).
+    per epoch, so different-T datasets mix without ever forming a mixed-T batch.
+    :meth:`set_epoch` reseeds the interleave order and forwards to any child
+    dataset exposing ``set_epoch`` (the clip-window jitter).
     """
 
     def __init__(self, loaders: list[DataLoader], seed: int = 42):
@@ -419,30 +416,6 @@ class InterleavedLoader:
 
 
 # -------------------------------------------------------------------- builders
-
-def _build_image_dataset(spec: dict):
-    """Construct one still-image sub-dataset from a ``data.datasets`` entry."""
-    name = spec["name"]
-    if name == "damon":
-        return DamonDataset.from_config(spec["config"], split=spec.get("split", "trainval"))
-    if name == "climbing":
-        return ClimbingImagesDataset.from_config(spec["config"])
-    raise ValueError(f"{name!r} is not a still-image dataset")
-
-
-def _manifest_image_indices(manifest: dict, n: int) -> Tuple[list, list]:
-    """Read the still-image split from a manifest; reject out-of-range indices."""
-    if "images" not in manifest:
-        raise ValueError("split manifest has no 'images' entry but the config has image datasets")
-    train_idx = [int(i) for i in manifest["images"]["train"]]
-    val_idx = [int(i) for i in manifest["images"]["val"]]
-    referenced = set(train_idx) | set(val_idx)
-    if referenced and max(referenced) >= n:
-        raise ValueError(
-            f"split manifest references image index {max(referenced)} but the current "
-            f"dataset has only {n} items — the source data changed since the checkpoint")
-    return train_idx, val_idx
-
 
 def _manifest_video_ids(manifest: dict, key: str, scenes: list) -> Tuple[set, set]:
     """Read the video-group split from a manifest; reject ids missing from disk."""
@@ -490,16 +463,13 @@ def make_loaders(
 ):
     """Build interleaved train + configured-evaluation loaders.
 
-    Still-image datasets (damon/climbing) are concatenated and split randomly by
-    ``val_ratio``/``seed`` (T=1 clips). ClimbingCorpus datasets are split by
-    source video (no video crosses train/val) into windowed clips (T), unless
+    ClimbingCorpus datasets are split by source video (no video crosses train/val) into windowed clips (T), unless
     ``data.eval_split=test``: then every curated train scene is used for
     training and annotated manual test scenes form evaluation. Batches keep a
     fixed ``frames_per_batch`` budget: ``B_clips = frames_per_batch // T``.
 
     :param manifest: when given, splits are taken **from the manifest** instead of
-        re-derived (``{"images": {"train": [idx...], "val": [idx...]},
-        "corpus:<config>": {"train": [vid...], "val": [vid...]}}``); missing
+        re-derived (``{"corpus:<config>": {"train": [vid...], "val": [vid...]}}``); missing
         members raise. Used by evaluate/resume to reproduce the exact split a
         checkpoint was trained on rather than the current directory's derivation.
     :param distributed_rank: Process rank for ``DistributedSampler`` sharding.
@@ -525,30 +495,12 @@ def make_loaders(
     clip_len = int(seq["frames_per_clip"])
     use_conf = bool(cfg["contact"]["targets"]["joint"]["use_confidence_weights"])
 
-    image_specs = [s for s in specs if s["name"] in ("damon", "climbing")]
     corpus_specs = [s for s in specs if s["name"] == "climbing_corpus"]
 
     datasets_for_validation = []
     train_parts: list[tuple] = []   # (dataset, batch_size, shuffle)
     eval_parts: list[tuple] = []
     out_manifest: dict = {}
-
-    if image_specs:
-        subsets = [_build_image_dataset(s) for s in image_specs]
-        datasets_for_validation += subsets
-        ds = subsets[0] if len(subsets) == 1 else ConcatDataset(subsets)
-        if manifest is not None:
-            train_idx, val_idx = _manifest_image_indices(manifest, len(ds))
-        else:
-            train_idx, val_idx = train_val_indices(len(ds), val_ratio, seed)
-        train_parts.append((Subset(ds, train_idx), frames_per_batch, True))
-        eval_parts.append((Subset(ds, val_idx), frames_per_batch, False))
-        out_manifest["images"] = {"train": [int(i) for i in train_idx],
-                                  "val": [int(i) for i in val_idx]}
-        sizes = " + ".join(f"{s['name']}={len(d)}" for s, d in zip(image_specs, subsets))
-        if distributed_rank == 0:
-            print(f"Image datasets [{sizes}] -> total={len(ds)} "
-                  f"train={len(train_idx)} val={len(val_idx)} (val_ratio={val_ratio}, seed={seed})")
 
     if corpus_specs:
         clips_per_batch = max(1, frames_per_batch // clip_len)

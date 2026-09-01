@@ -13,8 +13,8 @@ pass. The two gradient paths it opens are
 
 - the **pose** path (``pred_keypoints_3d`` / ``pred_cam_t`` — the recomputed
   final readout): where contact is predicted, the pose must stop jittering.
-  That is the same depth-wobble attack :mod:`contact.motion_consistency` makes
-  on the root, applied to the limbs that are pinned to the wall;
+  That is the same depth-wobble attack applied to the limbs that are
+  pinned to the wall;
 - the **contact** path, only when ``detach_gate: false``: the head can lower a
   probability to escape a moving limb's penalty. The supervised focal loss is
   the counterweight — there is deliberately no extra guard here (a collapse of

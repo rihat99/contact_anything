@@ -88,9 +88,8 @@ def _hex_to_bgr(color: str) -> tuple[int, int, int]:
     return (blue, green, red)
 
 
-# One arrow colour per force output. First four match
-# legacy/demo_climbing_videos.py::FORCE_COLORS (there in RGB hex); the last two
-# cover the six-group kindyn order's left_ankle / right_ankle (heels).
+# One arrow colour per force output, in the six-group kindyn order
+# (LH, RH, left/right foot, left/right ankle).
 FORCE_COLORS = ("#e0530f", "#f0a500", "#1c72d8", "#2fb3ad", "#8b41c9", "#d1367f")
 FORCE_COLORS_BGR = tuple(_hex_to_bgr(color) for color in FORCE_COLORS)
 FORCE_METERS_PER_BW = 1.0       # 3D arrow length in metres per unit body weight of |f|
@@ -362,8 +361,7 @@ def _predict_requests(
         collect_force = force_data is not None and output.get("force") is not None
         if collect_force:
             batch_forces = output["force"]["joint_forces"].float().cpu().numpy()
-            # Camera-frame 3D position of each anchor (keypoints_3d + cam translation),
-            # matching legacy/demo_climbing_videos.py::_draw_force_arrows' ``point_cam``.
+            # Camera-frame 3D position of each anchor (keypoints_3d + cam translation).
             batch_anchor_cam = (
                 output["mhr"]["pred_keypoints_3d"][:, anchor_indices]
                 + output["mhr"]["pred_cam_t"][:, None, :]
@@ -751,7 +749,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
-        "--config", type=Path, default=REPO / "configs" / "climbing_videos_joint.yaml")
+        "--config", type=Path, required=True)
     parser.add_argument("--split", choices=("train", "test"), default="test")
     parser.add_argument(
         "--overlay-labels", action="store_true",

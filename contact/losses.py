@@ -179,7 +179,7 @@ class MultiTargetContactLoss(nn.Module):
         dice_eps = float(cfg["loss"]["dice_eps"])
         self.losses = nn.ModuleDict()
         self.weights: dict[str, float] = {}
-        for name in ("vertex", "joint"):
+        for name in ("joint",):
             spec = targets[name]
             if not spec["enabled"]:
                 continue

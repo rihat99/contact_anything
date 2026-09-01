@@ -9,9 +9,9 @@ loop, scheduler, monitor-based best selection, and resume.
 
 Usage::
 
-    python scripts/train.py --config configs/climbing_videos_joint.yaml
+    python scripts/train.py --config configs/X.yaml
     CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
-        scripts/train.py --config configs/climbing_videos_joint.yaml
+        scripts/train.py --config configs/X.yaml
     python scripts/train.py --config configs/X.yaml --resume auto
     python scripts/train.py --config configs/X.yaml --resume output/<run>/last.pth
 """
@@ -42,7 +42,6 @@ from contact.config import DEFAULTS as CONFIG_DEFAULTS
 from contact.config import _deep_merge, load_config
 from contact.data.climbing_corpus import FORCE_GROUP_NAMES, MOTION_JOINT_NAMES
 from contact.data.collate import batch_to_device, make_loaders
-from contact.embedding_augment import anneal_scale, augment_batch
 from contact.engine import forward_model, select_temporal_supervision
 from contact.losses import MultiTargetContactLoss, ddp_global_mean_term
 from contact.metrics import (
@@ -57,15 +56,6 @@ from contact.motion_supervision import (
 from contact.model import _trainable_name_filter, build_model
 from contact.targets import TargetSpec
 from contact.tracking import RunLogger
-
-#: PoseSmoothnessLoss diagnostics logged per step and aggregated over eval.
-#: The ``gt_*`` pair is a REFERENCE value (the corpus GT trajectory put through
-#: the same stencils); it never enters the objective.
-POSE_SMOOTH_DIAG_KEYS = (
-    "jerk_rms", "snap_rms", "gt_jerk_rms", "gt_snap_rms",
-    "root_pos_jerk_rms", "root_pos_snap_rms",
-    "root_rot_jerk_rms", "root_rot_snap_rms")
-
 
 # The per-target metrics a monitor may select (direction: all "max"; only
 # ``val/loss`` is "min"). Mirrors the keys produced by ``contact.metrics.prf1``.
@@ -173,22 +163,14 @@ def _resume_config_diffs(saved: dict, current: dict) -> list[str]:
 
     diffs: list[str] = []
     for section in ("model", "contact", "physics", "force_supervision",
-                    "motion_supervision", "motion_consistency", "motion_rollout",
-                    "contact_consistency", "force_consistency",
-                    "pose_supervision", "keypoint_supervision",
-                    "pose_smoothness", "loss"):
+                    "motion_supervision", "contact_consistency",
+                    "force_consistency", "pose_supervision",
+                    "keypoint_supervision", "loss"):
         if _normalized(saved, section) != _normalized(current, section):
             diffs.append(f"  {section}: differs")
     for key in ("datasets", "sequence", "eval_split"):
         if (saved.get("data", {}) or {}).get(key) != (current.get("data", {}) or {}).get(key):
             diffs.append(f"  data.{key}: differs")
-    # Default-merged, unlike the raw comparisons above: a config predating the
-    # section must resume equal to a current resolution holding its defaults.
-    def _aug(cfg: dict) -> dict:
-        return _deep_merge(CONFIG_DEFAULTS["data"]["embedding_augment"],
-                           (cfg.get("data") or {}).get("embedding_augment") or {})
-    if _aug(saved) != _aug(current):
-        diffs.append("  data.embedding_augment: differs")
     s_optim = {k: v for k, v in (saved.get("optim") or {}).items() if k != "epochs"}
     c_optim = {k: v for k, v in (current.get("optim") or {}).items() if k != "epochs"}
     if s_optim != c_optim:
@@ -371,8 +353,8 @@ class Trainer:
             (self.out_dir / "split_manifest.json").write_text(
                 json.dumps(self.split_manifest, indent=2))
 
-        self.contact_enabled = any(
-            self.cfg["contact"]["targets"][t]["enabled"] for t in ("vertex", "joint"))
+        self.contact_enabled = bool(
+            self.cfg["contact"]["targets"]["joint"]["enabled"])
         if self.contact_enabled:
             self.loss_fn = MultiTargetContactLoss(self.cfg).to(device)
             self.targets = self.loss_fn.target_names
@@ -460,34 +442,6 @@ class Trainer:
                     "keypoint_supervision enabled for training: without a pose "
                     "objective the pose-moving params never receive gradients")
 
-        # Pose->motion consistency: the predicted pose differentiated to a
-        # pelvis twist, pulled toward the kindyn GT and the motion head (grads
-        # reach the pose path AND the motion head). Config-validated to require
-        # motion_supervision + a trainable pose path.
-        self.consistency_loss = None
-        if self.cfg["motion_consistency"]["enabled"]:
-            from contact.motion_consistency import MotionConsistencyLoss
-            self.consistency_loss = MotionConsistencyLoss(self.cfg, device=device)
-
-        # Roll-out consistency: INTEGRATE the predicted root velocity and compare
-        # horizon displacements with the GT path and the predicted pose's path —
-        # the mirror of motion_consistency (which differentiates the pose).
-        self.rollout_loss = None
-        self.rollout_diag_keys: list[tuple[str, str]] = []
-        if self.cfg["motion_rollout"]["enabled"]:
-            from contact.motion_rollout import MotionRolloutLoss
-            self.rollout_loss = MotionRolloutLoss(self.cfg, device=device)
-            # (diagnostic, its mass key) — pooled plus one pair per horizon.
-            angular = bool(self.cfg["motion_supervision"]["angular"])
-            self.rollout_diag_keys = [("disp_err_m", "n_rows")] + (
-                [("rot_err_deg", "n_rot_rows")] if angular else [])
-            for horizon in self.cfg["motion_rollout"]["horizons"]:
-                self.rollout_diag_keys.append(
-                    (f"disp_err_m_h{horizon}", f"n_rows_h{horizon}"))
-                if angular:
-                    self.rollout_diag_keys.append(
-                        (f"rot_err_deg_h{horizon}", f"n_rows_h{horizon}"))
-
         # Contact-consistency: predicted-contact-gated zero-velocity of the six
         # extremity keypoints in the world frame (grad -> pose path; the gate
         # is detached unless contact_consistency.detach_gate=false).
@@ -495,13 +449,6 @@ class Trainer:
         if self.cfg["contact_consistency"]["enabled"]:
             from contact.contact_consistency import ContactConsistencyLoss
             self.contact_cons_loss = ContactConsistencyLoss(self.cfg, device=device)
-
-        # Pose smoothness: jerk + snap of the PREDICTED trajectory pushed toward
-        # zero (no target). Grad -> pose path only.
-        self.pose_smooth_loss = None
-        if self.cfg["pose_smoothness"]["enabled"]:
-            from contact.pose_smoothness import PoseSmoothnessLoss
-            self.pose_smooth_loss = PoseSmoothnessLoss(self.cfg, device=device)
 
         # Force-consistency: linear Newton residual (bw units) between the
         # predicted world-root acceleration and gravity + the net predicted
@@ -546,9 +493,6 @@ class Trainer:
                         else (self.targets[0] if self.targets else None))
         self.eval_split = str(self.cfg["data"]["eval_split"])
         self.target_frame = str(self.cfg["data"]["sequence"]["target_frame"])
-        _aug = self.cfg["data"]["embedding_augment"]
-        self.embed_aug = _aug if _aug["enabled"] else None
-
         ocfg = self.cfg["optim"]
         self.grad_clip = float(self.cfg["loss"]["grad_clip"])
         # The fine-tuned head copies (pretrained weights) get their own
@@ -901,30 +845,6 @@ class Trainer:
         return scalars
 
     @staticmethod
-    def _consistency_scalars(prefix: str, cons_parts: dict) -> dict:
-        """Flatten MotionConsistencyLoss parts into ``{prefix}/consistency/*``."""
-        scalars = {f"{prefix}/consistency/loss": cons_parts["loss"]}
-        for name, term in cons_parts["terms"].items():
-            scalars[f"{prefix}/consistency/{name}"] = term["loss"]
-            scalars[f"{prefix}/consistency/{name}_mass"] = term["weight_mass"]
-        for key in ("vel_rmse", "acc_rmse", "pos_err_m", "rot_err_deg"):
-            if key in cons_parts:
-                scalars[f"{prefix}/consistency/{key}"] = cons_parts[key]
-        return scalars
-
-    @staticmethod
-    def _rollout_scalars(prefix: str, parts: dict) -> dict:
-        """Flatten MotionRolloutLoss parts into ``{prefix}/rollout/*``."""
-        scalars = {f"{prefix}/rollout/loss": parts["loss"]}
-        for name, term in parts["terms"].items():
-            scalars[f"{prefix}/rollout/{name}"] = term["loss"]
-            scalars[f"{prefix}/rollout/{name}_mass"] = term["weight_mass"]
-        for key, value in parts.items():
-            if key.startswith(("disp_err_m", "rot_err_deg")):
-                scalars[f"{prefix}/rollout/{key}"] = value
-        return scalars
-
-    @staticmethod
     def _contact_cons_scalars(prefix: str, parts: dict) -> dict:
         """Flatten ContactConsistencyLoss parts into ``{prefix}/contact_cons/*``."""
         scalars = {f"{prefix}/contact_cons/loss": parts["loss"]}
@@ -947,23 +867,6 @@ class Trainer:
             if key in parts:
                 scalars[f"{prefix}/force_cons/{key}"] = parts[key]
         return scalars
-
-    @staticmethod
-    def _pose_smoothness_scalars(prefix: str, parts: dict) -> dict:
-        """Flatten PoseSmoothnessLoss parts into ``{prefix}/pose_smooth/*``."""
-        scalars = {f"{prefix}/pose_smooth/loss": parts["loss"]}
-        for name, term in parts["terms"].items():
-            scalars[f"{prefix}/pose_smooth/{name}"] = term["loss"]
-            scalars[f"{prefix}/pose_smooth/{name}_mass"] = term["weight_mass"]
-        for key in POSE_SMOOTH_DIAG_KEYS:
-            scalars[f"{prefix}/pose_smooth/{key}"] = parts[key]
-        return scalars
-
-    @property
-    def aug_scale(self) -> float:
-        """Embedding-augment strength for the current epoch (see `anneal_scale`)."""
-        return anneal_scale(self.epoch, self.epochs,
-                            float(self.embed_aug["anneal_start_frac"]))
 
     def _force_cons_ramp_scale(self) -> float:
         """Linear warm-up factor for the force-consistency weight.
@@ -1019,11 +922,6 @@ class Trainer:
         )
         print(f"Trainable params: {n_train:,} | targets={self.targets} primary={self.primary} | "
               f"monitor={self.monitor} ({self.monitor_mode}) | supervision={supervised}")
-        if self.embed_aug is not None:
-            print(f"Embedding augment: gaussian_alpha={self.embed_aug['gaussian_alpha']} "
-                  f"cutmix_prob={self.embed_aug['cutmix_prob']} "
-                  f"area={self.embed_aug['cutmix_area']} "
-                  f"anneal_start_frac={self.embed_aug['anneal_start_frac']} (train only)")
         print(f"Batch budget: {fpb} frames/rank x {self.world_size} rank(s) "
               f"= {fpb * self.world_size} global frames -> {layout} per rank | "
               f"train batches/epoch={len(self.train_loader)} "
@@ -1047,9 +945,6 @@ class Trainer:
             epoch_frames += frames
             window_frames += frames
 
-            if self.embed_aug is not None:
-                augment_batch(batch, self.embed_aug, self.aug_scale)
-
             out = self.forward_module(batch)
             if self.loss_fn is not None:
                 logits, targets = self._supervision(out["contact"], batch)
@@ -1067,16 +962,11 @@ class Trainer:
             force_parts = None
             motion_parts = None
             pose_parts = None
-            cons_parts = None
-            rollout_parts = None
             ccons_parts = None
             fcons_parts = None
             kp_parts = None
-            psmooth_parts = None
             physics_active = force_active = motion_active = pose_active = False
-            cons_active = ccons_active = fcons_active = kp_active = False
-            rollout_active = False
-            psmooth_active = False
+            ccons_active = fcons_active = kp_active = False
             total = (None if (self.freeze_contact or contact_loss is None)
                      else contact_loss)
             if self.physics_loss is not None:
@@ -1103,18 +993,6 @@ class Trainer:
                 pose_scaled, pose_active = self._ddp_physics_loss(
                     pose_total, pose_parts)
                 total = pose_scaled if total is None else total + pose_scaled
-            if self.consistency_loss is not None:
-                cons_total, cons_parts = self.consistency_loss(
-                    out, batch, exclude_outliers=True)
-                cons_scaled, cons_active = self._ddp_physics_loss(
-                    cons_total, cons_parts)
-                total = cons_scaled if total is None else total + cons_scaled
-            if self.rollout_loss is not None:
-                # Same (numerator, mass) term contract again.
-                ro_total, rollout_parts = self.rollout_loss(out, batch)
-                ro_scaled, rollout_active = self._ddp_physics_loss(
-                    ro_total, rollout_parts)
-                total = ro_scaled if total is None else total + ro_scaled
             if self.contact_cons_loss is not None:
                 # Same (numerator, mass) term contract again.
                 ccons_total, ccons_parts = self.contact_cons_loss(out, batch)
@@ -1134,12 +1012,6 @@ class Trainer:
                 kp_total, kp_parts = self.keypoint_loss(out, batch)
                 kp_scaled, kp_active = self._ddp_physics_loss(kp_total, kp_parts)
                 total = kp_scaled if total is None else total + kp_scaled
-            if self.pose_smooth_loss is not None:
-                # Same (numerator, mass) term contract again.
-                ps_total, psmooth_parts = self.pose_smooth_loss(out, batch)
-                ps_scaled, psmooth_active = self._ddp_physics_loss(
-                    ps_total, psmooth_parts)
-                total = ps_scaled if total is None else total + ps_scaled
             if total is None:
                 raise RuntimeError(
                     "no training objective: the contact loss is frozen/absent and "
@@ -1151,9 +1023,8 @@ class Trainer:
             # decay would still nudge the weights. Skip the optimiser step for those.
             active = ((contact_active and not self.freeze_contact)
                       or physics_active or force_active or motion_active
-                      or pose_active or cons_active or ccons_active
-                      or fcons_active or kp_active or psmooth_active
-                      or rollout_active)
+                      or pose_active or ccons_active
+                      or fcons_active or kp_active)
             loss = total
             finite = torch.tensor(
                 int(bool(torch.isfinite(loss).item())), device=self.device,
@@ -1229,19 +1100,12 @@ class Trainer:
                     scalars.update(self._motion_scalars("train", motion_parts))
                 if pose_parts is not None:
                     scalars.update(self._pose_scalars("train", pose_parts))
-                if cons_parts is not None:
-                    scalars.update(self._consistency_scalars("train", cons_parts))
-                if rollout_parts is not None:
-                    scalars.update(self._rollout_scalars("train", rollout_parts))
                 if ccons_parts is not None:
                     scalars.update(self._contact_cons_scalars("train", ccons_parts))
                 if fcons_parts is not None:
                     scalars.update(self._force_cons_scalars("train", fcons_parts))
                 if kp_parts is not None:
                     scalars.update(self._keypoint_scalars("train", kp_parts))
-                if psmooth_parts is not None:
-                    scalars.update(
-                        self._pose_smoothness_scalars("train", psmooth_parts))
                 self.logger.log(scalars, self.global_step)
 
             if self.is_main:
@@ -1316,8 +1180,6 @@ class Trainer:
         # in float64 over the split, then all-reduced once (exact global values).
         motion_stats = None
         pose_stats = None
-        cons_terms = ("gt", "head", "pos", "rot")
-        cons_sums = [0.0] * (2 * len(cons_terms))   # (num, mass) per term
         # Keypoint diagnostics: exact global mass-weighted means. The camera /
         # depth health is INVISIBLE to pose_mae (rotations only) — the v2 probe
         # collapsed the camera to metres of depth error while posting a "new
@@ -1330,15 +1192,6 @@ class Trainer:
                    "vert_err_m", "vert_size_ratio",
                    "cam_dev_m", "rot_dev_deg")
         kp_sums = [0.0] * (2 * len(kp_keys))        # (num, mass) per key
-        # Pose smoothness: the RMS diagnostics are aggregated as mass-weighted
-        # means of SQUARES (then sqrt'd), so the split value is the exact global
-        # RMS rather than a mean of per-batch RMSes.
-        psmooth_sums = [0.0] * (2 * len(POSE_SMOOTH_DIAG_KEYS))
-        # (num, mass) per rollout diagnostic: the pooled displacement/rotation
-        # errors and their per-horizon splits, each normalised by its own window
-        # count (the horizons have different masses).
-        rollout_keys = self.rollout_diag_keys
-        rollout_sums = [0.0] * (2 * len(rollout_keys))
         ccons_sums = [0.0, 0.0]      # (num, mass) of the gated |v_world| diagnostic
         fcons_sums = [0.0, 0.0]      # (num, mass) of the raw Newton |r| diagnostic
         for batch in tqdm(
@@ -1381,23 +1234,6 @@ class Trainer:
                 pose_stats = stats.clone() if pose_stats is None else pose_stats + stats
                 if self.loss_fn is None:
                     running_loss += pose_parts["loss"]
-            if self.consistency_loss is not None:
-                # Eval is NEVER outlier-filtered, like the motion loss.
-                _, cons_parts = self.consistency_loss(
-                    out, batch, exclude_outliers=False)
-                for i, name in enumerate(cons_terms):
-                    term = cons_parts["terms"].get(name)
-                    if term is not None:
-                        cons_sums[2 * i] += float(
-                            term["weighted_numerator_tensor"].detach())
-                        cons_sums[2 * i + 1] += term["weight_mass"]
-            if self.rollout_loss is not None:
-                _, ro_parts = self.rollout_loss(out, batch)
-                for i, (key, mass_key) in enumerate(rollout_keys):
-                    mass = ro_parts.get(mass_key, 0)
-                    if mass > 0:
-                        rollout_sums[2 * i] += ro_parts[key] * mass
-                        rollout_sums[2 * i + 1] += mass
             if self.contact_cons_loss is not None:
                 _, ccons_parts = self.contact_cons_loss(out, batch)
                 term = ccons_parts["terms"].get("vel")
@@ -1411,13 +1247,6 @@ class Trainer:
                 if term is not None and term["weight_mass"] > 0:
                     fcons_sums[0] += fcons_parts["residual_bw"] * term["weight_mass"]
                     fcons_sums[1] += term["weight_mass"]
-            if self.pose_smooth_loss is not None:
-                _, ps_parts = self.pose_smooth_loss(out, batch)
-                for i, key in enumerate(POSE_SMOOTH_DIAG_KEYS):
-                    rows = float(ps_parts["n_gt_rows" if key.startswith("gt_")
-                                          else "n_rows"])
-                    psmooth_sums[2 * i] += ps_parts[key] ** 2 * rows
-                    psmooth_sums[2 * i + 1] += rows
             if self.keypoint_loss is not None:
                 _, kp_parts = self.keypoint_loss(out, batch)
                 rows = float(kp_parts["n_supervised_rows"])
@@ -1488,28 +1317,6 @@ class Trainer:
             if self.distributed:
                 dist.all_reduce(pose_stats, op=dist.ReduceOp.SUM)
             metrics["pose"] = metrics_from_stats(pose_stats)
-        if self.consistency_loss is not None:
-            if self.distributed:
-                packed = torch.tensor(
-                    cons_sums, dtype=torch.float64, device=self.device)
-                dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-                cons_sums = packed.cpu().tolist()
-            metrics["consistency"] = {
-                name: cons_sums[2 * i] / max(cons_sums[2 * i + 1], 1.0)
-                for i, name in enumerate(cons_terms)
-                # A zero-weight term never accumulates mass — drop it so the
-                # report only carries the terms this run actually trains.
-                if cons_sums[2 * i + 1] > 0.0}
-        if self.rollout_loss is not None:
-            if self.distributed:
-                packed = torch.tensor(
-                    rollout_sums, dtype=torch.float64, device=self.device)
-                dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-                rollout_sums = packed.cpu().tolist()
-            metrics["rollout"] = {
-                key: rollout_sums[2 * i] / rollout_sums[2 * i + 1]
-                for i, (key, _) in enumerate(rollout_keys)
-                if rollout_sums[2 * i + 1] > 0.0}
         for accum, loss_obj, family, key in (
                 (ccons_sums, self.contact_cons_loss, "contact_cons", "vel_ms"),
                 (fcons_sums, self.force_cons_loss, "force_cons", "residual_bw")):
@@ -1522,16 +1329,6 @@ class Trainer:
                 accum = packed.cpu().tolist()
             if accum[1] > 0.0:
                 metrics[family] = {key: accum[0] / accum[1]}
-        if self.pose_smooth_loss is not None:
-            if self.distributed:
-                packed = torch.tensor(
-                    psmooth_sums, dtype=torch.float64, device=self.device)
-                dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-                psmooth_sums = packed.cpu().tolist()
-            metrics["pose_smooth"] = {
-                key: math.sqrt(psmooth_sums[2 * i] / psmooth_sums[2 * i + 1])
-                for i, key in enumerate(POSE_SMOOTH_DIAG_KEYS)
-                if psmooth_sums[2 * i + 1] > 0.0}
         if self.keypoint_loss is not None:
             if self.distributed:
                 packed = torch.tensor(
@@ -1598,13 +1395,6 @@ class Trainer:
                     k = v["metrics"]["keypoint"]
                     phys_note += ("  kp[" + " ".join(
                         f"{key} {val:.3f}" for key, val in k.items()) + "]")
-                if "pose_smooth" in v["metrics"]:
-                    s = v["metrics"]["pose_smooth"]
-                    phys_note += (
-                        "  smooth[jerk "
-                        f"{s.get('jerk_rms', 0.0):.3g}/{s.get('gt_jerk_rms', 0.0):.3g} "
-                        f"snap {s.get('snap_rms', 0.0):.3g}/"
-                        f"{s.get('gt_snap_rms', 0.0):.3g} (pred/GT)]")
                 if "motion" in v["metrics"]:
                     m = v["metrics"]["motion"]
                     j = self.motion_headline_joint
@@ -1642,12 +1432,6 @@ class Trainer:
                 if "motion" in v["metrics"]:
                     for key, val in v["metrics"]["motion"].items():
                         val_scalars[f"{self.eval_split}/motion/{key}"] = val
-                if "consistency" in v["metrics"]:
-                    for key, val in v["metrics"]["consistency"].items():
-                        val_scalars[f"{self.eval_split}/consistency/{key}"] = val
-                if "rollout" in v["metrics"]:
-                    for key, val in v["metrics"]["rollout"].items():
-                        val_scalars[f"{self.eval_split}/rollout/{key}"] = val
                 if "contact_cons" in v["metrics"]:
                     for key, val in v["metrics"]["contact_cons"].items():
                         val_scalars[f"{self.eval_split}/contact_cons/{key}"] = val
@@ -1657,9 +1441,6 @@ class Trainer:
                 if "keypoint" in v["metrics"]:
                     for key, val in v["metrics"]["keypoint"].items():
                         val_scalars[f"{self.eval_split}/keypoint/{key}"] = val
-                if "pose_smooth" in v["metrics"]:
-                    for key, val in v["metrics"]["pose_smooth"].items():
-                        val_scalars[f"{self.eval_split}/pose_smooth/{key}"] = val
                 # Pose q-space metrics: computed above from the all-reduced
                 # stats vector, and named in the configs' tensorboard keep-list,
                 # but never emitted before (audit finding F9) — so every

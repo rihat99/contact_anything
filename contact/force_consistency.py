@@ -11,7 +11,7 @@ so the residual this loss minimises is::
     r = a_world / g  -  ĝ_world  -  R_world←root · Σ_i f_i^root      [bw]
 
 ``a_world`` is the second difference of the PREDICTED world root position
-(:func:`~contact.motion_consistency.predicted_root_world` — hip keypoints +
+(:func:`~contact.root_world.predicted_root_world` — hip keypoints +
 ``pred_cam_t`` lifted with the dataset extrinsics), ``ĝ_world`` the kindyn unit
 DOWN direction (``gravity_world``; world y is down-positive), and the forces
 are the six-group head output in the kindyn body-root frame, already
@@ -56,7 +56,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .motion_consistency import predicted_root_world
+from .root_world import predicted_root_world
 from .physics.loss import _linear_windowed_mean
 
 #: Standard gravity (m/s²) — the scale that turns an acceleration into body
@@ -75,7 +75,7 @@ class ForceConsistencyLoss:
     :param device: device the loss runs on (predictions are moved to it).
     :param dtype: floating dtype of the residual and the loss (float32); the
         world trajectory and its second difference stay float64 up to the
-        residual, as in :class:`~contact.motion_consistency.MotionConsistencyLoss`.
+        residual.
     """
 
     def __init__(

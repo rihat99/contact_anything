@@ -7,8 +7,8 @@ extrinsics place every frame's body in one static metric reconstruction world
 physics loss (step 06) receives ``q`` (and the shaped body) as constants — only
 the predicted forces carry gradients.
 
-Two facts, both verified against the vendored model on real checkpoint outputs
-(``tests/test_physics_adapter.py``), fix the mapping:
+Two facts, both verified against the vendored model on real checkpoint outputs,
+fix the mapping:
 
 * The 204-slot ``mhr_model_params`` vector fed to SAM's MHR *is* Momentum's
   ``compact_v6`` vector, so ``MHRClassic(model_parameters=mhr_model_params)``

@@ -1,8 +1,6 @@
 """ClimbingVideos corpus — per-joint contact (+ GT force) clips read from ``features/``.
 
-Training-time replacement for the exported ClimbingVideos_v1 loader
-(``ClimbingVideosDataset``, retired to ``legacy/climbing_videos.py``): reads the
-raw pipeline corpus at ``/data3/rikhat.akizhanov/better/data/ClimbingVideos``
+Reads the raw pipeline corpus at ``/data3/rikhat.akizhanov/better/data/ClimbingVideos``
 directly — ``scenes/scenes.db`` (scene selection + train/test split),
 ``features/human_optim/<shard>/<scene>/contacts_<level>.npz`` (52-joint labels,
 folded to the 22 SMPL-X body joints exactly as the v1 exporter did),
@@ -74,8 +72,7 @@ v1 camera-0-derived direction, and ``load_forces=True`` adds per-frame GT forces
   axes.
 * ``motion_root_pos`` ``[3]`` float32 — the smoothed kindyn root position in
   the metric WORLD frame (``q_root[:3]``, same trajectory ``motion_rot`` comes
-  from). With ``motion_rot`` it is the absolute root-pose anchor of the
-  consistency loss (``motion_consistency.loss.pos/rot``).
+  from). With ``motion_rot`` it is the absolute root-pose anchor.
 * ``motion_root_valid`` bool — the raw kindyn-coverage bit for that frame.
   Unlike ``motion_valid`` it needs no stencil support or edge trim: an
   absolute pose is per-frame.
@@ -217,8 +214,8 @@ NUM_MHR_SCALES = 68
 #: anchors the contact/force tokens use. Read when ``motion_root_source='mhr'``.
 MOTION_MHR70_INDICES = (62, 41, 15, 18, 17, 20)
 #: MHR70 left/right hip keypoints. Their mean is the body placement the pose
-#: predictions are lifted from (``contact.motion_consistency._HIP_KPS``), so it
-#: is also the position half of the ``mhr`` motion root.
+#: predictions are lifted from (``contact.root_world._HIP_KPS``), so it is
+#: also the position half of the ``mhr`` motion root.
 _MHR70_HIP_KPS = (9, 10)
 
 #: Width of the ``cond_feat`` input-conditioning vector (``model.cond_input``):
@@ -338,8 +335,7 @@ def quat_xyzw_to_matrix(quat: np.ndarray) -> np.ndarray:
     """Rotation matrices from ``xyzw`` quaternions (normalized internally).
 
     The kindyn root quaternion ``q[..., 3:7]`` uses this layout, and
-    ``R(q_xyzw)`` equals ``R(global_orient)`` (world-from-root) — verified
-    numerically in ``tests/test_climbing_corpus.py``.
+    ``R(q_xyzw)`` equals ``R(global_orient)`` (world-from-root).
 
     :param quat: ``(..., 4)`` quaternions, ``xyzw`` order.
     :returns: ``(..., 3, 3)`` float32 rotation matrices.
@@ -788,10 +784,8 @@ def _longest_valid_run(valid: np.ndarray) -> tuple[int, int]:
 class ClimbingCorpusDataset(Dataset):
     """Windowed per-joint contact (+ force) clips straight from the corpus.
 
-    Duck-types the retired v1 ``ClimbingVideosDataset`` (``legacy/
-    climbing_videos.py``: ``supervised_targets``/``topology``/``name``/
-    ``set_epoch``, list-of-frame-dict clips, ``_scenes``/``_items`` internals),
-    so the existing collate and sliding-window machinery run unchanged.
+    Exposes ``supervised_targets``/``name``/``set_epoch``, list-of-frame-dict
+    clips and ``_scenes``/``_items`` internals for the collate machinery.
 
     :param corpus_root: corpus root containing ``scenes/``, ``features/``, ``frames/``.
     :param scenes: explicit scene ids; ``None`` discovers them from the DB and,
@@ -1526,9 +1520,9 @@ class ClimbingCorpusDataset(Dataset):
         * ``mhr`` — the MHR-native source: the six limb slots are the
           :data:`MOTION_MHR70_INDICES` columns of ``mhr_sup_1``'s ``kp_world``,
           and the root is the (MEAN-HIPS position, ``q_world`` root quaternion)
-          pair — the same free-flyer ``motion_consistency`` builds from the
+          pair — the same free-flyer ``contact.root_world`` builds from the
           PREDICTION, so the two twists are the same construction on the same
-          rig and ``hip_offset_root`` is exactly zero. It is deliberately NOT
+          rig. It is deliberately NOT
           ``q_world[..., :7]``: the MHR free-flyer root sits ~0.93 m from the
           hips with a leg-pose-dependent 0.28 m spread, so its twist is a
           different physical quantity. Rows the fit did not cover are
@@ -1610,10 +1604,10 @@ class ClimbingCorpusDataset(Dataset):
         # foot-level frame — a different physical quantity from the kindyn
         # pelvis, and from what the motion head is anchored to.
         #
-        # This pairing is exactly what motion_consistency builds on the
+        # This pairing is exactly what contact.root_world builds on the
         # PREDICTION side (``p_w = mean(kp[9,10]) + pred_cam_t`` lifted by the
         # extrinsics, ``R_w`` from ``global_rot``), so GT and prediction are the
-        # same construction on the same rig and ``hip_offset_root`` is exactly
+        # same construction on the same rig and the hip offset is exactly
         # zero for this source.
         hips = kp[:, :, _MHR70_HIP_KPS].mean(axis=2)               # [P, N, 3]
         root7 = np.concatenate([hips, q_world[..., 3:7]], axis=-1)  # [P, N, 7]
