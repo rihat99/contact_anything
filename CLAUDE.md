@@ -97,7 +97,6 @@ CUDA_VISIBLE_DEVICES=0 python scripts/precompute_embeddings.py --split all --sha
 | `contact/` | Our library: `config.py` (yaml + `base:` include + strict validation), `model.py` (build/freeze/eval-pin), `targets.py`, `losses.py`, `metrics.py`, `engine.py` (shared forward), `checkpoint.py` (schema v2), `tracking.py` (TB+wandb), `root_world.py` (predicted body root → metric world + SO(3) helpers), the loss modules (`force_supervision`, `motion_supervision`, `pose_supervision`, `keypoint_supervision`, `contact_consistency`, `force_consistency`), `data/` (corpus loader, collate, splits), `physics/` (`adapter.py` MHR bridge + `loss.py` RNEA residual). |
 | `scripts/` | Thin CLIs: train, evaluate, evaluate_motion, predict_reconstruction, the two renderers, extract_corpus_frames, convert_kindyn_to_mhr, precompute_mhr_supervision, precompute_embeddings. |
 | `configs/` | `base.yaml` (all defaults, commented) + experiment overrides; `configs/datasets/*.yaml` = dataset paths/options. `allmod_rope_t60_gv.yaml` is the current experiment, self-contained on `base.yaml`. |
-| `third_party/` | `sam3` and `moge` submodules (masks / intrinsics for data prep). |
 | `output/` | Training runs (gitignored). Historical runs live in `../contact_anything/output/old/`. |
 
 There is **no test suite** — deliberately removed 2026-09-01.

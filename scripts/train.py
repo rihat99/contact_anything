@@ -1,4 +1,4 @@
-"""Train the contact head(s) on still-image and/or video contact datasets.
+"""Train the contact/force/motion/pose branches on ClimbingVideos corpus clips.
 
 Slim and modular: config load/validate in ``contact/config.py``, model build in
 ``contact/model.py``, data pipeline in ``contact/data/collate.py``, the shared
