@@ -1,0 +1,8 @@
+# The ClimbingVideos corpus read straight from its pipeline tree: frames/ JPEGs,
+# sam3 masks/boxes, per-frame metric cameras, contacts_<level> joint labels, and
+# the kindyn / MHR ground truth. Split source of truth is scenes/scenes.db
+# (864 curated train scenes; the test split evaluates on the annotated scenes).
+# WHICH ground-truth signals load is derived from the enabled losses, not set here.
+name: climbing_videos
+root: /data3/rikhat.akizhanov/better/data/ClimbingVideos
+contact_level: 1        # contacts_1.npz | contacts_2.npz

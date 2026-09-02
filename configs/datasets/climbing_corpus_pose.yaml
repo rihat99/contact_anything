@@ -1,8 +1,0 @@
-name: climbing_corpus
-
-# climbing_corpus for the pose-temporal experiment (E2): no motion targets; the
-# pose pseudo-GT (mhr_1.npz) loading is switched on by pose_supervision.enabled
-# in the experiment config, not here. See climbing_corpus.yaml for the layout.
-data:
-  root: /data3/rikhat.akizhanov/better/data/ClimbingVideos
-  contact_level: 1
