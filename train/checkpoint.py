@@ -44,8 +44,13 @@ def save(
     step: int,
     best: float,
     config: dict,
+    extra: Optional[dict] = None,
 ) -> None:
-    """Write a checkpoint of the trainable state plus optimizer/run metadata."""
+    """Write a checkpoint of the trainable state plus optimizer/run metadata.
+
+    ``extra`` entries (e.g. the trainer's ``ema_raw`` weights) are stored
+    alongside and returned untouched by :func:`load`.
+    """
     torch.save(
         {
             "state_dict": trainable_state_dict(model),
@@ -55,6 +60,7 @@ def save(
             "step": int(step),
             "best": float(best),
             "config": config,
+            **(extra or {}),
         },
         Path(path),
     )

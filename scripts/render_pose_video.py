@@ -112,7 +112,7 @@ def predict_pass(model, ds, cfg: dict, device: str, with_gt: bool) -> dict:
 
 
 def draw_mesh(img: np.ndarray, verts2d: np.ndarray, verts_cam: np.ndarray,
-              faces: np.ndarray) -> None:
+              faces: np.ndarray, colour=MESH_BGR) -> None:
     """Painter-sorted, lambert-shaded solid mesh alpha-blended onto ``img``."""
     tri2d = verts2d[faces].astype(np.float32)                   # [F, 3, 2]
     tricam = verts_cam[faces].astype(np.float32)                # [F, 3, 3]
@@ -126,7 +126,7 @@ def draw_mesh(img: np.ndarray, verts2d: np.ndarray, verts_cam: np.ndarray,
             & (xs.max(1) >= 0) & (xs.min(1) < width)
             & (ys.max(1) >= 0) & (ys.min(1) < height))
     order = np.argsort(-depth[keep])
-    colour = np.asarray(MESH_BGR, np.float32)
+    colour = np.asarray(colour, np.float32)
     overlay = img.copy()
     for points, factor in zip(tri2d[keep][order].astype(np.int32), shade[keep][order]):
         cv2.fillConvexPoly(overlay, points, tuple(float(c) for c in colour * factor))

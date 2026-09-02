@@ -1,0 +1,29 @@
+# Pose-token probe: NO learned tokens, NO temporal block, NO contact loss.
+# Only a from-scratch SMPL-X pose head + CLIFF camera head on the frozen pose
+# token, supervised by the kindyn SMPL-X GT. Single-frame clips (a per-frame
+# head needs no window), every 5th frame per epoch with per-epoch jitter.
+base: configs/base.yaml
+
+model:
+  contact: {enabled: false}
+  smplx: {enabled: true}
+
+data:
+  frames_per_batch: 64
+  clip: {frames: 1, stride: 5, jitter: true}
+  eval_max_frames: 120                # ~0.1 GiB/frame no-grad (per-layer vertex readouts); fits a shared 48 GB card
+
+contact_supervision: {enabled: false}
+smplx_supervision: {enabled: true}
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 0.01
+  epochs: 30
+  warmup_steps: 500
+  lr_min: 1.0e-6
+  grad_clip: 1.0
+
+output:
+  exp_name: smplx_probe
+  monitor: metric_pose/mpjpe

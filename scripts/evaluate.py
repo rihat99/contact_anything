@@ -5,7 +5,7 @@
     python scripts/evaluate.py --config configs/allmod_rope_t60_gv.yaml \
         --checkpoint none            # the untrained (frozen-baseline) arm
 
-Prints every ``test/*`` metric the enabled losses report, and — when the contact
+Prints every ``loss_test/*`` term and ``metric_*/*`` metric the enabled losses report, and — when the contact
 branch is on — a precision/recall/F1 threshold curve plus per-group scores at
 ``--threshold``.
 """
@@ -25,9 +25,10 @@ from train.config import signal_needs                  # noqa: E402
 from train.predict import load_model                   # noqa: E402
 from train.trainer import evaluate_losses              # noqa: E402
 from model.loss import KINDYN_GROUP_NAMES, build_losses  # noqa: E402
+from model.loss.contact import CURVE_THRESHOLDS       # noqa: E402
 
 GROUPS = KINDYN_GROUP_NAMES
-CURVE = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+CURVE = CURVE_THRESHOLDS
 _EPS = 1e-8
 
 

@@ -475,3 +475,71 @@ def motion_targets(
         "motion_root_pos": q_root[..., :3].astype(np.float32),
         "motion_root_valid": src_valid.copy(),
     }
+
+
+# ------------------------------------------------------------------ SMPL-X
+
+#: Body joints of the corpus SMPL-X (``smplx_mid``): pelvis + 21 articulated.
+NUM_SMPLX_BODY_JOINTS = 22
+NUM_SMPLX_BETAS = 10
+#: ``q`` layout: ``[pelvis_world (3), root quat xyzw (4), 51 x joint quat xyzw]``.
+SMPLX_Q_DIM = 211
+_SMPLX_BODY_Q = slice(7, 7 + 4 * (NUM_SMPLX_BODY_JOINTS - 1))
+
+
+def load_smplx(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> dict:
+    """SMPL-X body GT from ``kindyn_1.npz`` (BetterHuman ``q`` convention).
+
+    The root of ``q`` IS the pelvis pose: ``q[:3]`` equals ``joints_world[0]``
+    and ``q[3:7]`` is the world-from-root quaternion (the stored classic
+    ``transl`` differs from it only by the shape-dependent pelvis offset
+    ``J0(beta)``). Joint rotations are parent-local; hands, face and expression
+    are dropped (hands never move a body joint; face/expression are zero
+    corpus-wide). Invalid rows are zeroed / set to the identity so nothing
+    downstream ever multiplies a NaN by a zero mask.
+
+    :returns: ``smplx_joints_world (P, N, 22, 3)`` metres,
+        ``smplx_root_rot (P, N, 3, 3)`` world-from-root,
+        ``smplx_body_rot (P, N, 21, 3, 3)`` parent-local joints 1..21,
+        ``smplx_betas (P, 10)`` per person, ``smplx_valid (P, N)`` bool.
+    """
+    kindyn = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
+    if str(kindyn["model_type"]) != "smplx_mid" or int(kindyn["num_betas"]) != NUM_SMPLX_BETAS:
+        raise ValueError(
+            f"{scene}: kindyn body is {str(kindyn['model_type'])!r} with "
+            f"{int(kindyn['num_betas'])} betas; expected smplx_mid / {NUM_SMPLX_BETAS}")
+    kindyn_ids = np.asarray(kindyn["object_ids"])
+
+    def _rows(key, dtype):
+        return rows_by_object_id(
+            np.asarray(kindyn[key], dtype), kindyn_ids, object_ids, scene, "kindyn")
+
+    q = _rows("q", np.float32)                                # [P, N, 211]
+    valid = _rows("valid_mask", bool)                         # [P, N]
+    joints = _rows("joints_world", np.float32)                # [P, N, 52, 3]
+    betas = _rows("betas", np.float32)                        # [P, 10]
+    n_people = len(object_ids)
+    if q.shape != (n_people, n, SMPLX_Q_DIM):
+        raise ValueError(f"{scene}: kindyn q {q.shape} != ({n_people}, {n}, {SMPLX_Q_DIM})")
+    if joints.shape[:2] != (n_people, n) or joints.shape[2] < NUM_SMPLX_BODY_JOINTS:
+        raise ValueError(f"{scene}: kindyn joints_world {joints.shape} is not (P, N, >=22, 3)")
+    if betas.shape != (n_people, NUM_SMPLX_BETAS) or not np.isfinite(betas).all():
+        raise ValueError(f"{scene}: kindyn betas {betas.shape} are not (P, 10) finite")
+    joints = joints[:, :, :NUM_SMPLX_BODY_JOINTS]
+    valid = valid & np.isfinite(q).all(axis=-1) & np.isfinite(joints).all(axis=(2, 3))
+
+    q = np.where(valid[..., None], q, 0.0).astype(np.float32)
+    root_rot = quat_xyzw_to_matrix(q[..., 3:7])                             # [P, N, 3, 3]
+    body_rot = quat_xyzw_to_matrix(
+        q[..., _SMPLX_BODY_Q].reshape(n_people, n, NUM_SMPLX_BODY_JOINTS - 1, 4))
+    eye = np.eye(3, dtype=np.float32)
+    root_rot = np.where(valid[..., None, None], root_rot, eye)
+    body_rot = np.where(valid[..., None, None, None], body_rot, eye)
+    joints = np.where(valid[..., None, None], joints, 0.0)
+    return {
+        "smplx_joints_world": joints.astype(np.float32),
+        "smplx_root_rot": root_rot.astype(np.float32),
+        "smplx_body_rot": body_rot.astype(np.float32),
+        "smplx_betas": betas,
+        "smplx_valid": valid,
+    }

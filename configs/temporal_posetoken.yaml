@@ -1,0 +1,55 @@
+# Temporal probe A — contact from the POSE TOKEN, no learned tokens.
+#
+# The frozen decoder runs with its 145 original tokens only. ONE 4-layer RoPE temporal
+# transformer (cross_modal_temporal over the single `pose` modality) mixes the pose
+# token across the clip's 60 frames (2.0-2.6 s at the auto stride). Two heads read the
+# mixed token: the from-scratch SMPL-X pose + CLIFF camera head (smplx_supervision) and a
+# flat contact head straight to the six kindyn_6 logits (contact_supervision, BCE).
+# Sibling: configs/temporal_tokens.yaml (six learned anchored contact tokens instead).
+#
+# Launch (both GPUs, DDP):
+#   CUDA_VISIBLE_DEVICES=6,7 torchrun --standalone --nproc-per-node=2 \
+#     scripts/train.py --config configs/temporal_posetoken.yaml
+base: configs/base.yaml
+
+model:
+  contact:
+    enabled: true
+    source: pose_token                # no token block: head reads the final pose token
+  smplx: {enabled: true}
+  cross_modal_temporal:
+    enabled: true
+    modalities: [pose]                # K = 1: a plain temporal transformer on the pose token
+    num_layers: 4
+    num_heads: 16                     # head_dim 64
+    mlp_ratio: 2.0
+    dropout: 0.1
+    time_scale: 25.0
+    max_rel_sec: 2.5
+
+data:
+  frames_per_batch: 60                # 1 clip x 60 frames per GPU (shared 48 GB cards, ~19 GB free)
+  clip: {frames: 60, stride: auto, jitter: true}
+  eval_max_frames: 120                # ~11 GiB no-grad peak; the frozen json uses the same cap
+
+contact_supervision:
+  enabled: true
+  criterion: bce
+  weight: 3.7                         # EQUAL gradient pressure on the shared temporal block: at weight 1
+                                      # ||g_contact||/||g_smplx|| = 0.27 (per-batch 0.10-0.66) after 300 warm-up
+                                      # steps (scratchpad temporal/grad_balance.py, 16 batches); the
+                                      # SMPL-X side is ~85% kp2d+kp3d
+smplx_supervision: {enabled: true}
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 0.01
+  epochs: 5
+  warmup_steps: 500
+  lr_min: 1.0e-6
+  grad_clip: 1.0
+
+output:
+  exp_name: temporal_posetoken
+  monitor: metric_pose/mpjpe
+  frozen_metrics: output/frozen_sam3d_smplx.json

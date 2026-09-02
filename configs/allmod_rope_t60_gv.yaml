@@ -65,6 +65,8 @@ contact_supervision:
   # positive prior, R=0.07-0.18) and a lower alpha makes them worse — the real fix there
   # is a PER-GROUP alpha, which the contact loss does not support (unlike
   # force_supervision.loss.group_weights).
+  criterion: focal                  # pinned: base.yaml switched to bce / weight 1.0 on 2026-09-02
+  weight: 5.0
   focal_alpha: 0.45
 
 force_supervision:
@@ -147,14 +149,14 @@ optim:
   lr: 2.0e-4
   weight_decay: 1.0e-4
   epochs: 40
-  warmup_epochs: 1
+  warmup_steps: 500
   lr_min: 1.0e-6
   grad_clip: 300.0                    # a 1.0 bound clipped 100% of steps (raw med 75,
                                       # p99 228), which is per-step normalization
 
 output:
   exp_name: allmod_rope_t60_gv
-  monitor: test/pose/mae              # minimised. A KNOWN-imperfect monitor: q-space MAE
+  monitor: metric_pose/mae            # minimised. A KNOWN-imperfect monitor: q-space MAE
                                       # can fall while camera-frame keypoint error rises.
                                       # The honest read is test/keypoint/{kp3d_err_m,
                                       # depth_err_m, vert_err_m, vert_size_ratio}.

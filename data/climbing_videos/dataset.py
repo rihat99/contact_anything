@@ -2,7 +2,7 @@
 
 Composes :mod:`data.climbing_videos.scene` (frames, masks, boxes, cameras,
 six-group contact labels), :mod:`data.climbing_videos.kindyn` (GT forces, the
-fitted gravity, the pelvis gravity-view twist) and
+fitted gravity, the pelvis gravity-view twist, the SMPL-X body GT) and
 :mod:`data.climbing_videos.mhr_gt` (MHR pose ``q``, bones, scales, keypoints,
 vertices) into the frame schema documented in :mod:`data.base`.
 
@@ -45,7 +45,7 @@ class ClimbingVideosDataset(ClipDataset):
         (manual annotation, fixed windows).
     :param contact_level: label readout level — ``contacts_1`` or ``contacts_2``.
     :param load: signal groups to emit, a subset of
-        ``{"forces", "motion", "pose", "keypoints"}``.
+        ``{"forces", "motion", "pose", "keypoints", "smplx"}``.
     :param embedding_dir: precomputed-embedding root (``features/embedding``).
     :param motion_smooth_sec: Gaussian width in seconds applied to the root
         trajectory before differentiating.
@@ -127,6 +127,8 @@ class ClimbingVideosDataset(ClipDataset):
             data.update(mhr_gt.load_pose(scene, human_dir, object_ids, n))
         if "keypoints" in self.load:
             data.update(mhr_gt.load_keypoints(scene, human_dir, object_ids, n))
+        if "smplx" in self.load:
+            data.update(kindyn.load_smplx(scene, human_dir, object_ids, n))
         return data
 
     # ------------------------------------------------------------------ frames
@@ -202,4 +204,10 @@ class ClimbingVideosDataset(ClipDataset):
             frame["vert_gt_world"] = data["vert_gt_world"][person, position]  # [V, 3]
             frame["vert_valid"] = valid and bool(data["vert_valid"][person, position])
             frame["vert_indices"] = data["vert_indices"]                     # [V]
+        if "smplx" in self.load:
+            frame["smplx_joints_world"] = data["smplx_joints_world"][person, position]
+            frame["smplx_root_rot"] = data["smplx_root_rot"][person, position]   # [3, 3]
+            frame["smplx_body_rot"] = data["smplx_body_rot"][person, position]   # [21, 3, 3]
+            frame["smplx_betas"] = data["smplx_betas"][person]                   # [10]
+            frame["smplx_valid"] = valid and bool(data["smplx_valid"][person, position])
         return frame

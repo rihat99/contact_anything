@@ -87,8 +87,11 @@ class Loss(ABC):
     :attr:`term_names`, and implement :meth:`__call__` and :meth:`metrics`.
     """
 
-    #: Loss identity: the yaml section stem, and the metric-log namespace.
+    #: Loss identity: the yaml section stem, and the loss-term log namespace.
     name: str = ""
+    #: Tensorboard section of the reported metrics (``metric_<group>/<metric>``);
+    #: defaults to :attr:`name`. Set in ``__init__`` when it differs.
+    metric_group: str = ""
     #: Names of the entries of :attr:`LossResult.stats`.
     stat_names: tuple[str, ...] = ()
     #: The fixed term set this loss emits every batch (set in ``__init__`` from
@@ -101,6 +104,8 @@ class Loss(ABC):
         self.model = getattr(model, "module", model)
         self.device = torch.device(device)
         self.dtype = torch.float32
+        if not self.metric_group:
+            self.metric_group = self.name
 
     @abstractmethod
     def __call__(self, out: dict, batch: dict, *, train: bool) -> LossResult:
@@ -138,9 +143,9 @@ class Loss(ABC):
 def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
     """Instantiate every enabled loss, in a fixed order.
 
-    The order (contact, force, motion, pose, keypoint, contact_consistency,
-    force_consistency, physics) is what makes the trainer's packed mass
-    all-reduce identical on every rank.
+    The order (contact, force, motion, pose, keypoint, smplx,
+    contact_consistency, force_consistency, physics) is what makes the
+    trainer's packed mass all-reduce identical on every rank.
 
     :raises ValueError: when an enabled loss has no branch to supervise, or when
         two mutually exclusive objectives are both on.
@@ -190,6 +195,11 @@ def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
                  "head fine-tune)")
         from model.loss.keypoint import KeypointLoss
         losses.append(KeypointLoss(cfg, model, device))
+
+    if cfg["smplx_supervision"]["enabled"]:
+        _require(net.head_smplx is not None, "smplx_supervision", "model.smplx.enabled")
+        from model.loss.smplx import SmplxLoss
+        losses.append(SmplxLoss(cfg, model, device))
 
     if cfg["contact_consistency"]["enabled"]:
         _require(net.head_contact is not None,

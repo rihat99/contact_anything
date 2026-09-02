@@ -7,13 +7,16 @@ also freezes and eval-pins the base. Nothing here touches ``requires_grad``:
 the wrapper's parameters are frozen at construction and every module this
 builder adds is trainable by construction.
 
-The contact head is always the per-token regime — one shared classifier applied
-to each anchored token, so the six kindyn_6 anchors give six contact outputs.
+The contact head is the per-token regime — one shared classifier applied to
+each anchored token, so the six kindyn_6 anchors give six contact outputs —
+or, with ``contact.source: pose_token``, one flat classifier from the pose
+token to the six kindyn_6 groups.
 """
 from __future__ import annotations
 
 import torch
 
+from model.loss import NUM_KINDYN_GROUPS
 from model.network import ContactAnything
 from model.wrapper import SAM3DBodyWrapper
 
@@ -39,9 +42,13 @@ def build_model(cfg: dict, device: torch.device | str) -> ContactAnything:
 
     contact = _section(cfg, "contact")
     if contact is not None:
-        num_tokens = len(contact["keypoint_indices"]) + contact["num_global_tokens"]
-        contact["targets"] = {"joint": num_tokens}
-        contact["pool_mode"] = "per_token"
+        if contact["source"] == "pose_token":
+            contact["targets"] = {"joint": NUM_KINDYN_GROUPS}
+            contact["pool_mode"] = "flat"
+        else:
+            num_tokens = len(contact["keypoint_indices"]) + contact["num_global_tokens"]
+            contact["targets"] = {"joint": num_tokens}
+            contact["pool_mode"] = "per_token"
 
     motion = _section(cfg, "motion")
     if motion is not None:
@@ -57,6 +64,7 @@ def build_model(cfg: dict, device: torch.device | str) -> ContactAnything:
         finetune_pose_head=bool(mcfg["finetune_pose_head"]),
         finetune_camera_head=bool(mcfg["finetune_camera_head"]),
         extra_token_attention=str(mcfg["extra_token_attention"]),
+        smplx=_section(cfg, "smplx"),
     )
     model.to(device)
     model.eval()

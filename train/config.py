@@ -9,8 +9,8 @@ define, and runs the handful of cross-key checks that pure key validation
 cannot express.
 
 :func:`signal_needs` derives which optional dataset signal groups the run
-must load (``forces``/``motion``/``pose``/``keypoints``) from the enabled
-losses — that is never configured directly.
+must load (``forces``/``motion``/``pose``/``keypoints``/``smplx``) from the
+enabled losses — that is never configured directly.
 """
 from __future__ import annotations
 
@@ -25,7 +25,10 @@ SCHEMA_PATH = REPO_ROOT / "configs" / "base.yaml"
 
 _MODALITY_ORDER = ("pose", "contact", "force", "motion")
 _MONITOR_MAX = ("f1", "f2", "iou", "r3d", "precision", "recall", "accuracy")
-_MONITOR_MIN = ("mae", "err", "loss", "residual", "rmse")
+_MONITOR_MIN = ("mae", "err", "loss", "residual", "rmse", "mpjpe", "pve", "accel")
+#: Tensorboard metric section of every loss (``metric_<group>/...``); a loss
+#: whose group is not its own name is listed here.
+METRIC_GROUPS = {"smplx": "pose"}
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -77,9 +80,10 @@ def monitor_mode(monitor: str) -> str:
 
 def enabled_branches(cfg: dict) -> dict:
     """Which modality token blocks the configured build creates."""
+    contact = cfg["model"]["contact"]
     return {
         "pose": True,
-        "contact": bool(cfg["model"]["contact"]["enabled"]),
+        "contact": bool(contact["enabled"]) and contact["source"] == "tokens",
         "force": bool(cfg["model"]["force"]["enabled"]),
         "motion": bool(cfg["model"]["motion"]["enabled"]),
     }
@@ -90,6 +94,7 @@ def enabled_losses(cfg: dict) -> list[str]:
     sections = (("contact", "contact_supervision"), ("force", "force_supervision"),
                 ("motion", "motion_supervision"), ("pose", "pose_supervision"),
                 ("keypoint", "keypoint_supervision"),
+                ("smplx", "smplx_supervision"),
                 ("contact_consistency", "contact_consistency"),
                 ("force_consistency", "force_consistency"), ("physics", "physics"))
     return [name for name, section in sections if cfg[section]["enabled"]]
@@ -109,6 +114,8 @@ def signal_needs(cfg: dict) -> set[str]:
         needs.add("pose")
     if cfg["keypoint_supervision"]["enabled"]:
         needs.add("keypoints")
+    if cfg["smplx_supervision"]["enabled"]:
+        needs.add("smplx")
     return needs
 
 
@@ -119,16 +126,20 @@ def validate(cfg: dict) -> None:
     cross_modal = model["cross_modal_temporal"]
     modalities = list(cross_modal["modalities"]) if cross_modal["enabled"] else []
 
+    if model["contact"]["enabled"] and model["contact"]["source"] not in (
+            "tokens", "pose_token"):
+        raise ValueError(
+            "model.contact.source must be 'tokens' or 'pose_token'; got "
+            f"{model['contact']['source']!r}")
     if cross_modal["enabled"]:
         if len(set(modalities)) != len(modalities) or any(
                 m not in _MODALITY_ORDER for m in modalities):
             raise ValueError(
                 "model.cross_modal_temporal.modalities must be a duplicate-free "
                 f"subset of {list(_MODALITY_ORDER)}; got {modalities!r}")
-        if len(modalities) < 2:
+        if not modalities:
             raise ValueError(
-                "model.cross_modal_temporal.modalities needs >= 2 entries "
-                f"(there is nothing to mix otherwise); got {modalities!r}")
+                "model.cross_modal_temporal.modalities needs >= 1 entry; got []")
         missing = [m for m in modalities if not branches[m]]
         if missing:
             raise ValueError(
@@ -146,11 +157,27 @@ def validate(cfg: dict) -> None:
             ("model.finetune_camera_head", model["finetune_camera_head"]),
         ) if on
     ]
-    if pose_writers and not (pose_sup or kp_sup):
+    smplx_sup = cfg["smplx_supervision"]["enabled"]
+    if pose_writers and not (pose_sup or kp_sup or smplx_sup):
         raise ValueError(
-            f"{', '.join(pose_writers)} write(s) the pose readout but neither "
-            "pose_supervision nor keypoint_supervision is enabled — nothing "
-            "would train the written pose")
+            f"{', '.join(pose_writers)} write(s) the pose readout but none of "
+            "pose_supervision / keypoint_supervision / smplx_supervision is "
+            "enabled — nothing would train the written pose")
+    if model["smplx"]["enabled"]:
+        # The SMPL-X head replaces the MHR readout (its recompute is skipped),
+        # so nothing may consume a written MHR pose in that build.
+        mhr_consumers = [
+            name for name, on in (
+                ("pose_supervision", pose_sup), ("keypoint_supervision", kp_sup),
+                ("model.finetune_pose_head", model["finetune_pose_head"]),
+                ("model.finetune_camera_head", model["finetune_camera_head"]),
+                ("physics", cfg["physics"]["enabled"]),
+            ) if on]
+        if mhr_consumers:
+            raise ValueError(
+                f"model.smplx.enabled is exclusive with {', '.join(mhr_consumers)}: "
+                "the SMPL-X head is the pose output and the MHR readout is not "
+                "recomputed")
     if model["finetune_camera_head"] and not kp_sup:
         raise ValueError(
             "model.finetune_camera_head requires keypoint_supervision.enabled "
@@ -177,9 +204,33 @@ def validate(cfg: dict) -> None:
                 "contact anchors; got "
                 f"{model['contact']['keypoint_indices']!r}")
 
-    if cfg["contact_supervision"]["enabled"] and not branches["contact"]:
-        raise ValueError(
-            "contact_supervision.enabled requires model.contact.enabled")
+    optim = cfg["optim"]
+    betas = optim["betas"]
+    if len(betas) != 2 or not all(0.0 <= float(b) < 1.0 for b in betas):
+        raise ValueError(f"optim.betas must be two values in [0, 1); got {betas}")
+    if not 0.0 <= float(optim["ema"]) < 1.0:
+        raise ValueError(f"optim.ema must lie in [0, 1); got {optim['ema']}")
+    if int(optim["warmup_steps"]) < 0:
+        raise ValueError("optim.warmup_steps must be >= 0")
+    if cfg["contact_supervision"]["enabled"]:
+        if not model["contact"]["enabled"]:
+            raise ValueError(
+                "contact_supervision.enabled requires model.contact.enabled")
+        if cfg["contact_supervision"]["criterion"] not in ("bce", "focal"):
+            raise ValueError(
+                "contact_supervision.criterion must be 'bce' or 'focal'; got "
+                f"{cfg['contact_supervision']['criterion']!r}")
+        cs = cfg["contact_supervision"]
+        if float(cs["neg_weight"]) <= 0 or any(float(w) <= 0 for w in cs["pos_weight"]):
+            raise ValueError("contact_supervision.neg_weight / pos_weight must be positive")
+        if len(cs["pos_weight"]) != 6:
+            raise ValueError(
+                f"contact_supervision.pos_weight needs six factors (kindyn_6 order); "
+                f"got {len(cs['pos_weight'])}")
+        if int(cs["transition_tolerance"]) < 0:
+            raise ValueError("contact_supervision.transition_tolerance must be >= 0")
+    if cfg["smplx_supervision"]["enabled"] and not model["smplx"]["enabled"]:
+        raise ValueError("smplx_supervision.enabled requires model.smplx.enabled")
     if cfg["force_supervision"]["enabled"] and not branches["force"]:
         raise ValueError(
             "force_supervision.enabled requires model.force.enabled")
@@ -198,12 +249,14 @@ def validate(cfg: dict) -> None:
                 "exclusive supervision regimes for the same force output")
 
     monitor = str(cfg["output"]["monitor"])
+    groups = sorted({METRIC_GROUPS.get(name, name) for name in enabled_losses(cfg)})
     parts = monitor.split("/")
-    if monitor != "test/loss" and (
-            len(parts) != 3 or parts[0] != "test" or parts[1] not in enabled_losses(cfg)):
+    if monitor != "loss_test/total" and (
+            len(parts) != 2 or not parts[0].startswith("metric_")
+            or parts[0][len("metric_"):] not in groups):
         raise ValueError(
-            f"output.monitor {monitor!r} must be 'test/loss' or 'test/<loss>/<metric>' "
-            f"with <loss> one of the enabled losses {enabled_losses(cfg)}")
+            f"output.monitor {monitor!r} must be 'loss_test/total' or "
+            f"'metric_<group>/<name>' with <group> one of {groups}")
     monitor_mode(monitor)
 
 

@@ -8,6 +8,8 @@ model:
   extra_token_attention: mutual       # mutual | causal — decoder mask among the appended token blocks
   contact:
     enabled: true
+    source: tokens                    # tokens (learned anchored tokens, per-token head) |
+                                      # pose_token (no tokens: one flat head pose token -> 6)
     keypoint_indices: [62, 41, 15, 18, 17, 20]   # MHR70 anchors, kindyn_6 order
     num_global_tokens: 0
     mlp_depth: 2
@@ -33,7 +35,7 @@ model:
     dropout: 0.0
   cross_modal_temporal:
     enabled: false
-    modalities: [contact, force]      # >= 2 of pose|contact|force|motion
+    modalities: [contact, force]      # >= 1 of pose|contact|force|motion
     num_layers: 4
     num_heads: 16
     mlp_ratio: 2.0
@@ -50,6 +52,12 @@ model:
     max_rel_sec: 2.5
   finetune_pose_head: false
   finetune_camera_head: false
+  smplx:                              # pose-token probe: from-scratch SMPL-X pose + CLIFF camera heads
+    enabled: false
+    model_path: /data3/rikhat.akizhanov/better/BetterHuman/models/smplx/SMPLX_NEUTRAL.npz
+    mlp_depth: 2                      # SAM3D's own head shape: C -> C -> D
+    mlp_channel_div_factor: 1
+    dropout: 0.0
 
 mhr_body:                             # BetterHuman MHR archive (pose loss q-space, physics adapter)
   model_path: null                    # null -> $BETTERHUMAN_MODELS_DIR, then the sibling ../BetterHuman
@@ -67,9 +75,13 @@ data:
 contact_supervision:
   enabled: true
   confidence_weights: true
+  criterion: bce                     # bce (plain, calibrated) | focal (alpha/gamma below)
   focal_alpha: 0.5
   focal_gamma: 2.0
-  weight: 5.0
+  weight: 1.0
+  neg_weight: 1.0                    # cost of a NEGATIVE row (>1 = penalise false contacts more)
+  pos_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]   # per-group POSITIVE cost (kindyn_6 order; heels ~3 % prior)
+  transition_tolerance: 0            # drop the k frames either side of a GT transition from the loss
 
 force_supervision:
   enabled: false
@@ -116,6 +128,19 @@ keypoint_supervision:
     cam_rail_margin_m: 0.5
     rot_rail_margin_rad: 0.2
 
+smplx_supervision:                    # kindyn SMPL-X GT (camera frame) for model.smplx
+  enabled: false
+  loss:
+    kp2d: 10.0                        # Huber, crop-normalized [-0.5, 0.5] units
+    kp3d: 5.0                         # Huber, pelvis-relative camera metres (22 joints)
+    orient: 1.0                       # MSE on the root 6D
+    pose: 1.0                         # MSE on the 21 body-joint 6D
+    betas: 0.1                        # MSE on the 10 betas
+    cam: 1.0                          # Huber on the CLIFF (s, tx, ty) proxy
+    huber_delta_2d: 0.05
+    huber_delta_3d: 0.1
+    huber_delta_cam: 0.05
+
 contact_consistency:
   enabled: false
   detach_gate: true
@@ -153,9 +178,14 @@ optim:
   lr: 1.0e-4
   weight_decay: 1.0e-4
   epochs: 20
-  warmup_epochs: 1
+  warmup_steps: 500                   # linear ramp over this many optimizer steps, then per-step cosine to lr_min
   lr_min: 1.0e-5
   grad_clip: 1.0
+  grad_clip_per_group: false          # true = clip each trainable top-level module to grad_clip separately
+  betas: [0.9, 0.999]                 # AdamW moment decays ((0.9, 0.95) = the usual transformer recipe)
+  decay_1d: true                      # false = no weight decay on biases / norm weights / gates (ndim <= 1)
+  ema: 0.0                            # EMA decay of the trainable weights, used for eval + saved as the
+                                      # checkpoint weights (raw weights ride along as ema_raw); 0 = off
   head_lr_scale: 0.1                  # lr multiplier for the fine-tuned pose/camera head copies
 
 output:
@@ -163,4 +193,7 @@ output:
   exp_name: contact
   log_freq: 10
   save_freq: 5
-  monitor: test/contact/f1            # *f1|*iou|*r3d -> max; *mae|*err*|*loss|*residual -> min
+  monitor: metric_contact/f1          # loss_test/total or metric_<group>/<name>;
+                                      # *f1|*iou|*r3d -> max; *mae|*err*|*loss|*mpjpe|*pve|*accel -> min
+  frozen_metrics: null                # json of frozen-baseline metrics (scripts/eval_frozen_smplx.py)
+                                      # drawn as the `frozen` tensorboard run next to the live ones

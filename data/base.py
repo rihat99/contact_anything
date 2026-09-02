@@ -55,6 +55,10 @@ plus, per requested signal group (``load``):
     ``kp3d_world`` ``(70, 3)`` metres, ``kp_valid`` bool, ``vert_gt_world``
     ``(V, 3)``, ``vert_valid`` bool, ``vert_indices`` ``(V,)`` int64
     (scene-constant).
+``smplx``
+    ``smplx_joints_world`` ``(22, 3)`` metres (row 0 = pelvis), ``smplx_root_rot``
+    ``(3, 3)`` world-from-root, ``smplx_body_rot`` ``(21, 3, 3)`` parent-local,
+    ``smplx_betas`` ``(10,)`` per person, ``smplx_valid`` bool.
 
 The six contact/force groups are ``left_hand, right_hand, left_foot (toe),
 right_foot, left_ankle (heel), right_ankle`` in that fixed order everywhere.
@@ -75,7 +79,7 @@ from torch.utils.data import Dataset
 #: clip spans the same physical time at every corpus fps.
 REFERENCE_FPS = 25.0
 
-SIGNAL_GROUPS = frozenset({"forces", "motion", "pose", "keypoints"})
+SIGNAL_GROUPS = frozenset({"forces", "motion", "pose", "keypoints", "smplx"})
 
 
 class Clip(NamedTuple):
