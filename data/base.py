@@ -56,9 +56,17 @@ plus, per requested signal group (``load``):
     ``(V, 3)``, ``vert_valid`` bool, ``vert_indices`` ``(V,)`` int64
     (scene-constant).
 ``smplx``
-    ``smplx_joints_world`` ``(22, 3)`` metres (row 0 = pelvis), ``smplx_root_rot``
-    ``(3, 3)`` world-from-root, ``smplx_body_rot`` ``(21, 3, 3)`` parent-local,
-    ``smplx_betas`` ``(10,)`` per person, ``smplx_valid`` bool.
+    ``smplx_joints_world`` ``(52, 3)`` metres (row 0 = pelvis, 22 body joints then
+    the 30 finger joints), ``smplx_root_rot`` ``(3, 3)`` world-from-root,
+    ``smplx_body_rot`` ``(21, 3, 3)`` and ``smplx_hand_rot`` ``(30, 3, 3)``
+    parent-local, ``smplx_betas`` ``(10,)`` per person, ``smplx_valid`` bool.
+``keypoints2d``
+    ``kp2d_in`` ``(70, 3)`` sapiens ``[u, v, score]`` full-image px in MHR70
+    order (an INPUT, not a label), ``kp2d_in_valid`` bool.
+``camera``
+    ``cam_twist`` ``(6,)`` the camera's own twist ``[m/s, rad/s]`` in the current
+    camera frame between the clip's sampled rows (an INPUT; one-sided at the
+    clip ends, zero for a one-row clip).
 
 The six contact/force groups are ``left_hand, right_hand, left_foot (toe),
 right_foot, left_ankle (heel), right_ankle`` in that fixed order everywhere.
@@ -79,7 +87,8 @@ from torch.utils.data import Dataset
 #: clip spans the same physical time at every corpus fps.
 REFERENCE_FPS = 25.0
 
-SIGNAL_GROUPS = frozenset({"forces", "motion", "pose", "keypoints", "smplx"})
+SIGNAL_GROUPS = frozenset(
+    {"forces", "motion", "pose", "keypoints", "smplx", "keypoints2d", "camera"})
 
 
 class Clip(NamedTuple):

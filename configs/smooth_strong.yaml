@@ -1,0 +1,13 @@
+# Arm S2 (2026-09-03) — configs/smooth_mild.yaml at 3x the weights (~80-90 % of the SMPL-X
+# gradient at the b8_lr2 checkpoint). Same reading rules.
+#
+# Launch:
+#   CUDA_VISIBLE_DEVICES=0,5 torchrun --standalone --nproc-per-node=2 \
+#     scripts/train.py --config configs/smooth_strong.yaml
+base: configs/smooth_mild.yaml
+
+pose_smoothness:
+  loss: {root: 0.012, joints: 0.15}
+
+output:
+  exp_name: smooth_strong

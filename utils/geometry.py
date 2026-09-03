@@ -103,6 +103,60 @@ def so3_log(rot: Tensor) -> Tensor:
     return quat_log_xyzw(matrix_to_quat_xyzw(rot))
 
 
+def _hat(vec: Tensor) -> Tensor:
+    """Skew-symmetric matrix of a vector. ``(..., 3) -> (..., 3, 3)``."""
+    zero = torch.zeros_like(vec[..., 0])
+    x, y, z = vec[..., 0], vec[..., 1], vec[..., 2]
+    return torch.stack([
+        torch.stack([zero, -z, y], dim=-1),
+        torch.stack([z, zero, -x], dim=-1),
+        torch.stack([-y, x, zero], dim=-1),
+    ], dim=-2)
+
+
+def se3_exp(twist: Tensor) -> tuple[Tensor, Tensor]:
+    """SE(3) exponential of a twist ``[linear, angular]``. ``(..., 6) -> (R (..., 3, 3), p (..., 3))``.
+
+    The inverse of the loader's ``se3_log`` layout: ``R = exp(hat(omega))``,
+    ``p = V(omega) u`` with ``V = I + (1 - cos t)/t^2 W + (t - sin t)/t^3 W^2``
+    (Taylor branches near the identity).
+    """
+    u, omega = twist[..., :3], twist[..., 3:]
+    theta2 = (omega * omega).sum(dim=-1, keepdim=True)
+    small = theta2 < _TAYLOR_THETA2
+    safe = torch.where(small, torch.ones_like(theta2), theta2)
+    theta = safe.sqrt()
+    a = torch.where(small, 0.5 - theta2 / 24.0, (1.0 - torch.cos(theta)) / safe)
+    b = torch.where(small, 1.0 / 6.0 - theta2 / 120.0,
+                    (theta - torch.sin(theta)) / (safe * theta))
+    skew = _hat(omega)
+    v_mat = (torch.eye(3, dtype=twist.dtype, device=twist.device)
+             + a[..., None] * skew + b[..., None] * (skew @ skew))
+    return roma.rotvec_to_rotmat(omega), (v_mat @ u[..., None])[..., 0]
+
+
+def se3_log(rot: Tensor, trans: Tensor) -> Tensor:
+    """``log`` of the SE(3) element ``(rot, trans)``. ``(..., 3, 3), (..., 3) -> (..., 6)``.
+
+    Torch mirror of the loader's ``kindyn.se3_log_xyzw`` (layout ``[linear,
+    angular]``, the ``V^{-1}(omega) = I - W/2 + coeff W^2`` correction on the
+    linear part, Taylor branch near the identity), so a predicted trajectory is
+    differentiated through the same arithmetic as its target.
+    """
+    omega = so3_log(rot)
+    theta2 = (omega * omega).sum(dim=-1, keepdim=True)
+    small = theta2 < _TAYLOR_THETA2
+    safe = torch.where(small, torch.ones_like(theta2), theta2)
+    theta = safe.sqrt()
+    cot_half = torch.cos(theta / 2.0) / torch.sin(theta / 2.0).clamp(min=1e-30)
+    coeff = torch.where(small, 1.0 / 12.0 + theta2 / 720.0,
+                        1.0 / safe - cot_half / (2.0 * theta))
+    skew = _hat(omega)
+    v_inv = (torch.eye(3, dtype=rot.dtype, device=rot.device)
+             - 0.5 * skew + coeff[..., None] * (skew @ skew))
+    return torch.cat([(v_inv @ trans[..., None])[..., 0], omega], dim=-1)
+
+
 def lift_to_world(points_cam: Tensor, cam_from_world: Tensor) -> Tensor:
     """Absolute camera-frame points -> world. ``(B, K, 3)``, ``(B, 4, 4)`` -> ``(B, K, 3)``.
 

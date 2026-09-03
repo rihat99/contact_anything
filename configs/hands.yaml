@@ -1,0 +1,25 @@
+# Arm H (2026-09-03) — the b8_lr2 recipe + the 30 finger joints in the SMPL-X head.
+#
+# model.smplx.hands: the head regresses 30 extra parent-local 6D rotations and runs the
+# 52-joint BetterHuman body; kindyn's q already carries the finger quaternions (FK of the GT
+# q reproduces joints_world to 5e-7 m). Supervision: hand_pose 6D MSE at half the body-pose
+# weight, and the finger joints enter kp2d / kp3d at 0.1 each (body joints 1.0), so the
+# fingers cannot dominate the shared token gradient. Body metrics (22 joints, flat-hand
+# vertices) stay protocol-identical to every earlier run; hand_mpjpe (wrist-aligned, mm) is new.
+# Compared against temporal_tokens_b8_lr2_20260902_203707 — NOTE that run predates the
+# optimizer bundle now in base.yaml, so the delta folds the bundle in (user call 2026-09-03).
+#
+# Launch:
+#   CUDA_VISIBLE_DEVICES=0,5 torchrun --standalone --nproc-per-node=2 \
+#     scripts/train.py --config configs/hands.yaml
+base: configs/temporal_tokens_b8_lr2.yaml
+
+model:
+  smplx: {enabled: true, hands: true}
+
+smplx_supervision:
+  joint_weights: {fingers: 0.1}
+  loss: {hand_pose: 0.5}
+
+output:
+  exp_name: hands

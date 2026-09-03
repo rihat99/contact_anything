@@ -32,6 +32,7 @@ from pathlib import Path
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
+from scipy.spatial.transform import Rotation
 
 from .scene import (
     GROUP_NAMES,
@@ -398,18 +399,49 @@ def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> 
 
 # ------------------------------------------------------------------ motion
 
+#: Frames the pelvis linear vel/acc target can be expressed in.
+MOTION_LINEAR_FRAMES = ("gravity_view", "body")
+#: Free-flyer trajectories the pelvis twist can be differentiated from:
+#: ``mhr`` = the MHR pseudo-GT's mean-hips + root orientation (what the MHR
+#: readout path lifts to the world), ``smplx`` = the kindyn SMPL-X pelvis +
+#: root rotation (what the SMPL-X head predicts; the roll-out's body).
+MOTION_ROOT_SOURCES = ("mhr", "smplx")
+
+
+def smplx_motion_root(smplx: dict) -> tuple[np.ndarray, np.ndarray]:
+    """``(root7 (P, N, 7) float32, valid (P, N))`` of the kindyn SMPL-X body.
+
+    :param smplx: :func:`load_smplx`'s output — pelvis = ``smplx_joints_world
+        [..., 0]``, orientation = ``smplx_root_rot`` as an ``xyzw`` quaternion.
+    """
+    rot = np.asarray(smplx["smplx_root_rot"], np.float64)              # [P, N, 3, 3]
+    p, n = rot.shape[:2]
+    quat = Rotation.from_matrix(rot.reshape(-1, 3, 3)).as_quat().reshape(p, n, 4)
+    root7 = np.concatenate(
+        [np.asarray(smplx["smplx_joints_world"], np.float64)[:, :, 0], quat], axis=-1)
+    valid = np.asarray(smplx["smplx_valid"], bool) & np.isfinite(root7).all(axis=-1)
+    identity_root = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    return np.where(valid[:, :, None], root7, identity_root).astype(np.float32), valid
+
+
 def motion_targets(
     root7: np.ndarray, src_valid: np.ndarray, fps: float, gravity: np.ndarray,
     extrinsics: np.ndarray, smooth_sec: float, outlier_acc_ms2: float,
+    linear_frame: str = "gravity_view",
 ) -> dict:
-    """Pelvis gravity-view twist targets from a free-flyer trajectory.
+    """Pelvis twist targets from a free-flyer trajectory.
 
     The whole scene is differentiated at once in float64 (never per clip).
     Everything derived from the root — the twist, ``R`` and ``omega`` — comes
     from the SMOOTHED trajectory, so the target, the frame it is expressed in
-    and the world conversion all describe the same motion. The linear half is
-    converted world-first (``a_world = R (a_body + omega x v_body)``, the
-    Coriolis relation) and then into the gravity-view frame.
+    and the world conversion all describe the same motion. With
+    ``linear_frame="gravity_view"`` the linear half is converted world-first
+    (``a_world = R (a_body + omega x v_body)``, the Coriolis relation) and then
+    into the gravity-view frame; with ``"body"`` it is BVR's root body twist
+    itself (``v = R^T p_dot`` exactly, ``a`` the proper twist acceleration) and
+    ``motion_lin_rot`` is the world-from-root rotation, so ``R v`` is the
+    world velocity exactly (the acceleration's world conversion then omits the
+    Coriolis term — a diagnostic-only ~7 % effect).
 
     :param root7: ``(P, N, 7)`` world position + world-from-root ``xyzw`` quat.
     :param src_valid: ``(P, N)`` coverage of the source fit.
@@ -418,6 +450,7 @@ def motion_targets(
     :param smooth_sec: Gaussian width in seconds applied before differentiating.
     :param outlier_acc_ms2: world ``|a|`` above which a row is flagged an
         outlier (a train-only filter bit); ``0`` disables the flag.
+    :param linear_frame: one of :data:`MOTION_LINEAR_FRAMES`.
     :returns: ``motion_gt (P, N, 1, 12)``, ``motion_valid (P, N)``,
         ``motion_outlier (P, N, 1)``, ``motion_rot``/``motion_lin_rot``
         ``(P, N, 3, 3)``, ``motion_omega (P, N, 3)``,
@@ -434,10 +467,16 @@ def motion_targets(
     twist_vel, twist_acc, omega, ang_acc = root_body_twist(q_root, dt)
     world_vel = np.einsum("pnij,pnj->pni", rot, twist_vel)
     world_acc = np.einsum("pnij,pnj->pni", rot, twist_acc + np.cross(omega, twist_vel))
-    lin_rot = np.broadcast_to(
-        gravity_view_basis(gravity, extrinsics), (n_people, n, 3, 3))
-    vel_out = np.einsum("pnji,pnj->pni", lin_rot, world_vel)
-    acc_out = np.einsum("pnji,pnj->pni", lin_rot, world_acc)
+    if linear_frame == "gravity_view":
+        lin_rot = np.broadcast_to(
+            gravity_view_basis(gravity, extrinsics), (n_people, n, 3, 3))
+        vel_out = np.einsum("pnji,pnj->pni", lin_rot, world_vel)
+        acc_out = np.einsum("pnji,pnj->pni", lin_rot, world_acc)
+    elif linear_frame == "body":
+        lin_rot, vel_out, acc_out = rot, twist_vel, twist_acc
+    else:
+        raise ValueError(
+            f"linear_frame must be one of {MOTION_LINEAR_FRAMES}; got {linear_frame!r}")
 
     # Validity: central-difference support (n-1, n, n+1 inside the scene AND
     # source-valid), then MOTION_EDGE_TRIM frames trimmed at each scene edge and
@@ -481,10 +520,15 @@ def motion_targets(
 
 #: Body joints of the corpus SMPL-X (``smplx_mid``): pelvis + 21 articulated.
 NUM_SMPLX_BODY_JOINTS = 22
+#: Finger joints: 15 per hand (index, middle, pinky, ring, thumb x 3), left then right.
+NUM_SMPLX_HAND_JOINTS = 30
+NUM_SMPLX_JOINTS = NUM_SMPLX_BODY_JOINTS + NUM_SMPLX_HAND_JOINTS
 NUM_SMPLX_BETAS = 10
-#: ``q`` layout: ``[pelvis_world (3), root quat xyzw (4), 51 x joint quat xyzw]``.
+#: ``q`` layout: ``[pelvis_world (3), root quat xyzw (4), 51 x joint quat xyzw]``
+#: (21 body joints, then the 30 finger joints).
 SMPLX_Q_DIM = 211
 _SMPLX_BODY_Q = slice(7, 7 + 4 * (NUM_SMPLX_BODY_JOINTS - 1))
+_SMPLX_HAND_Q = slice(_SMPLX_BODY_Q.stop, _SMPLX_BODY_Q.stop + 4 * NUM_SMPLX_HAND_JOINTS)
 
 
 def load_smplx(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> dict:
@@ -493,15 +537,17 @@ def load_smplx(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> d
     The root of ``q`` IS the pelvis pose: ``q[:3]`` equals ``joints_world[0]``
     and ``q[3:7]`` is the world-from-root quaternion (the stored classic
     ``transl`` differs from it only by the shape-dependent pelvis offset
-    ``J0(beta)``). Joint rotations are parent-local; hands, face and expression
-    are dropped (hands never move a body joint; face/expression are zero
+    ``J0(beta)``). Joint rotations are parent-local: the 21 body joints and
+    the 30 finger joints (raw local rotations — the classic hand mean is not
+    part of the ``q`` convention); face and expression are dropped (zero
     corpus-wide). Invalid rows are zeroed / set to the identity so nothing
     downstream ever multiplies a NaN by a zero mask.
 
-    :returns: ``smplx_joints_world (P, N, 22, 3)`` metres,
-        ``smplx_root_rot (P, N, 3, 3)`` world-from-root,
-        ``smplx_body_rot (P, N, 21, 3, 3)`` parent-local joints 1..21,
-        ``smplx_betas (P, 10)`` per person, ``smplx_valid (P, N)`` bool.
+    :returns: ``smplx_joints_world (P, N, 52, 3)`` metres (22 body joints,
+        then the 30 finger joints), ``smplx_root_rot (P, N, 3, 3)``
+        world-from-root, ``smplx_body_rot (P, N, 21, 3, 3)`` parent-local
+        joints 1..21, ``smplx_hand_rot (P, N, 30, 3, 3)`` parent-local finger
+        joints, ``smplx_betas (P, 10)`` per person, ``smplx_valid (P, N)`` bool.
     """
     kindyn = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
     if str(kindyn["model_type"]) != "smplx_mid" or int(kindyn["num_betas"]) != NUM_SMPLX_BETAS:
@@ -521,25 +567,29 @@ def load_smplx(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> d
     n_people = len(object_ids)
     if q.shape != (n_people, n, SMPLX_Q_DIM):
         raise ValueError(f"{scene}: kindyn q {q.shape} != ({n_people}, {n}, {SMPLX_Q_DIM})")
-    if joints.shape[:2] != (n_people, n) or joints.shape[2] < NUM_SMPLX_BODY_JOINTS:
-        raise ValueError(f"{scene}: kindyn joints_world {joints.shape} is not (P, N, >=22, 3)")
+    if joints.shape != (n_people, n, NUM_SMPLX_JOINTS, 3):
+        raise ValueError(
+            f"{scene}: kindyn joints_world {joints.shape} is not (P, N, {NUM_SMPLX_JOINTS}, 3)")
     if betas.shape != (n_people, NUM_SMPLX_BETAS) or not np.isfinite(betas).all():
         raise ValueError(f"{scene}: kindyn betas {betas.shape} are not (P, 10) finite")
-    joints = joints[:, :, :NUM_SMPLX_BODY_JOINTS]
     valid = valid & np.isfinite(q).all(axis=-1) & np.isfinite(joints).all(axis=(2, 3))
 
     q = np.where(valid[..., None], q, 0.0).astype(np.float32)
     root_rot = quat_xyzw_to_matrix(q[..., 3:7])                             # [P, N, 3, 3]
     body_rot = quat_xyzw_to_matrix(
         q[..., _SMPLX_BODY_Q].reshape(n_people, n, NUM_SMPLX_BODY_JOINTS - 1, 4))
+    hand_rot = quat_xyzw_to_matrix(
+        q[..., _SMPLX_HAND_Q].reshape(n_people, n, NUM_SMPLX_HAND_JOINTS, 4))
     eye = np.eye(3, dtype=np.float32)
     root_rot = np.where(valid[..., None, None], root_rot, eye)
     body_rot = np.where(valid[..., None, None, None], body_rot, eye)
+    hand_rot = np.where(valid[..., None, None, None], hand_rot, eye)
     joints = np.where(valid[..., None, None], joints, 0.0)
     return {
         "smplx_joints_world": joints.astype(np.float32),
         "smplx_root_rot": root_rot.astype(np.float32),
         "smplx_body_rot": body_rot.astype(np.float32),
+        "smplx_hand_rot": hand_rot.astype(np.float32),
         "smplx_betas": betas,
         "smplx_valid": valid,
     }

@@ -1,0 +1,23 @@
+# Arm S1 (2026-09-03) — the b8_lr2 recipe + a MILD jerk prior on the SMPL-X head's trajectory.
+#
+# pose_smoothness: Huber-toward-zero jerk of the world-lifted root body twist (linear +
+# angular) and of the root-local joints, 5-point stencils identical to the GT jerk statistics,
+# in units of the GT p75 (root lin 20.65 m/s^3, ang 52.55 rad/s^3, joints 29.35 m/s^3 at the
+# sampler's dt). Measured on the trained b8_lr2 checkpoint: the prediction's RMS jerk is
+# 409 / 275 / 177 vs the GT's 50 / 59 / 74 (6 test scenes), and at weight 1 the prior's gradient
+# is 268 + 60 (root) / 24 (joints) against the SMPL-X loss's 4.4 (4 train batches). These weights
+# put each prior at ~25-30 % of the SMPL-X gradient; configs/smooth_strong.yaml at ~80-90 %.
+# Read metric_smooth/pred_rms_* against gt_rms_* (the goal is the GT's jerk, not zero) and the
+# pose metrics for over-smoothing (the 2026-08-29 angular terms over-smoothed the MHR path).
+#
+# Launch:
+#   CUDA_VISIBLE_DEVICES=6,7 torchrun --standalone --nproc-per-node=2 \
+#     scripts/train.py --config configs/smooth_mild.yaml
+base: configs/temporal_tokens_b8_lr2.yaml
+
+pose_smoothness:
+  enabled: true
+  loss: {root: 0.004, joints: 0.05}
+
+output:
+  exp_name: smooth_mild

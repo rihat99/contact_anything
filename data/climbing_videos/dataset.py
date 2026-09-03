@@ -4,7 +4,8 @@ Composes :mod:`data.climbing_videos.scene` (frames, masks, boxes, cameras,
 six-group contact labels), :mod:`data.climbing_videos.kindyn` (GT forces, the
 fitted gravity, the pelvis gravity-view twist, the SMPL-X body GT) and
 :mod:`data.climbing_videos.mhr_gt` (MHR pose ``q``, bones, scales, keypoints,
-vertices) into the frame schema documented in :mod:`data.base`.
+vertices) and :mod:`data.climbing_videos.sapiens` (2D keypoint INPUT) into the
+frame schema documented in :mod:`data.base`.
 
 Which signal groups load is decided by the caller (``load``), never by the
 dataset yaml: the trainer derives it from which losses are enabled.
@@ -26,7 +27,7 @@ import torch
 from PIL import Image
 
 from ..base import SIGNAL_GROUPS, ClipDataset
-from . import kindyn, mhr_gt, scene as scene_io
+from . import camera, kindyn, mhr_gt, sapiens, scene as scene_io
 
 #: Default Gaussian width (SECONDS) applied to the root trajectory before
 #: differentiating, so the label bandwidth does not depend on the scene's fps.
@@ -45,12 +46,17 @@ class ClimbingVideosDataset(ClipDataset):
         (manual annotation, fixed windows).
     :param contact_level: label readout level — ``contacts_1`` or ``contacts_2``.
     :param load: signal groups to emit, a subset of
-        ``{"forces", "motion", "pose", "keypoints", "smplx"}``.
+        ``{"forces", "motion", "pose", "keypoints", "smplx", "keypoints2d", "camera"}``.
     :param embedding_dir: precomputed-embedding root (``features/embedding``).
     :param motion_smooth_sec: Gaussian width in seconds applied to the root
         trajectory before differentiating.
     :param motion_outlier_acc_ms2: world ``|a|`` above which a motion row is
         flagged an outlier; ``0`` disables the flag.
+    :param motion_linear_frame: frame of the pelvis linear vel/acc target —
+        ``"gravity_view"`` or ``"body"`` (the BVR root body twist).
+    :param motion_root_source: trajectory the twist is differentiated from —
+        ``"mhr"`` (MHR pseudo-GT mean-hips + root) or ``"smplx"`` (kindyn
+        SMPL-X pelvis + root rotation, the body the SMPL-X head predicts).
 
     Windowing parameters (``clip_frames``, ``stride``, ``jitter``, ``seed``,
     ``full_scenes``, ``max_frames``) are :class:`~data.base.ClipDataset`'s.
@@ -81,6 +87,8 @@ class ClimbingVideosDataset(ClipDataset):
         max_frames: Optional[int] = None,
         motion_smooth_sec: float = MOTION_SMOOTH_SEC,
         motion_outlier_acc_ms2: float = MOTION_OUTLIER_ACC_MS2,
+        motion_linear_frame: str = "gravity_view",
+        motion_root_source: str = "mhr",
     ):
         self.root = Path(root)
         if int(contact_level) not in (1, 2):
@@ -98,6 +106,16 @@ class ClimbingVideosDataset(ClipDataset):
             raise ValueError(
                 f"motion_smooth_sec must be finite and >= 0; got {motion_smooth_sec!r}")
         self.motion_outlier_acc_ms2 = float(motion_outlier_acc_ms2)
+        if motion_linear_frame not in kindyn.MOTION_LINEAR_FRAMES:
+            raise ValueError(
+                f"motion_linear_frame must be one of {kindyn.MOTION_LINEAR_FRAMES}; "
+                f"got {motion_linear_frame!r}")
+        self.motion_linear_frame = str(motion_linear_frame)
+        if motion_root_source not in kindyn.MOTION_ROOT_SOURCES:
+            raise ValueError(
+                f"motion_root_source must be one of {kindyn.MOTION_ROOT_SOURCES}; "
+                f"got {motion_root_source!r}")
+        self.motion_root_source = str(motion_root_source)
         if scenes is None:
             scenes = self.list_scenes(self.root, split)
         super().__init__(
@@ -118,17 +136,24 @@ class ClimbingVideosDataset(ClipDataset):
             # load (which set it too): the corpus tilt reaches 61 degrees.
             gravity = kindyn.fitted_gravity_world(scene, human_dir)
             data["gravity_world"] = gravity.astype(np.float32)
-            root7, src_valid = mhr_gt.motion_root(
-                scene, human_dir, object_ids, n, data["fps"])
+            if self.motion_root_source == "smplx":
+                root7, src_valid = kindyn.smplx_motion_root(
+                    kindyn.load_smplx(scene, human_dir, object_ids, n))
+            else:
+                root7, src_valid = mhr_gt.motion_root(
+                    scene, human_dir, object_ids, n, data["fps"])
             data.update(kindyn.motion_targets(
                 root7, src_valid, data["fps"], gravity, data["extrinsics"],
-                self.motion_smooth_sec, self.motion_outlier_acc_ms2))
+                self.motion_smooth_sec, self.motion_outlier_acc_ms2,
+                linear_frame=self.motion_linear_frame))
         if "pose" in self.load:
             data.update(mhr_gt.load_pose(scene, human_dir, object_ids, n))
         if "keypoints" in self.load:
             data.update(mhr_gt.load_keypoints(scene, human_dir, object_ids, n))
         if "smplx" in self.load:
             data.update(kindyn.load_smplx(scene, human_dir, object_ids, n))
+        if "keypoints2d" in self.load:
+            data.update(sapiens.load_keypoints2d(self.root, scene, object_ids, n))
         return data
 
     # ------------------------------------------------------------------ frames
@@ -208,6 +233,27 @@ class ClimbingVideosDataset(ClipDataset):
             frame["smplx_joints_world"] = data["smplx_joints_world"][person, position]
             frame["smplx_root_rot"] = data["smplx_root_rot"][person, position]   # [3, 3]
             frame["smplx_body_rot"] = data["smplx_body_rot"][person, position]   # [21, 3, 3]
+            frame["smplx_hand_rot"] = data["smplx_hand_rot"][person, position]   # [30, 3, 3]
             frame["smplx_betas"] = data["smplx_betas"][person]                   # [10]
             frame["smplx_valid"] = valid and bool(data["smplx_valid"][person, position])
+        if "keypoints2d" in self.load:
+            frame["kp2d_in"] = data["kp2d_in"][person, position]             # [70, 3]
+            frame["kp2d_in_valid"] = valid and bool(
+                data["kp2d_in_valid"][person, position])
+        if "camera" in self.load:
+            frame["cam_twist"] = self._camera_twist(data, row, positions)     # [6]
         return frame
+
+    @staticmethod
+    def _camera_twist(data: dict, row: int, positions: np.ndarray) -> np.ndarray:
+        """The camera's own twist at clip row ``row`` (see :mod:`.camera`)."""
+        extrinsics, fps = data["extrinsics"], data["fps"]
+        seconds = data["frame_indices"][positions] / fps
+        has_prev, has_next = row > 0, row < len(positions) - 1
+        return camera.row_camera_twist(
+            extrinsics[int(positions[row - 1])] if has_prev else None,
+            extrinsics[int(positions[row])],
+            extrinsics[int(positions[row + 1])] if has_next else None,
+            float(seconds[row] - seconds[row - 1]) if has_prev else 0.0,
+            float(seconds[row + 1] - seconds[row]) if has_next else 0.0,
+        )

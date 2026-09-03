@@ -28,8 +28,11 @@ model:
     contact_gate: {enabled: false, sharpness: 4.0}
   motion:
     enabled: false
-    keypoint_indices: [9]             # one pelvis token; output = 12-dim gravity-view twist
+    source: tokens                    # tokens (learned motion tokens, per-token head) |
+                                      # pose_token (no tokens: one flat head pose token -> 3 x terms)
+    keypoint_indices: [9]             # one pelvis token (tokens source)
     anchored: true
+    terms: [vel, acc, ang_vel, ang_acc]   # head output channels, 3 each, in this order (subset, same order)
     mlp_depth: 2
     mlp_channel_div_factor: 4
     dropout: 0.0
@@ -55,9 +58,30 @@ model:
   smplx:                              # pose-token probe: from-scratch SMPL-X pose + CLIFF camera heads
     enabled: false
     model_path: /data3/rikhat.akizhanov/better/BetterHuman/models/smplx/SMPLX_NEUTRAL.npz
+    hands: false                      # also regress the 30 finger joints (52-joint body, q 211)
     mlp_depth: 2                      # SAM3D's own head shape: C -> C -> D
     mlp_channel_div_factor: 1
     dropout: 0.0
+  token_inputs:                       # extra per-frame inputs ADDED to the pose token (zero-init MLP) before the temporal bricks
+    keypoints2d:
+      enabled: false
+      source: sapiens                 # sapiens (corpus features/sapiens, loads the keypoints2d signal) |
+                                      # mhr (the frozen readout's own pred_keypoints_2d, score 1 — deployment)
+      indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 41, 62]
+                                      # MHR70 subset: COCO-17 + toes/heels + the two wrists
+      min_score: 0.3                  # keypoints scoring below are zeroed (coords + score)
+      noise_std: 0.0                  # train-only Gaussian noise on the crop-normalised coords ([-0.5, 0.5] = crop)
+      drop_prob: 0.0                  # train-only per-keypoint drop probability
+    camera_twist:
+      enabled: false                  # the camera's own twist [m/s, rad/s] in the current camera frame (loads the
+                                      # camera signal) -> zero-init MLP -> the motion tokens (motion.source tokens)
+                                      # or the pose token (motion.source pose_token / no motion branch)
+  token_masking:                      # train-only span corruption of the cross_modal_temporal input (all K tokens of a frame)
+    enabled: false
+    frac: 0.15                        # expected fraction of corrupted frames per clip
+    span_min: 1
+    span_max: 5                       # span length uniform in [span_min, span_max] frames
+    replace: mask                     # mask (learned per-slot embedding) | swap (same slots of a random frame of another clip)
 
 mhr_body:                             # BetterHuman MHR archive (pose loss q-space, physics adapter)
   model_path: null                    # null -> $BETTERHUMAN_MODELS_DIR, then the sibling ../BetterHuman
@@ -100,8 +124,24 @@ motion_supervision:
   enabled: false
   target_smooth_sec: 0.12
   outlier_acc_ms2: 50.0
-  standardize: {mean: null, std: null}   # [1][4][3] pelvis (vel, acc, ang_vel, ang_acc)
-  loss: {vel: 1.0, acc: 1.0, ang_vel: 1.0, ang_acc: 1.0, huber_delta: 1.0}
+  linear_frame: gravity_view          # gravity_view | body (BVR root body twist: v = R^T p_dot, the twist acc)
+  root_source: mhr                    # mhr (MHR pseudo-GT mean-hips + root; the MHR readout's body) |
+                                      # smplx (kindyn SMPL-X pelvis + root rotation; the SMPL-X head's body)
+  standardize: {mean: null, std: null}   # [1][4][3] pelvis (vel, acc, ang_vel, ang_acc) — measured PER linear_frame + root_source
+  loss: {vel: 1.0, acc: 1.0, ang_vel: 1.0, ang_acc: 1.0, huber_delta: 1.0}   # a term with weight 0 needs no head channel
+
+pose_smoothness:                      # jerk prior on the SMPL-X head's trajectory toward ZERO (no target); needs T >= 5
+  enabled: false
+  loss:
+    root: 0.0                         # weight of the root body-twist jerk (linear + angular terms, world-lifted)
+    joints: 0.0                       # weight of the root-local joint jerk (21 articulated joints, camera cancels)
+    huber_delta_root_lin: 20.65       # m/s^3 — GT p75 at the clip sampler's dt (scratchpad massive/jerk_stats.md);
+    huber_delta_root_ang: 52.55       # rad/s^3   the Huber runs in units of these, quadratic below, linear beyond
+    huber_delta_joints: 29.35         # m/s^3
+
+rollout_eval:                         # eval-only: integrate the predicted BODY-frame root twist (vel + ang_vel) from the
+  enabled: false                      # first frame's predicted pose -> world trajectory; GVHMR WA-MPJPE100 / W-MPJPE100 /
+                                      # RTE / jitter of the rolled-out AND of the GT-camera-lifted per-frame SMPL-X joints
 
 pose_supervision:
   enabled: false
@@ -130,11 +170,13 @@ keypoint_supervision:
 
 smplx_supervision:                    # kindyn SMPL-X GT (camera frame) for model.smplx
   enabled: false
+  joint_weights: {fingers: 0.1}       # weight of each finger joint in kp2d / kp3d (body joints 1.0)
   loss:
     kp2d: 10.0                        # Huber, crop-normalized [-0.5, 0.5] units
-    kp3d: 5.0                         # Huber, pelvis-relative camera metres (22 joints)
+    kp3d: 5.0                         # Huber, pelvis-relative camera metres (22 | 52 joints)
     orient: 1.0                       # MSE on the root 6D
     pose: 1.0                         # MSE on the 21 body-joint 6D
+    hand_pose: 0.0                    # MSE on the 30 finger-joint 6D (needs model.smplx.hands)
     betas: 0.1                        # MSE on the 10 betas
     cam: 1.0                          # Huber on the CLIFF (s, tx, ty) proxy
     huber_delta_2d: 0.05
@@ -181,10 +223,10 @@ optim:
   warmup_steps: 500                   # linear ramp over this many optimizer steps, then per-step cosine to lr_min
   lr_min: 1.0e-5
   grad_clip: 1.0
-  grad_clip_per_group: false          # true = clip each trainable top-level module to grad_clip separately
-  betas: [0.9, 0.999]                 # AdamW moment decays ((0.9, 0.95) = the usual transformer recipe)
-  decay_1d: true                      # false = no weight decay on biases / norm weights / gates (ndim <= 1)
-  ema: 0.0                            # EMA decay of the trainable weights, used for eval + saved as the
+  grad_clip_per_group: true           # clip each trainable top-level module to grad_clip separately (false = one global norm)
+  betas: [0.9, 0.95]                  # AdamW moment decays (the usual transformer recipe; torch default 0.999)
+  decay_1d: false                     # no weight decay on biases / norm weights / gates (ndim <= 1); true = decay all
+  ema: 0.999                          # EMA decay of the trainable weights, used for eval + saved as the
                                       # checkpoint weights (raw weights ride along as ema_raw); 0 = off
   head_lr_scale: 0.1                  # lr multiplier for the fine-tuned pose/camera head copies
 

@@ -21,9 +21,9 @@ from model.network import ContactAnything
 from model.wrapper import SAM3DBodyWrapper
 
 
-def _section(cfg: dict, name: str) -> dict | None:
-    """The named ``model`` sub-section minus ``enabled``, or ``None`` when off."""
-    node = cfg["model"][name]
+def _section(parent: dict, name: str) -> dict | None:
+    """``parent[name]`` minus ``enabled``, or ``None`` when off."""
+    node = parent[name]
     if not node["enabled"]:
         return None
     return {k: v for k, v in node.items() if k != "enabled"}
@@ -40,7 +40,7 @@ def build_model(cfg: dict, device: torch.device | str) -> ContactAnything:
     mcfg = cfg["model"]
     wrapper = SAM3DBodyWrapper(mcfg["checkpoint_path"], mcfg["mhr_model_path"])
 
-    contact = _section(cfg, "contact")
+    contact = _section(mcfg, "contact")
     if contact is not None:
         if contact["source"] == "pose_token":
             contact["targets"] = {"joint": NUM_KINDYN_GROUPS}
@@ -50,21 +50,20 @@ def build_model(cfg: dict, device: torch.device | str) -> ContactAnything:
             contact["targets"] = {"joint": num_tokens}
             contact["pool_mode"] = "per_token"
 
-    motion = _section(cfg, "motion")
-    if motion is not None:
-        motion["output_dims"] = 12
-
     model = ContactAnything(
         wrapper,
         contact=contact,
-        force=_section(cfg, "force"),
-        motion=motion,
-        cross_modal=_section(cfg, "cross_modal_temporal"),
-        pose_temporal=_section(cfg, "pose_temporal"),
+        force=_section(mcfg, "force"),
+        motion=_section(mcfg, "motion"),
+        cross_modal=_section(mcfg, "cross_modal_temporal"),
+        pose_temporal=_section(mcfg, "pose_temporal"),
         finetune_pose_head=bool(mcfg["finetune_pose_head"]),
         finetune_camera_head=bool(mcfg["finetune_camera_head"]),
         extra_token_attention=str(mcfg["extra_token_attention"]),
-        smplx=_section(cfg, "smplx"),
+        smplx=_section(mcfg, "smplx"),
+        keypoints2d=_section(mcfg["token_inputs"], "keypoints2d"),
+        token_masking=_section(mcfg, "token_masking"),
+        camera_twist=_section(mcfg["token_inputs"], "camera_twist"),
     )
     model.to(device)
     model.eval()

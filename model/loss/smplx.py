@@ -12,10 +12,17 @@ Terms (every one a per-frame MEAN over its elements, mass = supervised frames):
   CLIFF's point: the crop camera cannot express the crop's bearing angle), the
   metric is crop-normalized so its scale is bounded (SAM3D / HMR2.0 practice).
 * ``kp3d`` — Huber on pelvis-relative camera-frame joints (metres).
-* ``orient`` / ``pose`` — MSE on the raw 6D outputs vs the GT's first two
-  rotation-matrix columns (GVHMR / WHAM practice); GT rotations arrive as
-  matrices, never as the stored axis-angles (those sit off the principal branch).
+* ``orient`` / ``pose`` / ``hand_pose`` — MSE on the raw 6D outputs vs the GT's
+  first two rotation-matrix columns (GVHMR / WHAM practice); GT rotations
+  arrive as matrices, never as the stored axis-angles (those sit off the
+  principal branch). ``hand_pose`` covers the 30 finger joints of a
+  ``model.smplx.hands`` head.
 * ``betas`` — MSE on the 10 shape coefficients (per-person GT served per frame).
+
+The keypoint terms run over every joint the head emits (22, or 52 with hands)
+as a WEIGHTED mean: body joints at 1, finger joints at
+``joint_weights.fingers`` (their GT is the least reliable part of the fit and
+their lever arm on the body is negligible).
 * ``cam`` — Huber on the CLIFF ``(s, tx, ty)`` proxy vs the GT pelvis inverted
   into the same proxy — translation is supervised in proxy space, as every
   surveyed method does, never in metres.
@@ -35,6 +42,13 @@ the 10475 vertices with flat hands:
   spacing, so the number is theirs on 30 fps footage and fps-exact on the
   corpus's 24-60 fps scenes. GVHMR's trim (every interior frame; WHAM also
   drops the first and last) is used.
+* ``hand_mpjpe`` / ``hand_pa_mpjpe`` (mm, hands heads only) — per-frame mean
+  over the 30 finger joints of the L2 error after aligning each hand on its
+  own wrist (translation only: still charged for the wrist's orientation) and
+  after a per-hand Procrustes alignment of wrist + 15 fingers (pure finger
+  articulation). The body metrics always use the 22 body joints and the
+  FLAT-hand vertices (the 22-joint body at the body part of ``q``), so they
+  stay comparable across hands / no-hands runs and the frozen baseline.
 
 The reduction is frame-weighted (``np.concatenate(all frames).mean()`` in both
 repos), which is exactly what the additive ``(sum, count)`` statistics give.
@@ -55,23 +69,33 @@ from utils.geometry import (
 )
 from utils.metrics import mean_from_stats
 
-_TERM_NAMES = ("kp2d", "kp3d", "orient", "pose", "betas", "cam")
-#: Reported metrics, in the order of the statistics vector.
+_TERM_NAMES = ("kp2d", "kp3d", "orient", "pose", "hand_pose", "betas", "cam")
+#: Reported body metrics, in the order of the statistics vector.
 POSE_METRICS = ("mpjpe", "pa_mpjpe", "pve", "accel")
+#: Appended for a hands head (wrist-aligned and per-hand Procrustes-aligned finger error).
+HAND_METRICS = ("hand_mpjpe", "hand_pa_mpjpe")
 #: Minimum camera-frame depth (metres) for a projectable GT row.
 _MIN_DEPTH_M = 0.25
 #: The two hip joints whose mean is the alignment pelvis (WHAM/GVHMR
 #: ``pelvis_idxs`` for the SMPL 24 / SMPL-X 22 body joint set).
 SMPLX_HIPS = (1, 2)
+NUM_BODY_JOINTS = 22
+NUM_HAND_JOINTS = 30
+#: Wrist joint of each hand's 15 finger joints (left wrist 20, right wrist 21).
+HAND_WRISTS = (20, 21)
+#: Width of the body part of ``q`` (pelvis, root quat, 21 joint quats).
+BODY_Q_DIM = 91
 
 
-def gt_smplx_camera(batch: dict, device, dtype=torch.float32) -> dict:
+def gt_smplx_camera(batch: dict, device, dtype=torch.float32, hands: bool = False) -> dict:
     """The kindyn SMPL-X GT of a batch, lifted into each frame's camera.
 
-    :returns: ``joints (B, 22, 3)`` metres, ``root_rot (B, 3, 3)``
-        camera-from-root, ``body_rot (B, 21, 3, 3)`` parent-local, ``betas
-        (B, 10)``, ``q (B, 91)`` the BetterHuman camera-frame configuration,
-        ``valid (B,)`` bool (labelled, tracked, and in front of the camera).
+    :param hands: assemble ``q`` with the finger quaternions (a 52-joint body).
+    :returns: ``joints (B, 52, 3)`` metres (22 body joints first), ``root_rot
+        (B, 3, 3)`` camera-from-root, ``body_rot (B, 21, 3, 3)`` and
+        ``hand_rot (B, 30, 3, 3)`` parent-local, ``betas (B, 10)``, ``q (B, 91 |
+        211)`` the BetterHuman camera-frame configuration, ``valid (B,)`` bool
+        (labelled, tracked, and in front of the camera).
     """
     ext = batch["cam_from_world"].to(device, dtype)                      # (B, 4, 4)
     rot_cw, t_cw = ext[:, :3, :3], ext[:, :3, 3]
@@ -79,31 +103,38 @@ def gt_smplx_camera(batch: dict, device, dtype=torch.float32) -> dict:
     joints = torch.einsum("bij,bkj->bki", rot_cw, joints_world) + t_cw[:, None]
     root_rot = rot_cw @ batch["smplx_root_rot"].to(device, dtype)
     body_rot = batch["smplx_body_rot"].to(device, dtype)
+    hand_rot = batch["smplx_hand_rot"].to(device, dtype)
     valid = (batch["smplx_valid"] & batch["frame_valid"]).to(device)
     valid = valid & (joints[..., 2] > _MIN_DEPTH_M).all(dim=-1)
     return {
         "joints": joints, "root_rot": root_rot, "body_rot": body_rot,
-        "betas": batch["smplx_betas"].to(device, dtype),
-        "q": smplx_q(joints[:, 0], root_rot, body_rot), "valid": valid,
+        "hand_rot": hand_rot, "betas": batch["smplx_betas"].to(device, dtype),
+        "q": smplx_q(joints[:, 0], root_rot, body_rot, hand_rot if hands else None),
+        "valid": valid,
     }
 
 
-def smplx_q(pelvis: Tensor, root_rot: Tensor, body_rot: Tensor) -> Tensor:
-    """Assemble the 22-joint BetterHuman configuration ``(B, 91)``.
+def smplx_q(pelvis: Tensor, root_rot: Tensor, body_rot: Tensor,
+            hand_rot: Tensor | None = None) -> Tensor:
+    """Assemble the BetterHuman configuration ``(B, 91)`` (``(B, 211)`` with hands).
 
     :param pelvis: pelvis position ``(B, 3)`` (the root of ``q`` IS the pelvis).
     :param root_rot: root rotation ``(B, 3, 3)``.
     :param body_rot: parent-local body rotations ``(B, 21, 3, 3)``.
+    :param hand_rot: parent-local finger rotations ``(B, 30, 3, 3)`` or ``None``.
     """
-    return torch.cat([
+    parts = [
         pelvis,
         roma.rotmat_to_unitquat(root_rot),                                # xyzw
         roma.rotmat_to_unitquat(body_rot).reshape(pelvis.shape[0], -1),
-    ], dim=-1)
+    ]
+    if hand_rot is not None:
+        parts.append(roma.rotmat_to_unitquat(hand_rot).reshape(pelvis.shape[0], -1))
+    return torch.cat(parts, dim=-1)
 
 
 def smplx_vertices(body, betas: Tensor, q: Tensor) -> Tensor:
-    """Skinned vertices ``(B, 10475, 3)`` of a BetterHuman SMPL-X body (flat hands)."""
+    """Skinned vertices ``(B, 10475, 3)`` of a BetterHuman SMPL-X body at ``q``."""
     shaped = body.with_shape(betas=betas)
     return body.vertices_from_data(shaped.fk(q))
 
@@ -113,17 +144,23 @@ def pose_metric_stats(
     pred_joints: Tensor, pred_verts: Tensor, gt_joints: Tensor, gt_verts: Tensor,
     valid: Tensor, seq_len: int, frame_pos_sec: Tensor,
 ) -> Tensor:
-    """Additive ``(sum, count)`` pairs of :data:`POSE_METRICS` — float64 ``[8]``.
+    """Additive ``(sum, count)`` pairs of :data:`POSE_METRICS` — float64 ``[8]``
+    (``[10]`` with :data:`HAND_METRICS` when ``pred_joints`` carries the fingers).
 
-    :param pred_joints: ``(B, 22, 3)`` camera metres, ``B = n_clips * seq_len``
-        clip-major.
-    :param pred_verts: ``(B, V, 3)``.
-    :param gt_joints: ``(B, 22, 3)``.
-    :param gt_verts: ``(B, V, 3)``.
+    :param pred_joints: ``(B, 22 | 52, 3)`` camera metres, ``B = n_clips *
+        seq_len`` clip-major; the body metrics use the first 22 rows.
+    :param pred_verts: ``(B, V, 3)`` flat-hand vertices.
+    :param gt_joints: ``(B, 22 | 52, 3)`` (52 required for the hand metric).
+    :param gt_verts: ``(B, V, 3)`` flat-hand vertices.
     :param valid: ``(B,)`` bool rows that count.
     :param seq_len: frames per clip (the acceleration stencil never crosses a clip).
     :param frame_pos_sec: ``(B,)`` elapsed seconds per frame.
     """
+    hands = pred_joints.shape[1] == NUM_BODY_JOINTS + NUM_HAND_JOINTS
+    hand_stats: list[float] = []
+    if hands:
+        hand_stats = _hand_metric_stats(pred_joints, gt_joints, valid)
+    pred_joints, gt_joints = pred_joints[:, :NUM_BODY_JOINTS], gt_joints[:, :NUM_BODY_JOINTS]
     hips = list(SMPLX_HIPS)
     pred_pelvis = pred_joints[:, hips].mean(dim=1, keepdim=True)
     gt_pelvis = gt_joints[:, hips].mean(dim=1, keepdim=True)
@@ -158,13 +195,36 @@ def pose_metric_stats(
         float((pa_mpjpe * mask).sum()), count,
         float((pve * mask).sum()), count,
         accel_sum, accel_count,
-    ], dtype=torch.float64)
+    ] + hand_stats, dtype=torch.float64)
+
+
+def _hand_metric_stats(pred_joints: Tensor, gt_joints: Tensor, valid: Tensor) -> list[float]:
+    """``(sum, count)`` pairs of :data:`HAND_METRICS` (mm) over valid rows."""
+    per_hand = NUM_HAND_JOINTS // 2
+    errors, pa_errors = [], []
+    for hand, wrist in enumerate(HAND_WRISTS):
+        lo = NUM_BODY_JOINTS + hand * per_hand
+        fingers = slice(lo, lo + per_hand)
+        pred = pred_joints[:, fingers] - pred_joints[:, wrist:wrist + 1]
+        gt = gt_joints[:, fingers] - gt_joints[:, wrist:wrist + 1]
+        errors.append((pred - gt).norm(dim=-1))                          # (B, 15)
+        # Procrustes over wrist + fingers; the wrist row is dropped from the error.
+        origin = torch.zeros_like(pred[:, :1])
+        aligned = procrustes_align(torch.cat([origin, pred], dim=1),
+                                   torch.cat([origin, gt], dim=1))[:, 1:]
+        pa_errors.append((aligned - gt).norm(dim=-1))
+    mask = valid.to(pred_joints.dtype)
+    err = torch.cat(errors, dim=1).mean(dim=-1) * 1000.0                 # (B,)
+    pa_err = torch.cat(pa_errors, dim=1).mean(dim=-1) * 1000.0
+    return [float((err * mask).sum()), float(mask.sum()),
+            float((pa_err * mask).sum()), float(mask.sum())]
 
 
 def pose_metrics_from_stats(stats: Tensor) -> dict[str, float]:
-    """:data:`POSE_METRICS` from the summed statistics vector."""
+    """:data:`POSE_METRICS` (+ :data:`HAND_METRICS`) from the summed statistics vector."""
+    names = POSE_METRICS + (HAND_METRICS if len(stats) > 2 * len(POSE_METRICS) else ())
     return {name: mean_from_stats(float(stats[2 * i]), float(stats[2 * i + 1]))
-            for i, name in enumerate(POSE_METRICS)}
+            for i, name in enumerate(names)}
 
 
 class SmplxLoss(Loss):
@@ -172,12 +232,15 @@ class SmplxLoss(Loss):
 
     name = "smplx"
     metric_group = "pose"
-    stat_names = tuple(f"{key}_{part}" for key in POSE_METRICS for part in ("sum", "count"))
 
     def __init__(self, cfg: dict, model, device: torch.device | str) -> None:
         super().__init__(cfg, model, device)
-        loss_cfg = cfg["smplx_supervision"]["loss"]
+        section = cfg["smplx_supervision"]
+        loss_cfg = section["loss"]
+        self.hands = bool(self.model.head_smplx.hands)
         self.weights = {name: float(loss_cfg[name]) for name in _TERM_NAMES}
+        if self.weights["hand_pose"] > 0.0 and not self.hands:
+            raise ValueError("smplx_supervision.loss.hand_pose needs model.smplx.hands")
         self.term_names = tuple(n for n in _TERM_NAMES if self.weights[n] > 0.0)
         if not self.term_names:
             raise ValueError(
@@ -185,6 +248,14 @@ class SmplxLoss(Loss):
         self.delta_2d = float(loss_cfg["huber_delta_2d"])
         self.delta_3d = float(loss_cfg["huber_delta_3d"])
         self.delta_cam = float(loss_cfg["huber_delta_cam"])
+        # Per-joint keypoint weights over the joints the head emits.
+        num_joints = self.model.head_smplx.num_joints
+        joint_w = torch.ones(num_joints, dtype=self.dtype)
+        joint_w[NUM_BODY_JOINTS:] = float(section["joint_weights"]["fingers"])
+        self.joint_w = (joint_w / joint_w.sum()).to(self.device)         # sums to 1
+        metric_names = POSE_METRICS + (HAND_METRICS if self.hands else ())
+        self.stat_names = tuple(f"{key}_{part}" for key in metric_names
+                                for part in ("sum", "count"))
 
     def __call__(self, out: dict, batch: dict, *, train: bool) -> LossResult:
         pred = out["smplx"]
@@ -192,12 +263,16 @@ class SmplxLoss(Loss):
         body_6d = pred["body_6d"].to(self.device, self.dtype)            # (B,21,6)
         betas = pred["betas"].to(self.device, self.dtype)                # (B,10)
         cam = pred["cam"].to(self.device, self.dtype)                    # (B,3)
-        joints = pred["joints_cam"].to(self.device, self.dtype)          # (B,22,3)
-        kp2d_crop = pred["kp2d_crop"].to(self.device, self.dtype)        # (B,22,2)
+        joints = pred["joints_cam"].to(self.device, self.dtype)          # (B,J,3)
+        kp2d_crop = pred["kp2d_crop"].to(self.device, self.dtype)        # (B,J,2)
         anchor = (root_6d.sum() + body_6d.sum() + betas.sum() + cam.sum()) * 0.0
+        hand_6d = None
+        if self.hands:
+            hand_6d = pred["hand_6d"].to(self.device, self.dtype)        # (B,30,6)
+            anchor = anchor + hand_6d.sum() * 0.0
 
-        gt = gt_smplx_camera(batch, self.device, self.dtype)
-        gt_joints = gt["joints"]
+        gt = gt_smplx_camera(batch, self.device, self.dtype, hands=self.hands)
+        gt_joints = gt["joints"][:, :joints.shape[1]]
         mask = gt["valid"].to(self.dtype)                                # (B,)
         mass = float(mask.sum())
 
@@ -214,15 +289,19 @@ class SmplxLoss(Loss):
         raw: dict[str, tuple[Tensor, float]] = {}
         if self.weights["kp2d"] > 0.0:
             huber = F.smooth_l1_loss(kp2d_crop, gt_crop, reduction="none", beta=self.delta_2d)
-            raw["kp2d"] = ((huber.mean(dim=(1, 2)) * mask).sum(), mass)
+            raw["kp2d"] = (((huber.mean(dim=-1) * self.joint_w).sum(dim=1) * mask).sum(), mass)
         if self.weights["kp3d"] > 0.0:
             huber = F.smooth_l1_loss(joints - joints[:, :1], gt_joints - gt_joints[:, :1],
                                      reduction="none", beta=self.delta_3d)
-            raw["kp3d"] = ((huber.mean(dim=(1, 2)) * mask).sum(), mass)
+            raw["kp3d"] = (((huber.mean(dim=-1) * self.joint_w).sum(dim=1) * mask).sum(), mass)
         if self.weights["orient"] > 0.0:
             raw["orient"] = (((root_6d - gt_root_6d).square().mean(dim=-1) * mask).sum(), mass)
         if self.weights["pose"] > 0.0:
             raw["pose"] = (((body_6d - gt_body_6d).square().mean(dim=(1, 2)) * mask).sum(), mass)
+        if self.weights["hand_pose"] > 0.0:
+            gt_hand_6d = rotmat_to_rot6d(gt["hand_rot"])
+            raw["hand_pose"] = (
+                ((hand_6d - gt_hand_6d).square().mean(dim=(1, 2)) * mask).sum(), mass)
         if self.weights["betas"] > 0.0:
             raw["betas"] = (((betas - gt["betas"]).square().mean(dim=-1) * mask).sum(), mass)
         if self.weights["cam"] > 0.0:
@@ -232,9 +311,12 @@ class SmplxLoss(Loss):
         stats = self.empty_stats()
         if not train:
             # Vertices only at evaluation: the metrics are their sole consumer.
-            body = self.model.head_smplx.body(self.device)
-            pred_verts = smplx_vertices(body, betas.detach(), pred["q_cam"].detach())
-            gt_verts = smplx_vertices(body, gt["betas"], gt["q"])
+            # Flat hands on both sides (the 22-joint body at the body part of q)
+            # keep PVE comparable across hands / no-hands runs.
+            body = self.model.head_smplx.body_flat(self.device)
+            pred_verts = smplx_vertices(
+                body, betas.detach(), pred["q_cam"].detach()[:, :BODY_Q_DIM])
+            gt_verts = smplx_vertices(body, gt["betas"], gt["q"][:, :BODY_Q_DIM])
             stats = pose_metric_stats(
                 joints.detach(), pred_verts, gt_joints, gt_verts, gt["valid"],
                 int(batch["seq_len"]), batch["frame_pos_sec"].to(self.device),
@@ -248,5 +330,6 @@ class SmplxLoss(Loss):
         return pose_metrics_from_stats(stats)
 
 
-__all__ = ["SmplxLoss", "POSE_METRICS", "SMPLX_HIPS", "gt_smplx_camera", "smplx_q",
-           "smplx_vertices", "pose_metric_stats", "pose_metrics_from_stats"]
+__all__ = ["SmplxLoss", "POSE_METRICS", "HAND_METRICS", "SMPLX_HIPS", "BODY_Q_DIM",
+           "gt_smplx_camera", "smplx_q", "smplx_vertices", "pose_metric_stats",
+           "pose_metrics_from_stats"]

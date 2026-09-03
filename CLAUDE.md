@@ -34,6 +34,8 @@ sibling `../BetterRobot` / `../BetterHuman` checkouts (or `$BETTERHUMAN_MODELS_D
 
 ```bash
 # Train (resume: --resume auto | --resume path/to/last.pth; --limit-scenes N for smoke runs)
+# Rank 0's console goes to output/logs/<run>.log by itself (evaluate.py: output/logs/<run>_eval.log);
+# redirect anything else you launch into output/logs/ too — never write files into output/ itself.
 python scripts/train.py --config configs/temporal_posetoken.yaml
 CUDA_VISIBLE_DEVICES=6,7 $CONDA/bin/torchrun --standalone --nproc-per-node=2 \
   scripts/train.py --config configs/temporal_tokens.yaml        # data.frames_per_batch is per GPU
@@ -45,10 +47,15 @@ python scripts/eval_frozen_smplx.py --config configs/temporal_posetoken.yaml --o
 python scripts/evaluate.py --config configs/allmod_rope_t60_gv.yaml --checkpoint output/<run>/best.pth
 
 # Renders and inference
-python scripts/render_video.py --config <yaml> --checkpoint <pth> --split test --scenes 5 --out <dir>
+python scripts/render_video.py --config <yaml> --checkpoint <pth> --split test --scenes 5 --out <dir> \
+  --overlay-labels --gt-panel --scale 0.5     # SMPL-X-head builds: GT body+labels | predicted body+contacts (2026-09-03)
 python scripts/render_pose_video.py --config <yaml> --checkpoint <pth> --scenes 3 --out <dir>
 python scripts/render_smplx_video.py --config configs/smplx_probe.yaml --checkpoint <pth> --scenes 8 --out <dir>   # GT | frozen MHR | SMPL-X head
 python scripts/predict_reconstruction.py --config <yaml> --checkpoint <pth> --root <BVR out-tree>
+# Temporal-block diagnostic: attention mass per layer/head (self / same-frame / cross-frame, |dt|,
+# effective frames, temporal profile, slot mixing, gate norms) + full / same_frame / bypass ablations
+# on the test protocol -> <run>/diag_temporal/{summary.json, *.png}; compare runs on these numbers
+python scripts/diag_temporal.py --config <yaml> --checkpoint <pth>            # ~17 min on a free card
 
 # Data preparation (scripts/data/)
 python scripts/data/extract_frames.py                       # frames/ JPEG tree
@@ -73,7 +80,7 @@ tensorboard --logdir output/<run>/tensorboard/    # sections: optim, loss_train,
 | `utils/` | `geometry.py` (torch SO(3)/6D/CLIFF camera proxy/projection/Procrustes/lifting/windowed mean), `metrics.py`, `distributed.py`, `betterhuman.py`. |
 | `scripts/` | Thin CLIs (above) + `scripts/data/` preparation scripts. |
 | `configs/` | `base.yaml` (every key, its default, one comment) + experiment overrides + `datasets/climbing_videos.yaml`. |
-| `output/` | Runs (gitignored): `<exp>_<YYYYMMDD_HHMMSS>/{config.yaml, last.pth, best.pth, epoch_XXXX.pth, tensorboard/}`. |
+| `output/` | Runs (gitignored): `<exp>_<YYYYMMDD_HHMMSS>/{config.yaml, last.pth, best.pth, epoch_XXXX.pth, tensorboard/, render*/, diag_*/}`; console transcripts under `output/logs/` only; `frozen_sam3d_smplx.json` = the frozen baseline. Results table: `docs/results.md`. |
 
 ## Architecture
 
@@ -146,10 +153,22 @@ tensorboard --logdir output/<run>/tensorboard/    # sections: optim, loss_train,
    The cost-weighted contact loss (`neg_weight 2`, heel `pos_weight 4`, `transition_tolerance 2`;
    options kept, default off) was worse along the whole P/R curve (P@R0.9 0.919 vs 0.928) — a
    threshold on the plain model buys precision for free; heels stay unpredicted. The optimizer
-   hygiene bundle (`betas .95`, `decay_1d false`, `ema`, `grad_clip_per_group`; options kept)
-   gained 1.5-4 mm on pose at lr 1e-4 but cost ~0.005 F1, not attributable within the bundle.
-   Gradient surgery (PCGrad) was measured pointless: contact/pose gradients on the shared block
-   have cos ≈ 0 with balanced magnitudes.
+   hygiene bundle (`betas [0.9, 0.95]`, `decay_1d false`, `ema 0.999`, `grad_clip_per_group`)
+   gained 1.5-4 mm on pose at lr 1e-4 but cost ~0.005 F1, not attributable within the bundle;
+   it is the `base.yaml` DEFAULT since 2026-09-03 (every recorded run above trained without it —
+   a run's own `config.yaml` holds the values it actually used). Gradient surgery (PCGrad) was
+   measured pointless: contact/pose gradients on the shared block have cos ≈ 0 with balanced
+   magnitudes. All results so far: `docs/results.md`.
+10. **What the temporal block does** (`scripts/diag_temporal.py` on the b8_lr2 run, 2026-09-03;
+   numbers in `docs/results.md`): it is NOT collapsed to within-frame attention — the opposite:
+   same-frame mass is 1-3 % per layer, mean |dt| ≈ 0.7 s, ~10-12 effective frames, the profile a
+   broad skirt over the whole ±2.5 s window (half the mass beyond 20 steps) — i.e. soft clip-wide
+   context pooling, not local smoothing. Ablations: closing the window to the query's own frame
+   leaves POSE unchanged (60.03 vs 60.07 mm) and costs CONTACT 0.026 F1 (precision −0.068);
+   zeroing the gates costs 17 mm pose and 0.056 F1. So the pose gain is the block's per-frame
+   (FFN) transform and the temporal context only buys contact precision. Same protocol (auto
+   stride) the per-frame SMPL-X probe scores 57.6 / 38.9 / 74.7 mm — better than every temporal
+   run on pose (different training budget; not a controlled ablation).
 
 ### Losses (`model/loss/`, all on one interface)
 
@@ -236,6 +255,8 @@ above, `optim.{lr,weight_decay,epochs,warmup_steps,lr_min,grad_clip,grad_clip_pe
 
 - Never `rm`: move to `/data3/rikhat.akizhanov/trash/<name>_<date>/`. Commit/push only on
   explicit instruction. Shared GPU box: never touch other users' processes.
+- `output/` holds run directories and the frozen-baseline json only; every console transcript
+  or launch log goes to `output/logs/` (the train/evaluate CLIs tee themselves there).
 - Skepticism: log raw metrics and trajectories; the user owns verdicts. No validation split
   (train on all train scenes, evaluate on test only).
 - Keep the codebase pruned: no `.get()` fallbacks on schema-guaranteed keys, no history

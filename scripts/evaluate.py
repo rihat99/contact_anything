@@ -7,7 +7,8 @@
 
 Prints every ``loss_test/*`` term and ``metric_*/*`` metric the enabled losses report, and — when the contact
 branch is on — a precision/recall/F1 threshold curve plus per-group scores at
-``--threshold``.
+``--threshold``. The report is mirrored to ``<output.dir>/logs/<run>_eval.log``
+(``untrained_eval.log`` for ``--checkpoint none``).
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from data import build_datasets                        # noqa: E402
 from data.loaders import build_loaders                 # noqa: E402
 from train.config import signal_needs                  # noqa: E402
+from train.logger import tee_output                    # noqa: E402
 from train.predict import load_model                   # noqa: E402
 from train.trainer import evaluate_losses              # noqa: E402
 from model.loss import KINDYN_GROUP_NAMES, build_losses  # noqa: E402
@@ -96,6 +98,9 @@ def main() -> None:
 
     checkpoint = None if args.checkpoint.lower() == "none" else args.checkpoint
     model, cfg = load_model(args.config, checkpoint, args.device)
+    run = "untrained" if checkpoint is None else Path(checkpoint).resolve().parent.name
+    tee_output(Path(cfg["output"]["dir"]) / "logs" / f"{run}_eval.log")
+    print(f"config: {args.config}   checkpoint: {checkpoint or 'none (untrained)'}")
     _, test_sets = build_datasets(cfg, signal_needs(cfg), limit_scenes=args.limit_scenes)
     _, test_loader = build_loaders(cfg, [], test_sets)
     losses = build_losses(cfg, model, args.device)

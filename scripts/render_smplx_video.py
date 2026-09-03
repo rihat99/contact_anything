@@ -30,14 +30,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt                                 # noqa: E402
 import numpy as np                                              # noqa: E402
-import roma                                                     # noqa: E402
 import torch                                                    # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import _render_common as rc                                     # noqa: E402
 from render_pose_video import draw_keypoints, draw_mesh, nan_means   # noqa: E402
-from model.loss.smplx import SMPLX_HIPS                      # noqa: E402
+from model.loss.smplx import SMPLX_HIPS, gt_smplx_camera, smplx_vertices   # noqa: E402
 
 #: The 12 joints both skeletons name: shoulders, elbows, hips, knees, ankles,
 #: wrists (left, right) — SMPL-X body indices and the MHR70 keypoint indices.
@@ -100,19 +99,11 @@ def predict_pass(model, ds, cfg: dict, device: str) -> dict:
         # SMPL-X head: its own q / betas through the same body -> vertices
         head_data = body.with_shape(betas=sx["betas"]).fk(sx["q_cam"])
         head_verts = rc.to_numpy(body.vertices_from_data(head_data))
-        head_kp3d = rc.to_numpy(sx["joints_cam"])
-        # GT: kindyn SMPL-X lifted to the camera, hands flat (the 22-joint build)
-        ext = batch["cam_from_world"].to(dev)
-        rot_cw, t_cw = ext[:, :3, :3], ext[:, :3, 3]
-        gt_joints = torch.einsum("bij,bkj->bki", rot_cw,
-                                 batch["smplx_joints_world"].to(dev)) + t_cw[:, None]
-        gt_root = rot_cw @ batch["smplx_root_rot"].to(dev)
-        n = gt_joints.shape[0]
-        q_gt = torch.cat([gt_joints[:, 0], roma.rotmat_to_unitquat(gt_root),
-                          roma.rotmat_to_unitquat(batch["smplx_body_rot"].to(dev)).reshape(n, -1)], -1)
-        gt_data = body.with_shape(betas=batch["smplx_betas"].to(dev)).fk(q_gt)
-        gt_verts = rc.to_numpy(body.vertices_from_data(gt_data))
-        gt_kp3d = rc.to_numpy(gt_joints)
+        head_kp3d = rc.to_numpy(sx["joints_cam"][:, :22])
+        # GT: kindyn SMPL-X lifted to the camera through the head's own body
+        gt = gt_smplx_camera(batch, dev, hands=model.head_smplx.hands)
+        gt_verts = rc.to_numpy(smplx_vertices(body, gt["betas"], gt["q"]))
+        gt_kp3d = rc.to_numpy(gt["joints"][:, :22])
         gt_valid = rc.to_numpy(batch["smplx_valid"]) > 0
 
         arms = {"frozen": (frozen_verts, frozen_kp3d), "head": (head_verts, head_kp3d),

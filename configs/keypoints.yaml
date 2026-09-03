@@ -1,0 +1,23 @@
+# Arm K (2026-09-03) — the b8_lr2 recipe + 2D keypoints as an INPUT to the pose token.
+#
+# GVHMR-style early fusion: the frame's sapiens keypoints (23 MHR70 indices = COCO-17 +
+# toes/heels + wrists), crop-normalised like SAM 3D Body's own _full_to_crop plus their
+# detector score, through a zero-init MLP (69 -> C -> C) ADDED to the pose token BEFORE the
+# cross-modal temporal block. Keypoints below score 0.3 are zeroed (3 % of body keypoints,
+# 86 px median error vs the projected MHR GT; the rest 7.6 px). The frozen decoder never sees
+# them — only the temporal block, the contact head (through the block) and the SMPL-X head.
+# Deployment reads the frozen readout's own pred_keypoints_2d instead (`source: mhr`); evaluate
+# this checkpoint under both sources to measure that gap.
+# Compared against temporal_tokens_b8_lr2_20260902_203707 (delta folds the optimizer bundle in).
+#
+# Launch:
+#   CUDA_VISIBLE_DEVICES=6,7 torchrun --standalone --nproc-per-node=2 \
+#     scripts/train.py --config configs/keypoints.yaml
+base: configs/temporal_tokens_b8_lr2.yaml
+
+model:
+  token_inputs:
+    keypoints2d: {enabled: true, source: sapiens}
+
+output:
+  exp_name: keypoints

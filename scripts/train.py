@@ -3,6 +3,9 @@
     python scripts/train.py --config configs/allmod_rope_t60_gv.yaml
     CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
         scripts/train.py --config configs/allmod_rope_t60_gv.yaml
+
+Rank 0's console output is mirrored to ``<output.dir>/logs/<run>.log`` (appended
+on resume), so no shell redirect is needed to keep a transcript.
 """
 from __future__ import annotations
 
@@ -24,6 +27,7 @@ from data.loaders import build_loaders                 # noqa: E402
 from model.build import build_model                    # noqa: E402
 from model.loss import build_losses                    # noqa: E402
 from train.config import load_config, signal_needs     # noqa: E402
+from train.logger import tee_output                    # noqa: E402
 from train.trainer import Trainer                      # noqa: E402
 
 
@@ -64,6 +68,7 @@ def run_dir(cfg: dict, resume: Path | None, is_main: bool, distributed: bool) ->
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+        tee_output(Path(cfg["output"]["dir"]) / "logs" / f"{out_dir.name}.log")
         print(f"Output: {out_dir}")
     if distributed:
         dist.barrier()

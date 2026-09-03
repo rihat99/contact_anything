@@ -143,8 +143,8 @@ class Loss(ABC):
 def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
     """Instantiate every enabled loss, in a fixed order.
 
-    The order (contact, force, motion, pose, keypoint, smplx,
-    contact_consistency, force_consistency, physics) is what makes the
+    The order (contact, force, motion, pose, keypoint, smplx, rollout,
+    smoothness, contact_consistency, force_consistency, physics) is what makes the
     trainer's packed mass all-reduce identical on every rank.
 
     :raises ValueError: when an enabled loss has no branch to supervise, or when
@@ -176,9 +176,11 @@ def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
     if motion_on:
         _require(net.head_motion is not None,
                  "motion_supervision", "model.motion.enabled")
-        _require("motion" in net.cross_modal_modalities, "motion_supervision",
-                 "'motion' in model.cross_modal_temporal.modalities (a per-frame "
-                 "head cannot represent a derivative)")
+        read = "motion" if net.motion_tokens is not None else "pose"
+        _require(read in net.cross_modal_modalities, "motion_supervision",
+                 f"'{read}' in model.cross_modal_temporal.modalities — the token "
+                 "the motion head reads (a per-frame head cannot represent a "
+                 "derivative)")
         from model.loss.motion import MotionLoss
         losses.append(MotionLoss(cfg, model, device))
 
@@ -200,6 +202,18 @@ def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
         _require(net.head_smplx is not None, "smplx_supervision", "model.smplx.enabled")
         from model.loss.smplx import SmplxLoss
         losses.append(SmplxLoss(cfg, model, device))
+
+    if cfg["rollout_eval"]["enabled"]:
+        _require(net.head_smplx is not None, "rollout_eval", "model.smplx.enabled")
+        _require(motion_on, "rollout_eval",
+                 "motion_supervision.enabled (its standardize table)")
+        from model.loss.rollout import RolloutLoss
+        losses.append(RolloutLoss(cfg, model, device))
+
+    if cfg["pose_smoothness"]["enabled"]:
+        _require(net.head_smplx is not None, "pose_smoothness", "model.smplx.enabled")
+        from model.loss.smoothness import SmoothnessLoss
+        losses.append(SmoothnessLoss(cfg, model, device))
 
     if cfg["contact_consistency"]["enabled"]:
         _require(net.head_contact is not None,

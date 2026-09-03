@@ -16,9 +16,14 @@ A frozen-baseline dict (``output.frozen_metrics``) is written as a SECOND run,
 ``<run>/tensorboard/frozen``, at every evaluation step with the same
 ``metric_*`` tags — tensorboard overlays it on the live curves as a flat line
 without adding a single card.
+
+:func:`tee_output` mirrors a process's stdout/stderr into a text log under
+``<output.dir>/logs/`` — the console transcript of a run (or an evaluation)
+lives there, never next to the run directories.
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -63,3 +68,35 @@ class Logger:
             self.writer.close()
         if self.frozen_writer is not None:
             self.frozen_writer.close()
+
+
+class _Tee:
+    """File-like that writes to a console stream and a log file at once."""
+
+    def __init__(self, stream, handle):
+        self._stream = stream
+        self._handle = handle
+
+    def write(self, text: str) -> int:
+        self._handle.write(text)
+        return self._stream.write(text)
+
+    def flush(self) -> None:
+        self._handle.flush()
+        self._stream.flush()
+
+    def __getattr__(self, name: str):
+        return getattr(self._stream, name)
+
+
+def tee_output(path: str | Path) -> None:
+    """Mirror stdout and stderr into ``path`` (appended) for the rest of the process.
+
+    Python-level output only (prints, warnings, tqdm); the console keeps
+    receiving everything. Call once, on the rank that prints.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a", buffering=1)
+    sys.stdout = _Tee(sys.stdout, handle)
+    sys.stderr = _Tee(sys.stderr, handle)

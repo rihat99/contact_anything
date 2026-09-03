@@ -24,11 +24,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = REPO_ROOT / "configs" / "base.yaml"
 
 _MODALITY_ORDER = ("pose", "contact", "force", "motion")
+_MOTION_TERMS = ("vel", "acc", "ang_vel", "ang_acc")
 _MONITOR_MAX = ("f1", "f2", "iou", "r3d", "precision", "recall", "accuracy")
-_MONITOR_MIN = ("mae", "err", "loss", "residual", "rmse", "mpjpe", "pve", "accel")
+_MONITOR_MIN = ("mae", "err", "loss", "residual", "rmse", "mpjpe", "pve", "accel",
+                "rte", "jitter")
 #: Tensorboard metric section of every loss (``metric_<group>/...``); a loss
 #: whose group is not its own name is listed here.
-METRIC_GROUPS = {"smplx": "pose"}
+METRIC_GROUPS = {"smplx": "pose", "rollout": "global", "smoothness": "smooth"}
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -85,7 +87,8 @@ def enabled_branches(cfg: dict) -> dict:
         "pose": True,
         "contact": bool(contact["enabled"]) and contact["source"] == "tokens",
         "force": bool(cfg["model"]["force"]["enabled"]),
-        "motion": bool(cfg["model"]["motion"]["enabled"]),
+        "motion": (bool(cfg["model"]["motion"]["enabled"])
+                   and cfg["model"]["motion"]["source"] == "tokens"),
     }
 
 
@@ -94,7 +97,8 @@ def enabled_losses(cfg: dict) -> list[str]:
     sections = (("contact", "contact_supervision"), ("force", "force_supervision"),
                 ("motion", "motion_supervision"), ("pose", "pose_supervision"),
                 ("keypoint", "keypoint_supervision"),
-                ("smplx", "smplx_supervision"),
+                ("smplx", "smplx_supervision"), ("rollout", "rollout_eval"),
+                ("smoothness", "pose_smoothness"),
                 ("contact_consistency", "contact_consistency"),
                 ("force_consistency", "force_consistency"), ("physics", "physics"))
     return [name for name, section in sections if cfg[section]["enabled"]]
@@ -115,6 +119,13 @@ def signal_needs(cfg: dict) -> set[str]:
     if cfg["keypoint_supervision"]["enabled"]:
         needs.add("keypoints")
     if cfg["smplx_supervision"]["enabled"]:
+        needs.add("smplx")
+    keypoints2d = cfg["model"]["token_inputs"]["keypoints2d"]
+    if keypoints2d["enabled"] and keypoints2d["source"] == "sapiens":
+        needs.add("keypoints2d")      # the sapiens detections (an input, not a label)
+    if cfg["model"]["token_inputs"]["camera_twist"]["enabled"]:
+        needs.add("camera")           # the camera's own twist (an input)
+    if cfg["rollout_eval"]["enabled"] or cfg["pose_smoothness"]["enabled"]:
         needs.add("smplx")
     return needs
 
@@ -147,12 +158,57 @@ def validate(cfg: dict) -> None:
                 "block in this build — enable model.contact / model.force / "
                 "model.motion accordingly")
 
+    keypoints2d = model["token_inputs"]["keypoints2d"]
+    if keypoints2d["enabled"]:
+        if keypoints2d["source"] not in ("sapiens", "mhr"):
+            raise ValueError(
+                "model.token_inputs.keypoints2d.source must be 'sapiens' or 'mhr'; "
+                f"got {keypoints2d['source']!r}")
+        indices = [int(i) for i in keypoints2d["indices"]]
+        if not indices or len(set(indices)) != len(indices) or any(
+                not 0 <= i < 70 for i in indices):
+            raise ValueError(
+                "model.token_inputs.keypoints2d.indices must be a non-empty "
+                f"duplicate-free list of MHR70 indices; got {indices}")
+        if not 0.0 <= float(keypoints2d["min_score"]) <= 1.0:
+            raise ValueError("model.token_inputs.keypoints2d.min_score must lie in [0, 1]")
+    motion = model["motion"]
+    if motion["enabled"]:
+        if motion["source"] not in ("tokens", "pose_token"):
+            raise ValueError(
+                "model.motion.source must be 'tokens' or 'pose_token'; got "
+                f"{motion['source']!r}")
+        terms = [str(t) for t in motion["terms"]]
+        if (not terms or len(set(terms)) != len(terms)
+                or any(t not in _MOTION_TERMS for t in terms)
+                or terms != [t for t in _MOTION_TERMS if t in terms]):
+            raise ValueError(
+                "model.motion.terms must be a non-empty duplicate-free subset of "
+                f"{list(_MOTION_TERMS)} in that order; got {terms}")
+    masking = model["token_masking"]
+    if masking["enabled"]:
+        if not cross_modal["enabled"]:
+            raise ValueError(
+                "model.token_masking corrupts the cross_modal_temporal input; "
+                "enable model.cross_modal_temporal")
+        if not 0.0 < float(masking["frac"]) <= 1.0:
+            raise ValueError("model.token_masking.frac must lie in (0, 1]")
+        if not 1 <= int(masking["span_min"]) <= int(masking["span_max"]):
+            raise ValueError("need 1 <= model.token_masking.span_min <= span_max")
+        if masking["replace"] not in ("mask", "swap"):
+            raise ValueError(
+                "model.token_masking.replace must be 'mask' or 'swap'; got "
+                f"{masking['replace']!r}")
+
     pose_sup = cfg["pose_supervision"]["enabled"]
     kp_sup = cfg["keypoint_supervision"]["enabled"]
     pose_writers = [
         name for name, on in (
             ("model.cross_modal_temporal.modalities['pose']", "pose" in modalities),
             ("model.pose_temporal", model["pose_temporal"]["enabled"]),
+            ("model.token_inputs.keypoints2d", keypoints2d["enabled"]),
+            ("model.token_inputs.camera_twist (into the pose token)",
+             model["token_inputs"]["camera_twist"]["enabled"] and not branches["motion"]),
             ("model.finetune_pose_head", model["finetune_pose_head"]),
             ("model.finetune_camera_head", model["finetune_camera_head"]),
         ) if on
@@ -183,15 +239,49 @@ def validate(cfg: dict) -> None:
             "model.finetune_camera_head requires keypoint_supervision.enabled "
             "(kp2d is the only loss that constrains the camera)")
 
-    if cfg["motion_supervision"]["enabled"]:
-        if not branches["motion"]:
+    ms = cfg["motion_supervision"]
+    if ms["linear_frame"] not in ("gravity_view", "body"):
+        raise ValueError(
+            "motion_supervision.linear_frame must be 'gravity_view' or 'body'; got "
+            f"{ms['linear_frame']!r}")
+    if ms["root_source"] not in ("mhr", "smplx"):
+        raise ValueError(
+            "motion_supervision.root_source must be 'mhr' or 'smplx'; got "
+            f"{ms['root_source']!r}")
+    if ms["enabled"]:
+        if not motion["enabled"]:
             raise ValueError(
                 "motion_supervision.enabled requires model.motion.enabled")
-        if "motion" not in modalities:
+        # A per-frame head cannot represent a derivative: the token the head
+        # reads must be mixed across frames.
+        read = "motion" if branches["motion"] else "pose"
+        if read not in modalities:
             raise ValueError(
-                "motion_supervision.enabled requires 'motion' in "
-                "model.cross_modal_temporal.modalities — a per-frame head cannot "
-                "represent a derivative")
+                f"motion_supervision.enabled requires '{read}' in "
+                "model.cross_modal_temporal.modalities (the token the motion head "
+                "reads) — a per-frame head cannot represent a derivative")
+        active = [t for t in _MOTION_TERMS if float(ms["loss"][t]) != 0.0]
+        missing = [t for t in active if t not in motion["terms"]]
+        if missing:
+            raise ValueError(
+                f"motion_supervision.loss weights {missing} are non-zero but "
+                f"model.motion.terms {motion['terms']} has no such channels")
+    if cfg["pose_smoothness"]["enabled"]:
+        if not model["smplx"]["enabled"]:
+            raise ValueError("pose_smoothness.enabled requires model.smplx.enabled")
+        if int(cfg["data"]["clip"]["frames"]) < 5:
+            raise ValueError("pose_smoothness needs data.clip.frames >= 5 (a 5-point stencil)")
+    if cfg["rollout_eval"]["enabled"]:
+        if not (model["smplx"]["enabled"] and ms["enabled"]):
+            raise ValueError(
+                "rollout_eval.enabled requires model.smplx.enabled (the per-frame "
+                "body) and motion_supervision.enabled (the standardize table)")
+        if ms["linear_frame"] != "body" or ms["root_source"] != "smplx" or not all(
+                t in motion["terms"] for t in ("vel", "ang_vel")):
+            raise ValueError(
+                "rollout_eval integrates the SMPL-X head's BODY-frame root twist: needs "
+                "motion_supervision.linear_frame 'body', root_source 'smplx' and "
+                "'vel' + 'ang_vel' in model.motion.terms")
 
     if model["force"]["contact_gate"]["enabled"]:
         if not branches["contact"]:
@@ -229,8 +319,13 @@ def validate(cfg: dict) -> None:
                 f"got {len(cs['pos_weight'])}")
         if int(cs["transition_tolerance"]) < 0:
             raise ValueError("contact_supervision.transition_tolerance must be >= 0")
-    if cfg["smplx_supervision"]["enabled"] and not model["smplx"]["enabled"]:
-        raise ValueError("smplx_supervision.enabled requires model.smplx.enabled")
+    if cfg["smplx_supervision"]["enabled"]:
+        if not model["smplx"]["enabled"]:
+            raise ValueError("smplx_supervision.enabled requires model.smplx.enabled")
+        if float(cfg["smplx_supervision"]["loss"]["hand_pose"]) > 0 and not model["smplx"]["hands"]:
+            raise ValueError(
+                "smplx_supervision.loss.hand_pose > 0 requires model.smplx.hands (the head "
+                "regresses no finger rotations otherwise)")
     if cfg["force_supervision"]["enabled"] and not branches["force"]:
         raise ValueError(
             "force_supervision.enabled requires model.force.enabled")

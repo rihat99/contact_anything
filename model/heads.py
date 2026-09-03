@@ -323,16 +323,21 @@ class SmplxHead(nn.Module):
       position in full-image camera metres (:func:`utils.geometry.cliff_cam_to_translation`).
 
     The root of the BetterHuman ``q`` IS the pelvis pose, so no shape-dependent
-    pelvis offset couples the camera and shape outputs. Hands are not
-    predicted (they never move a body joint), so the body is the 22-joint
-    build. The forward runs BetterHuman's differentiable FK on the assembled
-    ``q`` and projects the joints with the frame intrinsics, so the output is
-    self-contained: parameters, camera-frame joints, full-image and
-    crop-normalized 2D points. The body model is a plain tensor holder (not a
-    module) built lazily on the input device.
+    pelvis offset couples the camera and shape outputs. With ``hands`` the
+    30 finger joints (15 per hand, left then right, raw parent-local
+    rotations — the classic hand mean is not part of the ``q`` convention) are
+    regressed too and the body is the 52-joint build; otherwise the 22-joint
+    build (fingers never move a body joint). The forward runs BetterHuman's
+    differentiable FK on the assembled ``q`` and projects the joints with the
+    frame intrinsics, so the output is self-contained: parameters,
+    camera-frame joints, full-image and crop-normalized 2D points. The body
+    models are plain tensor holders (not modules) built lazily on the input
+    device; :meth:`body_flat` is always the 22-joint build (the metric
+    protocol's flat-hand vertices).
     """
 
     NUM_BODY_JOINTS = 21
+    NUM_HAND_JOINTS = 30
     NUM_BETAS = 10
     _MEAN_ROOT_6D = (1.0, 0.0, 0.0, 0.0, -1.0, 0.0)
     _MEAN_JOINT_6D = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
@@ -344,10 +349,14 @@ class SmplxHead(nn.Module):
         mlp_depth: int = 2,
         mlp_channel_div_factor: int = 1,
         dropout: float = 0.0,
+        hands: bool = False,
     ):
         super().__init__()
         self.model_path = str(model_path)
-        n_pose = 6 + 6 * self.NUM_BODY_JOINTS + self.NUM_BETAS
+        self.hands = bool(hands)
+        self.num_hand_joints = self.NUM_HAND_JOINTS if self.hands else 0
+        n_pose = (6 + 6 * (self.NUM_BODY_JOINTS + self.num_hand_joints)
+                  + self.NUM_BETAS)
         self.proj_pose = FFN(
             embed_dims=input_dim,
             feedforward_channels=input_dim // mlp_channel_div_factor,
@@ -371,23 +380,34 @@ class SmplxHead(nn.Module):
             nn.init.zeros_(final_linear.bias)
         mean_pose = torch.tensor(
             list(self._MEAN_ROOT_6D)
-            + list(self._MEAN_JOINT_6D) * self.NUM_BODY_JOINTS
+            + list(self._MEAN_JOINT_6D) * (self.NUM_BODY_JOINTS + self.num_hand_joints)
             + [0.0] * self.NUM_BETAS)
         self.register_buffer("mean_pose", mean_pose, persistent=False)
         self.register_buffer("mean_cam", torch.tensor([1.0, 0.0, 0.0]), persistent=False)
-        self._body = None
-        self._body_device = None
+        self._bodies: dict = {}
+
+    @property
+    def num_joints(self) -> int:
+        """Joints in ``joints_cam``: 22, or 52 with hands."""
+        return 1 + self.NUM_BODY_JOINTS + self.num_hand_joints
+
+    def _body(self, device: torch.device, hands: bool):
+        key = (device, hands)
+        if key not in self._bodies:
+            import better_human as bh
+            self._bodies[key] = bh.SMPLX(
+                model_path=self.model_path, gender="neutral", num_betas=self.NUM_BETAS,
+                use_hands=hands, use_face=False, compute_mass=False,
+                dtype=torch.float32, device=device)
+        return self._bodies[key]
 
     def body(self, device: torch.device):
-        """The 22-joint BetterHuman SMPL-X body on ``device`` (built once)."""
-        if self._body is None or self._body_device != device:
-            import better_human as bh
-            self._body = bh.SMPLX(
-                model_path=self.model_path, gender="neutral", num_betas=self.NUM_BETAS,
-                use_hands=False, use_face=False, compute_mass=False,
-                dtype=torch.float32, device=device)
-            self._body_device = device
-        return self._body
+        """The head's BetterHuman SMPL-X body on ``device`` (22 or 52 joints; built once)."""
+        return self._body(device, self.hands)
+
+    def body_flat(self, device: torch.device):
+        """The 22-joint body on ``device`` — flat-hand vertices for the metrics."""
+        return self._body(device, False)
 
     def forward(
         self,
@@ -410,35 +430,45 @@ class SmplxHead(nn.Module):
 
         Returns:
             ``root_6d [B, 6]``, ``body_6d [B, 21, 6]`` (raw, mean included),
-            ``root_rot [B, 3, 3]`` camera-from-root, ``body_rot [B, 21, 3, 3]``,
-            ``betas [B, 10]``, ``cam [B, 3]`` (s, tx, ty), ``pelvis_cam [B, 3]`` m,
-            ``q_cam [B, 91]`` BetterHuman configuration, ``joints_cam [B, 22, 3]`` m,
-            ``kp2d_full [B, 22, 2]`` px, ``kp2d_crop [B, 22, 2]`` in ``[-0.5, 0.5]``.
+            ``hand_6d [B, 30, 6]`` (``None`` without hands), ``root_rot [B, 3, 3]``
+            camera-from-root, ``body_rot [B, 21, 3, 3]``, ``hand_rot [B, 30, 3, 3]``
+            (``None`` without hands), ``betas [B, 10]``, ``cam [B, 3]`` (s, tx, ty),
+            ``pelvis_cam [B, 3]`` m, ``q_cam [B, 91 | 211]`` BetterHuman
+            configuration (body first, finger quaternions last), ``joints_cam
+            [B, J, 3]`` m with ``J`` = :attr:`num_joints` (22 body joints first),
+            ``kp2d_full [B, J, 2]`` px, ``kp2d_crop [B, J, 2]`` in ``[-0.5, 0.5]``.
         """
         pose_token = pose_token.float()
         batch = pose_token.shape[0]
         pose = self.proj_pose(pose_token) + self.mean_pose
         cam = self.proj_cam(pose_token) + self.mean_cam
+        n_body, n_hand = 6 * self.NUM_BODY_JOINTS, 6 * self.num_hand_joints
         root_6d = pose[:, :6]
-        body_6d = pose[:, 6:6 + 6 * self.NUM_BODY_JOINTS].reshape(batch, self.NUM_BODY_JOINTS, 6)
-        betas = pose[:, 6 + 6 * self.NUM_BODY_JOINTS:]
+        body_6d = pose[:, 6:6 + n_body].reshape(batch, self.NUM_BODY_JOINTS, 6)
+        betas = pose[:, 6 + n_body + n_hand:]
         root_rot = rot6d_to_rotmat(root_6d)
         body_rot = rot6d_to_rotmat(body_6d)
         pelvis_cam = cliff_cam_to_translation(
             cam, bbox_center.float(), bbox_size.float(), cam_int.float())
-
-        q_cam = torch.cat([
+        quats = [
             pelvis_cam,
             roma.rotmat_to_unitquat(root_rot),                            # xyzw
             roma.rotmat_to_unitquat(body_rot).reshape(batch, -1),
-        ], dim=-1)                                                        # [B, 91]
+        ]
+        hand_6d = hand_rot = None
+        if self.hands:
+            hand_6d = pose[:, 6 + n_body:6 + n_body + n_hand].reshape(
+                batch, self.NUM_HAND_JOINTS, 6)
+            hand_rot = rot6d_to_rotmat(hand_6d)
+            quats.append(roma.rotmat_to_unitquat(hand_rot).reshape(batch, -1))
+        q_cam = torch.cat(quats, dim=-1)                                  # [B, 91 | 211]
         shaped = self.body(pose_token.device).with_shape(betas=betas)
         joints_cam = shaped.fk(q_cam).joint_pose_world[..., 1:, :3]      # drop the universe row
         kp2d_full, kp2d_crop = project_to_crop(
             joints_cam, cam_int.float(), affine_trans.float(), img_size.float())
         return {
-            "root_6d": root_6d, "body_6d": body_6d, "root_rot": root_rot,
-            "body_rot": body_rot, "betas": betas, "cam": cam,
-            "pelvis_cam": pelvis_cam, "q_cam": q_cam, "joints_cam": joints_cam,
-            "kp2d_full": kp2d_full, "kp2d_crop": kp2d_crop,
+            "root_6d": root_6d, "body_6d": body_6d, "hand_6d": hand_6d,
+            "root_rot": root_rot, "body_rot": body_rot, "hand_rot": hand_rot,
+            "betas": betas, "cam": cam, "pelvis_cam": pelvis_cam, "q_cam": q_cam,
+            "joints_cam": joints_cam, "kp2d_full": kp2d_full, "kp2d_crop": kp2d_crop,
         }
