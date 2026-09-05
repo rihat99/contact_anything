@@ -45,6 +45,9 @@ model:
     dropout: 0.0
     time_scale: 25.0
     max_rel_sec: 2.5
+    gate_init: zero_gate              # zero_gate (gamma = 0, random output projections: only the gates learn at first) |
+                                      # zero_proj (gamma = 1, ZERO output projections: first-order gradient to the
+                                      # projections from step one). Both an exact identity at init
   pose_temporal:
     enabled: false
     num_layers: 4
@@ -62,6 +65,12 @@ model:
     mlp_depth: 2                      # SAM3D's own head shape: C -> C -> D
     mlp_channel_div_factor: 1
     dropout: 0.0
+    camera: cliff                     # cliff (CLIFF crop weak-perspective (s, tx, ty), lifted with the crop side b and the focal) |
+                                      # ray (pelvis bearing x/z, y/z + log depth as a residual on depth_prior — the crop box never
+                                      # enters the lift, so a temporal block upstream can average depth across frames)
+    depth_prior: frozen               # ray only: frozen (the frozen SAM3D readout's own pelvis ray per frame: mean hips + pred_cam_t) |
+                                      # constant ((0, 0, log depth_prior_m))
+    depth_prior_m: 3.5                # ray + constant: the prior depth (m)
   token_inputs:                       # extra per-frame inputs ADDED to the pose token (zero-init MLP) before the temporal bricks
     keypoints2d:
       enabled: false
@@ -76,6 +85,12 @@ model:
       enabled: false                  # the camera's own twist [m/s, rad/s] in the current camera frame (loads the
                                       # camera signal) -> zero-init MLP -> the motion tokens (motion.source tokens)
                                       # or the pose token (motion.source pose_token / no motion branch)
+    bbox:
+      enabled: false                  # the CLIFF bbox vector [(cx-px)/f, (cy-py)/f, log(b/f)] -> zero-init MLP -> the pose token:
+                                      # the crop-to-metric factor the depth lift applies AFTER the temporal block
+    frozen_camera:
+      enabled: false                  # the frozen readout's own pelvis ray [x/z, y/z, log z] (mean hips + pred_cam_t) -> zero-init MLP ->
+                                      # the pose token: the per-frame depth MEASUREMENT the temporal block is to denoise
   token_masking:                      # train-only span corruption of the cross_modal_temporal input (all K tokens of a frame)
     enabled: false
     frac: 0.15                        # expected fraction of corrupted frames per clip
@@ -122,7 +137,8 @@ force_supervision:
 
 motion_supervision:
   enabled: false
-  target_smooth_sec: 0.12
+  target_smooth_sec: 0.0              # Gaussian width (s) on the GT root before differentiating; 0 = raw (user 2026-09-04:
+                                      # the kindyn fit is already smooth — GT jitter 6.7; every run trained on 0.12 was retired)
   outlier_acc_ms2: 50.0
   linear_frame: gravity_view          # gravity_view | body (BVR root body twist: v = R^T p_dot, the twist acc)
   root_source: mhr                    # mhr (MHR pseudo-GT mean-hips + root; the MHR readout's body) |
@@ -139,9 +155,24 @@ pose_smoothness:                      # jerk prior on the SMPL-X head's trajecto
     huber_delta_root_ang: 52.55       # rad/s^3   the Huber runs in units of these, quadratic below, linear beyond
     huber_delta_joints: 29.35         # m/s^3
 
-rollout_eval:                         # eval-only: integrate the predicted BODY-frame root twist (vel + ang_vel) from the
-  enabled: false                      # first frame's predicted pose -> world trajectory; GVHMR WA-MPJPE100 / W-MPJPE100 /
-                                      # RTE / jitter of the rolled-out AND of the GT-camera-lifted per-frame SMPL-X joints
+rollout_eval:                         # eval-only: GVHMR WA-MPJPE100 / W-MPJPE100 / RTE / jitter of the GT-camera-lifted
+  enabled: false                      # per-frame SMPL-X joints (lifted_*) and, with a motion head, of the predicted
+                                      # BODY-frame root twist integrated from the first frame's pose (rollout_*)
+
+motion_matching:                      # the PREDICTED SMPL-X trajectory differentiated (BVR body twist of the world-lifted
+  enabled: false                      # root, root-local joint differences) and matched to the kindyn GT motion / the
+  loss:                               # DETACHED motion head; grad -> pose path only; needs model.smplx, T >= 3 and
+    root_vel: 1.0                     # motion_supervision.linear_frame body + root_source smplx (the GT is the SMPL-X root)
+    root_ang_vel: 0.5                 # Huber, standardized by motion_supervision.standardize: root linear / angular velocity
+    root_acc: 0.0                     # and linear / angular twist acceleration vs the kindyn GT (target_smooth_sec)
+    root_ang_acc: 0.0
+    head_vel: 0.0                     # vs the motion head's DETACHED velocity (needs model.motion terms vel + ang_vel)
+    head_ang_vel: 0.0
+    joint_vel: 0.0                    # Huber on the 21 root-local joint velocities vs GT (m/s; the camera cancels)
+    joint_acc: 0.0                    # ... accelerations (m/s^2)
+    huber_delta: 1.0                  # standardized units (root + head terms)
+    huber_delta_joint_vel: 0.5        # m/s (GT root-local joint velocity RMS 0.89 m/s on the test clips)
+    huber_delta_joint_acc: 5.0        # m/s^2
 
 pose_supervision:
   enabled: false
@@ -171,17 +202,33 @@ keypoint_supervision:
 smplx_supervision:                    # kindyn SMPL-X GT (camera frame) for model.smplx
   enabled: false
   joint_weights: {fingers: 0.1}       # weight of each finger joint in kp2d / kp3d (body joints 1.0)
+  kp2d_space: crop                    # crop (SAM3D's crop-normalized [-0.5, 0.5] — its scale rides on the per-frame crop side b) |
+                                      # image (full image in bearing units px / f — the camera ray's own space, crop-independent)
   loss:
-    kp2d: 10.0                        # Huber, crop-normalized [-0.5, 0.5] units
+    kp2d: 10.0                        # Huber; crop units (kp2d_space crop) | bearing units (image)
     kp3d: 5.0                         # Huber, pelvis-relative camera metres (22 | 52 joints)
     orient: 1.0                       # MSE on the root 6D
     pose: 1.0                         # MSE on the 21 body-joint 6D
     hand_pose: 0.0                    # MSE on the 30 finger-joint 6D (needs model.smplx.hands)
     betas: 0.1                        # MSE on the 10 betas
-    cam: 1.0                          # Huber on the CLIFF (s, tx, ty) proxy
-    huber_delta_2d: 0.05
+    cam: 1.0                          # Huber on the CLIFF (s, tx, ty) proxy (model.smplx.camera cliff only; 0 under ray)
+    pelvis: 0.0                       # Huber on the absolute camera-frame pelvis (metres): the metric depth anchor
+    depth: 0.0                        # Huber on the pelvis log depth (log metres) — the crop-free depth anchor
+    bearing: 0.0                      # Huber on the pelvis bearing (x/z, y/z)
+    depth_vel: 0.0                    # Huber on d(log z)/dt vs the GT's (1/s; forward difference over the clip's real seconds)
+    depth_acc: 0.0                    # Huber on the second central difference of log z vs the GT's (1/s^2)
+    bearing_vel: 0.0                  # the same two on the bearing (1/s, 1/s^2)
+    bearing_acc: 0.0
+    huber_delta_2d: 0.05              # crop units (kp2d_space crop) | bearing units (image)
     huber_delta_3d: 0.1
     huber_delta_cam: 0.05
+    huber_delta_pelvis: 0.1           # m
+    huber_delta_depth: 0.05           # log units (5 %)
+    huber_delta_bearing: 0.02
+    huber_delta_depth_vel: 0.2        # 1/s (GT RMS ~0.07/s at 25 fps; the token's white noise ~0.15/s)
+    huber_delta_depth_acc: 5.0        # 1/s^2
+    huber_delta_bearing_vel: 0.2
+    huber_delta_bearing_acc: 5.0
 
 contact_consistency:
   enabled: false

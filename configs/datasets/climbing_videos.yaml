@@ -6,3 +6,4 @@
 name: climbing_videos
 root: /data3/rikhat.akizhanov/better/data/ClimbingVideos
 contact_level: 1        # contacts_1.npz | contacts_2.npz
+camera: all             # all | static | moving (the scenes.db static_camera flag: 115 + 19 static scenes)

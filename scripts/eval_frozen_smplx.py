@@ -1,7 +1,7 @@
 """Score the frozen SAM 3D Body, as SMPL-X, on the test protocol (the `frozen` line).
 
-    python scripts/eval_frozen_smplx.py --config configs/temporal_posetoken.yaml \
-        --out output/frozen_sam3d_smplx.json
+    python scripts/eval_frozen_smplx.py --config configs/static_ray.yaml \
+        --out output/frozen_sam3d_smplx_static16.json
 
 The corpus ships the frozen model's per-frame output refit to SMPL-X
 (``features/sam3d/<shard>/<scene>/smplx_params.npz``: classic camera-frame

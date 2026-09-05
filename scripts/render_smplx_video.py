@@ -14,7 +14,7 @@ scored on the same 12 named joints). A per-scene PNG plots the
 mean-hips camera depth (GT / frozen / head) and the per-frame 12-joint 3D and
 2D errors of both arms; a JSON record per scene is printed.
 
-    python scripts/render_smplx_video.py --config configs/smplx_probe.yaml \
+    python scripts/render_smplx_video.py --config configs/hands.yaml \
         --checkpoint output/<run>/best.pth --scenes 5 --out output/<run>/render
 """
 from __future__ import annotations

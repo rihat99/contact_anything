@@ -1,0 +1,5 @@
+name: climbing_videos
+root: /data3/rikhat.akizhanov/better/data/ClimbingVideos
+contact_level: 1
+camera: static         # the 113 train / 16 test scenes flagged static_camera in scenes.db (5 focal-jump scenes
+                       # flipped to moving 2026-09-04; docs/camera_ray_2026-09-04.md section 3)

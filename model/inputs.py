@@ -15,12 +15,22 @@ per-slot mask embedding, or by the same slots of a random frame of another clip
 in the batch (``swap``). The losses stay on the corrupted frames, so the block
 has to reconstruct them from their neighbours instead of copying each frame's
 own decoder token through.
+
+:class:`BboxInput` adds the CLIFF bbox vector (crop centre offset and crop side
+over the focal) to the pose token the same way, so the temporal block can see
+the crop-to-metric factor the depth lift applies after it.
+
+:class:`FrozenCameraInput` adds the frozen readout's own pelvis ray (bearing
+and log depth) the same way — the per-frame depth MEASUREMENT the temporal
+block is to denoise.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 from torch import Tensor
+
+from utils.geometry import translation_to_ray
 
 
 class KeypointInput(nn.Module):
@@ -163,6 +173,56 @@ class TokenMasking(nn.Module):
         else:
             fill = tokens[self._donors(n_clips, seq_len, tokens.device)]
         return torch.where(masked[:, None, None], fill, tokens), masked
+
+
+class BboxInput(nn.Module):
+    """The CLIFF bbox vector -> an additive pose-token embedding.
+
+    The pose token encodes the person's CROP-relative scale ``s``; the metric
+    depth ``2 f / (b s)`` also needs the crop side ``b`` (full-image px) and
+    the focal, which nothing before the SMPL-X head's lift ever sees. Feeding
+    ``[(cx - px) / f, (cy - py) / f, log(b / f)]`` to the pose token gives the
+    temporal block what it lacks to average DEPTH (not ``s``) across frames.
+    Zero-init like :class:`KeypointInput`.
+
+    :param dim: token width (output).
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(3, dim), nn.GELU(), nn.Linear(dim, dim))
+        nn.init.zeros_(self.mlp[2].weight)
+        nn.init.zeros_(self.mlp[2].bias)
+
+    def forward(self, bbox_center: Tensor, bbox_size: Tensor, cam_int: Tensor) -> Tensor:
+        """``bbox_center [B, 2]`` px, ``bbox_size [B]`` px, ``cam_int [B, 3, 3]`` -> ``[B, C]``."""
+        focal = cam_int[:, 0, 0]
+        offset = (bbox_center - cam_int[:, :2, 2]) / focal[:, None]
+        size = torch.log(bbox_size / focal)
+        return self.mlp(torch.cat([offset, size[:, None]], dim=-1))
+
+
+class FrozenCameraInput(nn.Module):
+    """The frozen readout's pelvis ray ``[x/z, y/z, log z]`` -> an additive pose-token embedding.
+
+    The frozen SAM 3D Body camera head is a per-frame depth measurement with
+    the same white noise the pose token carries (0.55 %/frame on the static
+    corpus, 2026-09-04 diagnostic); handing it to the temporal block in the
+    bbox-free ray form makes the block's depth job an explicit denoising of a
+    measurement sequence. Zero-init like :class:`KeypointInput`.
+
+    :param dim: token width (output).
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(3, dim), nn.GELU(), nn.Linear(dim, dim))
+        nn.init.zeros_(self.mlp[2].weight)
+        nn.init.zeros_(self.mlp[2].bias)
+
+    def forward(self, pelvis_cam: Tensor) -> Tensor:
+        """``pelvis_cam [B, 3]`` camera metres (detached upstream) -> ``[B, C]``."""
+        return self.mlp(translation_to_ray(pelvis_cam.float()))
 
 
 class TwistInput(nn.Module):

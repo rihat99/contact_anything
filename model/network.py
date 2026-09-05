@@ -13,9 +13,10 @@ wrapper):
    ``pred_keypoints_2d``) crop-normalised and ADDED to the pose token through
    a zero-init MLP; :class:`~model.inputs.TwistInput` (optional) likewise adds
    the camera's own twist to the motion tokens (or to the pose token when the
-   motion head reads that); :class:`~model.inputs.TokenMasking` (optional,
-   train only) then corrupts random spans of frames of the temporal block's
-   input.
+   motion head reads that); :class:`~model.inputs.BboxInput` (optional) adds
+   the CLIFF bbox vector to the pose token; :class:`~model.inputs.TokenMasking`
+   (optional, train only) then corrupts random spans of frames of the temporal
+   block's input.
 3. :class:`~model.rope.CrossModalRopeModule` (optional) — ONE post-decoder
    RoPE temporal transformer over the concatenation of the chosen modality
    token blocks, across the clip's frames (within-frame mixing is its
@@ -62,10 +63,12 @@ from model.heads import (
     SmplxHead,
     contact_gate_forces,
 )
-from model.inputs import KeypointInput, TokenMasking, TwistInput
+from model.inputs import (BboxInput, FrozenCameraInput, KeypointInput, TokenMasking,
+                          TwistInput)
 from model.rope import CrossModalRopeModule, RopeTemporalModule
 from model.tokens import LearnedTokenBlock
 from model.wrapper import SAM3DBodyWrapper
+from utils.geometry import frozen_pelvis_camera
 
 _MODALITY_ORDER = ("pose", "contact", "force", "motion")
 #: The motion head's possible output triples, in channel order.
@@ -101,8 +104,9 @@ class ContactAnything(nn.Module):
     :param extra_token_attention: ``"mutual" | "causal"`` decoder mask regime
         among the appended blocks.
     :param smplx: SMPL-X head config or ``None`` — ``{model_path, hands,
-        mlp_depth, mlp_channel_div_factor, dropout}``; a from-scratch pose +
-        camera readout of the final pose token (reads it, never writes it).
+        mlp_depth, mlp_channel_div_factor, dropout, camera, depth_prior,
+        depth_prior_m}``; a from-scratch pose + camera readout of the final
+        pose token (reads it, never writes it).
     :param keypoints2d: keypoint-input config or ``None`` — ``{source:
         "sapiens" | "mhr", indices (MHR70), min_score, noise_std, drop_prob}``;
         added to the pose token before the temporal bricks (a pose writer).
@@ -112,6 +116,12 @@ class ContactAnything(nn.Module):
     :param camera_twist: ``{}`` to add the camera's own twist (``cam_twist``)
         to the motion tokens — or to the pose token when the motion head reads
         the pose token / no motion branch exists (then a pose writer).
+    :param bbox: ``{}`` to add the CLIFF bbox vector (``bbox_center``,
+        ``bbox_scale``, ``cam_int``) to the pose token before the temporal
+        bricks (a pose writer).
+    :param frozen_camera: ``{}`` to add the frozen readout's own pelvis ray
+        (:class:`~model.inputs.FrozenCameraInput`) to the pose token before
+        the temporal bricks (a pose writer).
     """
 
     def __init__(
@@ -129,6 +139,8 @@ class ContactAnything(nn.Module):
         keypoints2d: Optional[dict] = None,
         token_masking: Optional[dict] = None,
         camera_twist: Optional[dict] = None,
+        bbox: Optional[dict] = None,
+        frozen_camera: Optional[dict] = None,
     ):
         super().__init__()
         assert extra_token_attention in ("mutual", "causal")
@@ -243,6 +255,9 @@ class ContactAnything(nn.Module):
                 mlp_channel_div_factor=int(smplx["mlp_channel_div_factor"]),
                 dropout=float(smplx["dropout"]),
                 hands=bool(smplx["hands"]),
+                camera=str(smplx["camera"]),
+                depth_prior=str(smplx["depth_prior"]),
+                depth_prior_m=float(smplx["depth_prior_m"]),
             )
 
         # --- keypoint input (pose token) ---
@@ -268,6 +283,13 @@ class ContactAnything(nn.Module):
         self.camera_input = None
         if camera_twist is not None:
             self.camera_input = TwistInput(dim)
+
+        # --- bbox input (pose token) ---
+        self.bbox_input = BboxInput(dim) if bbox is not None else None
+
+        # --- frozen camera input (pose token) ---
+        self.frozen_camera_input = (
+            FrozenCameraInput(dim) if frozen_camera is not None else None)
 
         # --- cross-modal temporal brick ---
         self.cross_modal_temporal = None
@@ -297,6 +319,7 @@ class ContactAnything(nn.Module):
                 dropout=float(cross_modal["dropout"]),
                 time_scale=float(cross_modal["time_scale"]),
                 max_rel_sec=cross_modal["max_rel_sec"],
+                gate_init=str(cross_modal["gate_init"]),
             )
 
         # --- train-time span masking of the cross-modal input ---
@@ -357,6 +380,8 @@ class ContactAnything(nn.Module):
             "pose" in self.cross_modal_modalities
             or self.pose_temporal is not None
             or self.keypoint_input is not None
+            or self.bbox_input is not None
+            or self.frozen_camera_input is not None
             or (self.camera_input is not None and self.motion_tokens is None)
             or self.head_pose_ft_proj is not None
             or self.head_camera_ft_proj is not None
@@ -419,6 +444,20 @@ class ContactAnything(nn.Module):
 
         if self.keypoint_input is not None:
             embedding = self._keypoint_embedding(batch, out["mhr"])
+            tokens = torch.cat([tokens[:, :1] + embedding[:, None], tokens[:, 1:]], dim=1)
+        if self.bbox_input is not None:
+            embedding = self.bbox_input(
+                batch["bbox_center"], batch["bbox_scale"][:, 0], batch["cam_int"])
+            tokens = torch.cat([tokens[:, :1] + embedding[:, None], tokens[:, 1:]], dim=1)
+        # The frozen readout's pelvis: the measurement the frozen-camera input
+        # and the ray head's frozen prior consume (no gradient into the base).
+        frozen_pelvis = None
+        if self.frozen_camera_input is not None or (
+                self.head_smplx is not None and self.head_smplx.camera == "ray"
+                and self.head_smplx.depth_prior == "frozen"):
+            frozen_pelvis = frozen_pelvis_camera(out["mhr"]).detach()
+        if self.frozen_camera_input is not None:
+            embedding = self.frozen_camera_input(frozen_pelvis)
             tokens = torch.cat([tokens[:, :1] + embedding[:, None], tokens[:, 1:]], dim=1)
         if self.camera_input is not None:
             embedding = self.camera_input(batch["cam_twist"])[:, None]     # [B, 1, C]
@@ -518,6 +557,7 @@ class ContactAnything(nn.Module):
                 cam_int=batch["cam_int"],
                 affine_trans=batch["affine_trans"],
                 img_size=batch["img_size"],
+                frozen_pelvis_cam=frozen_pelvis,
             )
 
         return {

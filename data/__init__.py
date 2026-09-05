@@ -64,11 +64,14 @@ def build_datasets(
                 cfg["motion_supervision"]["outlier_acc_ms2"]),
             motion_linear_frame=str(cfg["motion_supervision"]["linear_frame"]),
             motion_root_source=str(cfg["motion_supervision"]["root_source"]),
+            camera_filter=str(spec["camera"]),
         )
         cls = DATASETS[name]
 
         def scenes(split: str):
-            return None if limit_scenes is None else cls.list_scenes(root, split)[:limit_scenes]
+            if limit_scenes is None:
+                return None
+            return cls.list_scenes(root, split, str(spec["camera"]))[:limit_scenes]
 
         train_sets.append(cls(
             scenes=scenes("train"), split="train", jitter=bool(clip["jitter"]), **common))

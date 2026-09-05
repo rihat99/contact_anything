@@ -64,6 +64,8 @@ def build_model(cfg: dict, device: torch.device | str) -> ContactAnything:
         keypoints2d=_section(mcfg["token_inputs"], "keypoints2d"),
         token_masking=_section(mcfg, "token_masking"),
         camera_twist=_section(mcfg["token_inputs"], "camera_twist"),
+        bbox=_section(mcfg["token_inputs"], "bbox"),
+        frozen_camera=_section(mcfg["token_inputs"], "frozen_camera"),
     )
     model.to(device)
     model.eval()

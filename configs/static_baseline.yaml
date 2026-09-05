@@ -1,0 +1,42 @@
+# Static-camera BASELINE (2026-09-04): the hands recipe on the static subset with NO motion matching and
+# no twist head — the reference every static matching arm is compared against (same 30 epochs, same
+# lifted_* metrics).
+#   CUDA_VISIBLE_DEVICES=4,6 torchrun --standalone --nproc-per-node=2 scripts/train.py --config configs/static_baseline.yaml
+#
+# FLATTENED 2026-09-04 onto base.yaml from the chain static_baseline <- static_matching <- hands <- temporal_tokens_b8_lr2 <- temporal_tokens <- base
+# (originals in trash/configs_pruned_20260904/; verified identical resolved config).
+# Rationale: docs/results.md, docs/jitter_2026-09-04.md, docs/trajectory_jitter_explained.md.
+base: configs/base.yaml
+
+model:
+  cross_modal_temporal:
+    enabled: true
+    modalities: [pose, contact]
+    dropout: 0.1
+  smplx: {enabled: true, hands: true}
+data:
+  datasets: [configs/datasets/climbing_videos_static.yaml]
+  eval_max_frames: 120
+contact_supervision: {weight: 5.0}
+motion_supervision:
+  linear_frame: body
+  root_source: smplx
+  standardize:
+    mean:
+    - - [-0.01103, 0.04409, 0.02885]
+      - [-0.0005, -0.04009, -0.00859]
+      - [0.00499, 0.00094, -0.00187]
+      - [0.00035, 0.00171, 0.00089]
+    std:
+    - - [0.26113, 0.34747, 0.2893]
+      - [0.96997, 1.23198, 1.09867]
+      - [0.43325, 0.60972, 0.38503]
+      - [1.75947, 2.3388, 1.44859]
+rollout_eval: {enabled: true}
+motion_matching:
+  loss: {joint_vel: 1.0}
+smplx_supervision:
+  enabled: true
+  loss: {hand_pose: 0.5}
+optim: {lr: 0.0002, weight_decay: 0.01, epochs: 30, lr_min: 1.0e-06}
+output: {exp_name: static_baseline, monitor: metric_pose/mpjpe, frozen_metrics: output/frozen_sam3d_smplx_static16.json}

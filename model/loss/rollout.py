@@ -1,6 +1,7 @@
 """Roll-out evaluation: the predicted body twist integrated into a world trajectory.
 
-Eval only (no loss term). For every test clip the motion head's de-standardized
+Eval only (no loss term). Without a motion head only the ``lifted`` trajectory
+below is scored. With one, for every test clip the head's de-standardized
 BODY-frame root twist ``[v, omega]`` (``motion_supervision.linear_frame: body``)
 is integrated from the first frame's predicted world root pose — the SMPL-X
 head's camera-frame root lifted with THAT frame's GT extrinsics; every later
@@ -48,17 +49,20 @@ class RolloutLoss(Loss):
 
     def __init__(self, cfg: dict, model, device: torch.device | str) -> None:
         super().__init__(cfg, model, device)
-        if self.model.head_smplx is None or self.model.head_motion is None:
-            raise ValueError("rollout_eval needs the SMPL-X head and the motion head")
-        ms = cfg["motion_supervision"]
-        if ms["linear_frame"] != "body" or ms["root_source"] != "smplx" or not all(
-                t in self.model.motion_terms for t in ("vel", "ang_vel")):
-            raise ValueError(
-                "rollout_eval integrates the SMPL-X body's twist: motion_supervision."
-                "linear_frame must be 'body', root_source 'smplx', and "
-                "model.motion.terms must include 'vel' and 'ang_vel'")
-        self.mean, self.std = standardize_table(
-            cfg, ("vel", "ang_vel"), self.device, torch.float64)          # [1, K, 6]
+        if self.model.head_smplx is None:
+            raise ValueError("rollout_eval needs the SMPL-X head")
+        # Without a motion head only the camera-lifted trajectory is scored.
+        self.rollout = self.model.head_motion is not None
+        if self.rollout:
+            ms = cfg["motion_supervision"]
+            if ms["linear_frame"] != "body" or ms["root_source"] != "smplx" or not all(
+                    t in self.model.motion_terms for t in ("vel", "ang_vel")):
+                raise ValueError(
+                    "rollout_eval integrates the SMPL-X body's twist: motion_supervision."
+                    "linear_frame must be 'body', root_source 'smplx', and "
+                    "model.motion.terms must include 'vel' and 'ang_vel'")
+            self.mean, self.std = standardize_table(
+                cfg, ("vel", "ang_vel"), self.device, torch.float64)      # [1, K, 6]
 
     def __call__(self, out: dict, batch: dict, *, train: bool) -> LossResult:
         if train:
@@ -71,10 +75,12 @@ class RolloutLoss(Loss):
         smplx = out["smplx"]
         joints = smplx["joints_cam"][:, :NUM_BODY_JOINTS].to(self.device, torch.float64)
         root_rot = smplx["root_rot"].to(self.device, torch.float64)          # cam-from-root
-        motion = out["motion"]
-        twist = torch.cat([motion["joint_vel"][:, 0], motion["joint_ang_vel"][:, 0]],
-                          dim=-1).to(self.device, torch.float64)
-        twist = twist * self.std[0, 0] + self.mean[0, 0]                     # [B, 6] physical
+        twist = None
+        if self.rollout:
+            motion = out["motion"]
+            twist = torch.cat([motion["joint_vel"][:, 0], motion["joint_ang_vel"][:, 0]],
+                              dim=-1).to(self.device, torch.float64)
+            twist = twist * self.std[0, 0] + self.mean[0, 0]                 # [B, 6] physical
         ext = batch["cam_from_world"].to(self.device, torch.float64)
         seconds = batch["frame_pos_sec"].to(self.device, torch.float64)
         gt_world = batch["smplx_joints_world"][:, :NUM_BODY_JOINTS].to(
@@ -91,15 +97,17 @@ class RolloutLoss(Loss):
         n_clips = joints.shape[0] // seq_len
         for clip in range(n_clips):
             rows = slice(clip * seq_len, (clip + 1) * seq_len)
-            rolled = self._roll_out(local[rows], twist[rows], seconds[rows],
-                                    rot_w0[rows][0], pos_w0[rows][0])
             mask = valid[rows].cpu()
             if int(mask.sum()) < 2:
                 continue
             dt = seconds[rows][1:] - seconds[rows][:-1]
             fps = float(1.0 / dt.median()) if seq_len > 1 else 1.0
             gt = gt_world[rows].float().cpu()[mask]
-            for v, pred in enumerate((rolled, lifted[rows])):
+            variants = {1: lifted[rows]}
+            if self.rollout:
+                variants[0] = self._roll_out(local[rows], twist[rows], seconds[rows],
+                                             rot_w0[rows][0], pos_w0[rows][0])
+            for v, pred in variants.items():
                 result = global_metrics(pred.float().cpu()[mask], gt, fps)
                 for m, metric in enumerate(METRICS):
                     values = np.asarray(result[metric], np.float64)
@@ -129,6 +137,8 @@ class RolloutLoss(Loss):
     def metrics(self, stats: Tensor) -> dict[str, float]:
         out: dict[str, float] = {}
         for v, variant in enumerate(VARIANTS):
+            if variant == "rollout" and not self.rollout:
+                continue
             for m, metric in enumerate(METRICS):
                 base = 2 * (v * len(METRICS) + m)
                 out[f"{variant}_{metric}"] = mean_from_stats(

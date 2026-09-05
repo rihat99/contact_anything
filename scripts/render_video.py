@@ -28,7 +28,7 @@ Only the frames of the evaluation clip are written (see
 Under ``torchrun`` the scenes are sharded over ranks; every rank writes its own
 files, no process group needed.
 
-    python scripts/render_video.py --config configs/temporal_tokens_b8_lr2.yaml \
+    python scripts/render_video.py --config configs/hands.yaml \
         --checkpoint output/<run>/best.pth --split test --scenes 5 \
         --out output/<run>/render_contact --overlay-labels --gt-panel --scale 0.5
 """

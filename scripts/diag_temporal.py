@@ -1,7 +1,7 @@
 """Diagnose whether the post-decoder RoPE temporal block really attends across frames.
 
-    python scripts/diag_temporal.py --config configs/temporal_tokens_b8_lr2.yaml \
-        --checkpoint output/temporal_tokens_b8_lr2_20260902_203707/best.pth
+    python scripts/diag_temporal.py --config configs/hands.yaml \
+        --checkpoint output/hands_20260903_134106/best.pth
 
 ``model.cross_modal_temporal`` (:class:`model.rope.CrossModalRopeModule`) runs one
 sequence of ``T`` frames x ``K`` tokens per clip, frame-major (``index = t*K + k``),
@@ -335,6 +335,9 @@ def gate_summary(module) -> dict:
         "gamma_attn_absmax": [float(b.gamma_attn.detach().abs().max()) for b in blocks],
         "gamma_ffn_l2": [float(b.gamma_ffn.detach().norm()) for b in blocks],
         "gamma_ffn_absmax": [float(b.gamma_ffn.detach().abs().max()) for b in blocks],
+        "proj_l2": [float(b.proj.weight.detach().norm()) for b in blocks],
+        "ffn_out_l2": [float(b.ffn[3].weight.detach().norm()) for b in blocks],
+        "gate_init": [b.gate_init for b in blocks],
         "slot_embed_l2": module.slot_embed.detach().norm(dim=-1).tolist(),
     }
 
@@ -596,7 +599,9 @@ def print_report(summary: dict, labels: list[str]) -> None:
         print(f"  layer {layer}: |gamma_attn| {gates['gamma_attn_l2'][layer]:.4f} "
               f"(max |.| {gates['gamma_attn_absmax'][layer]:.4f})   "
               f"|gamma_ffn| {gates['gamma_ffn_l2'][layer]:.4f} "
-              f"(max |.| {gates['gamma_ffn_absmax'][layer]:.4f})")
+              f"(max |.| {gates['gamma_ffn_absmax'][layer]:.4f})   "
+              f"|W_proj| {gates['proj_l2'][layer]:.4f}  |W_ffn_out| {gates['ffn_out_l2'][layer]:.4f}"
+              f"  [{gates['gate_init'][layer]}]")
     print("  ||slot_embed|| per slot: " + "  ".join(
         f"{name}={value:.4f}" for name, value
         in zip(labels, gates["slot_embed_l2"])))

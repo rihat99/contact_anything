@@ -205,8 +205,8 @@ def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
 
     if cfg["rollout_eval"]["enabled"]:
         _require(net.head_smplx is not None, "rollout_eval", "model.smplx.enabled")
-        _require(motion_on, "rollout_eval",
-                 "motion_supervision.enabled (its standardize table)")
+        _require(motion_on or net.head_motion is None, "rollout_eval",
+                 "motion_supervision.enabled (its standardize table) when a motion head exists")
         from model.loss.rollout import RolloutLoss
         losses.append(RolloutLoss(cfg, model, device))
 
@@ -214,6 +214,11 @@ def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
         _require(net.head_smplx is not None, "pose_smoothness", "model.smplx.enabled")
         from model.loss.smoothness import SmoothnessLoss
         losses.append(SmoothnessLoss(cfg, model, device))
+
+    if cfg["motion_matching"]["enabled"]:
+        _require(net.head_smplx is not None, "motion_matching", "model.smplx.enabled")
+        from model.loss.motion_matching import MotionMatchingLoss
+        losses.append(MotionMatchingLoss(cfg, model, device))
 
     if cfg["contact_consistency"]["enabled"]:
         _require(net.head_contact is not None,

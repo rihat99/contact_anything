@@ -12,14 +12,22 @@
 # Launch:
 #   CUDA_VISIBLE_DEVICES=0,5 torchrun --standalone --nproc-per-node=2 \
 #     scripts/train.py --config configs/hands.yaml
-base: configs/temporal_tokens_b8_lr2.yaml
+#
+# FLATTENED 2026-09-04 onto base.yaml from the chain hands <- temporal_tokens_b8_lr2 <- temporal_tokens <- base
+# (originals in trash/configs_pruned_20260904/; verified identical resolved config).
+# Rationale: docs/results.md, docs/jitter_2026-09-04.md, docs/trajectory_jitter_explained.md.
+base: configs/base.yaml
 
 model:
+  cross_modal_temporal:
+    enabled: true
+    modalities: [pose, contact]
+    dropout: 0.1
   smplx: {enabled: true, hands: true}
-
+data: {eval_max_frames: 120}
+contact_supervision: {weight: 5.0}
 smplx_supervision:
-  joint_weights: {fingers: 0.1}
+  enabled: true
   loss: {hand_pose: 0.5}
-
-output:
-  exp_name: hands
+optim: {lr: 0.0002, weight_decay: 0.01, epochs: 5, lr_min: 1.0e-06}
+output: {exp_name: hands, monitor: metric_pose/mpjpe, frozen_metrics: output/frozen_sam3d_smplx.json}

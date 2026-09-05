@@ -7,8 +7,8 @@ Guidance for Claude Code when working in this repository.
 Fork of **SAM 3D Body** (Meta, single-image 3D human mesh recovery) extended with
 **per-joint contact**, **3D contact-force**, **root-motion** and **pose** heads trained on
 climbing **video clips** from the ClimbingVideos corpus. The base model is frozen; only the
-appended token blocks, the post-decoder RoPE temporal transformer, the heads and the optional
-split-head pose/camera fine-tune copies train.
+appended token blocks, the post-decoder RoPE temporal transformer, the zero-init pose-token
+inputs, the heads and the optional split-head pose/camera fine-tune copies train.
 
 **2026-09-01 — new era.** The repo was rebuilt twice in one day: the model layer
 (`model/`) and then everything else (`data/`, `model/loss/`, `train/`, `utils/`, `scripts/`).
@@ -36,12 +36,13 @@ sibling `../BetterRobot` / `../BetterHuman` checkouts (or `$BETTERHUMAN_MODELS_D
 # Train (resume: --resume auto | --resume path/to/last.pth; --limit-scenes N for smoke runs)
 # Rank 0's console goes to output/logs/<run>.log by itself (evaluate.py: output/logs/<run>_eval.log);
 # redirect anything else you launch into output/logs/ too — never write files into output/ itself.
-python scripts/train.py --config configs/temporal_posetoken.yaml
+python scripts/train.py --config configs/tb_projzero.yaml       # static subset, ray camera, zero_proj block
 CUDA_VISIBLE_DEVICES=6,7 $CONDA/bin/torchrun --standalone --nproc-per-node=2 \
-  scripts/train.py --config configs/temporal_tokens.yaml        # data.frames_per_batch is per GPU
+  scripts/train.py --config configs/hands.yaml                  # data.frames_per_batch is per GPU
 # Frozen SAM3D-as-SMPL-X baseline on the SAME test protocol -> the `frozen` tensorboard run
-# (output.frozen_metrics points at the json; recompute whenever eval_max_frames/stride change)
-python scripts/eval_frozen_smplx.py --config configs/temporal_posetoken.yaml --out output/frozen_sam3d_smplx.json
+# (output.frozen_metrics points at the json; recompute whenever eval_max_frames/stride/dataset change:
+# frozen_sam3d_smplx.json = the 108 test scenes, frozen_sam3d_smplx_static16.json = the static subset)
+python scripts/eval_frozen_smplx.py --config configs/hands.yaml --out output/frozen_sam3d_smplx.json
 
 # Evaluate on the annotated corpus test split (full-scene protocol; --checkpoint none = frozen baseline)
 python scripts/evaluate.py --config configs/allmod_rope_t60_gv.yaml --checkpoint output/<run>/best.pth
@@ -50,7 +51,7 @@ python scripts/evaluate.py --config configs/allmod_rope_t60_gv.yaml --checkpoint
 python scripts/render_video.py --config <yaml> --checkpoint <pth> --split test --scenes 5 --out <dir> \
   --overlay-labels --gt-panel --scale 0.5     # SMPL-X-head builds: GT body+labels | predicted body+contacts (2026-09-03)
 python scripts/render_pose_video.py --config <yaml> --checkpoint <pth> --scenes 3 --out <dir>
-python scripts/render_smplx_video.py --config configs/smplx_probe.yaml --checkpoint <pth> --scenes 8 --out <dir>   # GT | frozen MHR | SMPL-X head
+python scripts/render_smplx_video.py --config configs/hands.yaml --checkpoint <pth> --scenes 8 --out <dir>   # GT | frozen MHR | SMPL-X head
 python scripts/predict_reconstruction.py --config <yaml> --checkpoint <pth> --root <BVR out-tree>
 # Temporal-block diagnostic: attention mass per layer/head (self / same-frame / cross-frame, |dt|,
 # effective frames, temporal profile, slot mixing, gate norms) + full / same_frame / bypass ablations
@@ -72,15 +73,15 @@ tensorboard --logdir output/<run>/tensorboard/    # sections: optim, loss_train,
 |---|---|
 | `model/sam_3d_body/` | Vendored SAM-3D-Body fork, near-upstream (`c259bfc`). Only extension: a generic **extra-token-block** mechanism (append + asymmetric mask + per-layer update callbacks + blind gate), the precomputed-embedding path and the `proj=` split-head override. Never mentions contact/force/motion. |
 | `model/wrapper.py` | `SAM3DBodyWrapper`: builds/freezes/eval-pins the base; `forward(img|embedding, geometry, blocks, attention)` → tokens/bounds/frozen MHR; `decode_pose(pose_token, ctx, proj_pose, proj_camera)`. |
-| `model/tokens.py` `rope.py` `heads.py` | `LearnedTokenBlock` (token embeddings + anchored posemb/feat update), `RopeTemporalModule` + `CrossModalRopeModule`, `ContactHead`/`ForceHead`/`MotionHead` + contact gate, `SmplxHead` (pose-token probe). |
+| `model/tokens.py` `rope.py` `heads.py` `inputs.py` | `LearnedTokenBlock` (token embeddings + anchored posemb/feat update), `RopeTemporalModule` + `CrossModalRopeModule` (`gate_init: zero_gate | zero_proj`), `ContactHead`/`ForceHead`/`MotionHead` + contact gate, `SmplxHead` (pose-token probe; CLIFF or ray camera); `inputs.py` = zero-init pose-token inputs (`KeypointInput`, `BboxInput`, `FrozenCameraInput`, `TwistInput`) + `TokenMasking`. |
 | `model/network.py` `build.py` | `ContactAnything` (wrapper → cross-modal → pose-temporal → final readout with ft copies → heads); `build_model(cfg, device)`. |
-| `model/loss/` | One `Loss` interface (`__init__.py`) and one file per term: `contact` (BCE | focal), `force`, `motion`, `pose`, `keypoint`, `smplx`, `contact_consistency`, `force_consistency`, `physics` (+ `physics_adapter`). `build_losses(cfg, model, device)`. |
+| `model/loss/` | One `Loss` interface (`__init__.py`) and one file per term: `contact` (BCE | focal), `force`, `motion`, `pose`, `keypoint`, `smplx`, `motion_matching`, `smoothness`, `rollout` (eval-only GVHMR global metrics), `contact_consistency`, `force_consistency`, `physics` (+ `physics_adapter`). `build_losses(cfg, model, device)`. |
 | `data/` | `base.py` = `ClipDataset` ABC (windowing, jitter, full-scene eval) **and the frame schema** (module docstring); `climbing_videos/` (`scene.py` discovery/cameras/labels, `kindyn.py` forces + motion + SMPL-X GT, `mhr_gt.py` pose/keypoint GT, `dataset.py`); `transforms.py`, `collate.py` (generic), `loaders.py`, `reconstruction.py` (BVR out-trees, inference only). `build_datasets(cfg, needs)`. |
 | `train/` | `config.py` (yaml + `base:` include, **`configs/base.yaml` is the schema**), `checkpoint.py`, `trainer.py`, `logger.py` (tensorboard sections + the `frozen` baseline run), `predict.py` (`load_model`, `run_clip`). |
 | `utils/` | `geometry.py` (torch SO(3)/6D/CLIFF camera proxy/projection/Procrustes/lifting/windowed mean), `metrics.py`, `distributed.py`, `betterhuman.py`. |
 | `scripts/` | Thin CLIs (above) + `scripts/data/` preparation scripts. |
-| `configs/` | `base.yaml` (every key, its default, one comment) + experiment overrides + `datasets/climbing_videos.yaml`. |
-| `output/` | Runs (gitignored): `<exp>_<YYYYMMDD_HHMMSS>/{config.yaml, last.pth, best.pth, epoch_XXXX.pth, tensorboard/, render*/, diag_*/}`; console transcripts under `output/logs/` only; `frozen_sam3d_smplx.json` = the frozen baseline. Results table: `docs/results.md`. |
+| `configs/` | `base.yaml` (every key, its default, one comment) + experiment overrides + `datasets/climbing_videos{,_static}.yaml` (`camera: all | static | moving`). |
+| `output/` | Runs (gitignored): `<exp>_<YYYYMMDD_HHMMSS>/{config.yaml, last.pth, best.pth, epoch_XXXX.pth, tensorboard/, render*/, diag_*/}`; console transcripts under `output/logs/` only; `frozen_sam3d_smplx{,_static16}.json` = the frozen baselines. Results table: `docs/results.md`. |
 
 ## Architecture
 
@@ -118,11 +119,14 @@ tensorboard --logdir output/<run>/tensorboard/    # sections: optim, loss_train,
    and regresses the corpus SMPL-X body in the CAMERA frame under BetterHuman's `q`
    convention (root = pelvis pose): root + 21 body 6D rotations, 10 betas, and a CLIFF
    crop weak-perspective `(s,tx,ty)` lifted with the crop box + true focal to the pelvis
-   position. BetterHuman's 22-joint FK (hands never move a body joint; face/expression are
+   position (`model.smplx.camera: cliff`) — or, `camera: ray` (2026-09-04), the pelvis ray
+   `(x/z, y/z, log z)` as a residual on the FROZEN readout's own per-frame pelvis
+   (`depth_prior: frozen`; `constant` = a fixed depth), so the crop box never enters the
+   lift and depth can be averaged across frames. BetterHuman's 22-joint FK (hands never move a body joint; face/expression are
    zero corpus-wide; kindyn `scale` is identically 1) and the full-frame projection run
    inside the head, so `out["smplx"]` carries params, `joints_cam [B,22,3]`, `kp2d_full`
    px and `kp2d_crop` in `[-0.5,0.5]`. Legal with every token block and temporal brick
-   off (145 tokens, only the head trains; `configs/smplx_probe.yaml`, result 2026-09-02:
+   off (145 tokens, only the head trains; `smplx_probe.yaml`, trashed 2026-09-04; result 2026-09-02:
    59 mm MPJPE / 40 PA in ~3 epochs). With the head enabled the SMPL-X body IS the pose
    output: the final MHR recompute is skipped even when a temporal brick writes the pose
    token (`out["mhr"]` = the frozen readout) and the MHR-consuming losses / head fine-tunes
@@ -130,7 +134,7 @@ tensorboard --logdir output/<run>/tensorboard/    # sections: optim, loss_train,
    the corpus refit `features/sam3d/<shard>/<scene>/smplx_params.npz` (camera-frame
    classic params; `q[:3] = transl + pelvis_offset(β)`), scored OFFLINE by
    `scripts/eval_frozen_smplx.py` and drawn as the `frozen` tensorboard run.
-8. **Temporal probes** (`configs/temporal_posetoken.yaml` / `temporal_tokens.yaml`, 2026-09-02):
+8. **Temporal probes** (2026-09-02; the two configs were trashed 2026-09-04):
    `cross_modal_temporal` over `[pose]` alone (K = 1, a plain 4-layer RoPE transformer on the
    pose token — a single modality is legal) vs over `[pose, contact]` (K = 7); the SMPL-X head
    reads the mixed pose token, contact comes from the pose token (flat head) or from the six
@@ -143,9 +147,9 @@ tensorboard --logdir output/<run>/tensorboard/    # sections: optim, loss_train,
    65.1 / 45.7 / 85.7, F1 0.909; tokens 60.7 / 41.4 / 78.4, F1 0.917 — tokens ahead at every
    epoch. Both lost epoch 0 to the per-epoch warm-up bug (fixed the same day: per-step
    `optim.warmup_steps`).
-9. **Round 2 on the tokens build** (2026-09-02 evening; only the winner
-   `configs/temporal_tokens_b8_lr2.yaml` + its run survive, the three sibling arms were trashed
-   to `/data3/rikhat.akizhanov/trash/round2_arms_20260902/`): the trained-state gradient noise
+9. **Round 2 on the tokens build** (2026-09-02 evening; the winner `temporal_tokens_b8_lr2.yaml`
+   + its run were trashed in the 2026-09-04 prune, its recipe lives on flattened in
+   `configs/hands.yaml`; the three sibling arms went to `trash/round2_arms_20260902/`): the trained-state gradient noise
    scale is 16 / 108 / 239 clips (SMPL-X head / temporal block / contact head) vs 2 clips per
    step, so the arms ran 4 clips/GPU (8/step, 459 steps/epoch). At the UNSCALED lr 1e-4 that
    LOSES on pose at equal epochs (66.2 mm, step-limited); with sqrt lr scaling (lr 2e-4) it is
@@ -169,6 +173,24 @@ tensorboard --logdir output/<run>/tensorboard/    # sections: optim, loss_train,
    (FFN) transform and the temporal context only buys contact precision. Same protocol (auto
    stride) the per-frame SMPL-X probe scores 57.6 / 38.9 / 74.7 mm — better than every temporal
    run on pose (different training budget; not a controlled ablation).
+11. **Static-camera jitter round** (2026-09-04/05; summary table at the end of `docs/results.md`,
+   logs `docs/jitter_2026-09-04.md`, `camera_ray_2026-09-04.md`, `temporal_block_2026-09-04.md`,
+   explainer `docs/trajectory_jitter_explained.md`). Target: lifted-trajectory jitter close to the
+   GT's 6.35 on the 16-scene static test set (`configs/datasets/climbing_videos_static.yaml`); the
+   CLIFF baseline sits at 118. Found: 91 of 108 was per-frame pelvis DEPTH noise (the token's
+   white ~1 %/frame depth ambiguity; the CLIFF target `s` is 95 % crop jitter by construction),
+   the rest per-frame root-rotation / articulation noise made in the backbone feature maps (not
+   the bbox track, mask prompt or camera). Kept: the ray camera head on the frozen prior + bbox /
+   frozen-camera token inputs + image-space kp2d + depth/bearing vel/acc terms
+   (`configs/static_ray.yaml`, jitter 56.7) and `gate_init: zero_proj` (`configs/tb_projzero.yaml`,
+   52.4 — best without explicit smoothing); motion matching + pelvis anchor
+   (`configs/static_matching_anchor_raw.yaml`, 84 on the 19-scene set) as the CLIFF-side reference.
+   Rejected and REMOVED from the code (user: no explicit smoothing — the model must learn it):
+   learned convex output / prior kernels (reached 9.7), the GVHMR keypoint token, the locality
+   bias, the convex mixing path, warm-start / freeze stage 2, a hard 0.25 s window (all ≥ 50, or
+   worse than R1); pre-cleanup code in `/data3/rikhat.akizhanov/trash/cleanup_20260905/`. The
+   additive residual block only ever DILUTES its token (`x + c·avg`); averaging the frozen pose
+   token over ~0.1 s would give 14, so the block can in principle — the open question.
 
 ### Losses (`model/loss/`, all on one interface)
 
@@ -188,7 +210,10 @@ sums `stats` across batches and ranks. Tensorboard sections: `optim/*`, `loss_tr
 | `motion_supervision` | pelvis 12-dim twist | Huber on standardized GT (pinned `standardize` table), train-only outlier cut |
 | `pose_supervision` | 125 local MHR q channels + shape/bones/scale | Huber vs `mhr_1.npz` (kindyn refit as MHR), BetterHuman q-space |
 | `keypoint_supervision` | camera-frame keypoints/vertices, world vel/acc | Huber vs `mhr_sup_1.npz`; `cam_rail`/`rot_rail` trust regions vs the frozen readout |
-| `smplx_supervision` | the SMPL-X head (kindyn SMPL-X GT lifted to the camera) | `kp2d` Huber in crop-normalized units of the FULL-FRAME projection, `kp3d` Huber pelvis-relative metres, `orient`/`pose` MSE on raw 6D vs the GT matrix columns, `betas` MSE, `cam` Huber on the CLIFF proxy (GT pelvis inverted into `(s,tx,ty)`). Metrics (eval only, group `pose`) follow WHAM/GVHMR code line by line on the 22 body joints + 10475 vertices, flat hands: frames aligned by the MEAN OF THE TWO HIPS (`pelvis_idxs [1,2]`), `mpjpe`/`pa_mpjpe`/`pve` mm, `accel` = second finite difference of the aligned joints divided by the REAL dt² (m/s² — WHAM's `accel * 30**2` on 30 fps footage, fps-exact here), frame-weighted reduction. `metric_pose/*` |
+| `smplx_supervision` | the SMPL-X head (kindyn SMPL-X GT lifted to the camera) | `kp2d` Huber on the FULL-FRAME projection in crop-normalized units (`kp2d_space: crop`) or bearing units px/f (`image`), `kp3d` Huber pelvis-relative metres, `orient`/`pose`/`hand_pose` MSE on raw 6D vs the GT matrix columns, `betas` MSE, `cam` Huber on the CLIFF proxy (cliff camera only), `pelvis` Huber on the absolute camera pelvis (m), `depth`/`bearing` Huber on the pelvis ray `(x/z, y/z, log z)`, `depth_vel`/`depth_acc`/`bearing_vel`/`bearing_acc` Huber on the ray's first/second differences over the clip's real seconds vs the GT ray's. Metrics (eval only, group `pose`) follow WHAM/GVHMR code line by line on the 22 body joints + 10475 vertices, flat hands: frames aligned by the MEAN OF THE TWO HIPS (`pelvis_idxs [1,2]`), `mpjpe`/`pa_mpjpe`/`pve` mm, `accel` = second finite difference of the aligned joints divided by the REAL dt² (m/s²), plus `pelvis_err`/`depth_err`/`depth_bias` (mm, absolute camera pelvis), `dlogz_pred|gt|err` (RMS frame-to-frame log-depth step, %/frame) and `hand_mpjpe`/`hand_pa_mpjpe` with hands. `metric_pose/*` |
+| `motion_matching` | the pose path (SMPL-X head; grad → pose only) | the PREDICTED trajectory lifted with the GT extrinsics and differentiated (BVR body twist of the root, root-local joint vel/acc): Huber vs the kindyn GT twist (`root_vel/acc`, `root_ang_vel/acc`, standardized), vs the DETACHED motion head (`head_*`), and `joint_vel`/`joint_acc` (m/s, m/s²); needs `linear_frame body`, `root_source smplx`, T ≥ 3. `metric_matching/*` (r, RMSE) |
+| `pose_smoothness` | the pose path | Huber toward ZERO of the predicted world root (se3) and root-local joint jerk, 5-point stencils, GT-p75 Huber deltas. `metric_smooth/*` |
+| `rollout_eval` | eval only | GVHMR global metrics of the per-frame body LIFTED with the GT camera (`lifted_wa_mpjpe100`, `lifted_w_mpjpe100`, `lifted_rte`, `lifted_jitter`, `gt_jitter`) and, with a motion head, of the predicted root twist rolled out from the first frame (`rollout_*`). `metric_global/*` |
 | `contact_consistency` | pose path | predicted-contact-gated zero world velocity of the six extremities |
 | `force_consistency` | force + pose paths | linear Newton residual (bw, mass cancels), epoch ramp |
 | `physics` | forces (exclusive with force_supervision) | RNEA root-wrench residual on a BetterHuman MHR body, six groups mapped to wrists/toe-balls/ankles |
@@ -215,17 +240,22 @@ camera fine-tune needs keypoints, motion loss needs the motion modality, physics
 force_supervision, `contact_supervision.criterion` ∈ {bce, focal} (+ positive `neg_weight`/`pos_weight[6]`, `transition_tolerance` ≥ 0), monitor tag format
 `loss_test/total` | `metric_<group>/<name>` and max/min by suffix). Which GT signal
 groups a dataset loads is **derived** from the enabled losses (`signal_needs`), never
-configured. One dataset yaml: `configs/datasets/climbing_videos.yaml` (root, contact_level).
+configured. Dataset yamls: `configs/datasets/climbing_videos.yaml` (root, contact_level,
+`camera: all | static | moving` = the DB's `static_camera` flag) and `climbing_videos_static.yaml`
+(the 113 / 16-scene static subset).
 
-Sections: `model.{contact,force,motion,cross_modal_temporal,pose_temporal,finetune_*,smplx}`,
+Sections: `model.{contact,force,motion,cross_modal_temporal,pose_temporal,finetune_*,smplx,
+token_inputs.{keypoints2d,camera_twist,bbox,frozen_camera},token_masking}`,
 `mhr_body` (BetterHuman archive), `data.{datasets,embedding_cache,frames_per_batch,
-num_workers,seed,clip.{frames,stride,jitter},eval_max_frames}`, the nine loss sections
+num_workers,seed,clip.{frames,stride,jitter},eval_max_frames}`, the loss sections
 above, `optim.{lr,weight_decay,epochs,warmup_steps,lr_min,grad_clip,grad_clip_per_group,betas,decay_1d,ema,head_lr_scale}`,
 `output.{dir,exp_name,log_freq,save_freq,monitor,frozen_metrics}`.
 
 ## Data (ClimbingVideos corpus, read directly)
 
-- `scenes/scenes.db` curated split: 864 train / 108 test scenes; test scenes need
+- `scenes/scenes.db` curated split: 864 train / 108 test scenes (`static_camera` flag: 113 / 16
+  static after the 2026-09-04 focal-jump flips, DB backed up as
+  `scenes.db.bak_20260904_static_flags`); test scenes need
   `annotation.npz` (manual labels on 14 observable joints; the other eight are fixed
   non-contact). Train labels are automatic (`contacts_{level}.npz`, 52 → 22 joint fold).
 - **Six groups everywhere, fixed order**: `left_hand, right_hand, left_foot (toe),
@@ -236,7 +266,9 @@ above, `optim.{lr,weight_decay,epochs,warmup_steps,lr_min,grad_clip,grad_clip_pe
   parent joint and converted to body-weight units in the body-root frame; per-frame
   `force_confidence`; per-scene **fitted** `gravity_world` (unit, down-positive, tilted up to
   61° from +y — never assume world y is up). Motion GT = pelvis twist from the MHR rig
-  (`mhr_1` root + mean hips), 0.12 s Gaussian smoothing, BVR body-twist stencil.
+  (`mhr_1` root + mean hips) or the SMPL-X root (`motion_supervision.root_source`), Gaussian
+  smoothing `target_smooth_sec` (default 0 since 2026-09-04: the kindyn fit is already smooth),
+  BVR body-twist stencil.
   SMPL-X GT (`smplx` group): `q (211) = [pelvis_world, root quat xyzw, 51 joint quats]` of
   BetterHuman's `SMPLX(use_face=False, use_hands=True, num_betas=10)` — `q[:3]` IS
   `joints_world[0]`; the stored classic `transl` differs by the shape-dependent `J0(β)`

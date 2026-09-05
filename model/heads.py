@@ -17,12 +17,15 @@ trainable modules — the frozen base model never sees them.
 """
 from __future__ import annotations
 
+import math
+
 import roma
 import torch
 import torch.nn as nn
 
 from model.sam_3d_body.models.modules.transformer import FFN
-from utils.geometry import cliff_cam_to_translation, project_to_crop, rot6d_to_rotmat
+from utils.geometry import (cliff_cam_to_translation, project_to_crop, ray_to_translation,
+                            rot6d_to_rotmat, translation_to_ray)
 
 
 class ContactHead(nn.Module):
@@ -318,9 +321,16 @@ class SmplxHead(nn.Module):
     * ``proj_pose`` -> root orientation (6D), the 21 body-joint rotations (6D
       each, parent-local) and 10 betas. Mean = upright facing the camera
       (180 deg about x in OpenCV axes), identity joints, zero betas.
-    * ``proj_cam`` -> CLIFF crop weak-perspective ``(s, tx, ty)``, mean
-      ``(1, 0, 0)``, lifted with the crop box and the true focal to the pelvis
-      position in full-image camera metres (:func:`utils.geometry.cliff_cam_to_translation`).
+    * ``proj_cam`` -> the pelvis position in full-image camera metres, in one
+      of two parametrizations (``camera``): ``cliff`` — CLIFF crop
+      weak-perspective ``(s, tx, ty)``, mean ``(1, 0, 0)``, lifted with the crop
+      box and the true focal (:func:`utils.geometry.cliff_cam_to_translation`);
+      ``ray`` — the bearing ``(x/z, y/z)`` and the log depth, a residual on a
+      prior ray (``depth_prior``: the frozen readout's own pelvis ray of the
+      frame, or the constant ``(0, 0, log depth_prior_m)``). Under ``ray`` the
+      crop box never enters the lift, so a temporal block upstream can average
+      depth across frames without re-injecting the per-frame crop jitter that
+      the CLIFF proxy ``s`` must cancel (2026-09-04 diagnostic).
 
     The root of the BetterHuman ``q`` IS the pelvis pose, so no shape-dependent
     pelvis offset couples the camera and shape outputs. With ``hands`` the
@@ -350,10 +360,19 @@ class SmplxHead(nn.Module):
         mlp_channel_div_factor: int = 1,
         dropout: float = 0.0,
         hands: bool = False,
+        camera: str = "cliff",
+        depth_prior: str = "frozen",
+        depth_prior_m: float = 3.5,
     ):
         super().__init__()
         self.model_path = str(model_path)
         self.hands = bool(hands)
+        if camera not in ("cliff", "ray"):
+            raise ValueError(f"smplx.camera must be cliff | ray, got {camera!r}")
+        if depth_prior not in ("frozen", "constant"):
+            raise ValueError(f"smplx.depth_prior must be frozen | constant, got {depth_prior!r}")
+        self.camera = camera
+        self.depth_prior = depth_prior
         self.num_hand_joints = self.NUM_HAND_JOINTS if self.hands else 0
         n_pose = (6 + 6 * (self.NUM_BODY_JOINTS + self.num_hand_joints)
                   + self.NUM_BETAS)
@@ -383,7 +402,11 @@ class SmplxHead(nn.Module):
             + list(self._MEAN_JOINT_6D) * (self.NUM_BODY_JOINTS + self.num_hand_joints)
             + [0.0] * self.NUM_BETAS)
         self.register_buffer("mean_pose", mean_pose, persistent=False)
-        self.register_buffer("mean_cam", torch.tensor([1.0, 0.0, 0.0]), persistent=False)
+        # cliff: (s, tx, ty) about (1, 0, 0). ray: the constant prior ray (0, 0, log z0)
+        # (the frozen prior is per frame and arrives in the forward).
+        mean_cam = ([1.0, 0.0, 0.0] if camera == "cliff"
+                    else [0.0, 0.0, math.log(float(depth_prior_m))])
+        self.register_buffer("mean_cam", torch.tensor(mean_cam), persistent=False)
         self._bodies: dict = {}
 
     @property
@@ -418,10 +441,14 @@ class SmplxHead(nn.Module):
         cam_int: torch.Tensor,
         affine_trans: torch.Tensor,
         img_size: torch.Tensor,
+        frozen_pelvis_cam: torch.Tensor | None = None,
     ) -> dict:
         """
         Args:
             pose_token: final decoder pose token ``[B, C]``
+            frozen_pelvis_cam: the frozen readout's pelvis ``[B, 3]`` camera
+                metres (:func:`utils.geometry.frozen_pelvis_camera`) — the
+                prior ray of ``camera: ray`` + ``depth_prior: frozen``
             bbox_center: crop-box centre ``[B, 2]`` full-image px
             bbox_size: square crop-box side ``[B]`` full-image px
             cam_int: full-frame intrinsics ``[B, 3, 3]``
@@ -432,8 +459,9 @@ class SmplxHead(nn.Module):
             ``root_6d [B, 6]``, ``body_6d [B, 21, 6]`` (raw, mean included),
             ``hand_6d [B, 30, 6]`` (``None`` without hands), ``root_rot [B, 3, 3]``
             camera-from-root, ``body_rot [B, 21, 3, 3]``, ``hand_rot [B, 30, 3, 3]``
-            (``None`` without hands), ``betas [B, 10]``, ``cam [B, 3]`` (s, tx, ty),
-            ``pelvis_cam [B, 3]`` m, ``q_cam [B, 91 | 211]`` BetterHuman
+            (``None`` without hands), ``betas [B, 10]``, ``cam [B, 3]`` (s, tx, ty;
+            ``None`` under ``camera: ray``), ``ray [B, 3]`` (x/z, y/z, log z of the
+            pelvis), ``pelvis_cam [B, 3]`` m, ``q_cam [B, 91 | 211]`` BetterHuman
             configuration (body first, finger quaternions last), ``joints_cam
             [B, J, 3]`` m with ``J`` = :attr:`num_joints` (22 body joints first),
             ``kp2d_full [B, J, 2]`` px, ``kp2d_crop [B, J, 2]`` in ``[-0.5, 0.5]``.
@@ -441,15 +469,27 @@ class SmplxHead(nn.Module):
         pose_token = pose_token.float()
         batch = pose_token.shape[0]
         pose = self.proj_pose(pose_token) + self.mean_pose
-        cam = self.proj_cam(pose_token) + self.mean_cam
+        cam_delta = self.proj_cam(pose_token)
         n_body, n_hand = 6 * self.NUM_BODY_JOINTS, 6 * self.num_hand_joints
+        cam = None
+        if self.camera == "cliff":
+            cam = cam_delta + self.mean_cam
+            pelvis_cam = cliff_cam_to_translation(
+                cam, bbox_center.float(), bbox_size.float(), cam_int.float())
+        else:
+            if self.depth_prior == "frozen":
+                if frozen_pelvis_cam is None:
+                    raise ValueError(
+                        "SmplxHead(camera=ray, depth_prior=frozen) needs frozen_pelvis_cam")
+                prior = translation_to_ray(frozen_pelvis_cam.float()).detach()
+            else:
+                prior = self.mean_cam[None]
+            pelvis_cam = ray_to_translation(cam_delta + prior)
         root_6d = pose[:, :6]
         body_6d = pose[:, 6:6 + n_body].reshape(batch, self.NUM_BODY_JOINTS, 6)
         betas = pose[:, 6 + n_body + n_hand:]
         root_rot = rot6d_to_rotmat(root_6d)
         body_rot = rot6d_to_rotmat(body_6d)
-        pelvis_cam = cliff_cam_to_translation(
-            cam, bbox_center.float(), bbox_size.float(), cam_int.float())
         quats = [
             pelvis_cam,
             roma.rotmat_to_unitquat(root_rot),                            # xyzw
@@ -469,6 +509,7 @@ class SmplxHead(nn.Module):
         return {
             "root_6d": root_6d, "body_6d": body_6d, "hand_6d": hand_6d,
             "root_rot": root_rot, "body_rot": body_rot, "hand_rot": hand_rot,
-            "betas": betas, "cam": cam, "pelvis_cam": pelvis_cam, "q_cam": q_cam,
+            "betas": betas, "cam": cam, "ray": translation_to_ray(pelvis_cam),
+            "pelvis_cam": pelvis_cam, "q_cam": q_cam,
             "joints_cam": joints_cam, "kp2d_full": kp2d_full, "kp2d_crop": kp2d_crop,
         }

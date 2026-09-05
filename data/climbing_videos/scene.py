@@ -30,8 +30,12 @@ import numpy as np
 #: or bouldering, not rope supported. ``dataset_split`` is the DB's assignment.
 _SCENE_QUERY = (
     "SELECT scene_id FROM scenes WHERE human_selected=1 AND vlm_category IN (1,2) "
-    "AND vlm_rope_supported=0 AND dataset_split=? ORDER BY scene_id"
+    "AND vlm_rope_supported=0 AND dataset_split=?{camera} ORDER BY scene_id"
 )
+#: ``camera`` filter of :func:`list_scenes` -> SQL clause on the DB's per-scene
+#: ``static_camera`` flag (129 static / 843 moving curated scenes; the static
+#: set is 113 train + 16 annotated test scenes).
+_CAMERA_CLAUSE = {"all": "", "static": " AND static_camera=1", "moving": " AND static_camera=0"}
 
 #: 52 SMPLXMid joints = 22 body (0-21) + 30 fingers (22-51).
 N_JOINTS_52 = 52
@@ -77,25 +81,31 @@ def scene_shard(scene: str) -> str:
     return f"{scene[0:2]}/{scene[2:4]}"
 
 
-def list_scenes(root: str | Path, dataset_split: str) -> list[str]:
-    """Sorted curated scene ids of one DB ``dataset_split`` (``train``/``test``)."""
+def list_scenes(root: str | Path, dataset_split: str, camera: str = "all") -> list[str]:
+    """Sorted curated scene ids of one DB ``dataset_split`` (``train``/``test``).
+
+    :param camera: ``all`` | ``static`` | ``moving`` — the DB's ``static_camera`` flag.
+    """
+    if camera not in _CAMERA_CLAUSE:
+        raise ValueError(f"camera must be one of {sorted(_CAMERA_CLAUSE)}; got {camera!r}")
     db_path = Path(root) / "scenes" / "scenes.db"
     if not db_path.is_file():
         raise FileNotFoundError(f"no scene database at {db_path}")
+    query = _SCENE_QUERY.format(camera=_CAMERA_CLAUSE[camera])
     with sqlite3.connect(db_path) as db:
-        return [row[0] for row in db.execute(_SCENE_QUERY, (dataset_split,))]
+        return [row[0] for row in db.execute(query, (dataset_split,))]
 
 
-def list_train_scenes(root: str | Path) -> list[str]:
+def list_train_scenes(root: str | Path, camera: str = "all") -> list[str]:
     """Sorted curated scene ids of the DB's train split."""
-    return list_scenes(root, "train")
+    return list_scenes(root, "train", camera)
 
 
-def list_test_scenes(root: str | Path) -> list[str]:
+def list_test_scenes(root: str | Path, camera: str = "all") -> list[str]:
     """Test scenes whose manual ``annotation.npz`` exists (labels are available)."""
     corpus = Path(root)
     return [
-        scene for scene in list_scenes(corpus, "test")
+        scene for scene in list_scenes(corpus, "test", camera)
         if (corpus / "features" / "annotation" / scene_shard(scene) / scene
             / "annotation.npz").is_file()
     ]

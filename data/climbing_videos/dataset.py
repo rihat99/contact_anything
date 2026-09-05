@@ -65,10 +65,13 @@ class ClimbingVideosDataset(ClipDataset):
     name = "climbing_videos"
 
     @staticmethod
-    def list_scenes(root: str | Path, split: str) -> list[str]:
-        """Scene ids of ``split`` without loading them (train, or annotated test)."""
-        return (scene_io.list_train_scenes(root) if split == "train"
-                else scene_io.list_test_scenes(root))
+    def list_scenes(root: str | Path, split: str, camera: str = "all") -> list[str]:
+        """Scene ids of ``split`` without loading them (train, or annotated test).
+
+        :param camera: ``all`` | ``static`` | ``moving`` (the DB's ``static_camera`` flag).
+        """
+        return (scene_io.list_train_scenes(root, camera) if split == "train"
+                else scene_io.list_test_scenes(root, camera))
 
     def __init__(
         self,
@@ -89,6 +92,7 @@ class ClimbingVideosDataset(ClipDataset):
         motion_outlier_acc_ms2: float = MOTION_OUTLIER_ACC_MS2,
         motion_linear_frame: str = "gravity_view",
         motion_root_source: str = "mhr",
+        camera_filter: str = "all",
     ):
         self.root = Path(root)
         if int(contact_level) not in (1, 2):
@@ -117,7 +121,7 @@ class ClimbingVideosDataset(ClipDataset):
                 f"got {motion_root_source!r}")
         self.motion_root_source = str(motion_root_source)
         if scenes is None:
-            scenes = self.list_scenes(self.root, split)
+            scenes = self.list_scenes(self.root, split, camera_filter)
         super().__init__(
             scenes, split=split, clip_frames=clip_frames, stride=stride,
             jitter=jitter, seed=seed, full_scenes=full_scenes, max_frames=max_frames)

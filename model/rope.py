@@ -109,20 +109,34 @@ def frame_keep_mask(
 
 
 class _RopeBlock(nn.Module):
-    """Pre-LN transformer block: RoPE attention + FFN, zero-gated residuals.
+    """Pre-LN transformer block: RoPE attention + FFN, gated residuals.
 
     ``x -> x + gamma_attn * Attn(LN(x));  x -> x + gamma_ffn * FFN(LN(x))``
-    with q/k rotated by RoPE before the dot product. Both gammas start at
-    zero, so the block is an exact identity at init.
+    with q/k rotated by RoPE before the dot product. An exact identity at
+    init either way: ``gate_init: zero_gate`` starts both gammas at zero
+    (random output projections — only the gates get a gradient at first);
+    ``zero_proj`` starts the gammas at one and the attention / FFN output
+    projections at zero, so the projections get a first-order gradient from
+    step one.
     """
 
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float,
+        dropout: float,
+        gate_init: str = "zero_gate",
+    ):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim {dim} not divisible by num_heads {num_heads}")
+        if gate_init not in ("zero_gate", "zero_proj"):
+            raise ValueError(f"gate_init must be 'zero_gate' or 'zero_proj'; got {gate_init!r}")
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.dropout = float(dropout)
+        self.gate_init = str(gate_init)
 
         self.norm_attn = nn.LayerNorm(dim)
         self.qkv = nn.Linear(dim, 3 * dim)
@@ -140,7 +154,14 @@ class _RopeBlock(nn.Module):
             nn.Dropout(dropout),
         )
         self.gamma_ffn = nn.Parameter(torch.zeros(dim))
-
+        if gate_init == "zero_proj":
+            # Identity at init through ZERO output projections and UNIT gates.
+            nn.init.zeros_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
+            nn.init.zeros_(self.ffn[3].weight)
+            nn.init.zeros_(self.ffn[3].bias)
+            nn.init.ones_(self.gamma_attn)
+            nn.init.ones_(self.gamma_ffn)
     def forward(
         self,
         x: torch.Tensor,
@@ -366,6 +387,9 @@ class CrossModalRopeModule(nn.Module):
     :param max_rel_sec: attention window half-width in *seconds* (``None``
         disables). Set it to the training clip span so inference on arbitrarily
         long sequences only ever sees trained relative offsets.
+    :param gate_init: ``zero_gate`` (``gamma = 0``, random projections) or
+        ``zero_proj`` (``gamma = 1``, zero output projections) — both an exact
+        identity at init; see :class:`_RopeBlock`.
     """
 
     def __init__(
@@ -378,6 +402,7 @@ class CrossModalRopeModule(nn.Module):
         dropout: float = 0.1,
         time_scale: float = 25.0,
         max_rel_sec: Optional[float] = 2.5,
+        gate_init: str = "zero_gate",
     ):
         super().__init__()
         if num_slots <= 0:
@@ -393,7 +418,7 @@ class CrossModalRopeModule(nn.Module):
         self.time_scale = float(time_scale)
         self.max_rel_sec = None if max_rel_sec is None else float(max_rel_sec)
         self.blocks = nn.ModuleList(
-            _RopeBlock(dim, num_heads, mlp_ratio, dropout)
+            _RopeBlock(dim, num_heads, mlp_ratio, dropout, gate_init)
             for _ in range(num_layers)
         )
         self.head_dim = self.blocks[0].head_dim if num_layers > 0 else dim // num_heads

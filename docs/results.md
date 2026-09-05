@@ -9,6 +9,12 @@ over the six kindyn groups at threshold 0.5 (`f1` / `precision` / `recall` / `io
 `P@R0.9` = precision at 90 % recall interpolated on the threshold curve, per-group F1 in the
 order LH, RH, LF (toe), RF, LA (heel), RA. Transcripts: `output/logs/<run>_eval.log`.
 
+**Kept runs (2026-09-04 prune + 2026-09-05 cleanup):** `hands` (full corpus), `static_baseline`,
+`static_matching_anchor_raw`, `static_ray` and `tb_projzero` (static subset) stay in `output/`,
+each with its config. Every other run in the tables below is under `/data3/rikhat.akizhanov/trash/`
+(`runs_pruned_20260904/`, `cleanup_20260905/runs_removed/`, …); the numbers stand. The static-camera
+jitter round (2026-09-04/05) is summarised in the last section of this page.
+
 ## Main table (2026-09-02 runs, evaluated 2026-09-03)
 
 | run | config / checkpoint | mpjpe | pa | pve | accel | f1 | prec | rec | iou | P@R0.9 | LH | RH | LF | RF | LA | RA |
@@ -238,3 +244,38 @@ p90 0.165; SMPL-X joints move 17.4 mm raw / 5.7 mm hip-aligned on average withou
 metrics. Caveat: both ablation arms put the block in an attention regime it never trained in
 (7 or 0 keys instead of ~875), so their contact losses mix "temporal information removed" with
 out-of-distribution behaviour; the pose invariance is the robust finding.
+
+## Static-camera jitter round (2026-09-04/05)
+
+Static subset of the corpus (`configs/datasets/climbing_videos_static.yaml`: 113 train / 16
+annotated test scenes after the 2026-09-04 focal-jump flips), 30 epochs, `eval_max_frames 120`.
+`jitter` = GVHMR lifted-trajectory jitter (10 m/s³; GT 6.35 on this set), `dlogz` = RMS
+frame-to-frame step of the pelvis log depth in %/frame (prediction / prediction − GT; GT 0.278),
+`depth_err` = absolute pelvis depth error (mm). Investigation logs: `docs/jitter_2026-09-04.md`,
+`docs/camera_ray_2026-09-04.md`, `docs/temporal_block_2026-09-04.md`, explainer
+`docs/trajectory_jitter_explained.md`. Transcripts `output/logs/<run>*.log`.
+
+| run (static subset, 16-scene test) | clips/step | jitter | mpjpe | pa | depth_err | dlogz pred / err | F1 | status |
+|---|---|---|---|---|---|---|---|---|
+| frozen SAM3D (SMPL-X refit) | – | 126 (MHR70 lift) | 57.9 | 43.8 | 97 | 0.596 / 0.597 | – | reference, `output/frozen_sam3d_smplx_static16.json` |
+| `static_baseline` (CLIFF camera, no matching) | 8 | 118.0 | 60.6 | 44.5 | 125 | 0.583 / 0.586 | 0.876 | kept |
+| `static_matching_anchor_raw` (CLIFF + matching 1 / 0.5 / 1 + pelvis anchor 3) | 8 | 91.4 (19-scene set: 83.6) | 63.8 | 47.0 | 132 | 0.433 / 0.459 | 0.848 | kept (motion-matching reference; re-scored 2026-09-05, `output/logs/static_matching_anchor_raw_*_eval.log`) |
+| `static_ray` R1 (ray camera on the frozen prior, bbox + frozen-camera inputs, image kp2d, depth/bearing vel + acc; `zero_gate`) | 4 | 56.7 | 65.2 | – | 116 | 0.161 / 0.272 | 0.852 | kept |
+| `tb_projzero` A (R1 recipe + `gate_init: zero_proj`) | 2 | 52.4 (min 50.5 at ep 13) | 72.3 | – | 100 | 0.158 / – | 0.874 | kept — best without explicit smoothing |
+| SM-6 `static_sm_split_acc` (matching + anchor + learned convex OUTPUT smoother + acc matching) | 4 | 9.10 | 60.5 | 44.4 | 113 | 0.174 / 0.241 | 0.869 | rejected: explicit smoothing (code removed) |
+| R3 `static_ray_smprior` (R1 + convex kernel on the frozen PRIOR) | 2 | 51.3 | 65.5 | – | 109 | 0.160 / 0.247 | 0.872 | rejected: explicit smoothing (code removed) |
+| R2 `static_ray_noprior` (R1 with a constant prior, no frozen input) | 4 | = R1 through ep 8 (71.6) | – | – | 215 | 0.265 / 0.330 | – | ablation, stopped ep 13 |
+| B `tb_loc` (A + learnable locality bias σ 0.1 s) | 2 | 50.8 | 72.7 | – | 103 | 0.176 / – | 0.877 | no gain over A; σ widened to 0.13-0.52 s, self bias −0.3…−1.9 (code removed) |
+| C `tb_locwide` (σ init 1.0 s) | 2 | 52.1 | 72.6 | – | 103 | 0.158 / – | 0.895 | σ widened further (0.9-1.9 s) (code removed) |
+| D `tb_window` (R1 block, `max_rel_sec 0.25`) | 2 | 60.0 | 68.9 | 47.4 | 115 | 0.251 / 0.292 | 0.841 | worse than R1; a hard window does not make the zero-gate block denoise |
+| E `tb_stage2` (R1 heads frozen at lr 0, fresh zero_proj + locality block) | 2 | 57.0 | 65.5 | – | 114 | 0.177 / – | 0.862 | = R1: the block alone cannot denoise (warm-start / freeze code removed) |
+| F / H `tb_mix*` (convex mixing path, first version) | 2 | killed ep 5 (75 / 66) | – | – | – | – | – | gate never opened; the path mixed slots (bug found by a forced sweep), fixed same-slot version untrained (code removed) |
+| GVHMR token arm `static_anchor_raw_gvhmr` (2D keypoints as the main token) | 8 | 76.0 at ep 19 | 157.6 | 116.6 | – | – | – | far too slow to train on 113 scenes; stopped ep 21 (code removed) |
+
+Reading: the ray camera head removed depth as a jitter source (depth-only share 110 → 11-15) and
+the zero-projection block parametrisation is worth ~5 points on top; every arm that tried to make
+the residual softmax block a local average converged to dilution (`x + c·avg`, self bias negative,
+kernels wide) with a floor of ~50. The remaining jitter is per-frame rotation / articulation noise
+of the pose readout, created in the backbone feature maps (averaging the frozen pose token over
+~0.1 s gives 14 with no training — `temporal_block_2026-09-04.md` §2). Explicit smoothing reaches
+9-10 but is excluded by the user.

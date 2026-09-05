@@ -98,7 +98,7 @@ def enabled_losses(cfg: dict) -> list[str]:
                 ("motion", "motion_supervision"), ("pose", "pose_supervision"),
                 ("keypoint", "keypoint_supervision"),
                 ("smplx", "smplx_supervision"), ("rollout", "rollout_eval"),
-                ("smoothness", "pose_smoothness"),
+                ("smoothness", "pose_smoothness"), ("motion_matching", "motion_matching"),
                 ("contact_consistency", "contact_consistency"),
                 ("force_consistency", "force_consistency"), ("physics", "physics"))
     return [name for name, section in sections if cfg[section]["enabled"]]
@@ -125,8 +125,11 @@ def signal_needs(cfg: dict) -> set[str]:
         needs.add("keypoints2d")      # the sapiens detections (an input, not a label)
     if cfg["model"]["token_inputs"]["camera_twist"]["enabled"]:
         needs.add("camera")           # the camera's own twist (an input)
-    if cfg["rollout_eval"]["enabled"] or cfg["pose_smoothness"]["enabled"]:
+    if (cfg["rollout_eval"]["enabled"] or cfg["pose_smoothness"]["enabled"]
+            or cfg["motion_matching"]["enabled"]):
         needs.add("smplx")
+    if cfg["motion_matching"]["enabled"]:
+        needs.add("motion")           # the kindyn GT root twist
     return needs
 
 
@@ -157,6 +160,10 @@ def validate(cfg: dict) -> None:
                 f"model.cross_modal_temporal.modalities {missing} have no token "
                 "block in this build — enable model.contact / model.force / "
                 "model.motion accordingly")
+        if cross_modal["gate_init"] not in ("zero_gate", "zero_proj"):
+            raise ValueError(
+                "model.cross_modal_temporal.gate_init must be 'zero_gate' or "
+                f"'zero_proj'; got {cross_modal['gate_init']!r}")
 
     keypoints2d = model["token_inputs"]["keypoints2d"]
     if keypoints2d["enabled"]:
@@ -207,6 +214,9 @@ def validate(cfg: dict) -> None:
             ("model.cross_modal_temporal.modalities['pose']", "pose" in modalities),
             ("model.pose_temporal", model["pose_temporal"]["enabled"]),
             ("model.token_inputs.keypoints2d", keypoints2d["enabled"]),
+            ("model.token_inputs.bbox", model["token_inputs"]["bbox"]["enabled"]),
+            ("model.token_inputs.frozen_camera",
+             model["token_inputs"]["frozen_camera"]["enabled"]),
             ("model.token_inputs.camera_twist (into the pose token)",
              model["token_inputs"]["camera_twist"]["enabled"] and not branches["motion"]),
             ("model.finetune_pose_head", model["finetune_pose_head"]),
@@ -234,6 +244,21 @@ def validate(cfg: dict) -> None:
                 f"model.smplx.enabled is exclusive with {', '.join(mhr_consumers)}: "
                 "the SMPL-X head is the pose output and the MHR readout is not "
                 "recomputed")
+    smplx = model["smplx"]
+    if smplx["camera"] not in ("cliff", "ray"):
+        raise ValueError(f"model.smplx.camera must be 'cliff' or 'ray'; got {smplx['camera']!r}")
+    if smplx["depth_prior"] not in ("frozen", "constant"):
+        raise ValueError(
+            f"model.smplx.depth_prior must be 'frozen' or 'constant'; got {smplx['depth_prior']!r}")
+    if cfg["smplx_supervision"]["kp2d_space"] not in ("crop", "image"):
+        raise ValueError(
+            "smplx_supervision.kp2d_space must be 'crop' or 'image'; got "
+            f"{cfg['smplx_supervision']['kp2d_space']!r}")
+    if (smplx["enabled"] and smplx["camera"] == "ray" and smplx_sup
+            and float(cfg["smplx_supervision"]["loss"]["cam"]) > 0.0):
+        raise ValueError(
+            "smplx_supervision.loss.cam supervises the CLIFF (s, tx, ty) proxy, which "
+            "model.smplx.camera: ray does not produce — set it to 0")
     if model["finetune_camera_head"] and not kp_sup:
         raise ValueError(
             "model.finetune_camera_head requires keypoint_supervision.enabled "
@@ -272,16 +297,35 @@ def validate(cfg: dict) -> None:
         if int(cfg["data"]["clip"]["frames"]) < 5:
             raise ValueError("pose_smoothness needs data.clip.frames >= 5 (a 5-point stencil)")
     if cfg["rollout_eval"]["enabled"]:
-        if not (model["smplx"]["enabled"] and ms["enabled"]):
+        if not model["smplx"]["enabled"]:
             raise ValueError(
-                "rollout_eval.enabled requires model.smplx.enabled (the per-frame "
-                "body) and motion_supervision.enabled (the standardize table)")
-        if ms["linear_frame"] != "body" or ms["root_source"] != "smplx" or not all(
-                t in motion["terms"] for t in ("vel", "ang_vel")):
+                "rollout_eval.enabled requires model.smplx.enabled (the per-frame body)")
+        if branches["motion"]:
+            if not ms["enabled"]:
+                raise ValueError(
+                    "rollout_eval with a motion head requires motion_supervision.enabled "
+                    "(the standardize table)")
+            if ms["linear_frame"] != "body" or ms["root_source"] != "smplx" or not all(
+                    t in motion["terms"] for t in ("vel", "ang_vel")):
+                raise ValueError(
+                    "rollout_eval integrates the SMPL-X head's BODY-frame root twist: needs "
+                    "motion_supervision.linear_frame 'body', root_source 'smplx' and "
+                    "'vel' + 'ang_vel' in model.motion.terms")
+    if cfg["motion_matching"]["enabled"]:
+        mm = cfg["motion_matching"]["loss"]
+        if not model["smplx"]["enabled"]:
+            raise ValueError("motion_matching.enabled requires model.smplx.enabled")
+        if int(cfg["data"]["clip"]["frames"]) < 3:
+            raise ValueError("motion_matching needs data.clip.frames >= 3 (a central stencil)")
+        if ms["linear_frame"] != "body" or ms["root_source"] != "smplx":
             raise ValueError(
-                "rollout_eval integrates the SMPL-X head's BODY-frame root twist: needs "
-                "motion_supervision.linear_frame 'body', root_source 'smplx' and "
-                "'vel' + 'ang_vel' in model.motion.terms")
+                "motion_matching differentiates the SMPL-X head's root as a BODY twist: needs "
+                "motion_supervision.linear_frame 'body' and root_source 'smplx'")
+        if any(float(mm[t]) > 0.0 for t in ("head_vel", "head_ang_vel")) and not (
+                branches["motion"] and all(t in motion["terms"] for t in ("vel", "ang_vel"))):
+            raise ValueError(
+                "motion_matching.loss.head_* needs model.motion.enabled with 'vel' + "
+                "'ang_vel' in model.motion.terms")
 
     if model["force"]["contact_gate"]["enabled"]:
         if not branches["contact"]:

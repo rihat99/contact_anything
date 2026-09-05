@@ -281,6 +281,35 @@ def translation_to_cliff_cam(
     return torch.stack([s, tx, ty], dim=-1)
 
 
+def translation_to_ray(trans: Tensor) -> Tensor:
+    """Camera translation ``(x, y, z)`` -> the ray parametrization ``(x/z, y/z, log z)``.
+
+    The bearing is the pelvis pixel's normalized image coordinate ``((u - px) / f,
+    (v - py) / f)``; the depth is logarithmic so per-frame noise is relative.
+    """
+    z = trans[:, 2].clamp(min=1e-3)
+    return torch.stack([trans[:, 0] / z, trans[:, 1] / z, torch.log(z)], dim=-1)
+
+
+def ray_to_translation(ray: Tensor) -> Tensor:
+    """Exact inverse of :func:`translation_to_ray`: ``exp(d) (rx, ry, 1)``."""
+    z = torch.exp(ray[:, 2])
+    return torch.stack([ray[:, 0] * z, ray[:, 1] * z, z], dim=-1)
+
+
+def frozen_pelvis_camera(mhr: dict) -> Tensor:
+    """The frozen readout's mean-hips pelvis in camera metres ``(B, 3)``.
+
+    ``pred_keypoints_3d`` (MHR70, body-centred) at :data:`HIP_KEYPOINTS` placed
+    by ``pred_cam_t`` — the same pelvis :func:`frozen_root_world` lifts.
+    """
+    kp = mhr["pred_keypoints_3d"].float()
+    pelvis = kp[:, list(HIP_KEYPOINTS)].mean(dim=1) + mhr["pred_cam_t"].float()
+    # The frozen camera head never clamps its scale, so a degenerate frame can put
+    # the pelvis behind the camera; keep the ray (x/z, y/z, log z) bounded.
+    return torch.cat([pelvis[:, :2], pelvis[:, 2:].clamp(min=0.25)], dim=-1)
+
+
 def project_to_crop(
     points_cam: Tensor, cam_int: Tensor, affine_trans: Tensor, img_size: Tensor,
     min_depth: float = 0.25,
