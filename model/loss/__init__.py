@@ -17,13 +17,12 @@ Three rules follow from that and every loss respects them:
   ``0 * (sum of the tensors the loss consumes)`` anchor, so no parameter drops
   off the backward graph under ``find_unused_parameters=False``.
 * **Term weights (the yaml ``loss.*`` block) are applied INSIDE the loss**, to
-  the numerator. The trainer only scales by :meth:`Loss.weight_scale` (the
-  force-consistency ramp) and reduces.
+  the numerator. The trainer only reduces.
 
 Evaluation uses a second channel: :attr:`LossResult.stats`, a float64 vector of
 additive sufficient statistics summed over the split and all-reduced once, from
 which :meth:`Loss.metrics` computes the reported numbers. Means of per-batch
-means and rank-local Pearson correlations are both wrong; this is why.
+means are wrong under uneven shards; this is why.
 """
 from __future__ import annotations
 
@@ -117,10 +116,6 @@ class Loss(ABC):
             reported evaluation is protocol-stable.
         """
 
-    def weight_scale(self, epoch: int) -> float:
-        """Multiplier the trainer applies to this loss's terms at ``epoch``."""
-        return 1.0
-
     @abstractmethod
     def metrics(self, stats: Tensor) -> dict[str, float]:
         """Reported metrics from the SUMMED (all-reduced) statistics vector."""
@@ -141,107 +136,33 @@ class Loss(ABC):
 
 
 def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
-    """Instantiate every enabled loss, in a fixed order.
+    """Instantiate every enabled loss, in a fixed order (contact, force, smplx, motion).
 
-    The order (contact, force, motion, pose, keypoint, smplx, rollout,
-    smoothness, contact_consistency, force_consistency, physics) is what makes the
-    trainer's packed mass all-reduce identical on every rank.
+    The order is what makes the trainer's packed mass all-reduce identical on
+    every rank.
 
-    :raises ValueError: when an enabled loss has no branch to supervise, or when
-        two mutually exclusive objectives are both on.
+    :raises ValueError: when an enabled loss has no branch to supervise.
     """
     net = getattr(model, "module", model)
     losses: list[Loss] = []
-
-    force_on = bool(cfg["force_supervision"]["enabled"])
-    motion_on = bool(cfg["motion_supervision"]["enabled"])
-    physics_on = bool(cfg["physics"]["enabled"])
-    if force_on and physics_on:
-        raise ValueError(
-            "force_supervision and physics are mutually exclusive objectives "
-            "for the same force head — enable exactly one")
-
     if cfg["contact_supervision"]["enabled"]:
-        _require(net.head_contact is not None,
-                 "contact_supervision", "model.contact.enabled")
+        _require(net.has_contact, "contact_supervision",
+                 "model.contact.enabled or a refiner 'contact' output")
         from model.loss.contact import ContactLoss
         losses.append(ContactLoss(cfg, model, device))
-
-    if force_on:
-        _require(net.head_force is not None,
-                 "force_supervision", "model.force.enabled")
+    if cfg["force_supervision"]["enabled"]:
+        _require(net.has_force, "force_supervision",
+                 "model.force.enabled or a refiner 'force' output")
         from model.loss.force import ForceLoss
         losses.append(ForceLoss(cfg, model, device))
-
-    if motion_on:
-        _require(net.head_motion is not None,
-                 "motion_supervision", "model.motion.enabled")
-        read = "motion" if net.motion_tokens is not None else "pose"
-        _require(read in net.cross_modal_modalities, "motion_supervision",
-                 f"'{read}' in model.cross_modal_temporal.modalities — the token "
-                 "the motion head reads (a per-frame head cannot represent a "
-                 "derivative)")
-        from model.loss.motion import MotionLoss
-        losses.append(MotionLoss(cfg, model, device))
-
-    if cfg["pose_supervision"]["enabled"]:
-        _require(net.writes_pose, "pose_supervision",
-                 "a pose write path (cross-modal 'pose', pose_temporal or a "
-                 "head fine-tune)")
-        from model.loss.pose import PoseLoss
-        losses.append(PoseLoss(cfg, model, device))
-
-    if cfg["keypoint_supervision"]["enabled"]:
-        _require(net.writes_pose, "keypoint_supervision",
-                 "a pose write path (cross-modal 'pose', pose_temporal or a "
-                 "head fine-tune)")
-        from model.loss.keypoint import KeypointLoss
-        losses.append(KeypointLoss(cfg, model, device))
-
     if cfg["smplx_supervision"]["enabled"]:
         _require(net.head_smplx is not None, "smplx_supervision", "model.smplx.enabled")
         from model.loss.smplx import SmplxLoss
         losses.append(SmplxLoss(cfg, model, device))
-
-    if cfg["rollout_eval"]["enabled"]:
-        _require(net.head_smplx is not None, "rollout_eval", "model.smplx.enabled")
-        _require(motion_on or net.head_motion is None, "rollout_eval",
-                 "motion_supervision.enabled (its standardize table) when a motion head exists")
-        from model.loss.rollout import RolloutLoss
-        losses.append(RolloutLoss(cfg, model, device))
-
-    if cfg["pose_smoothness"]["enabled"]:
-        _require(net.head_smplx is not None, "pose_smoothness", "model.smplx.enabled")
-        from model.loss.smoothness import SmoothnessLoss
-        losses.append(SmoothnessLoss(cfg, model, device))
-
-    if cfg["motion_matching"]["enabled"]:
-        _require(net.head_smplx is not None, "motion_matching", "model.smplx.enabled")
-        from model.loss.motion_matching import MotionMatchingLoss
-        losses.append(MotionMatchingLoss(cfg, model, device))
-
-    if cfg["contact_consistency"]["enabled"]:
-        _require(net.head_contact is not None,
-                 "contact_consistency", "model.contact.enabled (it gates on the "
-                 "predicted contact probabilities)")
-        from model.loss.contact_consistency import ContactConsistencyLoss
-        losses.append(ContactConsistencyLoss(cfg, model, device))
-
-    if cfg["force_consistency"]["enabled"]:
-        _require(force_on, "force_consistency", "force_supervision.enabled "
-                 "(bw units in the kindyn root frame)")
-        _require(motion_on, "force_consistency",
-                 "motion_supervision.enabled (its GT root rotation)")
-        from model.loss.force_consistency import ForceConsistencyLoss
-        losses.append(ForceConsistencyLoss(cfg, model, device))
-
-    if physics_on:
-        _require(net.head_force is not None, "physics", "model.force.enabled")
-        # Imported lazily: it is the only loss that needs the BetterRobot /
-        # BetterHuman checkouts.
-        from model.loss.physics import PhysicsLoss
-        losses.append(PhysicsLoss(cfg, model, device))
-
+    if cfg["motion_supervision"]["enabled"]:
+        _require(net.has_motion, "motion_supervision", "a refiner 'motion' output")
+        from model.loss.motion import MotionLoss
+        losses.append(MotionLoss(cfg, model, device))
     return losses
 
 

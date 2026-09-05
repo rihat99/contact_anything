@@ -12,9 +12,9 @@ Two files are written into ``<stem>/predictions/``:
 ``contacts.npz``
     per-group probabilities and thresholded booleans.
 ``forces.npz`` (``--force-name``)
-    per-group 3D forces in body-weight units, in the head's own frame plus a
-    world-frame copy. A ``root``-frame head (the supervised regime) is rotated
-    by the kindyn root quaternion (``human_optim/kindyn_1.npz`` ``q[..., 3:7]``,
+    per-group 3D forces in body-weight units, in the head's body-root frame
+    plus a world-frame copy rotated by the kindyn root quaternion
+    (``human_optim/kindyn_1.npz`` ``q[..., 3:7]``,
     xyzw, world-from-root), so that tree must have run the dynamics stage; a
     ``local_world_aligned`` head is rotated by the axis flip into the OpenCV
     camera and then by ``cam_from_world``.
@@ -47,9 +47,6 @@ from data.reconstruction import ReconstructionSceneDataset, extract_frames  # no
 from model.loss import KINDYN_GROUP_NAMES                       # noqa: E402
 from train.predict import load_model                            # noqa: E402
 
-#: local_world_aligned (camera y-up) -> OpenCV camera frame (y-down, z-forward).
-LWA_TO_CAM = np.array([1.0, -1.0, -1.0], np.float32)
-
 
 def checkpoint_epoch(path: str | None) -> int:
     """Training epoch stored in a checkpoint; ``-1`` for the untrained model."""
@@ -78,9 +75,9 @@ def predict_scene(model, ds, cfg: dict, device: str) -> dict:
         mhr = output["mhr"]
         kp2d = rc.to_numpy(mhr["pred_keypoints_2d"])
         kp3d_cam = rc.to_numpy(mhr["pred_keypoints_3d"] + mhr["pred_cam_t"][:, None, :])
-        probs = (rc.to_numpy(output["contact"]["joint_probs"])
+        probs = (rc.to_numpy(output["contact"]["probs"])
                  if output["contact"] is not None else None)
-        forces = (rc.to_numpy(output["force"]["joint_forces"])
+        forces = (rc.to_numpy(output["force"]["forces"])
                   if output["force"] is not None else None)
         for row, position in enumerate(batch["frame_index"].tolist()):
             out["kp2d"][clip.person, position] = kp2d[row]
@@ -111,17 +108,10 @@ def provenance(ds, video: Path, checkpoint: str, epoch: int, cfg: dict,
     }
 
 
-def world_forces(forces: np.ndarray, out_dir: Path, ds, force_frame: str,
-                 scene: str) -> tuple[np.ndarray, dict]:
-    """Rotate head-frame forces to the world frame. ``-> (forces_world, extra keys)``."""
+def world_forces(forces: np.ndarray, out_dir: Path, ds, scene: str
+                 ) -> tuple[np.ndarray, dict]:
+    """Rotate body-root-frame forces to the world frame. ``-> (forces_world, extra keys)``."""
     data = ds.scene_data(scene)
-    if force_frame == "local_world_aligned":
-        # LWA (camera y-up) -> OpenCV camera, then camera -> world by the
-        # cam_from_world rotation (rotation only: body-weight units are scale-free).
-        cam = forces * LWA_TO_CAM[None, None, None, :]
-        rotation = data["extrinsics"][:, :3, :3]                   # [N, 3, 3]
-        return (np.einsum("nji,pnkj->pnki", rotation, cam).astype(np.float32),
-                {"lwa_to_opencv_cam_flip": LWA_TO_CAM})
     kindyn = np.load(out_dir / "human_optim" / "kindyn_1.npz", allow_pickle=True)
     q = rows_by_object_id(np.asarray(kindyn["q"], np.float32), kindyn["object_ids"],
                           data["object_ids"], scene, "kindyn")      # [P, N, nq]
@@ -139,7 +129,7 @@ def world_forces(forces: np.ndarray, out_dir: Path, ds, force_frame: str,
 
 
 def run_scene(args, model, cfg: dict, scene: str, video: Path, work_root: Path,
-              epoch: int, force_frame: str | None) -> None:
+              epoch: int) -> None:
     out_dir = args.out_root / scene
     pred_dir = out_dir / "predictions"
     targets = {"contact": pred_dir / "contacts.npz", "force": pred_dir / args.force_name}
@@ -175,13 +165,13 @@ def run_scene(args, model, cfg: dict, scene: str, video: Path, work_root: Path,
         forces = preds["forces"]
         anchors = preds["kp2d"][:, :, list(model.force_tokens.keypoint_indices)]
         anchor_cam = preds["kp3d_cam"][:, :, list(model.force_tokens.keypoint_indices)]
-        forces_world, extra = world_forces(forces, out_dir, ds, force_frame, scene)
+        forces_world, extra = world_forces(forces, out_dir, ds, scene)
         if model.contact_tokens is not None:
             extra["contact_probs"] = preds["probs"]
         np.savez_compressed(
             targets["force"], forces=forces, forces_world=forces_world,
             anchor_points_2d=anchors, anchor_cam=anchor_cam, units="body_weight",
-            force_frame=force_frame, **extra, **identity)
+            force_frame="root", **extra, **identity)
         magnitude = np.linalg.norm(forces, axis=-1)
         magnitude = magnitude[np.isfinite(magnitude)]
         print(f"  {targets['force'].name}: mean |f| {float(magnitude.mean()):.3f} bw, "
@@ -232,11 +222,6 @@ def main() -> int:
     if model.contact_tokens is None and model.force_tokens is None:
         raise SystemExit("this build has neither a contact nor a force head — "
                          "there is nothing to predict")
-    force_frame = cfg["model"]["force"]["frame"] if model.force_tokens else None
-    if force_frame == "local":
-        raise SystemExit("force.frame 'local' cannot be written in world coordinates "
-                         "without forward kinematics this script does not run")
-
     epoch = checkpoint_epoch(checkpoint)
     work_root = args.work_dir or Path(tempfile.mkdtemp(prefix="predict_reconstruction_"))
     work_root.mkdir(parents=True, exist_ok=True)
@@ -244,8 +229,7 @@ def main() -> int:
     for index, scene in enumerate(scenes, start=1):
         print(f"[{index}/{len(scenes)}] {scene}")
         try:
-            run_scene(args, model, cfg, scene, videos[scene], work_root, epoch,
-                      force_frame)
+            run_scene(args, model, cfg, scene, videos[scene], work_root, epoch)
         except Exception as error:          # a broken scene must not kill the batch
             print(f"  FAILED — {error}")
             failures.append(scene)

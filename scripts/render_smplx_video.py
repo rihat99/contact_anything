@@ -35,7 +35,7 @@ import torch                                                    # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import _render_common as rc                                     # noqa: E402
-from render_pose_video import draw_keypoints, draw_mesh, nan_means   # noqa: E402
+from _render_common import draw_keypoints, draw_mesh, nan_means  # noqa: E402
 from model.loss.smplx import SMPLX_HIPS, gt_smplx_camera, smplx_vertices   # noqa: E402
 
 #: The 12 joints both skeletons name: shoulders, elbows, hips, knees, ankles,
@@ -266,7 +266,8 @@ def main() -> int:
         raise ValueError("the config has no model.smplx head to render")
     root, contact_level = rc.dataset_spec(cfg)
     max_frames = args.max_frames or int(cfg["data"]["eval_max_frames"])
-    scenes, rank, world_size = rc.shard(rc.resolve_scenes(root, "test", args.scenes))
+    scenes, rank, world_size = rc.shard(
+        rc.resolve_scenes(root, "test", args.scenes, rc.dataset_camera(cfg)))
     print(f"[rank {rank}/{world_size}] {len(scenes)} scene(s) on {args.device}; "
           f"checkpoint = {checkpoint or 'none (untrained)'}")
 

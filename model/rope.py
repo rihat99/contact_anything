@@ -1,32 +1,27 @@
-"""RoPE-based temporal transformer over per-frame decoder tokens.
+"""RoPE temporal transformer over the per-frame decoder tokens.
 
-:class:`RopeTemporalModule` is the long-sequence temporal transformer for the
-pose path (GVHMR-style, Shen et al. 2024). A batch of
-``B_flat = B_clips * T`` flattened frames is reshaped to ``[B_clips, T, K, C]``
-and self-attention runs across the ``T`` frames of each clip, independently per
-token slot ``K`` (the pose path uses ``K = 1``).
+:class:`CrossModalRopeModule` is the single post-decoder mixing brick
+(``model.cross_modal_temporal``): ONE self-attention over the concatenation of
+the chosen modality token blocks across the frames of a clip.
 
-Design points (vs the retired sliding-window / sinusoidal module):
+Design points:
 
-* **Rotary position encoding on q/k** instead of an additive sinusoidal
-  encoding: attention logits depend only on *relative* time offsets, so a
-  model trained at ``T = 60`` runs single-pass on a whole scene.
-* **Time-valued positions**: RoPE positions are ``frame_pos_sec * time_scale``
-  (real elapsed seconds, ``time_scale = 25`` makes one 25-fps step ~= 1.0), so
-  the corpus's variable fps is encoded exactly rather than approximated by
-  frame indices.
-* **Seconds-based local window**: attention is restricted to relative offsets
-  ``|dt| <= max_rel_sec`` (the span seen in training), GVHMR's
-  never-see-unseen-offsets rule. Inert on training-length clips; activates
-  automatically on longer inference sequences.
-* **Bidirectional only** — no causal option (offline video; no paper supports
-  causal masking here).
+* **Rotary position encoding on q/k**: attention logits depend only on
+  *relative* positions, so a model trained on ``T = 60`` clips runs single-pass
+  on a whole scene.
+* **Positions are real elapsed seconds** (``frame_pos_sec x time_scale``), so
+  the block is exact under the corpus's variable frame rates.
+* **Local window** (``window``, seconds): a key further than ``window`` from
+  the query is hidden; the receptive field grows by ``window`` per layer, and
+  inference on a longer sequence never exposes an untrained relative offset.
+  ``None`` = every frame of the clip.
+* **Bidirectional only** — offline video; no causal option.
+* **Pre-LN residual blocks** with the attention and FFN output projections
+  zero-initialised: the module is an exact identity at initialisation and the
+  projections receive a first-order gradient from step one.
 
-Every attention/FFN branch is gated by a per-channel ``gamma = zeros``
-parameter, so at initialisation the module is an exact identity
-(``torch.equal``-verified), matching the repo's zero-init invariant. The
-module is bound outside the frozen wrapper (e.g. ``pose_temporal`` in
-:class:`model.network.ContactAnything`), so it trains by construction.
+The module is bound outside the frozen wrapper (:class:`model.network.
+ContactAnything`), so it trains by construction.
 """
 from __future__ import annotations
 
@@ -76,73 +71,58 @@ def rope_rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
 
 
 def frame_keep_mask(
-    pos_sec: torch.Tensor,
+    seconds: torch.Tensor,
     frame_valid: Optional[torch.Tensor],
-    max_rel_sec: Optional[float],
+    window: Optional[float],
 ) -> Optional[torch.Tensor]:
     """Frame-level attention keep-mask ``[n_clips, T, T]`` (``None`` = all-visible).
 
-    Rules: keys further than ``max_rel_sec`` away in time are hidden; an invalid
-    key frame is hidden from every query except its own diagonal, so no softmax
-    row is ever fully masked. ``None`` is returned when neither rule bites, which
+    Rules: keys further than ``window`` seconds away are hidden; an invalid key
+    frame is hidden from every query except its own diagonal, so no softmax row
+    is ever fully masked. ``None`` is returned when neither rule bites, which
     lets the caller skip building a mask at all.
 
-    :param pos_sec: elapsed seconds ``[n_clips, T]``.
+    :param seconds: frame times ``[n_clips, T]``.
     :param frame_valid: bool ``[n_clips, T]``, or ``None`` for all-valid.
-    :param max_rel_sec: attention window half-width in seconds (``None`` = off).
+    :param window: attention half-width in seconds (``None`` = off).
     """
-    n_clips, t = pos_sec.shape
+    n_clips, t = seconds.shape
     keep = None
-    if max_rel_sec is not None:
-        dt = (pos_sec[:, :, None] - pos_sec[:, None, :]).abs()
-        if bool((dt > max_rel_sec).any()):
-            keep = dt <= max_rel_sec                        # [n_clips, T, T]
+    if window is not None:
+        dist = (seconds[:, :, None] - seconds[:, None, :]).abs()
+        if bool((dist > window).any()):
+            keep = dist <= window                           # [n_clips, T, T]
     if frame_valid is not None and not bool(frame_valid.all()):
         valid_key = frame_valid[:, None, :].expand(n_clips, t, t)
-        diag = torch.eye(t, dtype=torch.bool, device=pos_sec.device)
+        diag = torch.eye(t, dtype=torch.bool, device=seconds.device)
         valid_keep = valid_key | diag
         keep = valid_keep if keep is None else keep & valid_keep
     if keep is None:
         return None
-    # A query must always see itself even inside the time window.
-    return keep | torch.eye(t, dtype=torch.bool, device=pos_sec.device)
+    # A query must always see itself even inside the window rule.
+    return keep | torch.eye(t, dtype=torch.bool, device=seconds.device)
 
 
 class _RopeBlock(nn.Module):
-    """Pre-LN transformer block: RoPE attention + FFN, gated residuals.
+    """Pre-LN transformer block: RoPE attention + FFN, both residual.
 
-    ``x -> x + gamma_attn * Attn(LN(x));  x -> x + gamma_ffn * FFN(LN(x))``
-    with q/k rotated by RoPE before the dot product. An exact identity at
-    init either way: ``gate_init: zero_gate`` starts both gammas at zero
-    (random output projections — only the gates get a gradient at first);
-    ``zero_proj`` starts the gammas at one and the attention / FFN output
-    projections at zero, so the projections get a first-order gradient from
-    step one.
+    ``x -> x + Proj(Attn(LN(x)));  x -> x + FFN(LN(x))`` with q/k rotated by
+    RoPE before the dot product and both output projections zero-initialised
+    (an exact identity at init).
     """
 
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        mlp_ratio: float,
-        dropout: float,
-        gate_init: str = "zero_gate",
-    ):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim {dim} not divisible by num_heads {num_heads}")
-        if gate_init not in ("zero_gate", "zero_proj"):
-            raise ValueError(f"gate_init must be 'zero_gate' or 'zero_proj'; got {gate_init!r}")
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.dropout = float(dropout)
-        self.gate_init = str(gate_init)
 
         self.norm_attn = nn.LayerNorm(dim)
         self.qkv = nn.Linear(dim, 3 * dim)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(dropout)
-        self.gamma_attn = nn.Parameter(torch.zeros(dim))
 
         hidden = int(dim * mlp_ratio)
         self.norm_ffn = nn.LayerNorm(dim)
@@ -153,22 +133,18 @@ class _RopeBlock(nn.Module):
             nn.Linear(hidden, dim),
             nn.Dropout(dropout),
         )
-        self.gamma_ffn = nn.Parameter(torch.zeros(dim))
-        if gate_init == "zero_proj":
-            # Identity at init through ZERO output projections and UNIT gates.
-            nn.init.zeros_(self.proj.weight)
-            nn.init.zeros_(self.proj.bias)
-            nn.init.zeros_(self.ffn[3].weight)
-            nn.init.zeros_(self.ffn[3].bias)
-            nn.init.ones_(self.gamma_attn)
-            nn.init.ones_(self.gamma_ffn)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+        nn.init.zeros_(self.ffn[3].weight)
+        nn.init.zeros_(self.ffn[3].bias)
+
     def forward(
         self,
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_mask: Optional[torch.Tensor],
-        token_emb: Optional[torch.Tensor] = None,
+        token_emb: torch.Tensor,
     ) -> torch.Tensor:
         """Run one block.
 
@@ -177,18 +153,15 @@ class _RopeBlock(nn.Module):
         :param sin: RoPE table ``[B, 1, T, head_dim]``.
         :param attn_mask: bool ``[B, 1, T, T]`` (``True`` = may attend) or
             ``None`` for all-visible.
-        :param token_emb: optional identity embedding broadcastable onto
+        :param token_emb: slot identity embedding broadcastable onto
             ``[B, T, C]``, added to the LayerNormed input before the q/k/v
             projection. RoPE encodes *time* only, so a sequence carrying
             several tokens per frame needs this to tell its slots apart. Added
-            INSIDE the gated branch, never to the residual stream, so the
-            zero-gate identity at init is preserved exactly. ``None`` (the
-            pose path) leaves the block bit-identical to before.
+            INSIDE the attention branch, never to the residual stream, so the
+            identity at init is preserved exactly.
         """
         b, t, c = x.shape
-        normed = self.norm_attn(x)
-        if token_emb is not None:
-            normed = normed + token_emb
+        normed = self.norm_attn(x) + token_emb
         qkv = self.qkv(normed).reshape(b, t, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)      # each [B, H, T, hd]
         q = rope_rotate(q, cos, sin)
@@ -199,197 +172,33 @@ class _RopeBlock(nn.Module):
             dropout_p=self.dropout if self.training else 0.0,
         )                                                   # [B, H, T, hd]
         attn = attn.transpose(1, 2).reshape(b, t, c)
-        attn = self.proj_drop(self.proj(attn))
-        x = x + self.gamma_attn * attn
-        x = x + self.gamma_ffn * self.ffn(self.norm_ffn(x))
-        return x
+        x = x + self.proj_drop(self.proj(attn))
+        return x + self.ffn(self.norm_ffn(x))
 
-
-class RopeTemporalModule(nn.Module):
-    """Zero-gated RoPE temporal self-attention over a token block.
-
-    :param dim: token working dim (``DECODER.DIM``); blocks run natively at
-        this width (no bottleneck adapter).
-    :param num_layers: number of stacked :class:`_RopeBlock` s.
-    :param num_heads: attention heads per block (``dim / num_heads`` even).
-    :param mlp_ratio: FFN hidden expansion factor.
-    :param dropout: dropout inside attention/FFN.
-    :param time_scale: multiplier from elapsed seconds to RoPE positions;
-        ``25`` calibrates one 25-fps frame step to a unit position.
-    :param max_rel_sec: attention window half-width in *seconds* (``None``
-        disables). Frames further apart than this never attend each other;
-        set it to the training clip span so inference on arbitrarily long
-        sequences only ever sees trained relative offsets.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        num_layers: int = 4,
-        num_heads: int = 16,
-        mlp_ratio: float = 2.0,
-        dropout: float = 0.1,
-        time_scale: float = 25.0,
-        max_rel_sec: Optional[float] = 2.5,
-    ):
-        super().__init__()
-        if not math.isfinite(time_scale) or time_scale <= 0:
-            raise ValueError("time_scale must be finite and positive")
-        if max_rel_sec is not None and (
-            not math.isfinite(max_rel_sec) or max_rel_sec <= 0
-        ):
-            raise ValueError("max_rel_sec must be finite and positive, or None")
-        self.dim = dim
-        self.time_scale = float(time_scale)
-        self.max_rel_sec = None if max_rel_sec is None else float(max_rel_sec)
-        self.blocks = nn.ModuleList(
-            _RopeBlock(dim, num_heads, mlp_ratio, dropout)
-            for _ in range(num_layers)
-        )
-        self.head_dim = self.blocks[0].head_dim if num_layers > 0 else dim // num_heads
-
-    def _attn_mask(
-        self, pos_sec: torch.Tensor, frame_valid: Optional[torch.Tensor]
-    ) -> Optional[torch.Tensor]:
-        """Bool keep-mask ``[n_clips, 1, T, T]``, or ``None`` when all-visible.
-
-        Thin head-dim wrapper around :func:`frame_keep_mask`.
-
-        :param pos_sec: elapsed seconds ``[n_clips, T]``.
-        :param frame_valid: bool ``[n_clips, T]`` or ``None``.
-        """
-        keep = frame_keep_mask(pos_sec, frame_valid, self.max_rel_sec)
-        if keep is None:
-            return None
-        return keep[:, None]                                # [n_clips, 1, T, T]
-
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        seq_len: int,
-        frame_pos_sec: Optional[torch.Tensor] = None,
-        frame_valid: Optional[torch.Tensor] = None,
-        attend: Optional[str] = None,
-        causal: Optional[bool] = None,
-    ) -> torch.Tensor:
-        """Temporal self-attention across the frames of each clip.
-
-        :param tokens: ``[B_flat, K, C]`` with ``B_flat = B_clips * seq_len``
-            (clip-major, frame-minor order); slots attend independently.
-        :param seq_len: frames per clip ``T``.
-        :param frame_pos_sec: elapsed seconds per flattened frame ``[B_flat]``;
-            ``None`` (single images) falls back to zero positions.
-        :param frame_valid: per-frame validity ``[B_flat]`` bool.
-        :param attend: accepted for signature compatibility; must be ``None``
-            or ``'per_token'`` (the only supported mode).
-        :param causal: accepted for signature compatibility; must be falsy —
-            the module is bidirectional by design.
-        :returns: updated tokens ``[B_flat, K, C]``.
-        """
-        if attend not in (None, "per_token"):
-            raise ValueError(f"RopeTemporalModule only attends per_token; got {attend!r}")
-        if causal:
-            raise ValueError("RopeTemporalModule is bidirectional; causal is unsupported")
-
-        b_flat, num_slots, input_dim = tokens.shape
-        if input_dim != self.dim:
-            raise AssertionError(
-                f"token dim {input_dim} does not match configured dim {self.dim}")
-        if b_flat % seq_len != 0:
-            raise AssertionError(f"batch {b_flat} not divisible by seq_len {seq_len}")
-        n_clips = b_flat // seq_len
-
-        if frame_pos_sec is None:
-            pos_sec = torch.zeros(
-                n_clips, seq_len, device=tokens.device, dtype=torch.float32)
-        else:
-            pos_sec = frame_pos_sec.to(tokens.device).float().view(n_clips, seq_len)
-
-        cos, sin = rope_cos_sin(pos_sec * self.time_scale, self.head_dim)
-        cos = cos.to(tokens.dtype)[:, None]                 # [n_clips, 1, T, hd]
-        sin = sin.to(tokens.dtype)[:, None]
-        valid = None
-        if frame_valid is not None:
-            valid = frame_valid.to(
-                device=tokens.device, dtype=torch.bool).view(n_clips, seq_len)
-        mask = self._attn_mask(pos_sec, valid)
-
-        # Fold slots into the batch: each slot attends over its own T frames.
-        x = (tokens.view(n_clips, seq_len, num_slots, input_dim)
-             .permute(0, 2, 1, 3).reshape(n_clips * num_slots, seq_len, input_dim))
-        if num_slots > 1:
-            cos = cos.repeat_interleave(num_slots, dim=0)
-            sin = sin.repeat_interleave(num_slots, dim=0)
-            mask = None if mask is None else mask.repeat_interleave(num_slots, dim=0)
-        for block in self.blocks:
-            x = block(x, cos, sin, mask)
-        return (x.view(n_clips, num_slots, seq_len, input_dim)
-                .permute(0, 2, 1, 3).reshape(b_flat, num_slots, input_dim))
-
-
-# ===========================================================================
-# CrossModalRopeModule — one RoPE temporal transformer over ALL modality
-# tokens of a clip (shares _RopeBlock / rope_cos_sin / frame_keep_mask above).
-#
-#
-# :class:`CrossModalRopeModule` is the single post-decoder mixing brick: it runs
-# self-attention over the concatenation, across a clip's frames, of every listed
-# modality's token block (pose, contact, force, motion). It replaces the retired
-# per-modality sliding-window temporal blocks, the sinusoidal
-# ``cross_modal_temporal`` and the per-frame ``frame_attn`` module at once —
-# within-frame cross-modal attention is simply the ``dt = 0`` diagonal of joint
-# attention.
-#
-# Sequence layout, per clip: ``T`` frames x ``K`` tokens, frame-major
-# (``index = t * K + k``), where ``K`` is the total token count of the listed
-# modalities concatenated in canonical order (pose, contact, force, motion).
-#
-# Positions
-#     Rotary embedding only, at ``frame_pos_sec * time_scale``. Every token of a
-#     frame gets the SAME position, so within-frame pairs attend un-rotated and
-#     across-frame pairs see relative elapsed time — no absolute or sinusoidal
-#     encoding anywhere, and a model trained at ``T = 60`` runs single-pass on a
-#     whole scene.
-#
-# Slot identity
-#     RoPE carries time only, so a learned ``[K, C]`` embedding indexed by slot
-#     position tells the concatenated tokens apart. It is added to the
-#     LayerNormed input *inside* each block's gated attention branch, never to
-#     the residual stream, so the module stays an exact identity at
-#     initialisation (every ``gamma`` starts at zero) — the repo's zero-init
-#     invariant.
-#
-# Masking
-#     Frame-level: keys further than ``max_rel_sec`` away are hidden, and an
-#     invalid frame's tokens are hidden from every other frame (its own frame
-#     stays visible, so no softmax row is ever empty). The frame mask is expanded
-#     to the token grid, so all ``K`` tokens of a frame share one visibility row.
-#
-# The model attribute an instance is bound to (``cross_modal_temporal``) carries
-# the substring the freeze/eval filters in :mod:`contact.model` match on.
-# ===========================================================================
 
 class CrossModalRopeModule(nn.Module):
-    """Zero-gated RoPE self-attention over all modality tokens of a clip.
+    """RoPE self-attention over all modality tokens of a clip, across its frames.
 
-    :param dim: token working dim (``DECODER.DIM``); blocks run natively at
-        this width (no bottleneck adapter).
-    :param num_slots: tokens per frame ``K`` = the concatenated width of the
-        participating modality blocks. Sizes the learned slot embedding, so it
-        is part of the architecture (a different modality list is a different
-        module).
+    One sequence per clip of ``T`` frames x ``K`` tokens, frame-major
+    (``index = t * K + k``), ``K`` = the total token count of the listed
+    modalities concatenated in canonical order (pose, contact, force). Every
+    token of a frame gets the SAME RoPE position, so within-frame pairs attend
+    un-rotated and across-frame pairs see only their relative offset. A learned
+    ``[K, C]`` slot embedding (added to the LayerNormed input inside each
+    block's attention branch, never to the residual stream) tells the slots
+    apart. The frame keep-mask (window + ``frame_valid``) is expanded to the
+    token grid, so all ``K`` tokens of a frame share one visibility row.
+
+    :param dim: token working dim (``DECODER.DIM``).
+    :param num_slots: tokens per frame ``K`` (sizes the slot embedding, so it
+        is part of the architecture).
     :param num_layers: number of stacked RoPE blocks.
     :param num_heads: attention heads per block (``dim / num_heads`` even).
     :param mlp_ratio: FFN hidden expansion factor.
     :param dropout: dropout inside attention/FFN.
-    :param time_scale: multiplier from elapsed seconds to RoPE positions;
-        ``25`` calibrates one 25-fps frame step to a unit position.
-    :param max_rel_sec: attention window half-width in *seconds* (``None``
-        disables). Set it to the training clip span so inference on arbitrarily
-        long sequences only ever sees trained relative offsets.
-    :param gate_init: ``zero_gate`` (``gamma = 0``, random projections) or
-        ``zero_proj`` (``gamma = 1``, zero output projections) — both an exact
-        identity at init; see :class:`_RopeBlock`.
+    :param window: attention half-width in seconds (``None`` = whole clip).
+    :param time_scale: RoPE rotation units per second (``25`` makes one
+        25-fps step a unit position).
     """
 
     def __init__(
@@ -400,28 +209,23 @@ class CrossModalRopeModule(nn.Module):
         num_heads: int = 16,
         mlp_ratio: float = 2.0,
         dropout: float = 0.1,
+        window: Optional[float] = 2.5,
         time_scale: float = 25.0,
-        max_rel_sec: Optional[float] = 2.5,
-        gate_init: str = "zero_gate",
     ):
         super().__init__()
         if num_slots <= 0:
             raise ValueError(f"num_slots must be positive; got {num_slots}")
+        if window is not None and (not math.isfinite(window) or window <= 0):
+            raise ValueError("window must be finite and positive, or None")
         if not math.isfinite(time_scale) or time_scale <= 0:
             raise ValueError("time_scale must be finite and positive")
-        if max_rel_sec is not None and (
-            not math.isfinite(max_rel_sec) or max_rel_sec <= 0
-        ):
-            raise ValueError("max_rel_sec must be finite and positive, or None")
         self.dim = dim
         self.num_slots = int(num_slots)
+        self.window = None if window is None else float(window)
         self.time_scale = float(time_scale)
-        self.max_rel_sec = None if max_rel_sec is None else float(max_rel_sec)
         self.blocks = nn.ModuleList(
-            _RopeBlock(dim, num_heads, mlp_ratio, dropout, gate_init)
-            for _ in range(num_layers)
-        )
-        self.head_dim = self.blocks[0].head_dim if num_layers > 0 else dim // num_heads
+            _RopeBlock(dim, num_heads, mlp_ratio, dropout) for _ in range(num_layers))
+        self.head_dim = dim // num_heads
         # Small init (ViT positional-embedding convention): slots are
         # distinguishable from step one without swamping the LayerNormed
         # features they are added to.
@@ -432,7 +236,7 @@ class CrossModalRopeModule(nn.Module):
         self,
         tokens: torch.Tensor,
         seq_len: int,
-        frame_pos_sec: Optional[torch.Tensor] = None,
+        frame_pos_sec: torch.Tensor,
         frame_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Mix every modality token with every other across the clip's frames.
@@ -442,8 +246,7 @@ class CrossModalRopeModule(nn.Module):
             blocks already concatenated in canonical order.
         :param seq_len: frames per clip ``T``. ``T = 1`` (still images) is legal
             and degenerates to within-frame cross-modal attention.
-        :param frame_pos_sec: elapsed seconds per flattened frame ``[B_flat]``;
-            ``None`` (single images) falls back to zero positions.
+        :param frame_pos_sec: elapsed seconds per flattened frame ``[B_flat]``.
         :param frame_valid: per-frame validity ``[B_flat]`` bool.
         :returns: updated tokens ``[B_flat, K, C]``.
         """
@@ -459,15 +262,10 @@ class CrossModalRopeModule(nn.Module):
             raise AssertionError(f"batch {b_flat} not divisible by seq_len {seq_len}")
         n_clips = b_flat // seq_len
 
-        if frame_pos_sec is None:
-            pos_sec = torch.zeros(
-                n_clips, seq_len, device=tokens.device, dtype=torch.float32)
-        else:
-            pos_sec = frame_pos_sec.to(tokens.device).float().view(n_clips, seq_len)
-
+        seconds = frame_pos_sec.to(tokens.device).float().view(n_clips, seq_len)
         # Every token of a frame shares that frame's position: within-frame
-        # pairs see dt = 0 (un-rotated), across-frame pairs see relative time.
-        token_pos = pos_sec.repeat_interleave(num_slots, dim=1)   # [n_clips, T*K]
+        # pairs see offset 0 (un-rotated), across-frame pairs their relative offset.
+        token_pos = seconds.repeat_interleave(num_slots, dim=1)     # [n_clips, T*K]
         cos, sin = rope_cos_sin(token_pos * self.time_scale, self.head_dim)
         cos = cos.to(tokens.dtype)[:, None]                 # [n_clips, 1, T*K, hd]
         sin = sin.to(tokens.dtype)[:, None]
@@ -476,12 +274,11 @@ class CrossModalRopeModule(nn.Module):
         if frame_valid is not None:
             valid = frame_valid.to(
                 device=tokens.device, dtype=torch.bool).view(n_clips, seq_len)
-        frame_mask = frame_keep_mask(pos_sec, valid, self.max_rel_sec)
-        mask = None
-        if frame_mask is not None:
+        mask = frame_keep_mask(seconds, valid, self.window)
+        if mask is not None:
             # [n_clips, T, T] -> [n_clips, 1, T*K, T*K]: all K tokens of a frame
             # share one visibility row (frame-major token order).
-            mask = frame_mask.repeat_interleave(num_slots, dim=1)
+            mask = mask.repeat_interleave(num_slots, dim=1)
             mask = mask.repeat_interleave(num_slots, dim=2)[:, None]
 
         slot_emb = self.slot_embed.repeat(seq_len, 1)[None]  # [1, T*K, C]

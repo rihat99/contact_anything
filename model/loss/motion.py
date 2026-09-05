@@ -1,210 +1,133 @@
-"""Pelvis root-twist loss against the kindyn ground truth.
+"""Supervision of the refiner's motion output against finite-differenced kindyn GT.
 
-Reads ``out["motion"]["joint_motion"] (B, 1, 3 * len(terms))`` — the
-standardized pelvis twist, three channels per term of ``model.motion.terms``
-in the order ``vel, acc, ang_vel, ang_acc``: linear velocity / acceleration
-in the ``motion_supervision.linear_frame`` (``gravity_view`` or ``body``),
-then the body angular velocity / acceleration (the SE3-log body rate, the
-same in either linear frame).
+Reads ``out["motion"]``: ``vel`` / ``acc`` ``(B, 22, 3)`` — world velocity and
+acceleration of the 22 SMPL-X body joints — and ``ang_vel`` / ``ang_acc``
+``(B, 3)`` of the root, every vector expressed in the predicted body frame
+``frame`` ``(B, 3, 3)`` (world-from-body of the depth-smoothed per-frame root).
 
-The gravity-view frame (GVHMR's) has its vertical along the scene's FITTED
-gravity — read per scene from ``kindyn_1.npz``, not a world axis; the corpus is
-genuinely tilted (median 3.2 deg, max 61 deg) — and its azimuth along the
-per-frame camera view direction. Body roll and pitch therefore no longer rotate
-the linear target, and the vertical is its own channel. The body frame is BVR's
-root body twist (``v = R^T p_dot``), the one a roll-out can integrate.
+Targets are built per clip from the kindyn world joints and root rotation
+(``smplx_joints_world`` / ``smplx_root_rot``): central finite differences at
+the clip's real frame spacing, Gaussian label smoothing of ``label_smooth_sec``
+on the velocity (the acceleration is the smoothed derivative of the smoothed
+velocity — the 2026-08 motion round showed raw kindyn derivatives are too noisy
+to learn from), then rotated into the predicted body frame so prediction and
+target share one frame. The smoothing weights by the derivative's own support
+(both neighbours valid), and rows within ``ceil(2 sigma / dt)`` frames of a run
+end or a hole are not supervised — their kernel is truncated.
 
-GT arrives from the loader in **physical** units (m/s, m/s^2, rad/s, rad/s^2)
-as the full 12-channel twist and is sliced to the head's terms and standardized
-here with the config's pinned ``motion_supervision.standardize`` table
-(measured per linear frame), so the objective is reproducible from a
-checkpoint's stored config alone (a registered buffer would not be serialised).
-
-One Huber term per head term with a non-zero weight, sharing one mask: an
-entry contributes when the frame is motion-valid (the central-difference
-stencil has support, outside the scene-edge and gap trims) and frame-valid.
-During TRAINING the per-frame outlier bit additionally drops the row — the
-same kindyn position spike contaminates the velocity and the acceleration —
-while evaluation never filters, so the reported numbers are protocol-stable
-across runs.
-
-Diagnostics are de-standardized and reported in two ways per quantity: the
-Pearson r pooled over the 3 target-axis components (what the head actually
-regresses), and the **world-vertical** one — the world vectors projected on the
-scene's fitted gravity, positive downward. Both sides go through the identical
-conversion, so the comparison stays like-for-like.
+Every quantity is divided by its ``scale`` (the GT RMS, config) before a Huber
+of width ``huber_delta`` in those standardized units, so the four terms start on
+an equal footing. Metrics: RMSE in physical units and the pooled Pearson
+correlation over all components, per quantity.
 """
 from __future__ import annotations
 
-from typing import Sequence
+import math
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from model.loss import Loss, LossResult
-from utils.metrics import pearson_from_stats, rmse_from_stats
+from model.refiner import (NUM_BODY_JOINTS, angular_velocity, gaussian_smooth,
+                           stencil_valid, time_derivative)
+from utils.metrics import pearson_from_stats
 
-#: The four possible triples, in the loader's ``motion_gt`` channel order.
-TERM_NAMES = ("vel", "acc", "ang_vel", "ang_acc")
-#: Columns of the per-quantity statistics block. The ``*_vert`` group feeds the
-#: world-vertical Pearson r, the ``*_3d`` group the pooled 3-component one
-#: (whose sample count is ``3 * n``).
-STAT_COLUMNS = ("n", "pred_vert", "gt_vert", "pred_vert_sq", "gt_vert_sq",
-                "pred_gt_vert", "sq_err_3d", "pred_3d", "gt_3d", "pred_3d_sq",
-                "gt_3d_sq", "pred_gt_3d")
-
-
-def standardize_table(
-    cfg: dict, terms: Sequence[str], device, dtype=torch.float32,
-) -> tuple[Tensor, Tensor]:
-    """``(mean, std)`` ``[1, K, 3 * len(terms)]`` of the pinned per-frame table.
-
-    ``motion_supervision.standardize`` is ``[K][4][3]`` over :data:`TERM_NAMES`;
-    the head's ``terms`` select and order the triples.
-    """
-    table = cfg["motion_supervision"]["standardize"]
-    if table["mean"] is None or table["std"] is None:
-        raise ValueError(
-            "motion_supervision.standardize.mean/std must be measured [K][4][3] "
-            "tables (null = not measured for this linear_frame)")
-    mean = torch.tensor(table["mean"], dtype=dtype)
-    std = torch.tensor(table["std"], dtype=dtype)
-    if mean.ndim != 3 or mean.shape[1:] != (len(TERM_NAMES), 3) or std.shape != mean.shape:
-        raise ValueError(
-            f"motion_supervision.standardize must be [K][4][3]; got mean "
-            f"{tuple(mean.shape)}, std {tuple(std.shape)}")
-    index = [TERM_NAMES.index(t) for t in terms]
-    return (mean[:, index].reshape(1, mean.shape[0], -1).to(device),
-            std[:, index].reshape(1, std.shape[0], -1).to(device))
-
-
-def select_terms(gt: Tensor, terms: Sequence[str]) -> Tensor:
-    """Slice the loader's ``(B, K, 12)`` twist to ``(B, K, 3 * len(terms))``."""
-    return torch.cat([gt[..., 3 * TERM_NAMES.index(t):3 * TERM_NAMES.index(t) + 3]
-                      for t in terms], dim=-1)
+QUANTITIES = ("vel", "acc", "ang_vel", "ang_acc")
+_STATS = ("se", "sum_p", "sum_g", "sum_pg", "sum_pp", "sum_gg", "n")
 
 
 class MotionLoss(Loss):
-    """Standardized Huber on the pelvis twist terms the head emits."""
+    """Standardized Huber on the four motion quantities of the refiner."""
 
     name = "motion"
+    stat_names = tuple(f"{q}/{s}" for q in QUANTITIES for s in _STATS)
 
     def __init__(self, cfg: dict, model, device: torch.device | str) -> None:
         super().__init__(cfg, model, device)
-        ms = cfg["motion_supervision"]
-        loss_cfg = ms["loss"]
-        self.terms = list(self.model.motion_terms)
-        self.weights = {name: float(loss_cfg[name]) for name in TERM_NAMES}
-        missing = [t for t in TERM_NAMES if self.weights[t] != 0.0 and t not in self.terms]
-        if missing:
-            raise ValueError(
-                f"motion_supervision.loss weights {missing} are non-zero but the head "
-                f"emits only {self.terms}")
-        self.term_names = tuple(n for n in self.terms if self.weights[n] != 0.0)
-        if not self.term_names:
-            raise ValueError(
-                "motion_supervision: every loss weight is 0 — disable the section instead")
-        self.stat_names = tuple(f"{term}/{column}"
-                                for term in self.terms for column in STAT_COLUMNS)
-        self.huber_delta = float(loss_cfg["huber_delta"])
-        self.mean, self.std = standardize_table(cfg, self.terms, self.device, self.dtype)
+        section = cfg["motion_supervision"]
+        self.sigma = float(section["label_smooth_sec"])
+        self.scale = {q: float(section["scale"][q]) for q in QUANTITIES}
+        self.weights = {q: float(section["loss"][q]) for q in QUANTITIES}
+        self.delta = float(section["loss"]["huber_delta"])
+        self.term_names = tuple(q for q in QUANTITIES if self.weights[q] > 0.0)
+
+    def targets(self, batch: dict, frame: Tensor) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+        """GT motion in the predicted body frame and the per-row validity masks.
+
+        :param frame: ``(B, 3, 3)`` world-from-body of the prediction.
+        :returns: ``({quantity: target}, {quantity: mask (B,) bool})``.
+        """
+        seq_len = int(batch["seq_len"])
+        n_frames = frame.shape[0]
+        n_clips = n_frames // seq_len
+        seconds = batch["frame_pos_sec"].to(self.device, self.dtype).view(n_clips, seq_len)
+        valid = (batch["smplx_valid"] & batch["frame_valid"]).to(self.device).view(n_clips, seq_len)
+        joints = batch["smplx_joints_world"][:, :NUM_BODY_JOINTS].to(self.device, self.dtype)
+        joints = joints.view(n_clips, seq_len, NUM_BODY_JOINTS, 3)
+        root = batch["smplx_root_rot"].to(self.device, self.dtype).view(n_clips, seq_len, 3, 3)
+
+        # A derivative exists only where both neighbours are valid; the smoothing must weight
+        # by THAT support (a forced-zero derivative next to a hole would otherwise leak into
+        # its valid neighbours). Rows within ~2 sigma of a run end or a hole see a truncated
+        # kernel, so the loss masks them too: radius = ceil(2 sigma / dt).
+        first = stencil_valid(valid, 1)
+        second = stencil_valid(valid, 2)
+        vel_w = gaussian_smooth(time_derivative(joints, seconds, valid), seconds, first, self.sigma)
+        acc_w = gaussian_smooth(time_derivative(vel_w, seconds, first), seconds, second, self.sigma)
+        ang_body = angular_velocity(root, seconds, valid)                    # GT body frame
+        ang_w = gaussian_smooth((root @ ang_body[..., None])[..., 0], seconds, first, self.sigma)
+        ang_acc_w = gaussian_smooth(time_derivative(ang_w, seconds, first), seconds, second, self.sigma)
+
+        to_body = frame.transpose(1, 2)                                      # body-from-world
+        targets = {
+            "vel": torch.einsum("bij,bkj->bki", to_body, vel_w.reshape(n_frames, NUM_BODY_JOINTS, 3)),
+            "acc": torch.einsum("bij,bkj->bki", to_body, acc_w.reshape(n_frames, NUM_BODY_JOINTS, 3)),
+            "ang_vel": (to_body @ ang_w.reshape(n_frames, 3, 1))[..., 0],
+            "ang_acc": (to_body @ ang_acc_w.reshape(n_frames, 3, 1))[..., 0],
+        }
+        steps = seconds[:, 1:] - seconds[:, :-1]
+        dt = float(steps[steps > 0].median()) if bool((steps > 0).any()) else 0.0
+        edge = int(math.ceil(2.0 * self.sigma / dt)) if dt > 0 else 0
+        rows_vel = stencil_valid(valid, max(1, edge)).reshape(n_frames)
+        rows_acc = stencil_valid(valid, max(2, edge)).reshape(n_frames)
+        masks = {"vel": rows_vel, "acc": rows_acc, "ang_vel": rows_vel, "ang_acc": rows_acc}
+        return targets, masks
 
     def __call__(self, out: dict, batch: dict, *, train: bool) -> LossResult:
-        pred = out["motion"]["joint_motion"].to(self.device, self.dtype)  # (B,K,3n)
-        anchor = pred.sum() * 0.0
-        gt = select_terms(batch["motion_gt"].to(self.device, self.dtype), self.terms)
-        if pred.shape != gt.shape:
-            raise ValueError(
-                f"motion prediction {tuple(pred.shape)} does not match the GT "
-                f"{tuple(gt.shape)} — model.motion.keypoint_indices / terms and the "
-                f"dataset's motion slots must agree")
-        if self.mean.shape[1] != pred.shape[1]:
-            raise ValueError(
-                f"motion_supervision.standardize has {self.mean.shape[1]} slot "
-                f"rows but the model predicts {pred.shape[1]} motion tokens")
+        motion = out["motion"]
+        pred = {q: motion[q].to(self.device, self.dtype) for q in QUANTITIES}
+        anchor = sum(p.sum() for p in pred.values()) * 0.0
+        # The frame is a fixed input of the loss: a trainable pose path must never lower this
+        # term by rotating its root instead of fixing the motion.
+        targets, masks = self.targets(batch, motion["frame"].detach().to(self.device, self.dtype))
 
-        valid = (batch["motion_valid"] & batch["frame_valid"]).to(self.device)
-        mask = valid[:, None].expand(-1, pred.shape[1])
-        n_outlier = 0
-        if train:
-            outlier = batch["motion_outlier"].to(self.device)
-            n_outlier = int((mask & outlier).sum())
-            mask = mask & ~outlier
-
-        huber = F.smooth_l1_loss(
-            pred, (gt - self.mean) / self.std, reduction="none", beta=self.huber_delta)
-        mass = float(mask.sum())
-        raw = {
-            name: (self.weights[name]
-                   * (huber[..., 3 * i:3 * i + 3].sum(dim=-1) * mask).sum(), mass)
-            for i, name in enumerate(self.terms) if self.weights[name] != 0.0
-        }
-
-        stats = self._statistics(pred.detach(), gt, mask, batch)
-        scalars = {"n_outlier": float(n_outlier), "n_rows": float(valid.sum())}
-        for i, name in enumerate(self.terms):
-            block = stats[i * len(STAT_COLUMNS):(i + 1) * len(STAT_COLUMNS)]
-            scalars[f"{name}_rmse"] = float(
-                rmse_from_stats(block[6], block[0]))
-        return LossResult(terms=self._terms(raw, anchor), scalars=scalars,
-                          stats=stats)
-
-    @torch.no_grad()
-    def _statistics(
-        self, pred: Tensor, gt: Tensor, mask: Tensor, batch: dict,
-    ) -> Tensor:
-        """De-standardized Pearson / RMSE sufficient statistics. ``[terms * 12]`` float64.
-
-        The vertical component is the world vector projected on the scene's
-        fitted ``gravity_world`` (down-positive) — a fixed axis index would be
-        wrong for the hundreds of scenes whose gravity is tilted. The linear
-        pair rotates by the linear frame's own world rotation, the angular
-        pair by the body rotation.
-        """
-        physical = pred * self.std + self.mean                          # (B,K,3n)
-        weight = mask.to(torch.float64)                                 # (B,K)
-        lin_rot = batch["motion_lin_rot"].to(self.device, self.dtype)   # (B,3,3)
-        rot = batch["motion_rot"].to(self.device, self.dtype)
-        gravity = batch["gravity_world"].to(self.device, self.dtype)    # (B,3)
-
-        stats = torch.zeros(len(self.terms), len(STAT_COLUMNS),
-                            dtype=torch.float64, device=self.device)
-        for i, name in enumerate(self.terms):
-            channels = slice(3 * i, 3 * i + 3)
-            p = physical[..., channels].to(torch.float64)               # (B,K,3)
-            g = gt[..., channels].to(torch.float64)
-            world = lin_rot if name in ("vel", "acc") else rot
-            p_world = torch.einsum("bij,bkj->bki", world, physical[..., channels])
-            g_world = torch.einsum("bij,bkj->bki", world, gt[..., channels])
-            p_vert = (p_world * gravity[:, None, :]).sum(-1).to(torch.float64)
-            g_vert = (g_world * gravity[:, None, :]).sum(-1).to(torch.float64)
-            weight3 = weight[:, :, None]
-            stats[i] = torch.stack([
-                weight.sum(),
-                (p_vert * weight).sum(), (g_vert * weight).sum(),
-                (p_vert * p_vert * weight).sum(), (g_vert * g_vert * weight).sum(),
-                (p_vert * g_vert * weight).sum(),
-                (((p - g) ** 2).sum(dim=-1) * weight).sum(),
-                (p * weight3).sum(), (g * weight3).sum(),
-                (p * p * weight3).sum(), (g * g * weight3).sum(),
-                (p * g * weight3).sum(),
-            ])
-        return stats.reshape(-1)
+        raw: dict[str, tuple[Tensor, float]] = {}
+        stats = []
+        for q in QUANTITIES:
+            p, g = pred[q].reshape(pred[q].shape[0], -1), targets[q].reshape(pred[q].shape[0], -1)
+            mask = masks[q].to(self.dtype)
+            if self.weights[q] > 0.0:
+                huber = F.smooth_l1_loss(p / self.scale[q], g / self.scale[q],
+                                         reduction="none", beta=self.delta).mean(dim=-1)
+                raw[q] = (self.weights[q] * (huber * mask).sum(), float(mask.sum()))
+            with torch.no_grad():
+                pm, gm = p.detach() * mask[:, None], g * mask[:, None]
+                stats += [float(((pm - gm) ** 2).sum()), float(pm.sum()), float(gm.sum()),
+                          float((pm * gm).sum()), float((pm * pm).sum()), float((gm * gm).sum()),
+                          float(mask.sum() * p.shape[1])]
+        return LossResult(
+            terms=self._terms(raw, anchor),
+            scalars={"n_rows": float(masks["vel"].sum())},
+            stats=torch.tensor(stats, dtype=torch.float64, device=self.device))
 
     def metrics(self, stats: Tensor) -> dict[str, float]:
-        blocks = stats.reshape(len(self.terms), len(STAT_COLUMNS))
-        out: dict[str, float] = {}
-        for i, name in enumerate(self.terms):
-            n, pv, gv, pv2, gv2, pgv, sq3, p3, g3, p32, g32, pg3 = blocks[i]
-            out[f"{name}_vert_r"] = float(
-                pearson_from_stats(n, pv, gv, pv2, gv2, pgv))
-            out[f"{name}_r3d"] = float(
-                pearson_from_stats(3.0 * n, p3, g3, p32, g32, pg3))
-            out[f"{name}_rmse"] = float(rmse_from_stats(sq3, n))
-            out[f"{name}_gt_rms"] = float(rmse_from_stats(g32, n))   # zero-predictor RMSE
-        out["n_rows"] = float(blocks[0, 0])
+        out = {}
+        for i, q in enumerate(QUANTITIES):
+            se, sp, sg, spg, spp, sgg, n = (float(v) for v in stats[7 * i:7 * i + 7])
+            out[f"{q}_rmse"] = math.sqrt(se / n) if n > 0 else float("nan")
+            out[f"{q}_pearson"] = pearson_from_stats(sp, sg, spg, spp, sgg, n)
         return out
 
 
-__all__ = ["MotionLoss", "TERM_NAMES", "STAT_COLUMNS", "standardize_table", "select_terms"]
+__all__ = ["MotionLoss", "QUANTITIES"]

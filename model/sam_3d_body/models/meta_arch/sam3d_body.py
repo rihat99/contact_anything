@@ -36,10 +36,10 @@ class ExtraTokenBlock:
 
     The fork knows nothing about what a block means; it only (1) appends the
     given ``tokens`` after the original token sequence, (2) builds an asymmetric
-    attention mask so no original token (and, under ``causal``, no earlier
-    block) ever attends it, and (3) invokes ``update_fn`` after every
-    intermediate decoder layer so the owner can refresh the block from the
-    layer's interm pose prediction.
+    attention mask so no original token ever attends it (the appended blocks
+    attend everything), and (3) invokes ``update_fn`` after every intermediate
+    decoder layer so the owner can refresh the block from the layer's interm
+    pose prediction.
 
     Attributes:
         name: unique block name; keys the returned ``blocks`` bounds dict.
@@ -49,14 +49,11 @@ class ExtraTokenBlock:
             pose_output) -> (token_embeddings, token_augment)`` — called for
             every decoder layer except the last, with the ray-conditioned image
             embeddings and that layer's interm pose output.
-        blind_to_image: gate this block's image cross-attention output to zero
-            (the block then sees the image only indirectly via self-attention).
     """
 
     name: str
     tokens: "torch.Tensor"
     update_fn: "Optional[Callable]" = None
-    blind_to_image: bool = False
 # --- end extra-token-block hook ---
 
 
@@ -339,7 +336,6 @@ class SAM3DBody(BaseModel):
         condition_info: Optional[torch.Tensor] = None,
         batch=None,
         extra_blocks=None,
-        extra_token_attention: str = "mutual",
     ):
         """
         Args:
@@ -386,7 +382,6 @@ class SAM3DBody(BaseModel):
 
         image_augment, token_augment, token_mask = None, None, None
         extra_block_bounds = {}          # extra-token-block hook
-        token_context_gate = None        # extra-token-block hook (blind blocks)
         if hasattr(self, "prompt_encoder") and keypoints is not None:
             if prev_estimate is None:
                 # Use initial embedding if no previous embedding
@@ -512,9 +507,8 @@ class SAM3DBody(BaseModel):
             # Append every externally-owned token block after the original
             # sequence, then build the mask: original tokens NEVER attend the
             # appended blocks, so the original outputs have an exactly-zero
-            # Jacobian w.r.t. anything block-side. 'mutual' lets the appended
-            # blocks fully inter-attend (only the first start is a barrier);
-            # 'causal' additionally bars every earlier block from later ones.
+            # Jacobian w.r.t. anything block-side; the appended blocks fully
+            # inter-attend (only the first block's start is a barrier).
             if extra_blocks:
                 for _blk in extra_blocks:
                     assert _blk.tokens.dim() == 3 and _blk.tokens.shape[0] == batch_size, (
@@ -529,31 +523,10 @@ class SAM3DBody(BaseModel):
                         [token_augment, torch.zeros_like(_blk.tokens)], dim=1)
                     extra_block_bounds[_blk.name] = (
                         _start, token_embeddings.shape[1])
-                _starts = [lo for lo, hi in extra_block_bounds.values()]
-                if extra_token_attention == "mutual":
-                    _starts = _starts[:1]
-                elif extra_token_attention != "causal":
-                    raise ValueError(
-                        "extra_token_attention must be 'mutual' or 'causal'; "
-                        f"got {extra_token_attention!r}")
+                _first_start = next(iter(extra_block_bounds.values()))[0]
                 token_mask = self._build_block_token_mask(
-                    batch_size, token_embeddings.shape[1], _starts,
+                    batch_size, token_embeddings.shape[1], _first_start,
                     token_embeddings.device)
-                # Blind blocks: every token cross-attends the image, and that
-                # attention is unmasked. A fully-masked query row would make
-                # softmax produce NaN, so instead the cross-attention *output*
-                # rows of a blind block are zeroed before their residual add.
-                # Cross-attention is independent per query row (keys/values are
-                # image-only), so no other row moves by a single ulp.
-                if any(_blk.blind_to_image for _blk in extra_blocks):
-                    token_context_gate = torch.ones(
-                        1, token_embeddings.shape[1], 1,
-                        dtype=token_embeddings.dtype,
-                        device=token_embeddings.device)
-                    for _blk in extra_blocks:
-                        if _blk.blind_to_image:
-                            _lo, _hi = extra_block_bounds[_blk.name]
-                            token_context_gate[:, _lo:_hi] = 0.0
             # --- end extra-token-block hook ---
 
         # We're doing intermediate model predictions
@@ -618,7 +591,6 @@ class SAM3DBody(BaseModel):
             token_mask,
             token_to_pose_output_fn=token_to_pose_output_fn,
             keypoint_token_update_fn=keypoint_token_update_fn_comb,
-            token_context_gate=token_context_gate,   # extra-token-block hook
         )
 
         # --- extra-token-block hook (return full sequence + bounds) ---
@@ -878,57 +850,21 @@ class SAM3DBody(BaseModel):
         else:
             return pose_token, pose_output
 
-    # --- extra-token-block hook (mask builder + external final readout) ---
+    # --- extra-token-block hook (mask builder) ---
     @staticmethod
-    def _build_block_token_mask(batch_size, num_total, block_starts, device):
+    def _build_block_token_mask(batch_size, num_total, start, device):
         """Asymmetric token-token attention mask for the appended token blocks.
 
-        For each start ``s`` in ``block_starts`` (ascending), every token before
-        ``s`` is barred from attending any token at ``>= s`` (True=allowed), while
-        tokens at ``>= s`` still attend everything before them. Passing every
-        appended block's start gives the block-causal regime; passing only the
-        FIRST start gives the mutual regime (the appended blocks fully
-        inter-attend, the original tokens still attend none of them). Returns a
-        bool mask of shape ``(batch_size, num_total, num_total)``.
+        Every token before ``start`` (the original sequence) is barred from
+        attending any token at ``>= start`` (True = allowed); the appended tokens
+        attend everything. Returns a bool mask ``(batch_size, num_total, num_total)``.
         """
         token_mask = torch.ones(
             batch_size, num_total, num_total, dtype=torch.bool, device=device,
         )
-        for start in block_starts:
-            token_mask[:, :start, start:] = False
+        token_mask[:, :start, start:] = False
         return token_mask
 
-    def readout_pose(self, pose_token, batch, proj_pose=None, proj_camera=None):
-        """Recompute the final MHR + camera readout from a (possibly updated)
-        body pose token.
-
-        Mirrors the in-decoder ``token_to_pose_output_fn`` exactly: with the
-        original projections and the token the decoder produced, the result is
-        bit-identical to the decoder's own final output. Callers that modify
-        the pose token after the decoder (temporal mixing) or substitute
-        fine-tuned projection copies (``proj_pose`` / ``proj_camera``) use this
-        for the final readout; every in-decoder intermediate prediction keeps
-        the frozen originals.
-
-        Args:
-            pose_token: ``[B, C]`` final body pose token.
-            batch: the same batch dict the decoder forward consumed
-                (camera/bbox fields; ``self.body_batch_idx`` must be current).
-            proj_pose / proj_camera: optional external projection FFNs
-                replacing ``head_pose.proj`` / ``head_camera.proj`` for this
-                call only.
-        """
-        batch_size = pose_token.shape[0]
-        prev_pose = self.init_pose.weight.expand(batch_size, -1)
-        prev_camera = self.init_camera.weight.expand(batch_size, -1)
-        pose_output = self.head_pose(pose_token, prev_pose, proj=proj_pose)
-        pose_output["pred_cam"] = self.head_camera(
-            pose_token, prev_camera, proj=proj_camera)
-        pose_output = self.camera_project(pose_output, batch)
-        pose_output["pred_keypoints_2d_cropped"] = self._full_to_crop(
-            batch, pose_output["pred_keypoints_2d"], self.body_batch_idx
-        )
-        return pose_output
     # --- end extra-token-block hook ---
 
     @torch.no_grad()
@@ -1242,7 +1178,6 @@ class SAM3DBody(BaseModel):
         batch: Dict,
         precomputed_features=None,
         extra_blocks=None,
-        extra_token_attention: str = "mutual",
     ) -> Dict:
         """Run a forward pass for the crop-image (pose) branch.
 
@@ -1255,7 +1190,6 @@ class SAM3DBody(BaseModel):
                 produces.
             extra_blocks: optional list of :class:`ExtraTokenBlock` appended to
                 the body decoder sequence (see ``forward_decoder``).
-            extra_token_attention: mask regime among the appended blocks.
         """
         batch_size, num_person = batch["img"].shape[:2]
 
@@ -1375,7 +1309,6 @@ class SAM3DBody(BaseModel):
                     condition_info=condition_info[self.body_batch_idx],
                     batch=batch,
                     extra_blocks=extra_blocks,
-                    extra_token_attention=extra_token_attention,
                 )
             # --- end extra-token-block hook ---
             else:
@@ -1444,7 +1377,6 @@ class SAM3DBody(BaseModel):
         decoder_type: str = "body",
         precomputed_features=None,
         extra_blocks=None,
-        extra_token_attention: str = "mutual",
     ) -> Tuple[Dict, Dict]:
         batch_size, num_person = batch["img"].shape[:2]
 
@@ -1462,7 +1394,6 @@ class SAM3DBody(BaseModel):
             batch,
             precomputed_features=precomputed_features,
             extra_blocks=extra_blocks,
-            extra_token_attention=extra_token_attention,
         )
 
         return pose_output

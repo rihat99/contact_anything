@@ -139,18 +139,9 @@ class ReconstructionSceneDataset(ClipDataset):
             "bbox": bbox,
             "intrinsics": intrinsics,
             "extrinsics": extrinsics,
-            "cam_centers": -np.einsum(
-                "nji,nj->ni", extrinsics[:, :3, :3], extrinsics[:, :3, 3]
-            ).astype(np.float32),
             "valid_mask": valid_mask,
             "fps": fps,
         }
-        kindyn_path = self.out_dir / "human_optim" / "kindyn_1.npz"
-        if kindyn_path.is_file():
-            gravity = np.asarray(
-                np.load(kindyn_path, allow_pickle=True)["gravity_world"],
-                np.float32).reshape(3)
-            scene_data["gravity_world"] = gravity / np.linalg.norm(gravity)
         return scene_data
 
     def _frame(
@@ -169,14 +160,9 @@ class ReconstructionSceneDataset(ClipDataset):
             "bbox": data["bbox"][person, position],
             "cam_int": data["intrinsics"][position],
             "cam_from_world": data["extrinsics"][position],
-            "cam_jump_m": float(np.linalg.norm(
-                data["cam_centers"][position]
-                - data["cam_centers"][int(positions[row - 1])])) if row > 0 else 0.0,
             "frame_pos_sec": float(position - int(positions[0])) / data["fps"],
             "frame_index": position,
             "frame_valid": True,
             "key": f"{scene}#{oid}@{position}",
         }
-        if "gravity_world" in data:
-            frame["gravity_world"] = data["gravity_world"]
         return frame

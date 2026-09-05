@@ -1,25 +1,18 @@
-"""Torch geometry shared by the loss terms: SO(3) logs and the camera -> world lift.
+"""Torch geometry shared by the SMPL-X head and its loss / metrics.
 
 Frames and units, the bug-prone part every consumer here depends on:
 
-* The pose head speaks camera-crop language. ``pred_keypoints_3d`` /
-  ``pred_vertices`` are camera-frame metres RELATIVE to the body root,
-  ``pred_cam_t`` is the crop translation that places them, and ``global_rot``
-  is an ``xyz`` Euler triple on the MHR head's *native* axes — the camera axes
-  differ from those by ``diag(1, -1, -1)`` (a rotation, ``det = +1``).
-* ``cam_from_world`` is the dataset's metric OpenCV extrinsic ``[R | t]``
+* The SMPL-X head predicts the body in the OpenCV CAMERA frame (metres);
+  ``cam_from_world`` is the dataset's metric OpenCV extrinsic ``[R | t]``
   (world -> camera), so the world lift of an absolute camera-frame point is
   ``p_w = R^T (p_c - t)``.
+* Camera translation has two parametrizations: CLIFF's crop weak-perspective
+  proxy ``(s, tx, ty)`` (lifted with the crop box and the focal) and the pelvis
+  ray ``(x/z, y/z, log z)``. Both directions of each are here, so the head and
+  the GT proxy targets share one arithmetic.
 
-Anything that compares a prediction against a metric world quantity (kindyn
-root poses, GT keypoints, force positions) has to undo all three; doing it in
-one place is what keeps the keypoint, contact-consistency and force-consistency
-losses on the same convention. Everything is differentiable end to end, so the
-gradient reaches the pose path.
-
-The quaternion / log helpers mirror the loader's float64 target derivation —
-same hemisphere flip, same small-angle Taylor branch — so a prediction and its
-target are compared through identical arithmetic.
+Everything is differentiable end to end except :func:`procrustes_align`
+(metrics only).
 """
 from __future__ import annotations
 
@@ -27,209 +20,16 @@ import roma
 import torch
 from torch import Tensor
 
-#: Camera-vs-native axis flip of the MHR head (axes 1, 2; ``det = +1``).
-CAMERA_FROM_NATIVE = torch.diag(torch.tensor([1.0, -1.0, -1.0]))
-
-#: MHR70 left/right hip keypoints. Their mean is the body placement every
-#: world lift of the prediction is rooted at (MHR70 has no pelvis keypoint).
-HIP_KEYPOINTS = (9, 10)
-
-#: Small-angle Taylor threshold on ``theta^2`` for the quaternion log.
-_TAYLOR_THETA2 = 1e-8
-
-
-def matrix_to_quat_xyzw(rot: Tensor) -> Tensor:
-    """Differentiable rotation matrix -> ``xyzw`` quaternion. ``(..., 3, 3) -> (..., 4)``.
-
-    Shepperd's method: all four candidate quaternions are formed and the
-    best-conditioned one (largest denominator) is selected per element with
-    ``gather`` — smooth wherever the selection is locally constant.
-    """
-    m = rot
-    m00, m11, m22 = m[..., 0, 0], m[..., 1, 1], m[..., 2, 2]
-    trace = m00 + m11 + m22
-    # Four squared denominators (each >= 0): 1 + trace and 1 + 2 m_ii - trace.
-    q_sq = torch.stack([
-        1.0 + trace, 1.0 + 2.0 * m00 - trace,
-        1.0 + 2.0 * m11 - trace, 1.0 + 2.0 * m22 - trace], dim=-1)
-    q_sq = q_sq.clamp(min=0.0)
-    best = q_sq.argmax(dim=-1, keepdim=True)
-    denom = 0.5 / (q_sq.gather(-1, best).squeeze(-1) + 1e-12).sqrt()
-
-    w0 = 0.25 / denom
-    cands = torch.stack([
-        torch.stack([(m[..., 2, 1] - m[..., 1, 2]) * denom,
-                     (m[..., 0, 2] - m[..., 2, 0]) * denom,
-                     (m[..., 1, 0] - m[..., 0, 1]) * denom, w0], dim=-1),
-        torch.stack([w0,
-                     (m[..., 0, 1] + m[..., 1, 0]) * denom,
-                     (m[..., 0, 2] + m[..., 2, 0]) * denom,
-                     (m[..., 2, 1] - m[..., 1, 2]) * denom], dim=-1),
-        torch.stack([(m[..., 0, 1] + m[..., 1, 0]) * denom, w0,
-                     (m[..., 1, 2] + m[..., 2, 1]) * denom,
-                     (m[..., 0, 2] - m[..., 2, 0]) * denom], dim=-1),
-        torch.stack([(m[..., 0, 2] + m[..., 2, 0]) * denom,
-                     (m[..., 1, 2] + m[..., 2, 1]) * denom, w0,
-                     (m[..., 1, 0] - m[..., 0, 1]) * denom], dim=-1),
-    ], dim=-2)                                              # (..., 4 cands, 4)
-    quat = cands.gather(
-        -2, best[..., None].expand(*best.shape[:-1], 1, 4)).squeeze(-2)
-    return quat / quat.norm(dim=-1, keepdim=True).clamp(min=1e-12)
-
-
-def quat_log_xyzw(quat: Tensor) -> Tensor:
-    """Rotation vector of an ``xyzw`` unit quaternion. ``(..., 4) -> (..., 3)``.
-
-    Hemisphere-aligned (``w >= 0``) so the log is the shortest rotation, with a
-    Taylor branch near identity where ``theta / sin(theta / 2)`` is ill-conditioned.
-    """
-    quat = torch.where(quat[..., 3:4] < 0.0, -quat, quat)
-    qxyz, qw = quat[..., :3], quat[..., 3:4]
-    sin_half2 = (qxyz * qxyz).sum(dim=-1, keepdim=True)
-    taylor = sin_half2 < _TAYLOR_THETA2 / 4.0
-    sin_half = torch.where(taylor, torch.ones_like(sin_half2), sin_half2).sqrt()
-    theta = 2.0 * torch.atan2(sin_half, qw.clamp(-1.0, 1.0))
-    factor = torch.where(
-        taylor, 2.0 + sin_half2 * (2.0 / 3.0), theta / sin_half.clamp(min=1e-30))
-    return factor * qxyz
-
-
-def so3_log(rot: Tensor) -> Tensor:
-    """Rotation vector of a rotation matrix. ``(..., 3, 3) -> (..., 3)``.
-
-    Taylor-smooth at the identity, unlike a ``acos`` geodesic angle whose
-    gradient explodes there — which is what a trust-region rail needs.
-    """
-    return quat_log_xyzw(matrix_to_quat_xyzw(rot))
-
-
-def _hat(vec: Tensor) -> Tensor:
-    """Skew-symmetric matrix of a vector. ``(..., 3) -> (..., 3, 3)``."""
-    zero = torch.zeros_like(vec[..., 0])
-    x, y, z = vec[..., 0], vec[..., 1], vec[..., 2]
-    return torch.stack([
-        torch.stack([zero, -z, y], dim=-1),
-        torch.stack([z, zero, -x], dim=-1),
-        torch.stack([-y, x, zero], dim=-1),
-    ], dim=-2)
-
-
-def se3_exp(twist: Tensor) -> tuple[Tensor, Tensor]:
-    """SE(3) exponential of a twist ``[linear, angular]``. ``(..., 6) -> (R (..., 3, 3), p (..., 3))``.
-
-    The inverse of the loader's ``se3_log`` layout: ``R = exp(hat(omega))``,
-    ``p = V(omega) u`` with ``V = I + (1 - cos t)/t^2 W + (t - sin t)/t^3 W^2``
-    (Taylor branches near the identity).
-    """
-    u, omega = twist[..., :3], twist[..., 3:]
-    theta2 = (omega * omega).sum(dim=-1, keepdim=True)
-    small = theta2 < _TAYLOR_THETA2
-    safe = torch.where(small, torch.ones_like(theta2), theta2)
-    theta = safe.sqrt()
-    a = torch.where(small, 0.5 - theta2 / 24.0, (1.0 - torch.cos(theta)) / safe)
-    b = torch.where(small, 1.0 / 6.0 - theta2 / 120.0,
-                    (theta - torch.sin(theta)) / (safe * theta))
-    skew = _hat(omega)
-    v_mat = (torch.eye(3, dtype=twist.dtype, device=twist.device)
-             + a[..., None] * skew + b[..., None] * (skew @ skew))
-    return roma.rotvec_to_rotmat(omega), (v_mat @ u[..., None])[..., 0]
-
-
-def se3_log(rot: Tensor, trans: Tensor) -> Tensor:
-    """``log`` of the SE(3) element ``(rot, trans)``. ``(..., 3, 3), (..., 3) -> (..., 6)``.
-
-    Torch mirror of the loader's ``kindyn.se3_log_xyzw`` (layout ``[linear,
-    angular]``, the ``V^{-1}(omega) = I - W/2 + coeff W^2`` correction on the
-    linear part, Taylor branch near the identity), so a predicted trajectory is
-    differentiated through the same arithmetic as its target.
-    """
-    omega = so3_log(rot)
-    theta2 = (omega * omega).sum(dim=-1, keepdim=True)
-    small = theta2 < _TAYLOR_THETA2
-    safe = torch.where(small, torch.ones_like(theta2), theta2)
-    theta = safe.sqrt()
-    cot_half = torch.cos(theta / 2.0) / torch.sin(theta / 2.0).clamp(min=1e-30)
-    coeff = torch.where(small, 1.0 / 12.0 + theta2 / 720.0,
-                        1.0 / safe - cot_half / (2.0 * theta))
-    skew = _hat(omega)
-    v_inv = (torch.eye(3, dtype=rot.dtype, device=rot.device)
-             - 0.5 * skew + coeff[..., None] * (skew @ skew))
-    return torch.cat([(v_inv @ trans[..., None])[..., 0], omega], dim=-1)
-
 
 def lift_to_world(points_cam: Tensor, cam_from_world: Tensor) -> Tensor:
     """Absolute camera-frame points -> world. ``(B, K, 3)``, ``(B, 4, 4)`` -> ``(B, K, 3)``.
 
-    ``p_w = R_ext^T (p_c - t_ext)``. Differencing predictions in the world
-    (rather than the camera) is what removes the camera egomotion exactly:
-    camera-frame differences bury body motion under handheld shake.
+    ``p_w = R_ext^T (p_c - t_ext)``.
     """
     ext = cam_from_world.to(points_cam.device, points_cam.dtype)
     return torch.einsum(
         "bji,bkj->bki", ext[:, :3, :3], points_cam - ext[:, :3, 3][:, None])
 
-
-def predicted_keypoints_world(
-    mhr: dict,
-    cam_from_world: Tensor,
-    indices: Tensor | None = None,
-    dtype: torch.dtype = torch.float32,
-) -> Tensor:
-    """Predicted MHR70 keypoints in world metres. ``(B, K, 3)``.
-
-    :param mhr: the model's MHR readout (``pred_keypoints_3d``, ``pred_cam_t``).
-    :param cam_from_world: ``(B, 4, 4)`` metric OpenCV extrinsics.
-    :param indices: optional keypoint subset (``None`` = all 70).
-    """
-    kp = mhr["pred_keypoints_3d"].to(dtype)
-    if indices is not None:
-        kp = kp[:, indices]
-    cam_t = mhr["pred_cam_t"].to(dtype)
-    return lift_to_world(kp + cam_t[:, None], cam_from_world)
-
-
-def predicted_root_world(
-    mhr: dict, cam_from_world: Tensor,
-) -> tuple[Tensor, Tensor]:
-    """Predicted body root in the world: position ``(B, 3)`` and rotation ``(B, 3, 3)``.
-
-    The position is the mean-hips keypoint (:data:`HIP_KEYPOINTS`) placed by
-    ``pred_cam_t`` and lifted with the extrinsics; the rotation composes the
-    extrinsics, the camera-vs-native flip and the head's Euler triple. Runs in
-    float64 — the consumer differentiates it twice.
-    """
-    dtype = torch.float64
-    kp = mhr["pred_keypoints_3d"].to(dtype)
-    cam_t = mhr["pred_cam_t"].to(dtype)
-    ext = cam_from_world.to(kp.device, dtype)
-    pelvis_cam = kp[:, list(HIP_KEYPOINTS)].mean(dim=1) + cam_t
-    pos_w = lift_to_world(pelvis_cam[:, None], ext)[:, 0]
-    rot_native = roma.euler_to_rotmat("xyz", mhr["global_rot"].to(dtype))
-    flip = CAMERA_FROM_NATIVE.to(kp.device, dtype)
-    rot_w = ext[:, :3, :3].transpose(-1, -2) @ flip @ rot_native
-    return pos_w, rot_w
-
-
-def windowed_mean(x: Tensor, kernel: Tensor) -> Tensor:
-    """Kernel-smooth ``x`` along the time axis with edge replication.
-
-    :param x: ``(..., T, C)`` Euclidean channels.
-    :param kernel: ``(L,)`` odd-length non-negative weights (normalised here);
-        a single-element kernel returns ``x`` unchanged.
-    :returns: ``(..., T, C)`` smoothed; edge frames use replicated boundaries.
-    """
-    if kernel.numel() == 1:
-        return x
-    weights = kernel / kernel.sum()
-    num_knots = x.shape[-2]
-    radius = kernel.numel() // 2
-    offsets = torch.arange(-radius, radius + 1, device=x.device)
-    centers = torch.arange(num_knots, device=x.device).unsqueeze(-1)
-    indices = (centers + offsets).clamp(0, num_knots - 1)      # (T, L)
-    return (x[..., indices, :] * weights.view(-1, 1)).sum(-2)
-
-
-# ------------------------------------------------------------------ SMPL-X head
 
 def rotmat_to_rot6d(rot: Tensor) -> Tensor:
     """Zhou et al. continuous 6D: the first two COLUMNS of ``R``, concatenated.
@@ -297,19 +97,6 @@ def ray_to_translation(ray: Tensor) -> Tensor:
     return torch.stack([ray[:, 0] * z, ray[:, 1] * z, z], dim=-1)
 
 
-def frozen_pelvis_camera(mhr: dict) -> Tensor:
-    """The frozen readout's mean-hips pelvis in camera metres ``(B, 3)``.
-
-    ``pred_keypoints_3d`` (MHR70, body-centred) at :data:`HIP_KEYPOINTS` placed
-    by ``pred_cam_t`` — the same pelvis :func:`frozen_root_world` lifts.
-    """
-    kp = mhr["pred_keypoints_3d"].float()
-    pelvis = kp[:, list(HIP_KEYPOINTS)].mean(dim=1) + mhr["pred_cam_t"].float()
-    # The frozen camera head never clamps its scale, so a degenerate frame can put
-    # the pelvis behind the camera; keep the ray (x/z, y/z, log z) bounded.
-    return torch.cat([pelvis[:, :2], pelvis[:, 2:].clamp(min=0.25)], dim=-1)
-
-
 def project_to_crop(
     points_cam: Tensor, cam_int: Tensor, affine_trans: Tensor, img_size: Tensor,
     min_depth: float = 0.25,
@@ -330,6 +117,28 @@ def project_to_crop(
     homog = torch.cat([pixels, torch.ones_like(u)[..., None]], dim=-1)   # (B,K,3)
     crop = (homog @ affine_trans.mT) / img_size[:, None] - 0.5
     return pixels, crop
+
+
+def smplx_q(pelvis: Tensor, root_rot: Tensor, body_rot: Tensor,
+            hand_rot: Tensor | None = None) -> Tensor:
+    """Assemble the BetterHuman SMPL-X configuration ``(B, 91)`` (``(B, 211)`` with hands).
+
+    ``[pelvis (3), root quat xyzw (4), 21 body-joint quats, (30 finger quats)]`` — the
+    root of ``q`` IS the pelvis pose, joint rotations are parent-local.
+
+    :param pelvis: pelvis position ``(B, 3)`` in the frame ``root_rot`` is expressed in.
+    :param root_rot: frame-from-root rotation ``(B, 3, 3)``.
+    :param body_rot: parent-local body rotations ``(B, 21, 3, 3)``.
+    :param hand_rot: parent-local finger rotations ``(B, 30, 3, 3)`` or ``None``.
+    """
+    parts = [
+        pelvis,
+        roma.rotmat_to_unitquat(root_rot),                                # xyzw
+        roma.rotmat_to_unitquat(body_rot).reshape(pelvis.shape[0], -1),
+    ]
+    if hand_rot is not None:
+        parts.append(roma.rotmat_to_unitquat(hand_rot).reshape(pelvis.shape[0], -1))
+    return torch.cat(parts, dim=-1)
 
 
 def procrustes_align(pred: Tensor, gt: Tensor) -> Tensor:

@@ -3,7 +3,7 @@
 Scripts that only need predictions (evaluation, rendering, reconstruction) go
 through here so the config -> build -> checkpoint recipe lives in one place.
 ``checkpoint_path=None`` returns the untrained model — the frozen-baseline arm,
-whose contact/force/motion heads are at their (zero-gated) initial values.
+whose trainable branches sit at their initial values.
 """
 from __future__ import annotations
 

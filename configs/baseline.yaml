@@ -1,0 +1,14 @@
+# Baseline: the temporal-tokens recipe (2026-09-02/03) — cross-modal RoPE block over the pose
+# token + six contact tokens, SMPL-X head with hands, 8 clips x 60 frames per step at lr 2e-4.
+# Reference numbers (docs/results.md, run `hands`): 61.0 mm MPJPE / 42.0 PA / F1 0.919 in 5 epochs.
+base: configs/base.yaml
+model:
+  cross_modal_temporal: {enabled: true, modalities: [pose, contact]}
+  smplx: {enabled: true, hands: true}
+data: {eval_max_frames: 120}
+contact_supervision: {weight: 5.0}
+smplx_supervision:
+  enabled: true
+  loss: {hand_pose: 0.5}
+optim: {lr: 0.0002, weight_decay: 0.01, epochs: 5, lr_min: 1.0e-06}
+output: {exp_name: baseline, monitor: metric_pose/mpjpe, frozen_metrics: output/frozen_sam3d_smplx.json}

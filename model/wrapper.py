@@ -4,23 +4,15 @@
 the vendored fork in :mod:`model.sam_3d_body`. It owns the frozen base model
 end to end — building it from the shipped checkpoint, freezing every
 parameter, and pinning it to eval so stochastic depth / dropout in the frozen
-backbone can never fire — and exposes exactly two operations:
-
-``forward``
-    One body decoder pass. Input is a flat batch of person crops
-    (``[B, ...]``, no person dimension — the wrapper adds the fork's
-    ``num_person = 1`` axis internally) plus the camera/bbox geometry the
-    model conditions on, and optionally a list of externally-owned
-    :class:`~model.sam_3d_body.models.meta_arch.sam3d_body.ExtraTokenBlock`
-    appended to the decoder sequence behind an asymmetric attention mask.
-    Output: the final token sequence, each block's bounds, and the frozen
-    final MHR + camera readout.
-
-``decode_pose``
-    Recompute the final MHR + camera readout from a (temporally mixed or
-    otherwise updated) pose token, optionally through externally-owned
-    fine-tuned projection copies. Bit-identical to the in-forward readout
-    when called with the unmodified pose token and no projection overrides.
+backbone can never fire — and exposes exactly one operation, ``forward``:
+one body decoder pass. Input is a flat batch of person crops (``[B, ...]``, no
+person dimension — the wrapper adds the fork's ``num_person = 1`` axis
+internally) plus the camera/bbox geometry the model conditions on, and
+optionally a list of externally-owned
+:class:`~model.sam_3d_body.models.meta_arch.sam3d_body.ExtraTokenBlock`
+appended to the decoder sequence behind an asymmetric attention mask. Output:
+the final token sequence, each block's bounds, and the frozen final MHR +
+camera readout.
 
 Conditioning notes (the bug-prone part — identical for both input paths):
 
@@ -191,7 +183,6 @@ class SAM3DBodyWrapper(nn.Module):
         mask: Optional[torch.Tensor] = None,
         mask_score: Optional[torch.Tensor] = None,
         blocks: Sequence[ExtraTokenBlock] = (),
-        attention: str = "mutual",
     ) -> Dict:
         """Run one frozen body decoder pass.
 
@@ -210,7 +201,6 @@ class SAM3DBodyWrapper(nn.Module):
         :param mask_score: ``[B]`` mask confidence (``<= 0`` = ignore mask).
         :param blocks: externally-owned token blocks appended to the decoder
             sequence (order = sequence order); may be empty.
-        :param attention: ``"mutual" | "causal"`` mask regime among the blocks.
         :returns: dict with
 
             - ``"tokens"``: ``[B, N_seq, C]`` final decoder token sequence
@@ -219,7 +209,6 @@ class SAM3DBodyWrapper(nn.Module):
             - ``"mhr"``: frozen final MHR + camera readout dict
             - ``"image_embeddings"``: mask-conditioned backbone features
             - ``"condition_info"``: the CLIFF condition vector
-            - ``"ctx"``: opaque context to hand back to :meth:`decode_pose`
         """
         batch = self._assemble_batch(
             img, embedding, bbox_center, bbox_scale, ori_img_size, img_size,
@@ -231,7 +220,6 @@ class SAM3DBodyWrapper(nn.Module):
             decoder_type="body",
             precomputed_features=embedding,
             extra_blocks=list(blocks),
-            extra_token_attention=attention,
         )
         return {
             "tokens": out["tokens"],
@@ -240,28 +228,5 @@ class SAM3DBodyWrapper(nn.Module):
             "mhr": out["mhr"],
             "image_embeddings": out["image_embeddings"],
             "condition_info": out["condition_info"],
-            "ctx": batch,
         }
 
-    def decode_pose(
-        self,
-        pose_token: torch.Tensor,
-        ctx: Dict,
-        proj_pose: Optional[nn.Module] = None,
-        proj_camera: Optional[nn.Module] = None,
-    ) -> Dict:
-        """Final MHR + camera readout from an (updated) pose token.
-
-        :param pose_token: ``[B, C]`` pose token (e.g. after temporal mixing).
-        :param ctx: the ``"ctx"`` entry of a prior :meth:`forward` output for
-            the same rows (supplies the camera/bbox geometry).
-        :param proj_pose: optional trainable copy of ``head_pose.proj``
-            applied instead of the frozen original (split-head fine-tune).
-        :param proj_camera: optional trainable copy of ``head_camera.proj``.
-        """
-        self.model._initialize_batch(ctx)
-        self.model.hand_batch_idx = []
-        self.model.body_batch_idx = list(range(pose_token.shape[0]))
-        return self.model.readout_pose(
-            pose_token, ctx, proj_pose=proj_pose, proj_camera=proj_camera
-        )

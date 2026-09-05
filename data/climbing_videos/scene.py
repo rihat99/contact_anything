@@ -56,7 +56,6 @@ NUM_GROUPS = len(GROUP_NAMES)
 #: Body-22 source joint of each group: hands are the wrists (fingers are folded
 #: there by the 52->22 fold), the toe groups the foot joints, the heels the ankles.
 GROUP_BODY22 = ((20,), (21,), (10,), (11,), (7,), (8,))
-#: MHR70 keypoint anchors of the same six groups.
 
 #: Joints an annotator can label in the manual test set.
 OBSERVABLE_14 = [1, 2, 4, 5, 7, 8, 10, 11, 16, 17, 18, 19, 20, 21]
@@ -71,9 +70,6 @@ ANNOTATION_TO_SMPLX22 = {
     "left_elbow": 18, "right_elbow": 19, "left_shoulder": 16, "right_shoulder": 17,
     "left_hip": 1, "right_hip": 2,
 }
-
-#: Fallback world down direction, used only by scenes loaded without kindyn.
-GRAVITY_WORLD = np.array([0.0, 1.0, 0.0], np.float32)
 
 
 def scene_shard(scene: str) -> str:
@@ -390,11 +386,6 @@ def load_scene(root: Path, scene: str, split: str, contact_level: int) -> dict:
     contact_gt, contact_valid, contact_conf = reduce_body22_to_groups(
         joint_contact.astype(np.float32), supervised22, conf22)
 
-    # World camera centres C = -R^T t; the per-clip jump is measured between
-    # consecutive SAMPLED frames in the dataset.
-    cam_centers = -np.einsum(
-        "nji,nj->ni", extrinsics[:, :3, :3], extrinsics[:, :3, 3]).astype(np.float32)
-
     return {
         "human_dir": human_dir,
         "frames_dir": root / "frames" / shard / scene,
@@ -404,8 +395,6 @@ def load_scene(root: Path, scene: str, split: str, contact_level: int) -> dict:
         "bbox": bbox,
         "intrinsics": intrinsics,
         "extrinsics": extrinsics,
-        "gravity_world": GRAVITY_WORLD.copy(),
-        "cam_centers": cam_centers,
         "valid_mask": valid_mask,
         "fps": float(contacts["fps"]),
         "contact_gt": contact_gt,                                     # [P, N, 6]

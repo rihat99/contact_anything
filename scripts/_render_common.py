@@ -18,6 +18,8 @@ covered clip(s), at the source fps divided by the clip stride.
 from __future__ import annotations
 
 import os
+import warnings
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Optional, Sequence
 
@@ -33,10 +35,22 @@ from data.transforms import crop_size
 from train.predict import run_clip
 
 REPO = Path(__file__).resolve().parents[1]
+#: Opacity of a drawn mesh over the frame.
+MESH_ALPHA = 0.55
 
 
 def dataset_spec(cfg: dict) -> tuple[Path, int]:
     """Corpus root and contact level from the config's dataset yaml."""
+    spec = _dataset_yaml(cfg)
+    return Path(spec["root"]), int(spec["contact_level"])
+
+
+def dataset_camera(cfg: dict) -> str:
+    """The dataset yaml's ``camera`` filter (``all`` | ``static`` | ``moving``)."""
+    return str(_dataset_yaml(cfg)["camera"])
+
+
+def _dataset_yaml(cfg: dict) -> dict:
     entries = list(cfg["data"]["datasets"])
     if len(entries) != 1:
         raise ValueError(
@@ -47,16 +61,18 @@ def dataset_spec(cfg: dict) -> tuple[Path, int]:
         raise ValueError(
             f"{path}: the renderers need the {ClimbingVideosDataset.name} dataset; "
             f"got {spec['name']!r}")
-    return Path(spec["root"]), int(spec["contact_level"])
+    return spec
 
 
-def resolve_scenes(root: Path, split: str, selection: Optional[str]) -> list[str]:
+def resolve_scenes(root: Path, split: str, selection: Optional[str],
+                   camera: str = "all") -> list[str]:
     """Scene ids to render: all of ``split``, its first N, or a named subset.
 
     :param selection: ``None`` (every scene), a count (``"5"``), or a
         comma-separated list of scene ids.
+    :param camera: the dataset yaml's camera filter (``all`` | ``static`` | ``moving``).
     """
-    available = ClimbingVideosDataset.list_scenes(root, split)
+    available = ClimbingVideosDataset.list_scenes(root, split, camera)
     if selection is None:
         return available
     if selection.strip().isdigit():
@@ -102,8 +118,6 @@ def build_dataset(
                        if bool(cfg["data"]["embedding_cache"]) else None),
         full_scenes=split == "test",
         max_frames=int(max_frames),
-        motion_smooth_sec=float(cfg["motion_supervision"]["target_smooth_sec"]),
-        motion_outlier_acc_ms2=float(cfg["motion_supervision"]["outlier_acc_ms2"]),
     )
 
 
@@ -149,3 +163,44 @@ def open_writer(path: Path, fps: float, size: tuple[int, int]) -> cv2.VideoWrite
 
 def to_numpy(tensor: torch.Tensor) -> np.ndarray:
     return tensor.detach().float().cpu().numpy()
+
+
+@contextmanager
+def nan_means():
+    """Silence the all-NaN-slice warning: uncovered frames are NaN by design."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        yield
+
+
+def draw_mesh(img: np.ndarray, verts2d: np.ndarray, verts_cam: np.ndarray,
+              faces: np.ndarray, colour) -> None:
+    """Painter-sorted, lambert-shaded solid mesh alpha-blended onto ``img`` (BGR)."""
+    tri2d = verts2d[faces].astype(np.float32)                   # [F, 3, 2]
+    tricam = verts_cam[faces].astype(np.float32)                # [F, 3, 3]
+    normals = np.cross(tricam[:, 1] - tricam[:, 0], tricam[:, 2] - tricam[:, 0])
+    shade = 0.30 + 0.70 * np.clip(
+        np.abs(normals[:, 2]) / (np.linalg.norm(normals, axis=1) + 1e-8), 0.0, 1.0)
+    depth = tricam[..., 2].mean(axis=1)
+    height, width = img.shape[:2]
+    xs, ys = tri2d[..., 0], tri2d[..., 1]
+    keep = (np.isfinite(tri2d).all(axis=(1, 2)) & np.isfinite(depth) & (depth > 0.05)
+            & (xs.max(1) >= 0) & (xs.min(1) < width)
+            & (ys.max(1) >= 0) & (ys.min(1) < height))
+    order = np.argsort(-depth[keep])
+    colour = np.asarray(colour, np.float32)
+    overlay = img.copy()
+    for points, factor in zip(tri2d[keep][order].astype(np.int32), shade[keep][order]):
+        cv2.fillConvexPoly(overlay, points, tuple(float(c) for c in colour * factor))
+    cv2.addWeighted(overlay, MESH_ALPHA, img, 1.0 - MESH_ALPHA, 0.0, dst=img)
+
+
+def draw_keypoints(img: np.ndarray, points: np.ndarray, colour, radius: int) -> None:
+    """Filled discs with a black outline at every finite ``(x, y)`` near the frame."""
+    height, width = img.shape[:2]
+    for x, y in points:
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        if -50 <= x < width + 50 and -50 <= y < height + 50:
+            cv2.circle(img, (int(x), int(y)), radius + 1, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(img, (int(x), int(y)), radius, colour, -1, cv2.LINE_AA)

@@ -1,4 +1,4 @@
-"""kindyn ground truth: contact forces, the fitted gravity, and the pelvis twist.
+"""kindyn ground truth: contact forces and the SMPL-X body.
 
 ``features/human_optim/<shard>/<scene>/kindyn_1.npz`` is the per-scene inverse
 dynamics solve. Two products are read here.
@@ -13,26 +13,15 @@ g`` (body-weight units) and rotated into the body-root frame by the kindyn root
 quaternion, so no extrinsics enter the objective. ``force_lever`` is each
 group joint's offset from the pelvis in the same frame (metres).
 
-**Motion.** The pelvis target is the free-flyer body twist of a trajectory
-supplied by the caller (:mod:`data.climbing_videos.mhr_gt` builds it from the
-MHR rig), Gaussian-smoothed in SECONDS so the label bandwidth does not depend
-on the scene's fps, differentiated with BVR's SE3-log stencil, and its LINEAR
-half re-expressed in the gravity-view frame: vertical = the scene's FITTED
-gravity, azimuth = the camera view direction. The angular half is the SE3-log
-body rate under any linear convention. Layout is
-``[lin_vel, lin_acc, ang_vel, ang_acc]``, 12 channels.
-
-Gravity is the per-scene FITTED unit down vector, not a world axis: it tilts
-from +y by a median 3.2 deg and up to 61 deg over the corpus, so treating world
-y as up is wrong for hundreds of scenes.
+**SMPL-X body.** The fitted ``q`` trajectory of BetterHuman's
+``SMPLX(use_face=False, use_hands=True, num_betas=10)`` — root = pelvis pose,
+parent-local joint quaternions — plus world joints and per-person betas.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
 import numpy as np
-from scipy.ndimage import gaussian_filter1d
-from scipy.spatial.transform import Rotation
 
 from .scene import (
     GROUP_NAMES,
@@ -50,14 +39,7 @@ KINDYN_FORCE_JOINTS = (
 )
 #: 52-joint membership per group (hands aggregate wrist + fingers).
 GROUPS_52 = (LEFT_HAND_GROUP_52, RIGHT_HAND_GROUP_52, (10,), (11,), (7,), (8,))
-#: Frames trimmed at each scene edge and on both sides of every validity gap —
-#: stricter than the single frame a central difference needs.
-MOTION_EDGE_TRIM = 2
-#: Small-angle cutoff on ``theta**2``, mirroring ``better_robot.lie.so3``.
-_TAYLOR_THETA2_FP64 = 1e-8
 
-
-# ------------------------------------------------------------------ geometry
 
 def quat_xyzw_to_matrix(quat: np.ndarray) -> np.ndarray:
     """Rotation matrices from ``xyzw`` quaternions (normalized internally).
@@ -81,218 +63,6 @@ def quat_xyzw_to_matrix(quat: np.ndarray) -> np.ndarray:
     return rot
 
 
-def _quat_conjugate_xyzw(quat: np.ndarray) -> np.ndarray:
-    return np.concatenate([-quat[..., :3], quat[..., 3:]], axis=-1)
-
-
-def _quat_mul_xyzw(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Hamilton product of two ``xyzw`` quaternions."""
-    ax, ay, az, aw = (a[..., i] for i in range(4))
-    bx, by, bz, bw = (b[..., i] for i in range(4))
-    return np.stack([
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-        aw * bw - ax * bx - ay * by - az * bz,
-    ], axis=-1)
-
-
-def _quat_act_xyzw(quat: np.ndarray, point: np.ndarray) -> np.ndarray:
-    """Rotate ``point`` by the ``xyzw`` quaternion."""
-    qxyz, qw = quat[..., :3], quat[..., 3:]
-    return point + 2.0 * np.cross(qxyz, np.cross(qxyz, point) + qw * point)
-
-
-def _hat3(vec: np.ndarray) -> np.ndarray:
-    """Skew-symmetric ``(..., 3, 3)`` matrix of an ``(..., 3)`` vector."""
-    zero = np.zeros(vec.shape[:-1], vec.dtype)
-    x, y, z = vec[..., 0], vec[..., 1], vec[..., 2]
-    return np.stack([
-        np.stack([zero, -z, y], axis=-1),
-        np.stack([z, zero, -x], axis=-1),
-        np.stack([-y, x, zero], axis=-1),
-    ], axis=-2)
-
-
-def so3_log_xyzw(quat: np.ndarray) -> np.ndarray:
-    """Rotation vector of an ``xyzw`` unit quaternion. ``(..., 4) -> (..., 3)``.
-
-    float64 mirror of ``better_robot.lie.so3.log`` — same hemisphere flip and
-    the same small-angle Taylor branch — so the targets follow the exact scheme
-    BetterVideoReconstruction differentiated its fitted trajectory with.
-    """
-    quat = np.asarray(quat, np.float64)
-    quat = np.where(quat[..., 3:4] < 0.0, -quat, quat)
-    qxyz, qw = quat[..., :3], quat[..., 3:4]
-    sin_half2 = (qxyz * qxyz).sum(axis=-1, keepdims=True)
-    taylor = sin_half2 < _TAYLOR_THETA2_FP64 / 4.0
-    sin_half = np.sqrt(np.where(taylor, 1.0, sin_half2))
-    theta = 2.0 * np.arctan2(sin_half, np.clip(qw, -1.0, 1.0))
-    factor = np.where(taylor, 2.0 + sin_half2 * (2.0 / 3.0),
-                      theta / np.maximum(sin_half, 1e-30))
-    return factor * qxyz
-
-
-def se3_log_xyzw(trans: np.ndarray, quat: np.ndarray) -> np.ndarray:
-    """``log`` of the SE3 element ``(trans, quat_xyzw)``. ``-> (..., 6)``.
-
-    float64 mirror of ``better_robot.lie.se3.log``: the linear part carries the
-    ``V^{-1}(omega) = I - W/2 + coeff * W^2`` correction (``W = hat(omega)``),
-    so it is a true manifold tangent rather than ``R^T dp``. Layout is
-    ``(linear, angular)``.
-    """
-    omega = so3_log_xyzw(quat)
-    theta2 = (omega * omega).sum(axis=-1, keepdims=True)
-    taylor = theta2 < _TAYLOR_THETA2_FP64
-    theta2_safe = np.where(taylor, 1.0, theta2)
-    theta = np.sqrt(theta2_safe)
-    cot_half = np.cos(theta / 2.0) / np.maximum(np.sin(theta / 2.0), 1e-30)
-    coeff = np.where(taylor, (1.0 / 12.0) + theta2 / 720.0,
-                     1.0 / theta2_safe - cot_half / (2.0 * theta))
-    skew = _hat3(omega)
-    v_inv = np.eye(3) - 0.5 * skew + coeff[..., None] * (skew @ skew)
-    linear = np.einsum("...ij,...j->...i", v_inv, np.asarray(trans, np.float64))
-    return np.concatenate([linear, omega], axis=-1)
-
-
-def hemisphere_align(quat: np.ndarray) -> np.ndarray:
-    """Remove double-cover sign flips from a quaternion sequence. ``(N, 4)``.
-
-    ``q`` and ``-q`` are the same rotation and the fit is free to switch between
-    them frame to frame; component-wise filtering would read such a flip as a
-    180-degree excursion.
-    """
-    dots = (quat[1:] * quat[:-1]).sum(axis=-1)
-    sign = np.concatenate([[1.0], np.cumprod(np.where(dots < 0.0, -1.0, 1.0))])
-    return quat * sign[:, None]
-
-
-def smooth_root_trajectory(
-    q_root: np.ndarray, valid: np.ndarray, sigma_samples: float,
-) -> np.ndarray:
-    """Gaussian-smooth a free-flyer trajectory. ``(N, 7) -> (N, 7)``.
-
-    Smoothing runs INSIDE each contiguous run of valid frames — filtering across
-    a tracking gap would invent motion — and invalid frames come back unchanged.
-    Positions are filtered component-wise; quaternions are hemisphere-aligned
-    first, then filtered and renormalized.
-
-    The width is given in SAMPLES so the caller controls the physical bandwidth:
-    ``sigma_sec * fps`` makes the label spectrum fps-independent, which is the
-    point — raw pelvis ``|a|`` RMS runs 3.4 m/s^2 at 24 fps against 13.3 at 60
-    fps for the same activity, i.e. mostly sampling-rate artifact.
-
-    :param valid: ``(N,)`` per-frame validity.
-    :param sigma_samples: Gaussian width in frames; ``<= 0`` returns the input.
-    """
-    if sigma_samples <= 0.0:
-        return q_root
-    out = np.array(q_root, np.float64, copy=True)
-    breaks = np.flatnonzero(np.diff(valid.astype(np.int8)) != 0) + 1
-    for run in np.split(np.arange(len(q_root)), breaks):
-        if not valid[run[0]] or len(run) < 2:
-            continue
-        out[run, :3] = gaussian_filter1d(
-            out[run, :3], sigma=sigma_samples, axis=0, mode="nearest", truncate=4.0)
-        quat = gaussian_filter1d(
-            hemisphere_align(out[run, 3:7]), sigma=sigma_samples, axis=0,
-            mode="nearest", truncate=4.0)
-        out[run, 3:7] = quat / np.clip(
-            np.linalg.norm(quat, axis=-1, keepdims=True), 1e-8, None)
-    return out
-
-
-def gravity_view_basis(gravity: np.ndarray, extrinsics: np.ndarray) -> np.ndarray:
-    """World-from-gravity-view rotations. ``(3,) | (N, 3)`` + ``(N, 4, 4) -> (N, 3, 3)``.
-
-    GVHMR's Gravity-View frame: the vertical axis is gravity (column 1, DOWN
-    positive) and the azimuth is the camera's view direction projected onto the
-    horizontal plane. The frame is gravity-aligned, uniquely defined per frame
-    and independent of both the arbitrary world azimuth and the body's pose — so
-    a pelvis roll/pitch error no longer rotates the linear target. Columns are
-    ``[forward, down, right]``, right-handed.
-
-    :param gravity: unit DOWN direction in world axes (per scene or per frame).
-    :param extrinsics: ``(N, 4, 4)`` cam-from-world; row 2 of the rotation block
-        is the camera's +z (forward) axis expressed in world axes.
-    """
-    n = extrinsics.shape[0]
-    down = np.broadcast_to(
-        np.asarray(gravity, np.float64).reshape(-1, 3), (n, 3)).copy()
-    down /= np.linalg.norm(down, axis=-1, keepdims=True)
-    view = np.asarray(extrinsics[:, 2, :3], np.float64)
-    fwd = view - (view * down).sum(-1, keepdims=True) * down
-    # Degenerate only when the camera looks along gravity: fall back to the world
-    # axis least parallel to it so the basis stays defined and deterministic.
-    fallback = np.eye(3)[np.argmin(np.abs(down), axis=-1)]
-    fallback = fallback - (fallback * down).sum(-1, keepdims=True) * down
-    fwd = np.where(np.linalg.norm(fwd, axis=-1, keepdims=True) > 1e-6, fwd, fallback)
-    fwd /= np.linalg.norm(fwd, axis=-1, keepdims=True)
-    return np.stack([fwd, down, np.cross(fwd, down)], axis=-1)
-
-
-def root_body_twist(
-    q_root: np.ndarray, dt: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """BVR's body-twist velocity/acceleration of the free-flyer root.
-
-    Mirrors ``BetterVideoReconstruction/tools/smplx_robot/dynamics.py::
-    velocity_acceleration_from_trajectory`` — the ONE place BVR derives v/a from
-    a fitted ``q`` — for the free-flyer joint::
-
-        d[t] = se3_log(T_t^-1 T_t+1)
-        v[t] = (d[t-1] + d[t]) / (2 dt)
-        a[t] = (d[t] - d[t-1]) / dt^2
-
-    The result lives in the ROOT-LOCAL (body) frame as a proper twist: its
-    linear acceleration equals ``R^T p_ddot - omega x v_body``, ~7 % away from
-    the plain ``R^T`` re-expression of the world acceleration.
-
-    :param q_root: ``(..., N, 7)`` world position ``[0:3]`` + world-from-root
-        ``xyzw`` quaternion ``[3:7]``.
-    :param dt: frame interval in seconds.
-    :returns: ``(vel, acc, omega, ang_acc)``, each ``(..., N, 3)`` float64.
-        Boundary frames are zero (they are never target-valid).
-    """
-    q_root = np.asarray(q_root, np.float64)
-    pos, quat = q_root[..., :3], q_root[..., 3:7]
-    quat = quat / np.clip(np.linalg.norm(quat, axis=-1, keepdims=True), 1e-8, None)
-    quat_inv = _quat_conjugate_xyzw(quat[..., :-1, :])
-    rel_trans = _quat_act_xyzw(quat_inv, pos[..., 1:, :] - pos[..., :-1, :])
-    rel_quat = _quat_mul_xyzw(quat_inv, quat[..., 1:, :])
-    diff = se3_log_xyzw(rel_trans, rel_quat)                       # (..., N-1, 6)
-
-    twist = np.zeros(q_root.shape[:-1] + (6,), np.float64)
-    acc = np.zeros_like(twist)
-    twist[..., 1:-1, :] = 0.5 * (diff[..., :-1, :] + diff[..., 1:, :]) / dt
-    acc[..., 1:-1, :] = (diff[..., 1:, :] - diff[..., :-1, :]) / (dt * dt)
-    return twist[..., :3], acc[..., :3], twist[..., 3:], acc[..., 3:]
-
-
-# ------------------------------------------------------------------ gravity
-
-def _unit_gravity(scene: str, raw: np.ndarray) -> np.ndarray:
-    gravity = np.asarray(raw, np.float64).reshape(3)
-    norm = float(np.linalg.norm(gravity))
-    if not np.isfinite(gravity).all() or not 0.9 < norm < 1.1:
-        raise ValueError(
-            f"{scene}: kindyn gravity_world {gravity.tolist()} is not a unit vector")
-    return gravity / norm
-
-
-def fitted_gravity_world(scene: str, human_dir: Path) -> np.ndarray:
-    """The scene's FITTED unit down direction, from ``kindyn_1.npz``.
-
-    A wrong gravity rotates every gravity-view target in the scene by a constant
-    the network cannot possibly infer, so the fitted vector is mandatory.
-    """
-    path = human_dir / "kindyn_1.npz"
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"{scene}: {path} missing — the gravity-view frame needs kindyn's gravity")
-    return _unit_gravity(scene, np.load(path, allow_pickle=True)["gravity_world"])
-
-
 # ------------------------------------------------------------------ forces
 
 def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> dict:
@@ -300,7 +70,7 @@ def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> 
 
     :returns: ``force_gt (P, N, 6, 3)``, ``force_contact (P, N, 6)`` bool,
         ``force_lever (P, N, 6, 3)`` metres, ``force_valid (P, N)``,
-        ``force_conf (P, N)`` and the scene's fitted ``gravity_world (3,)``.
+        ``force_conf (P, N)``.
     """
     kindyn = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
     kindyn_ids = np.asarray(kindyn["object_ids"])
@@ -392,127 +162,6 @@ def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> 
         "force_lever": lever.astype(np.float32),
         "force_valid": force_valid,
         "force_conf": force_conf,
-        "gravity_world": _unit_gravity(
-            scene, kindyn["gravity_world"]).astype(np.float32),
-    }
-
-
-# ------------------------------------------------------------------ motion
-
-#: Frames the pelvis linear vel/acc target can be expressed in.
-MOTION_LINEAR_FRAMES = ("gravity_view", "body")
-#: Free-flyer trajectories the pelvis twist can be differentiated from:
-#: ``mhr`` = the MHR pseudo-GT's mean-hips + root orientation (what the MHR
-#: readout path lifts to the world), ``smplx`` = the kindyn SMPL-X pelvis +
-#: root rotation (what the SMPL-X head predicts; the roll-out's body).
-MOTION_ROOT_SOURCES = ("mhr", "smplx")
-
-
-def smplx_motion_root(smplx: dict) -> tuple[np.ndarray, np.ndarray]:
-    """``(root7 (P, N, 7) float32, valid (P, N))`` of the kindyn SMPL-X body.
-
-    :param smplx: :func:`load_smplx`'s output — pelvis = ``smplx_joints_world
-        [..., 0]``, orientation = ``smplx_root_rot`` as an ``xyzw`` quaternion.
-    """
-    rot = np.asarray(smplx["smplx_root_rot"], np.float64)              # [P, N, 3, 3]
-    p, n = rot.shape[:2]
-    quat = Rotation.from_matrix(rot.reshape(-1, 3, 3)).as_quat().reshape(p, n, 4)
-    root7 = np.concatenate(
-        [np.asarray(smplx["smplx_joints_world"], np.float64)[:, :, 0], quat], axis=-1)
-    valid = np.asarray(smplx["smplx_valid"], bool) & np.isfinite(root7).all(axis=-1)
-    identity_root = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
-    return np.where(valid[:, :, None], root7, identity_root).astype(np.float32), valid
-
-
-def motion_targets(
-    root7: np.ndarray, src_valid: np.ndarray, fps: float, gravity: np.ndarray,
-    extrinsics: np.ndarray, smooth_sec: float, outlier_acc_ms2: float,
-    linear_frame: str = "gravity_view",
-) -> dict:
-    """Pelvis twist targets from a free-flyer trajectory.
-
-    The whole scene is differentiated at once in float64 (never per clip).
-    Everything derived from the root — the twist, ``R`` and ``omega`` — comes
-    from the SMOOTHED trajectory, so the target, the frame it is expressed in
-    and the world conversion all describe the same motion. With
-    ``linear_frame="gravity_view"`` the linear half is converted world-first
-    (``a_world = R (a_body + omega x v_body)``, the Coriolis relation) and then
-    into the gravity-view frame; with ``"body"`` it is BVR's root body twist
-    itself (``v = R^T p_dot`` exactly, ``a`` the proper twist acceleration) and
-    ``motion_lin_rot`` is the world-from-root rotation, so ``R v`` is the
-    world velocity exactly (the acceleration's world conversion then omits the
-    Coriolis term — a diagnostic-only ~7 % effect).
-
-    :param root7: ``(P, N, 7)`` world position + world-from-root ``xyzw`` quat.
-    :param src_valid: ``(P, N)`` coverage of the source fit.
-    :param gravity: ``(3,)`` fitted unit down vector.
-    :param extrinsics: ``(N, 4, 4)`` cam-from-world (the gravity-view azimuth).
-    :param smooth_sec: Gaussian width in seconds applied before differentiating.
-    :param outlier_acc_ms2: world ``|a|`` above which a row is flagged an
-        outlier (a train-only filter bit); ``0`` disables the flag.
-    :param linear_frame: one of :data:`MOTION_LINEAR_FRAMES`.
-    :returns: ``motion_gt (P, N, 1, 12)``, ``motion_valid (P, N)``,
-        ``motion_outlier (P, N, 1)``, ``motion_rot``/``motion_lin_rot``
-        ``(P, N, 3, 3)``, ``motion_omega (P, N, 3)``,
-        ``motion_root_pos (P, N, 3)``, ``motion_root_valid (P, N)``.
-    """
-    n_people, n = src_valid.shape
-    dt = 1.0 / fps
-    q_root = np.stack([
-        smooth_root_trajectory(
-            root7[person].astype(np.float64), src_valid[person], smooth_sec * fps)
-        for person in range(n_people)])                                # [P, N, 7]
-
-    rot = quat_xyzw_to_matrix(q_root[..., 3:7])                        # world-from-root
-    twist_vel, twist_acc, omega, ang_acc = root_body_twist(q_root, dt)
-    world_vel = np.einsum("pnij,pnj->pni", rot, twist_vel)
-    world_acc = np.einsum("pnij,pnj->pni", rot, twist_acc + np.cross(omega, twist_vel))
-    if linear_frame == "gravity_view":
-        lin_rot = np.broadcast_to(
-            gravity_view_basis(gravity, extrinsics), (n_people, n, 3, 3))
-        vel_out = np.einsum("pnji,pnj->pni", lin_rot, world_vel)
-        acc_out = np.einsum("pnji,pnj->pni", lin_rot, world_acc)
-    elif linear_frame == "body":
-        lin_rot, vel_out, acc_out = rot, twist_vel, twist_acc
-    else:
-        raise ValueError(
-            f"linear_frame must be one of {MOTION_LINEAR_FRAMES}; got {linear_frame!r}")
-
-    # Validity: central-difference support (n-1, n, n+1 inside the scene AND
-    # source-valid), then MOTION_EDGE_TRIM frames trimmed at each scene edge and
-    # on both sides of every validity gap.
-    target_valid = np.zeros((n_people, n), bool)
-    for person in range(n_people):
-        valid = src_valid[person]
-        diff_ok = np.zeros(n, bool)
-        if n >= 3:
-            diff_ok[1:n - 1] = valid[2:] & valid[1:-1] & valid[:-2]
-        keep = np.zeros(n, bool)
-        keep[MOTION_EDGE_TRIM:n - MOTION_EDGE_TRIM] = True
-        gaps = np.flatnonzero(~valid)
-        for offset in range(-MOTION_EDGE_TRIM, MOTION_EDGE_TRIM + 1):
-            neighbours = gaps + offset
-            neighbours = neighbours[(neighbours >= 0) & (neighbours < n)]
-            keep[neighbours] = False
-        target_valid[person] = diff_ok & keep
-
-    # Outlier bit on the WORLD acceleration magnitude (the fit's 1/dt^2 jitter
-    # on 50/60-fps scenes). A threshold of 0 means OFF — without that sentinel
-    # every entry would compare ``> 0`` true and mask the whole train loss.
-    outlier = np.zeros((n_people, n, 1), bool)
-    if outlier_acc_ms2 > 0.0:
-        outlier[..., 0] = np.linalg.norm(world_acc, axis=-1) > outlier_acc_ms2
-    motion_gt = np.concatenate(
-        [vel_out, acc_out, omega, ang_acc], axis=-1)[:, :, None]       # [P, N, 1, 12]
-    return {
-        "motion_gt": motion_gt.astype(np.float32),
-        "motion_valid": target_valid,
-        "motion_outlier": outlier,
-        "motion_rot": rot.astype(np.float32),
-        "motion_lin_rot": np.ascontiguousarray(lin_rot, np.float32),
-        "motion_omega": omega.astype(np.float32),
-        "motion_root_pos": q_root[..., :3].astype(np.float32),
-        "motion_root_valid": src_valid.copy(),
     }
 
 

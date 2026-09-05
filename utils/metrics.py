@@ -6,8 +6,8 @@ evaluation exact: a mean of per-batch means would weight a short final batch
 like a full one, and a Pearson r cannot be averaged at all.
 
 * Contact: masked confusion counts per output dimension -> P / R / F1 / F2 / IoU.
-* Regression: ``(n, sum_p, sum_g, sum_pp, sum_gg, sum_pg)`` -> Pearson r, and
-  ``(sum_sq_err, n)`` -> RMSE.
+* Pooled sums -> Pearson correlation.
+* ``(numerator, mass)`` -> the mass-weighted mean.
 """
 from __future__ import annotations
 
@@ -61,29 +61,17 @@ def prf1(counts: Tensor | Sequence[float]) -> dict[str, float]:
     }
 
 
-def pearson_from_stats(
-    n: Tensor, sum_p: Tensor, sum_g: Tensor,
-    sum_pp: Tensor, sum_gg: Tensor, sum_pg: Tensor,
-) -> Tensor:
-    """Pearson r from weighted sufficient statistics; ``nan`` when degenerate.
-
-    Degenerate means fewer than two samples or a zero variance on either side —
-    a correlation that does not exist must not read as 0.
-    """
-    cov = n * sum_pg - sum_p * sum_g
-    var_p = n * sum_pp - sum_p ** 2
-    var_g = n * sum_gg - sum_g ** 2
-    denom = (var_p.clamp(min=0) * var_g.clamp(min=0)).sqrt()
-    return torch.where(
-        (n >= 2) & (denom > 0), cov / denom.clamp(min=1e-30),
-        torch.full_like(cov, float("nan")))
-
-
-def rmse_from_stats(sum_sq_err: Tensor, n: Tensor) -> Tensor:
-    """Root mean squared error from ``(sum of squared errors, sample count)``."""
-    return torch.where(
-        n > 0, (sum_sq_err / n.clamp(min=1.0)).sqrt(),
-        torch.full_like(n, float("nan")))
+def pearson_from_stats(sum_x: float, sum_y: float, sum_xy: float, sum_xx: float,
+                       sum_yy: float, n: float) -> float:
+    """Pearson correlation from pooled sums; ``nan`` when either side is constant."""
+    if n <= 1:
+        return float("nan")
+    cov = sum_xy - sum_x * sum_y / n
+    var_x = sum_xx - sum_x * sum_x / n
+    var_y = sum_yy - sum_y * sum_y / n
+    if var_x <= _EPS or var_y <= _EPS:
+        return float("nan")
+    return cov / (var_x * var_y) ** 0.5
 
 
 def mean_from_stats(numerator: float, mass: float) -> float:

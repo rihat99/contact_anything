@@ -1,4 +1,4 @@
-"""ClimbingVideos corpus loader: scenes, kindyn GT, MHR GT, clip dataset."""
+"""ClimbingVideos corpus loader: scenes, kindyn GT, clip dataset."""
 from __future__ import annotations
 
 from .dataset import ClimbingVideosDataset

@@ -1,8 +1,8 @@
 """Evaluate a checkpoint on the annotated test scenes (one clip per scene/person).
 
-    python scripts/evaluate.py --config configs/allmod_rope_t60_gv.yaml \
+    python scripts/evaluate.py --config configs/baseline.yaml \
         --checkpoint output/<run>/best.pth
-    python scripts/evaluate.py --config configs/allmod_rope_t60_gv.yaml \
+    python scripts/evaluate.py --config configs/baseline.yaml \
         --checkpoint none            # the untrained (frozen-baseline) arm
 
 Prints every ``loss_test/*`` term and ``metric_*/*`` metric the enabled losses report, and — when the contact
@@ -13,6 +13,7 @@ branch is on — a precision/recall/F1 threshold curve plus per-group scores at
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -45,7 +46,7 @@ class ContactCurve:
     def __call__(self, out: dict, batch: dict) -> None:
         if out["contact"] is None:
             return
-        probs = out["contact"]["joint_probs"].detach().float().cpu()
+        probs = out["contact"]["probs"].detach().float().cpu()
         gt = batch["contact_gt"].detach().float().cpu() > 0.5
         valid = batch["contact_valid"].detach().float().cpu() > 0
         for i, threshold in enumerate(self.thresholds):
@@ -91,6 +92,8 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--limit-scenes", type=int, default=None,
                         help="smoke runs: use only the first N test scenes")
+    parser.add_argument("--json", type=Path, default=None,
+                        help="also write the metrics as json (output.frozen_metrics format)")
     args = parser.parse_args()
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -107,13 +110,19 @@ def main() -> None:
 
     curve = ContactCurve(sorted({*CURVE, float(args.threshold)}))
     metrics = evaluate_losses(model, test_loader, losses, args.device,
-                              hook=curve if cfg["model"]["contact"]["enabled"] else None)
+                              hook=curve if model.has_contact else None)
 
     print(f"\ncheckpoint: {checkpoint or 'none (untrained)'}")
     for tag in sorted(metrics):
         print(f"  {tag:<44s} {metrics[tag]:.6f}")
-    if cfg["model"]["contact"]["enabled"]:
+    if model.has_contact:
         curve.report(float(args.threshold))
+    if args.json is not None:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(
+            {"config": str(args.config), "checkpoint": checkpoint or "none",
+             "metrics": {tag: float(v) for tag, v in metrics.items()}}, indent=2))
+        print(f"wrote {args.json}")
 
 
 if __name__ == "__main__":

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from typing import Sequence, Tuple
 
-import numpy as np
 import torch
 
 from .transforms import build_transform, process_frame
@@ -25,8 +24,6 @@ _CROP_INPUTS = ("image", "img_wh", "mask", "bbox")
 #: on the live-image path).
 _CROP_OUTPUTS = ("img", "img_size", "ori_img_size", "bbox_center", "bbox_scale",
                  "bbox", "affine_trans", "mask", "mask_score")
-#: Scene-constant keys emitted once instead of stacked.
-_CONSTANT = ("vert_indices",)
 
 
 def _stack(values: list) -> torch.Tensor:
@@ -64,14 +61,7 @@ def make_collate(image_size: Tuple[int, int]):
                 raise ValueError(
                     f"batch key {key!r} is present on some frames and missing on "
                     f"{missing} others — datasets must agree on their signals")
-            if key in _CONSTANT:
-                first = np.asarray(frames[0][key])
-                if any(not np.array_equal(np.asarray(f[key]), first) for f in frames):
-                    raise ValueError(
-                        f"scene-constant key {key!r} differs between the clips of "
-                        "one batch")
-                batch[key] = torch.as_tensor(first)
-            elif isinstance(frames[0][key], str):
+            if isinstance(frames[0][key], str):
                 batch[key] = [f[key] for f in frames]
             else:
                 batch[key] = _stack([f[key] for f in frames])

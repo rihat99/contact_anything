@@ -2,9 +2,8 @@
 
 The frozen SAM-3D-Body weights live in the base checkpoint — re-saving them
 every epoch would be ~600 MB of nothing new. A checkpoint here carries the
-``requires_grad`` parameters (token blocks, heads, the RoPE bricks, the
-fine-tuned head copies), the optimizer and scheduler state, the run counters
-and the resolved config.
+``requires_grad`` parameters (token blocks, heads, the RoPE brick), the
+optimizer and scheduler state, the run counters and the resolved config.
 
 Loading is strict: the checkpoint's ``(name, shape)`` set must equal the live
 model's trainable set exactly. A mismatch raises with the full diff rather than

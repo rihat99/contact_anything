@@ -104,16 +104,11 @@ class PromptableDecoder(nn.Module):
         keypoint_token_update_fn=None,
         hand_embeddings=None,
         hand_augment=None,
-        token_context_gate=None,
     ):
         """
         Args:
             token_embedding: [B, N, C]
             image_embedding: [B, C, H, W]
-            token_context_gate: optional [1|B, N, 1] multiplier applied to each
-                layer's image cross-attention output before its residual add.
-                ``None`` (default) leaves every token cross-attending the image;
-                a 0 entry makes that token blind to it (blind extra-token blocks).
         """
         if channel_first:
             image_embedding = image_embedding.flatten(2).permute(0, 2, 1)
@@ -139,7 +134,6 @@ class PromptableDecoder(nn.Module):
                     token_augment,
                     image_augment,
                     token_mask,
-                    token_context_gate,
                 )
             else:
                 token_embedding, image_embedding = layer(
@@ -148,7 +142,6 @@ class PromptableDecoder(nn.Module):
                     token_augment,
                     torch.cat([image_augment, hand_augment], dim=1),
                     token_mask,
-                    token_context_gate,
                 )
                 image_embedding = image_embedding[:, : image_augment.shape[1]]
 

@@ -22,9 +22,6 @@ key                  type / shape                meaning
 ``bbox``             float ``(4,)``              person box, xyxy px
 ``cam_int``          float ``(3, 3)``            intrinsics of the full frame
 ``cam_from_world``   float ``(4, 4)``            OpenCV extrinsics, metric
-``gravity_world``    float ``(3,)``              fitted unit DOWN vector (per scene)
-``cam_jump_m``       float                       camera-centre displacement (m) from
-                                                 the previous SAMPLED clip frame
 ``frame_pos_sec``    float                       seconds since the clip's first frame
 ``frame_index``      int                         source frame index
 ``frame_valid``      bool                        tracked with a usable box (cameras
@@ -42,31 +39,11 @@ plus, per requested signal group (``load``):
     ``force_gt`` ``(6, 3)`` body-weight units in the body-root frame,
     ``force_contact`` ``(6,)`` bool, ``force_lever`` ``(6, 3)`` metres in the
     same frame, ``force_conf`` float, ``force_valid`` bool.
-``motion``
-    ``motion_gt`` ``(1, 12)`` standardizable pelvis twist (gravity-view linear
-    vel/acc, body angular vel/acc), ``motion_outlier`` ``(1,)`` bool,
-    ``motion_rot`` ``(3, 3)`` world-from-root, ``motion_lin_rot`` ``(3, 3)``
-    world-from-gravity-view, ``motion_omega`` ``(3,)`` body angular velocity,
-    ``motion_valid`` bool, ``motion_root_pos`` ``(3,)`` world, ``motion_root_valid`` bool.
-``pose``
-    ``pose_gt_q`` ``(132,)`` MHR world configuration, ``pose_valid`` bool,
-    ``pose_identity`` ``(45,)``, ``pose_gt_bones`` ``(6,)``, ``pose_gt_scale`` ``(68,)``.
-``keypoints``
-    ``kp3d_world`` ``(70, 3)`` metres, ``kp_valid`` bool, ``vert_gt_world``
-    ``(V, 3)``, ``vert_valid`` bool, ``vert_indices`` ``(V,)`` int64
-    (scene-constant).
 ``smplx``
     ``smplx_joints_world`` ``(52, 3)`` metres (row 0 = pelvis, 22 body joints then
     the 30 finger joints), ``smplx_root_rot`` ``(3, 3)`` world-from-root,
     ``smplx_body_rot`` ``(21, 3, 3)`` and ``smplx_hand_rot`` ``(30, 3, 3)``
     parent-local, ``smplx_betas`` ``(10,)`` per person, ``smplx_valid`` bool.
-``keypoints2d``
-    ``kp2d_in`` ``(70, 3)`` sapiens ``[u, v, score]`` full-image px in MHR70
-    order (an INPUT, not a label), ``kp2d_in_valid`` bool.
-``camera``
-    ``cam_twist`` ``(6,)`` the camera's own twist ``[m/s, rad/s]`` in the current
-    camera frame between the clip's sampled rows (an INPUT; one-sided at the
-    clip ends, zero for a one-row clip).
 
 The six contact/force groups are ``left_hand, right_hand, left_foot (toe),
 right_foot, left_ankle (heel), right_ankle`` in that fixed order everywhere.
@@ -87,8 +64,7 @@ from torch.utils.data import Dataset
 #: clip spans the same physical time at every corpus fps.
 REFERENCE_FPS = 25.0
 
-SIGNAL_GROUPS = frozenset(
-    {"forces", "motion", "pose", "keypoints", "smplx", "keypoints2d", "camera"})
+SIGNAL_GROUPS = frozenset({"forces", "smplx"})
 
 
 class Clip(NamedTuple):

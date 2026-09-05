@@ -1,0 +1,26 @@
+# Stage 2 of the two-stage pipeline (docs/refiner.md): the world-space temporal refiner.
+# Frozen SAM3D decoder WITH the six learned contact tokens (they train here — contact is a
+# stage-2 output), the FROZEN stage-1 SMPL-X / CLIFF head as the per-frame body, and the refiner
+# behind it: depth smoothing -> world lift -> world-independent per-frame token -> RoPE
+# transformer (4 x +-0.5 s) -> zero-init heads for the pose offset, contact, motion and forces.
+# Round 1 = plain supervised losses only. `depth_smooth_sec` is calibrated by
+# scripts/analyze_stage1.py (train minimum 0.2 s, test 0.3 s); kp2d is off so the pose supervision is world-only (knob).
+base: configs/base.yaml
+model:
+  contact: {enabled: true}
+  smplx: {enabled: true, hands: true, checkpoint: output/stage1_20260905_180319/best.pth, frozen: true}
+  refiner: {enabled: true, outputs: [pose, contact, motion, force], depth_smooth_sec: 0.25}
+data:
+  frames_per_batch: 240               # 2 clips x 120 frames per GPU
+  clip: {frames: 120, stride: auto, jitter: true}
+  eval_max_frames: 120
+contact_supervision: {enabled: true, weight: 5.0}
+force_supervision: {enabled: true}
+smplx_supervision:
+  enabled: true
+  loss: {kp2d: 0.0, kp3d: 5.0, orient: 1.0, pose: 1.0, hand_pose: 0.0, betas: 0.0, cam: 0.0, pelvis: 1.0}   # betas: the frozen head's clip mean, no gradient
+motion_supervision:
+  enabled: true
+  scale: {vel: 0.4, acc: 1.2, ang_vel: 0.57, ang_acc: 1.8}   # GT RMS on 150 train scenes (scripts/analyze_stage1.py)
+optim: {lr: 0.0002, weight_decay: 0.01, epochs: 10, lr_min: 1.0e-06}
+output: {exp_name: stage2, monitor: metric_pose/mpjpe, frozen_metrics: output/stage1_20260905_180319/eval_auto.json}   # the `frozen` TB line = stage 1 raw

@@ -46,18 +46,13 @@ class PerspectiveHead(nn.Module):
         self,
         x: torch.Tensor,
         init_estimate: Optional[torch.Tensor] = None,
-        proj: Optional[nn.Module] = None,
     ):
         """
         Args:
             x: pose token with shape [B, C], usually C=DECODER.DIM
             init_estimate: [B, self.ncam]
-            proj: optional external projection FFN replacing self.proj for this
-                call only (an externally-owned fine-tuned copy of self.proj)
         """
-        # --- split-head hook ---
-        pred_cam = (self.proj if proj is None else proj)(x)
-        # --- end split-head hook ---
+        pred_cam = self.proj(x)
         if init_estimate is not None:
             pred_cam = pred_cam + init_estimate
 

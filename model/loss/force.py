@@ -1,9 +1,12 @@
 """Supervised six-group force loss against the kindyn ground truth.
 
-Reads ``out["force"]["joint_forces"] (B, 6, 3)`` — body-weight units in the
+Reads ``out["force"]["forces"] (B, 6, 3)`` — body-weight units in the
 **body-root frame**, which is the frame the loader rotates the GT into (by the
-kindyn root quaternion), so the head learns that frame directly and no camera
-extrinsics enter this objective at all. Groups are in
+kindyn root quaternion), so a decoder-token head learns that frame directly and
+no camera extrinsics enter this objective at all. A head that predicts in its
+OWN body frame (the refiner: ``out["force"]["frame"]`` = world-from-body) has
+the GT and the lever arms rotated into that frame first (needs the ``smplx``
+GT group for the kindyn root rotation). Groups are in
 :data:`~model.loss.KINDYN_GROUP_NAMES` order.
 
 Four terms:
@@ -73,9 +76,18 @@ class ForceLoss(Loss):
                               dtype=self.dtype, device=self.device))
 
     def __call__(self, out: dict, batch: dict, *, train: bool) -> LossResult:
-        pred = out["force"]["joint_forces"].to(self.device, self.dtype)  # (B,K,3)
+        pred = out["force"]["forces"].to(self.device, self.dtype)  # (B,K,3)
         anchor = pred.sum() * 0.0
         gt = batch["force_gt"].to(self.device, self.dtype)
+        lever = batch["force_lever"].to(self.device, self.dtype)         # (B,K,3)
+        frame = out["force"].get("frame")
+        if frame is not None:
+            # The head predicts in ITS body frame (world-from-body `frame`); the loader's GT is
+            # in the kindyn root frame. rel = frame^T R_gt_root is world-independent.
+            rel = frame.detach().to(self.device, self.dtype).transpose(1, 2) @ batch[
+                "smplx_root_rot"].to(self.device, self.dtype)            # (B,3,3)
+            gt = torch.einsum("bij,bkj->bki", rel, gt)
+            lever = torch.einsum("bij,bkj->bki", rel, lever)
         if pred.shape != gt.shape:
             raise ValueError(
                 f"force prediction {tuple(pred.shape)} does not match the GT "
@@ -120,7 +132,6 @@ class ForceLoss(Loss):
             beta=self.huber_delta).sum(dim=-1)
         raw["sum_force"] = ((sum_huber * w_sum).sum(), float(w_sum.sum()))
 
-        lever = batch["force_lever"].to(self.device, self.dtype)         # (B,K,3)
         torque_rows = sum_rows & torch.isfinite(lever).all(dim=-1).all(dim=-1)
         # Zero the skipped rows' arms BEFORE the cross product: a non-finite
         # lever would otherwise turn `huber * mask` into NaN * 0 = NaN.

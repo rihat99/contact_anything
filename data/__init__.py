@@ -31,9 +31,7 @@ def build_datasets(
 ) -> tuple[list[ClipDataset], list[ClipDataset]]:
     """Build the train and test datasets listed in ``data.datasets``.
 
-    :param needs: signal groups the enabled losses and model inputs require
-        (``forces`` / ``motion`` / ``pose`` / ``keypoints`` / ``smplx`` /
-        ``keypoints2d`` / ``camera``).
+    :param needs: signal groups the enabled losses require (``forces`` / ``smplx``).
     :param limit_scenes: keep only the first N scenes of every split (smoke runs).
     :returns: ``(train_sets, test_sets)`` — one of each per listed dataset yaml.
     """
@@ -59,11 +57,6 @@ def build_datasets(
             load=set(needs),
             embedding_dir=(root / "features" / "embedding"
                            if bool(dcfg["embedding_cache"]) else None),
-            motion_smooth_sec=float(cfg["motion_supervision"]["target_smooth_sec"]),
-            motion_outlier_acc_ms2=float(
-                cfg["motion_supervision"]["outlier_acc_ms2"]),
-            motion_linear_frame=str(cfg["motion_supervision"]["linear_frame"]),
-            motion_root_source=str(cfg["motion_supervision"]["root_source"]),
             camera_filter=str(spec["camera"]),
         )
         cls = DATASETS[name]

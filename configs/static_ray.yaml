@@ -1,44 +1,21 @@
-# RAY camera head (2026-09-04): the 2026-09-04 high-pass diagnostic showed the CLIFF proxy target s_GT is 95 % per-frame
-# crop jitter (r(dlog s_GT, dlog b) = -0.99), so the temporal block had to transmit each frame's b exactly and could not
-# average depth; the bbox-free log(b s) still carried the token's WHITE depth noise (0.55 %/frame vs GT 0.25). This arm
-# changes the target: the head regresses the pelvis ray (bearing x/z, y/z + log depth) as a residual on the FROZEN
-# SAM3D readout's own pelvis ray, the pose token receives the CLIFF bbox vector and that frozen ray before the block,
-# kp2d moves to the full image (bearing units), and depth / bearing velocity + acceleration are matched to the clean GT
-# ray. No motion matching. Baseline: static_baseline (jitter 118.0 / 60.6 mm on the 16-scene set).
-# Result (R1, 30 epochs, 2 GPUs x 2 clips): jitter 56.7 / mpjpe 65.2 / depth_err 116 / F1 0.852.
-# Static set since 2026-09-04: 113 train / 16 test scenes (the 5 scenes with per-frame focal jumps flipped to moving).
-#   CUDA_VISIBLE_DEVICES=4,5 torchrun --standalone --nproc-per-node=2 scripts/train.py --config configs/static_ray.yaml
-# Rationale: docs/camera_ray_2026-09-04.md, docs/jitter_2026-09-04.md (section 14).
+# Static-camera subset with the ray camera head: the pelvis is regressed as (bearing, log depth)
+# about a fixed 3.5 m, so the crop box never enters the depth; the absolute anchors are the
+# image-space kp2d term plus the log-depth / bearing Huber terms (no CLIFF `cam` term).
+# Reference numbers (docs/results.md, static-camera round): the frozen model's lifted jitter is
+# 126 on this 16-scene test set (GT 6.35); the earlier ray runs (with the now-removed frozen
+# depth prior and camera token inputs) reached 52-57.
 base: configs/base.yaml
-
 model:
-  cross_modal_temporal:
-    enabled: true
-    modalities: [pose, contact]
-    dropout: 0.1
-  smplx: {enabled: true, hands: true, camera: ray, depth_prior: frozen}
-  token_inputs:
-    bbox: {enabled: true}
-    frozen_camera: {enabled: true}
+  cross_modal_temporal: {enabled: true, modalities: [pose, contact]}
+  smplx: {enabled: true, hands: true, camera: ray}
 data:
   datasets: [configs/datasets/climbing_videos_static.yaml]
-  frames_per_batch: 120           # 2 clips/GPU = 4 clips/step (the SM-6 recipe): the 8-clip recipe needs ~30 GB/GPU and
-  eval_max_frames: 120            # other users hold 10-18 GB per card (2026-09-04 OOM at 240)
+  frames_per_batch: 120           # 2 clips/GPU (other users hold 10-18 GB per card)
+  eval_max_frames: 120
 contact_supervision: {weight: 5.0}
-rollout_eval: {enabled: true}
 smplx_supervision:
   enabled: true
   kp2d_space: image
-  loss:
-    hand_pose: 0.5
-    cam: 0.0
-    pelvis: 0.0                     # the log-depth term is the anchor: a metre-space pelvis term weights far people by z
-    depth: 10.0                     # weights from per-term gradient norms at init (weight 1; scratchpad camera/ray_smoke.py):
-    bearing: 2.0                    # kp2d 4.2, kp3d 1.4, orient 7.7, pose 0.6, betas 7.4, depth 2.3, bearing 5.1, depth_vel 1.5,
-    depth_vel: 20.0                 # depth_acc 57.8, bearing_vel 0.15, bearing_acc 5.4, pelvis 57.2, contact 2.7 -> each depth
-    depth_acc: 0.5                  # term ~ 25-30 = the weighted kp2d term (42); bearing terms weak (kp2d pins the bearing)
-    bearing_vel: 5.0
-    bearing_acc: 0.2
-    huber_delta_2d: 0.02            # bearing units: 0.05 crop units x b/f (0.3-0.7 on the test clips)
+  loss: {hand_pose: 0.5, cam: 0.0, depth: 10.0, bearing: 2.0, huber_delta_2d: 0.02}
 optim: {lr: 0.0002, weight_decay: 0.01, epochs: 30, lr_min: 1.0e-06}
 output: {exp_name: static_ray, monitor: metric_pose/mpjpe, frozen_metrics: output/frozen_sam3d_smplx_static16.json}

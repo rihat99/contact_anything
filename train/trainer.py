@@ -1,9 +1,9 @@
 """Generic training loop over the :class:`~model.loss.Loss` interface.
 
-The trainer knows nothing about contact, force, motion or pose. Every
-supervision term arrives as a ``(numerator, mass)`` pair, and the total loss is
+The trainer knows nothing about contact, force or pose. Every supervision
+term arrives as a ``(numerator, mass)`` pair, and the total loss is
 
-    sum over losses, over terms:  weight_scale(epoch) * numerator * W / max(M, 1)
+    sum over losses, over terms:  numerator * W / max(M, 1)
 
 where ``M`` is the term's mass summed over ranks and ``W`` the world size — the
 factor that cancels DDP's gradient averaging, so the averaged gradient equals
@@ -84,10 +84,9 @@ def evaluate_losses(module, loader, losses: Sequence[Loss], device,
     Each loss's float64 ``stats`` vector is summed over batches and all-reduced
     once; ``metrics()`` turns the global sums into the reported values, tagged
     ``metric_{loss.metric_group}/{metric}``. ``loss_test/{loss}.{term}`` is each
-    term's global mass-weighted mean and ``loss_test/total`` their sum
-    (un-ramped: ``weight_scale`` is a train-time warm-up only). ``hook(out,
-    batch)`` sees every forward for callers that need raw predictions (the
-    threshold curve).
+    term's global mass-weighted mean and ``loss_test/total`` their sum.
+    ``hook(out, batch)`` sees every forward for callers that need raw
+    predictions (the threshold curve).
     """
     stats = {loss.name: torch.zeros(len(loss.stat_names), dtype=torch.float64,
                                     device=device)
@@ -139,8 +138,6 @@ class Trainer:
     :param resume: checkpoint to restore weights/optimizer/scheduler/counters from.
     """
 
-    _FT_PREFIXES = ("head_pose_ft_proj.", "head_camera_ft_proj.")
-
     def __init__(
         self,
         cfg: dict,
@@ -169,7 +166,6 @@ class Trainer:
         optim_cfg = cfg["optim"]
         self.epochs = int(optim_cfg["epochs"])
         self.grad_clip = float(optim_cfg["grad_clip"])
-        self.clip_per_group = bool(optim_cfg["grad_clip_per_group"])
         self._clip_groups = [
             ps for _, child in self.model.named_children()
             if (ps := [p for p in child.parameters() if p.requires_grad])]
@@ -227,35 +223,19 @@ class Trainer:
     # ------------------------------------------------------------------ setup
 
     def _build_optimizer(self, optim_cfg: dict) -> torch.optim.Optimizer:
-        """AdamW; the fine-tuned head copies form their own lr-scaled group.
-
-        ``optim.decay_1d: false`` splits every group so biases, norm weights,
-        the zero-init residual gates and every other ``ndim <= 1`` parameter get
-        no weight decay (the usual transformer recipe); the decayed group of the
-        base parameters stays ``param_groups[0]`` (the logged lr).
+        """AdamW over the trainable parameters; no weight decay on biases / norm
+        weights / any other ``ndim <= 1`` parameter (the usual transformer recipe).
+        ``param_groups[0]`` (the decayed weights) is the logged lr.
         """
-        trainable = [(n, p) for n, p in self.model.named_parameters() if p.requires_grad]
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
         lr = float(optim_cfg["lr"])
         wd = float(optim_cfg["weight_decay"])
-        decay_1d = bool(optim_cfg["decay_1d"])
-        groups = []
-        for prefix_group, group_lr in (
-                (False, lr), (True, lr * float(optim_cfg["head_lr_scale"]))):
-            params = [p for n, p in trainable
-                      if n.startswith(self._FT_PREFIXES) == prefix_group]
-            if not params:
-                continue
-            if decay_1d:
-                groups.append({"params": params, "lr": group_lr, "weight_decay": wd})
-                continue
-            decay = [p for p in params if p.ndim > 1]
-            no_decay = [p for p in params if p.ndim <= 1]
-            if decay:
-                groups.append({"params": decay, "lr": group_lr, "weight_decay": wd})
-            if no_decay:
-                groups.append({"params": no_decay, "lr": group_lr, "weight_decay": 0.0})
+        groups = [
+            {"params": [p for p in trainable if p.ndim > 1], "lr": lr, "weight_decay": wd},
+            {"params": [p for p in trainable if p.ndim <= 1], "lr": lr, "weight_decay": 0.0},
+        ]
         return torch.optim.AdamW(
-            groups, lr=lr, weight_decay=wd,
+            [g for g in groups if g["params"]], lr=lr, weight_decay=wd,
             betas=tuple(float(b) for b in optim_cfg["betas"]))
 
     # ------------------------------------------------------------------- EMA
@@ -317,12 +297,10 @@ class Trainer:
             dist.all_reduce(masses, op=dist.ReduceOp.SUM)
         return masses
 
-    def _total(self, results: dict, layout, masses: torch.Tensor,
-               scales: dict) -> torch.Tensor:
+    def _total(self, results: dict, layout, masses: torch.Tensor) -> torch.Tensor:
         total = None
         for (name, term), mass in zip(layout, masses):
-            contribution = scales[name] * ddp_global_mean_term(
-                results[name].terms[term].numerator, mass)
+            contribution = ddp_global_mean_term(results[name].terms[term].numerator, mass)
             total = contribution if total is None else total + contribution
         return total
 
@@ -334,16 +312,12 @@ class Trainer:
         ``min(inf, grad_clip)`` still looks perfectly finite.
         """
         cap = self.grad_clip if self.grad_clip > 0 else float("inf")
-        if self.clip_per_group:
-            # One clip per trainable top-level module: a spike in the
-            # from-scratch SMPL-X head no longer shrinks the temporal block's
-            # and contact head's step for that batch.
-            norms = [float(torch.nn.utils.clip_grad_norm_(ps, cap))
-                     for ps in self._clip_groups]
-            raw = math.sqrt(sum(n * n for n in norms))
-        else:
-            params = [p for p in self.model.parameters() if p.requires_grad]
-            raw = float(torch.nn.utils.clip_grad_norm_(params, cap))
+        # One clip per trainable top-level module: a spike in the from-scratch
+        # SMPL-X head does not shrink the temporal block's and contact head's
+        # step for that batch.
+        norms = [float(torch.nn.utils.clip_grad_norm_(ps, cap))
+                 for ps in self._clip_groups]
+        raw = math.sqrt(sum(n * n for n in norms))
         if not math.isfinite(raw):
             raise FloatingPointError(
                 f"non-finite raw gradient norm ({raw}) at epoch={self.epoch} "
@@ -355,7 +329,6 @@ class Trainer:
     def train_epoch(self) -> float:
         """One pass over the train loader; returns the mean step loss."""
         self.model.train()
-        scales = {loss.name: loss.weight_scale(self.epoch) for loss in self.losses}
         running, steps, skipped = 0.0, 0, 0
         window_frames, window_start = 0, time.perf_counter()
         pbar = tqdm(self.train_loader, desc=f"epoch {self.epoch}", disable=not self.is_main)
@@ -367,7 +340,7 @@ class Trainer:
             results = {loss.name: loss(out, batch, train=True) for loss in self.losses}
             layout = self._layout(results)
             masses = self._global_masses(results, layout)
-            total = self._total(results, layout, masses, scales)
+            total = self._total(results, layout, masses)
 
             finite = torch.tensor(int(bool(torch.isfinite(total).item())),
                                   device=self.device, dtype=torch.int32)

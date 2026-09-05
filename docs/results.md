@@ -9,11 +9,14 @@ over the six kindyn groups at threshold 0.5 (`f1` / `precision` / `recall` / `io
 `P@R0.9` = precision at 90 % recall interpolated on the threshold curve, per-group F1 in the
 order LH, RH, LF (toe), RF, LA (heel), RA. Transcripts: `output/logs/<run>_eval.log`.
 
-**Kept runs (2026-09-04 prune + 2026-09-05 cleanup):** `hands` (full corpus), `static_baseline`,
-`static_matching_anchor_raw`, `static_ray` and `tb_projzero` (static subset) stay in `output/`,
-each with its config. Every other run in the tables below is under `/data3/rikhat.akizhanov/trash/`
-(`runs_pruned_20260904/`, `cleanup_20260905/runs_removed/`, …); the numbers stand. The static-camera
-jitter round (2026-09-04/05) is summarised in the last section of this page.
+**Historical page (2026-09-05 simplification).** Every run below is in
+`/data3/rikhat.akizhanov/trash/` (`runs_pruned_20260904/`, `cleanup_20260905/runs_removed/`,
+`simplify_20260905/output/`, …) and every config named below except `baseline.yaml` (the former
+`hands.yaml`) and `static_ray.yaml` (now without the frozen depth prior, the bbox / frozen-camera
+inputs and the vel/acc terms) has been removed from the code along with the mechanisms they
+exercised (MHR pose path, motion head, matching / velocity / smoothness losses, block variants).
+The numbers stand as the record of what those mechanisms did. The static-camera jitter round
+(2026-09-04/05) is summarised in the last section; the round write-ups are in `docs/history/`.
 
 ## Main table (2026-09-02 runs, evaluated 2026-09-03)
 

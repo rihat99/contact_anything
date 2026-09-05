@@ -1,0 +1,21 @@
+# Stage 1 of the two-stage pipeline (docs/refiner.md): the PER-FRAME pose model.
+# From-scratch SMPL-X (52-joint, hands) + CLIFF camera heads on the frozen pose token; no
+# contact tokens (contact is trained in stage 2 only), no temporal block. Single frames sampled
+# every 5th source frame with per-epoch jitter (the 2026-09-02 probe recipe: 57.6 mm MPJPE at
+# stride auto, the best pose number on record), 64 frames per GPU.
+# NOTE: `clip.stride` also strides the per-epoch test clips (whole scenes at stride 5); for the
+# docs/results.md protocol re-evaluate best.pth with `data.clip.stride: auto`.
+base: configs/base.yaml
+model:
+  contact: {enabled: false}
+  smplx: {enabled: true, hands: true}
+data:
+  frames_per_batch: 64
+  clip: {frames: 1, stride: 5, jitter: true}
+  eval_max_frames: 120
+contact_supervision: {enabled: false}
+smplx_supervision:
+  enabled: true
+  loss: {hand_pose: 0.5}
+optim: {lr: 0.0002, weight_decay: 0.01, epochs: 20, lr_min: 1.0e-06}
+output: {exp_name: stage1, monitor: metric_pose/mpjpe, frozen_metrics: output/frozen_sam3d_smplx.json}

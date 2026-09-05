@@ -1,7 +1,7 @@
 """Score the frozen SAM 3D Body, as SMPL-X, on the test protocol (the `frozen` line).
 
-    python scripts/eval_frozen_smplx.py --config configs/static_ray.yaml \
-        --out output/frozen_sam3d_smplx_static16.json
+    python scripts/eval_frozen_smplx.py --config configs/baseline.yaml \
+        --out output/frozen_sam3d_smplx.json
 
 The corpus ships the frozen model's per-frame output refit to SMPL-X
 (``features/sam3d/<shard>/<scene>/smplx_params.npz``: classic camera-frame
@@ -9,9 +9,9 @@ The corpus ships the frozen model's per-frame output refit to SMPL-X
 topology gap never enters the comparison. Exactly the frames the config's
 evaluation scores (one clip per (scene, person), longest valid run, capped at
 ``data.eval_max_frames``, auto stride) are scored with exactly the metric code
-the trainer uses (:func:`model.loss.smplx.pose_metric_stats`: hip-aligned
-MPJPE / PA-MPJPE / PVE in mm, dt-exact Accel in m/s^2; flat hands on both
-sides). The result json is what ``output.frozen_metrics`` points at: the trainer
+the trainer uses (:func:`model.loss.smplx.eval_stats`: hip-aligned MPJPE /
+PA-MPJPE / PVE in mm, dt-exact Accel in m/s^2, the lifted GVHMR trajectory
+metrics; flat hands on both sides). The result json is what ``output.frozen_metrics`` points at: the trainer
 re-emits it at every evaluation step as the ``frozen`` tensorboard run.
 """
 from __future__ import annotations
@@ -32,9 +32,9 @@ from data import build_datasets                                     # noqa: E402
 from data.climbing_videos.scene import scene_shard                  # noqa: E402
 from data.loaders import build_loaders                              # noqa: E402
 from model.loss.smplx import (                                      # noqa: E402
-    POSE_METRICS,
+    eval_stats,
     gt_smplx_camera,
-    pose_metric_stats,
+    metric_names,
     pose_metrics_from_stats,
     smplx_q,
     smplx_vertices,
@@ -102,7 +102,7 @@ def main() -> None:
         dtype=torch.float32, device=device)
     frozen = FrozenSmplx(test_sets[0].root)
 
-    stats = torch.zeros(2 * len(POSE_METRICS), dtype=torch.float64)
+    stats = torch.zeros(2 * len(metric_names(False)), dtype=torch.float64)
     n_clips = 0
     for batch in tqdm(loader, desc="frozen"):
         rows = frozen.rows(batch["key"])
@@ -122,12 +122,10 @@ def main() -> None:
         gt = gt_smplx_camera(batch, device)
         gt_verts = smplx_vertices(body, gt["betas"], gt["q"])
         valid = gt["valid"] & torch.from_numpy(rows["valid"]).to(device)
-        stats += pose_metric_stats(
-            joints, verts, gt["joints"], gt_verts, valid,
-            int(batch["seq_len"]), batch["frame_pos_sec"].to(device))
+        stats += eval_stats(joints, verts, gt["joints"], gt_verts, valid, batch)
         n_clips += 1
 
-    metrics = pose_metrics_from_stats(stats)
+    metrics = pose_metrics_from_stats(stats, False)
     result = {
         "metrics": {f"metric_pose/{name}": value for name, value in metrics.items()},
         "protocol": {
