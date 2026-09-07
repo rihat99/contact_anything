@@ -1,0 +1,46 @@
+# RETIRED 2026-09-06: written for the camera-coordinate depth smoothing (`depth_smooth_sec`) and the
+# per-frame `pelvis` anchor, both removed with round 3 (configs/stage2_v3.yaml) — this yaml no longer
+# validates; the run's own output/<run>/config.yaml is the record of what it trained with.
+# Stage 2, round 2 (docs/refiner.md "Round 2"): the world-space temporal refiner with
+#  * a big, video-diverse batch: 60-frame clips, 8 clips per GPU (activation checkpointing of the
+#    frozen decoder, tf32) x 4 GPUs x 2 accumulated micro-batches = 64 clips per optimizer step, the
+#    clips of a step dealt out over distinct source videos;
+#  * the per-frame body smoothed before the lift: depth (0.25 s) AND root / joint rotations +
+#    bearing (0.08 s, the MPJPE-neutral sigma of scripts/analyze_stage1.py --pose-sigmas);
+#  * camera context in the per-frame token (camera direction in the body frame, log depth, crop box);
+#  * a 3-layer block (+-0.5 s per layer);
+#  * derivative-level pose objectives: velocity / acceleration matching of the REFINED trajectory
+#    (motion_supervision.loss.pose_*) and stillness of the extremities in contact (contact_consistency).
+base: configs/base.yaml
+model:
+  decoder_checkpointing: true
+  contact: {enabled: true}
+  smplx: {enabled: true, hands: true, checkpoint: output/stage1_20260905_180319/best.pth, frozen: true}
+  refiner:
+    enabled: true
+    outputs: [pose, contact, motion, force]
+    num_layers: 3
+    window: 0.5
+    depth_smooth_sec: 0.25
+    pose_smooth_sec: 0.08
+    camera_context: true
+data:
+  frames_per_batch: 480               # 8 clips x 60 frames per GPU (~33 GB with decoder_checkpointing)
+  clip: {frames: 60, stride: auto, jitter: true}
+  interleave_videos: true
+  eval_max_frames: 120
+contact_supervision: {enabled: true, weight: 5.0}
+force_supervision: {enabled: true}
+smplx_supervision:
+  enabled: true
+  loss: {kp2d: 0.0, kp3d: 10.0, orient: 1.0, pose: 2.0, hand_pose: 0.0, betas: 0.0, cam: 0.0, pelvis: 2.0}   # position anchors x2 (see docs: the first
+                                      # launch's pose head traded 2 mm MPJPE / 1.8 mm PA for the derivative terms)
+motion_supervision:
+  enabled: true
+  scale: {vel: 0.4, acc: 1.2, ang_vel: 0.57, ang_acc: 1.8}   # GT RMS on 150 train scenes (scripts/analyze_stage1.py)
+  loss: {vel: 1.0, acc: 1.0, ang_vel: 1.0, ang_acc: 1.0, pose_vel: 1.0, pose_acc: 0.2, pose_ang_vel: 1.0, pose_ang_acc: 0.5, huber_delta: 1.0}
+                                      # pose_acc / pose_ang_acc down-weighted: the raw second difference of the prediction
+                                      # against the smoothed GT acceleration rewards damping (first launch: PA 38.0 -> 40.8)
+contact_consistency: {enabled: true, weight: 0.5}
+optim: {lr: 0.0003, weight_decay: 0.01, epochs: 50, accumulate_steps: 2, warmup_steps: 100, lr_min: 1.0e-06}
+output: {exp_name: stage2_v2, monitor: metric_pose/mpjpe, save_freq: 10, frozen_metrics: output/stage1_20260905_180319/eval_auto.json}

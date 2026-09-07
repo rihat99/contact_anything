@@ -22,7 +22,13 @@ Terms (every one a per-frame MEAN over its elements, mass = supervised frames):
 * ``betas`` — MSE on the 10 shape coefficients (per-person GT served per frame).
 * ``cam`` — Huber on the CLIFF ``(s, tx, ty)`` proxy vs the GT pelvis inverted
   into the same proxy (``camera: cliff`` heads only).
-* ``pelvis`` — Huber on the absolute camera-frame pelvis (metres).
+* ``root_bias`` / ``root_shape`` — the WORLD root error of every clip split
+  into its mean over the clip's supervised rows (a Huber on the norm with a
+  wide knee: the absolute anchor) and the per-frame deviation from that mean
+  (a Huber on the norm with a small knee: the trajectory shape, which a
+  per-frame Huber past its knee cannot see behind a 10 cm bias). Both are
+  counted per frame, so a clip weighs by its rows; single-frame clips make the
+  shape term zero and the bias term the plain per-frame error.
 * ``depth`` / ``bearing`` — Huber on the pelvis ray ``(x/z, y/z, log z)`` of
   the LIFTED pelvis (any camera parametrization): the log depth and the
   bearing separately — the crop-free absolute anchors a ``ray`` head needs.
@@ -82,8 +88,8 @@ from utils.geometry import (
 from utils.gvhmr_metrics import compute_jitter, global_metrics
 from utils.metrics import mean_from_stats
 
-_TERM_NAMES = ("kp2d", "kp3d", "orient", "pose", "hand_pose", "betas", "cam", "pelvis",
-               "depth", "bearing")
+_TERM_NAMES = ("kp2d", "kp3d", "orient", "pose", "hand_pose", "betas", "cam", "root_bias",
+               "root_shape", "depth", "bearing")
 #: Camera-frame body metrics, in the order of the statistics vector (the ``dlogz_*``
 #: statistics are sums of SQUARES; :func:`pose_metrics_from_stats` takes the root).
 POSE_METRICS = ("mpjpe", "pa_mpjpe", "pve", "accel", "pelvis_err", "depth_err", "depth_bias",
@@ -320,7 +326,8 @@ class SmplxLoss(Loss):
             raise ValueError(
                 "smplx_supervision: every loss weight is 0 — disable the section instead")
         self.delta = {name: float(loss_cfg[f"huber_delta_{name}"])
-                      for name in ("2d", "3d", "cam", "pelvis", "depth", "bearing")}
+                      for name in ("2d", "3d", "cam", "root_bias", "root_shape", "depth",
+                                   "bearing")}
         self.kp2d_space = str(section["kp2d_space"])
         if self.kp2d_space not in ("crop", "image"):
             raise ValueError(f"smplx_supervision.kp2d_space must be crop | image; got {self.kp2d_space!r}")
@@ -396,10 +403,26 @@ class SmplxLoss(Loss):
             gt_cam = translation_to_cliff_cam(gt_joints[:, 0], bbox_center, bbox_size, cam_int)
             huber = F.smooth_l1_loss(cam, gt_cam, reduction="none", beta=self.delta["cam"])
             raw["cam"] = ((huber.mean(dim=-1) * mask).sum(), mass)
-        if self.weights["pelvis"] > 0.0:
-            huber = F.smooth_l1_loss(joints[:, 0], gt_joints[:, 0], reduction="none",
-                                     beta=self.delta["pelvis"])
-            raw["pelvis"] = ((huber.sum(dim=-1) * mask).sum(), mass)
+        if self.weights["root_bias"] > 0.0 or self.weights["root_shape"] > 0.0:
+            # World root error, split per clip into its mean over the supervised rows (the
+            # absolute anchor) and the per-frame deviation from it (the trajectory shape).
+            seq_len = int(batch["seq_len"])
+            n_clips = joints.shape[0] // seq_len
+            pred_w = lift_to_world(joints[:, :1], batch["cam_from_world"])[:, 0]
+            gt_w = batch["smplx_joints_world"][:, 0].to(self.device, self.dtype)
+            err = ((pred_w - gt_w) * mask[:, None]).view(n_clips, seq_len, 3)
+            rows = mask.view(n_clips, seq_len, 1)
+            bias = err.sum(dim=1, keepdim=True) / rows.sum(dim=1, keepdim=True).clamp(min=1.0)
+            bias_norm = bias.norm(dim=-1).expand(n_clips, seq_len).reshape(-1)
+            shape_norm = ((err - bias) * rows).norm(dim=-1).reshape(-1)
+            if self.weights["root_bias"] > 0.0:
+                huber = F.smooth_l1_loss(bias_norm, torch.zeros_like(bias_norm),
+                                         reduction="none", beta=self.delta["root_bias"])
+                raw["root_bias"] = ((huber * mask).sum(), mass)
+            if self.weights["root_shape"] > 0.0:
+                huber = F.smooth_l1_loss(shape_norm, torch.zeros_like(shape_norm),
+                                         reduction="none", beta=self.delta["root_shape"])
+                raw["root_shape"] = ((huber * mask).sum(), mass)
         if self.weights["depth"] > 0.0:
             huber = F.smooth_l1_loss(ray_pred[:, 2], ray_gt[:, 2], reduction="none",
                                      beta=self.delta["depth"])

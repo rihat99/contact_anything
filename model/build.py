@@ -61,7 +61,10 @@ def build_model(cfg: dict, device: torch.device | str) -> ContactAnything:
         ``model.train(True)`` toggles only the trainable branches.
     """
     mcfg = cfg["model"]
-    wrapper = SAM3DBodyWrapper(mcfg["checkpoint_path"], mcfg["mhr_model_path"])
+    wrapper = SAM3DBodyWrapper(
+        mcfg["checkpoint_path"], mcfg["mhr_model_path"],
+        autocast_bf16=bool(mcfg["decoder_bf16"]),
+        checkpoint_layers=bool(mcfg["decoder_checkpointing"]))
     model = ContactAnything(
         wrapper,
         contact=_section(mcfg, "contact"),
@@ -72,6 +75,9 @@ def build_model(cfg: dict, device: torch.device | str) -> ContactAnything:
     )
     if model.head_smplx is not None:
         init_smplx_head(model, mcfg["smplx"])
+    if mcfg["warm_start"] is not None:
+        from train import checkpoint as ckpt_io
+        ckpt_io.load_weights(mcfg["warm_start"], model)
     model.to(device)
     model.eval()
     return model

@@ -55,6 +55,11 @@ class SAM3DBodyWrapper(nn.Module):
     :param detach_interm_preds: run the decoder's per-layer interm MHR/camera
         readouts under ``no_grad`` (they only supply grid-sample locations for
         the token updates; every grad path through them ends in frozen params).
+    :param autocast_bf16: run the decoder pass under bf16 autocast (the MHR /
+        camera readouts inside stay fp32); the frozen weights stay fp32 masters.
+    :param checkpoint_layers: recompute every decoder layer in the backward
+        (activation checkpointing) — memory per frame drops several-fold, the
+        forward runs twice.
     """
 
     def __init__(
@@ -64,8 +69,11 @@ class SAM3DBodyWrapper(nn.Module):
         mask_embed_type: Optional[str] = "v2",
         backbone_no_grad: bool = True,
         detach_interm_preds: bool = True,
+        autocast_bf16: bool = False,
+        checkpoint_layers: bool = False,
     ):
         super().__init__()
+        self.autocast_bf16 = bool(autocast_bf16)
         from yacs.config import CfgNode
 
         cfg_path = os.path.join(os.path.dirname(checkpoint_path), "model_config.yaml")
@@ -93,6 +101,7 @@ class SAM3DBodyWrapper(nn.Module):
         for p in self.model.parameters():
             p.requires_grad = False
         self.model.eval()
+        self.model.decoder.checkpoint_layers = bool(checkpoint_layers)
 
     # The whole wrapper is frozen: train(True) from an enclosing module must
     # never re-enable the backbone's stochastic depth / dropout.
@@ -215,12 +224,13 @@ class SAM3DBodyWrapper(nn.Module):
             affine_trans, cam_int, mask, mask_score,
         )
         self.model._initialize_batch(batch)
-        out = self.model.forward_step(
-            batch,
-            decoder_type="body",
-            precomputed_features=embedding,
-            extra_blocks=list(blocks),
-        )
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.autocast_bf16):
+            out = self.model.forward_step(
+                batch,
+                decoder_type="body",
+                precomputed_features=embedding,
+                extra_blocks=list(blocks),
+            )
         return {
             "tokens": out["tokens"],
             "blocks": out["blocks"],

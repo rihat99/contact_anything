@@ -1,0 +1,7 @@
+# Round 4 arm D: arm A (configs/stage2_v4.yaml) WITHOUT forces — no force head, no supervised force loss, no RNEA
+# residual. Isolates what the force branch costs / buys the contacts and the pose.
+base: configs/stage2_v4.yaml
+model: {refiner: {outputs: [pose, contact, motion]}}
+force_supervision: {enabled: false}
+force_consistency: {enabled: false}
+output: {exp_name: stage2_v4_noforce}

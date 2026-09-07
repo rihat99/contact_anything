@@ -60,10 +60,13 @@ $PYTHON scripts/evaluate.py --config configs/baseline.yaml --checkpoint output/<
 CUDA_VISIBLE_DEVICES=0,5 $CONDA/bin/torchrun --standalone --nproc-per-node=2 scripts/train.py --config configs/stage1.yaml
 $PYTHON scripts/dump_stage1.py --config configs/stage1.yaml --checkpoint output/<stage1>/best.pth --split train --scenes 150
 $PYTHON scripts/dump_stage1.py --config configs/stage1.yaml --checkpoint output/<stage1>/best.pth --split test
-$PYTHON scripts/analyze_stage1.py --train output/<stage1>/dump_train --test output/<stage1>/dump_test
-#   -> train/test gap, depth_smooth_sec sweep, motion_supervision.scale numbers; then set
-#   model.smplx.checkpoint in configs/stage2.yaml and train it like stage 1
-$PYTHON -m pytest tests/ -q                                  # refiner unit tests (CPU, ~3 min)
+$PYTHON scripts/analyze_stage1.py --train output/<stage1>/dump_train --test output/<stage1>/dump_test \
+    --pose-sigmas 0,0.05,0.08,0.12 --depth-sigma 0.25
+#   -> train/test gap, depth_smooth_sec sweep, pose_smooth_sec sweep, motion_supervision.scale
+#   numbers; then set model.smplx.checkpoint in the stage-2 config and train it:
+CUDA_VISIBLE_DEVICES=0,4,5,6 $CONDA/bin/torchrun --standalone --nproc-per-node=4 scripts/train.py --config configs/stage2_v2.yaml
+#   (round 2: 8 x 60-frame clips per GPU with decoder_checkpointing, accumulate_steps 2 -> 64 clips/step)
+$PYTHON -m pytest tests/ -q                                  # refiner unit tests (CPU, ~10 s)
 
 # Renders (mp4 per test scene; shard scenes over ranks with torchrun)
 $PYTHON scripts/render_video.py --config configs/baseline.yaml --checkpoint output/<run>/best.pth \
@@ -93,16 +96,16 @@ CUDA_VISIBLE_DEVICES=0 $PYTHON scripts/data/precompute_embeddings.py --split all
 | `model/sam_3d_body/` | Vendored SAM 3D Body fork. Our additions are delimited by `# --- <name> hook ---` comments: the extra-token-block hook (append learned blocks behind the asymmetric mask, per-layer update callbacks, expose the final sequence) and the efficiency hooks (precomputed embeddings, `backbone_no_grad`, `detach_interm_preds`). |
 | `model/wrapper.py` | `SAM3DBodyWrapper`: builds / freezes / eval-pins the base; `forward(img|embedding, geometry, blocks)` → final tokens, block bounds, the frozen MHR readout. |
 | `model/tokens.py` `rope.py` `heads.py` | `LearnedTokenBlock` (token embeddings + anchored posemb/feat update), `CrossModalRopeModule` (the temporal brick), `ContactHead` / `ForceHead` (per-token FFNs), `SmplxHead`. |
-| `model/refiner.py` | `TemporalRefiner` (stage 2): depth smoothing → world lift → world-independent token → RoPE transformer → zero-init pose / contact / motion / force heads → FK back into every camera; plus the masked time-series helpers (`gaussian_smooth`, `time_derivative`, `angular_velocity`). |
+| `model/refiner.py` | `TemporalRefiner` (stage 2): depth + pose smoothing → world lift → world-independent token (+ camera context) → RoPE transformer → zero-init pose / contact / motion / force heads → FK back into every camera; plus the masked time-series helpers (`gaussian_smooth`, `smooth_rotations` / `project_rotation`, `time_derivative`, `angular_velocity`). |
 | `model/network.py` `build.py` | `ContactAnything` composes the above; `build_model(cfg, device)` maps the yaml sections onto it and applies `model.smplx.checkpoint` / `frozen`. |
-| `model/loss/` | One `Loss` interface (`__init__.py`) and one file per term: `contact` (BCE), `force`, `smplx` (+ every pose metric), `motion` (refiner velocities / accelerations). |
+| `model/loss/` | One `Loss` interface (`__init__.py`) and one file per term: `contact` (BCE), `force`, `smplx` (+ every pose metric), `motion` (refiner velocities / accelerations + pose-derivative matching), `contact_consistency` (in-contact stillness of the refined extremities), `force_consistency` (RNEA root-wrench residual, BetterRobot + BetterHuman). |
 | `data/` | `base.py` = `ClipDataset` ABC (windowing, jitter, full-scene eval) **and the frame schema** (module docstring); `climbing_videos/` (`scene.py` DB + labels, `kindyn.py` forces + SMPL-X GT, `dataset.py`); `reconstruction.py` (label-free BVR out-trees); `collate.py`, `loaders.py`, `transforms.py`. |
 | `train/` | `config.py` (schema = `configs/base.yaml`, cross-key checks, `signal_needs`), `trainer.py` (DDP-exact weighted means, EMA, per-module clipping, per-step warm-up + cosine), `checkpoint.py` (trainable-only, strict), `logger.py` (tensorboard + `tee_output`), `predict.py` (`load_model`). |
 | `utils/` | `geometry.py` (camera parametrizations, projection, world lift), `gvhmr_metrics.py`, `metrics.py`, `distributed.py`. |
 | `scripts/` | Thin CLIs (above); `_render_common.py` shares the scene / clip plumbing and the drawing helpers; `dump_stage1.py` + `analyze_stage1.py` are the stage-1 diagnostics. |
-| `tests/` | `test_refiner.py`: world-frame independence, identity at init, receptive-field locality, gradient flow (CPU, BetterHuman body). |
+| `tests/` | `test_refiner.py`: world-frame independence (with / without camera context), identity at init, pose smoothing (polar projection, still-body fixed point), receptive-field locality, gradient flow, the video-interleaved sampler (CPU, BetterHuman body). |
 | `viewer/` | viser results viewer (`scripts/view_results.py`, `docs/viewer.md`). |
-| `configs/` | `base.yaml` (the schema, every key with its default), `stage1.yaml`, `stage2.yaml`, `baseline.yaml`, `static_ray.yaml`, `datasets/*.yaml`. |
+| `configs/` | `base.yaml` (the schema, every key with its default), `stage1.yaml`, `stage2.yaml` (round 1), `stage2_v2.yaml` (round 2: smoothing, camera context, derivative objectives, 64-clip steps), `stage2_v2_force.yaml` (round 2 phase 2: warm start + RNEA force consistency), `baseline.yaml`, `static_ray.yaml`, `datasets/*.yaml`. |
 | `docs/` | `refiner.md` (the two-stage pipeline: design + results), `results.md` (every recorded number, incl. the trashed runs), `viewer.md`, `history/` (the 2026-09-03/05 round write-ups; their code is gone). |
 | `output/` | Run directories `<exp_name>_<stamp>/` (`best.pth`, `last.pth`, `config.yaml`, `tensorboard/`), the frozen-baseline jsons, `logs/`. |
 
@@ -110,6 +113,13 @@ CUDA_VISIBLE_DEVICES=0 $PYTHON scripts/data/precompute_embeddings.py --split all
 
 1. **Backbone** DINOv3-H (bf16, frozen) → `[B,1280,32,32]`; with `data.embedding_cache` the
    loader emits the cached embedding and the backbone is skipped (frame JPEGs not decoded).
+   With `data.pose_token_cache` (builds with NO learned decoder token: `model.contact` /
+   `model.force` off, no cross_modal; needs smplx + refiner) the loader emits the cached frozen
+   FINAL pose token (`features/pose_token`, one npz per scene, built by the GVHMR worktree's
+   `scripts/data/precompute_pose_tokens.py`) and backbone + decoder are both skipped
+   (`out["mhr"]` None; no image / mask / embedding loaded) — ~20x faster per batch, the token
+   within ~0.5 % of the live pass (bf16 storage + TF32 noise), so evaluate such runs through a
+   `pose_token_cache: false` twin config.
 2. **Promptable decoder** (frozen, dim 1024) with the pose token at index 0. Our
    `LearnedTokenBlock`s (contact 6, force 6; anchored at the MHR70 keypoints of the six kindyn
    groups `[62,41,15,18,17,20]`) are appended behind an **asymmetric mask**: original tokens
@@ -140,10 +150,18 @@ CUDA_VISIBLE_DEVICES=0 $PYTHON scripts/data/precompute_embeddings.py --split all
    come from the corpus refit `features/sam3d/<shard>/<scene>/smplx_params.npz`, scored offline
    by `scripts/eval_frozen_smplx.py` and drawn as the `frozen` tensorboard run.
 5. **Temporal refiner** (`model.refiner`, stage 2; `docs/refiner.md`) — behind the frozen
-   per-frame body. Pelvis log-depth Gaussian smoothing in camera coordinates
-   (`depth_smooth_sec`, bearing kept) → world lift with `cam_from_world`, clip-mean betas →
-   per-frame token = root-frame joint positions + body-frame root linear/angular velocity +
-   frame spacing + betas + projected pose token + projected contact tokens (`pose_token`,
+   per-frame body. World lift with `cam_from_world`, THEN Gaussian smoothing of the world
+   pelvis position (`root_smooth_sec`; never in camera coordinates — those carry the camera's
+   motion and the lift then fails to cancel it, the round-2 jitter source) and a shorter
+   Gaussian on the world root rotation and the parent-local joint rotations (matrix mean
+   projected onto SO(3), `project_rotation`; `pose_smooth_sec`, 0.08 s is MPJPE-neutral and
+   removes most of the rotation jitter; `learn_smoothing` turns both widths into trainable
+   log-sigmas — one for the root position, one per rotation (root + 21 joints) — in their own
+   optimizer group at `optim.lr × optim.smoothing_lr_scale`, logged as `smoothing/*`), clip-mean betas →
+   per-frame token = root-frame joint positions (FK of the smoothed pose) + body-frame root
+   linear/angular velocity + frame spacing + betas + optional camera context (`camera_context`:
+   pelvis→camera direction in the body frame, log depth, crop-box bearing and angular size) +
+   projected pose token + projected contact tokens (`pose_token`,
    `pose_token_dim`, `contact_token_dim`) → `CrossModalRopeModule` with ONE slot (`dim`,
    `num_layers`, `num_heads`, `window` seconds per layer) → zero-init heads listed in
    `outputs`: `pose` (6D deltas right-multiplied onto the root and the 21 joints + a body-frame
@@ -166,10 +184,12 @@ sums `stats` across batches and ranks. Tensorboard sections: `optim/*`, `loss_tr
 
 | section | supervises | with |
 |---|---|---|
-| `contact_supervision` | six-group contact logits | confidence-weighted BCE; metrics f1 / precision / recall / iou (thr 0.5), `precision_at_r90`, per-group f1 |
-| `force_supervision` | forces (root frame, bw) | Huber on in-contact rows + noncontact L1 + net force / torque vs kindyn GT, `force_confidence` row weights, `group_weights`; metrics mae, noncontact_mag |
-| `motion_supervision` | the refiner's `motion` output | Huber on `vel` / `acc` / `ang_vel` / `ang_acc` divided by `scale` (GT RMS), vs kindyn world joints / root finite-differenced with `label_smooth_sec` Gaussian smoothing and rotated into the predicted body frame; metrics `<q>_rmse`, `<q>_pearson` |
-| `smplx_supervision` | the SMPL-X head (or the refined body) | `kp2d` Huber on the full-frame projection (crop-normalized or bearing units), `kp3d` pelvis-relative, 6D MSE `orient` / `pose` / `hand_pose`, `betas` MSE, `cam` (CLIFF proxy) or the crop-free anchors `depth` / `bearing` / `pelvis`. Metrics (`metric_pose/*`, WHAM/GVHMR protocol): mpjpe / pa_mpjpe / pve / accel, pelvis_err / depth_err / depth_bias, dlogz_pred / gt / err, the camera-lifted GVHMR globals `lifted_wa_mpjpe100` / `lifted_w_mpjpe100` / `lifted_rte` / `lifted_jitter` + `gt_jitter`, hand_mpjpe / hand_pa_mpjpe |
+| `contact_supervision` | six-group contact logits | confidence-weighted BCE, optional per-group `class_weights` (`positive` = false-negative penalty, `negative` = false-positive penalty; train labels are 78-81 % positive for hands, 60 % toes, 3.5 % heels); metrics f1 / precision / recall / iou (thr 0.5), `precision_at_r90`, per-group f1 |
+| `force_supervision` | forces (root frame, bw) | on in-contact rows: vector Huber `force`, or the split `magnitude` (Huber on \|f\|) + `direction` (1 − cos on rows with \|f_gt\| ≥ `direction_min_bw`, predicted norm floored at 0.05 bw); + noncontact L1 + net force / torque vs kindyn GT; `force_confidence` ^ `confidence_power` row weights, `group_weights`; metrics mae, mag_mae, angle_deg, noncontact_mag |
+| `motion_supervision` | the refiner's `motion` output, and (`loss.pose_*`) the finite differences of the REFINED pose | Huber on `vel` / `acc` / `ang_vel` / `ang_acc` divided by `scale` (GT RMS), vs kindyn world joints / root finite-differenced with `label_smooth_sec` Gaussian smoothing (rotated into the predicted body frame for the head; world frame for the pose derivatives, prediction side unsmoothed); metrics `<q>_rmse`, `<q>_pearson`, `pose_<q>_*` |
+| `contact_consistency` | the refined extremities (wrists, toes, heels) | L1 on their world speed on limb-frames labelled in contact (label × confidence weights, gradient → pose path); metrics `speed`, `gt_speed` (the GT floor, ~0.13 m/s) |
+| `force_consistency` | the refined motion + predicted forces (+ detached contact probs as gate) | BetterRobot RNEA root-wrench residual on the 22-joint BetterHuman SMPL-X (optional `smooth_sec` pre-smoothing, default 0 since the refined motion is smoothed at the refiner's input; manifold central differences, forces at the extremity joint origins, scene gravity); pseudo-Huber on the force (bw) and torque (bw·m) parts with separate weights; metrics `force`, `torque`, `gt_force`, `gt_torque` (kindyn GT under kindyn forces) |
+| `smplx_supervision` | the SMPL-X head (or the refined body) | `kp2d` Huber on the full-frame projection (crop-normalized or bearing units), `kp3d` pelvis-relative, 6D MSE `orient` / `pose` / `hand_pose`, `betas` MSE, `cam` (CLIFF proxy), the crop-free ray anchors `depth` / `bearing`, or the clip-level WORLD root anchor `root_bias` (clip-mean error) / `root_shape` (per-frame deviation from it). Metrics (`metric_pose/*`, WHAM/GVHMR protocol): mpjpe / pa_mpjpe / pve / accel, pelvis_err / depth_err / depth_bias, dlogz_pred / gt / err, the camera-lifted GVHMR globals `lifted_wa_mpjpe100` / `lifted_w_mpjpe100` / `lifted_rte` / `lifted_jitter` + `gt_jitter`, hand_mpjpe / hand_pa_mpjpe |
 
 ### Invariants (do not break)
 
@@ -200,13 +220,22 @@ from the enabled losses (`signal_needs`), never configured. Dataset yamls:
 = the DB's `static_camera` flag) and `climbing_videos_static.yaml` (the 113 / 16-scene static
 subset).
 
-Sections: `model.{contact, force, cross_modal_temporal, smplx (+ checkpoint, frozen), refiner}`,
-`data.{datasets, embedding_cache, frames_per_batch, num_workers, seed, clip.{frames, stride,
-jitter}, eval_max_frames}`, the four loss sections (`motion_supervision` needs a refiner
-`motion` output; every refiner output needs its loss enabled — DDP has no unused-parameter
-tolerance), `optim.{lr, weight_decay, epochs, warmup_steps,
-lr_min, grad_clip, betas, ema}` (no decay on 1-d params and per-module clipping are fixed
-behaviour), `output.{dir, exp_name, log_freq, save_freq, monitor, frozen_metrics}`.
+Sections: `model.{checkpoint_path, mhr_model_path, decoder_bf16, decoder_checkpointing, contact,
+force, cross_modal_temporal, smplx (+ checkpoint, frozen), refiner}` (`decoder_checkpointing`
+recomputes the frozen decoder's layers in the backward — ~60 MB/frame instead of ~105;
+`decoder_bf16` runs it under bf16 autocast with fp32 MHR / keypoint readouts — measured
+harmless, 0.01 mm, but also useless: no speed, little memory; `warm_start` initialises the
+trainable weights from a run checkpoint with a fresh optimizer / schedule), `data.{datasets, embedding_cache, pose_token_cache,
+frames_per_batch, num_workers, seed, clip.{frames, stride, jitter}, interleave_videos,
+eval_max_frames}` (`interleave_videos` deals an epoch's clips out round-robin over the source
+videos so a step's global batch spans as many videos as clips), the six loss sections
+(`motion_supervision` needs a refiner `motion` output, its `loss.pose_*` and
+`contact_consistency` a refiner `pose` output, `force_consistency` the `pose` + `force` outputs;
+every refiner output needs its loss enabled — DDP has no unused-parameter tolerance),
+`optim.{lr, weight_decay, epochs, accumulate_steps, warmup_steps, lr_min, grad_clip, betas, ema}`
+(`accumulate_steps` micro-batches per optimizer step; no decay on 1-d params and per-module
+clipping are fixed behaviour), `output.{dir, exp_name, log_freq, save_freq, eval_every, monitor,
+frozen_metrics}`.
 
 ## Data (ClimbingVideos corpus, read directly)
 

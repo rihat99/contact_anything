@@ -3,11 +3,16 @@
 * helpers: Gaussian smoothing, finite differences and angular velocity on
   synthetic series;
 * identity at initialisation: the refiner returns the per-frame body it was
-  given (depth smoothing off, constant betas);
+  given (smoothing off, constant betas);
 * world-frame independence: a rigid re-definition of the world (extrinsics
   right-multiplied by the inverse transform) leaves EVERY camera-frame and
   body-frame output identical, and moves the world outputs rigidly;
-* gradients reach the contact tokens and the pose token.
+* gradients reach the contact tokens and the pose token;
+* pose smoothing: the polar projection matches the Procrustes one, a constant
+  trajectory is a fixed point, and frame independence survives the camera
+  context features;
+* the video-interleaved sampler visits every clip once and spreads a step's
+  block over distinct videos.
 """
 from __future__ import annotations
 
@@ -19,7 +24,9 @@ import roma
 import torch
 import yaml
 
-from model.refiner import TemporalRefiner, angular_velocity, gaussian_smooth, time_derivative
+from data.loaders import VideoInterleavedSampler
+from model.refiner import (TemporalRefiner, angular_velocity, gaussian_smooth, project_rotation,
+                           smooth_rotations, time_derivative)
 from utils.geometry import smplx_q
 
 REPO = Path(__file__).resolve().parents[1]
@@ -39,8 +46,14 @@ def synthetic(body, n_clips: int = 2, seq_len: int = 12, seed: int = 0):
     """Random per-frame camera-frame bodies + geometry, as the refiner sees them."""
     torch.manual_seed(seed)
     n = n_clips * seq_len
-    root_rot = roma.random_rotmat(n)
-    body_rot = roma.rotvec_to_rotmat(0.3 * torch.randn(n, 21, 3))
+    # Continuous trajectories (random walks of ~6 deg per frame) rather than independent
+    # random rotations: the rotation smoothing assumes adjacent frames are close.
+    base = roma.random_rotmat(n_clips).repeat_interleave(seq_len, dim=0)
+    walk = torch.cumsum(0.1 * torch.randn(n_clips, seq_len, 3), dim=1).reshape(n, 3)
+    root_rot = base @ roma.rotvec_to_rotmat(walk)
+    body_walk = torch.cumsum(0.1 * torch.randn(n_clips, seq_len, 21, 3), dim=1).reshape(n, 21, 3)
+    body_rot = roma.rotvec_to_rotmat(0.3 * torch.randn(n_clips, 21, 3)).repeat_interleave(
+        seq_len, dim=0) @ roma.rotvec_to_rotmat(body_walk)
     hand_rot = roma.rotvec_to_rotmat(0.2 * torch.randn(n, 30, 3))
     betas = (0.5 * torch.randn(n_clips, 10)).repeat_interleave(seq_len, dim=0)
     pelvis_cam = torch.tensor([0.1, 0.2, 3.0]) + 0.05 * torch.randn(n, 3)
@@ -51,8 +64,9 @@ def synthetic(body, n_clips: int = 2, seq_len: int = 12, seed: int = 0):
     tokens = torch.randn(n, 7, DECODER_DIM)
     blocks = {"contact": (1, 7), "pose": (0, 1)}
     ext = torch.eye(4).repeat(n, 1, 1)
-    ext[:, :3, :3] = roma.rotvec_to_rotmat(0.2 * torch.randn(n, 3))
-    ext[:, :3, 3] = torch.randn(n, 3)
+    ext[:, :3, :3] = roma.rotvec_to_rotmat(
+        torch.cumsum(0.02 * torch.randn(n_clips, seq_len, 3), dim=1).reshape(n, 3))
+    ext[:, :3, 3] = torch.cumsum(0.05 * torch.randn(n_clips, seq_len, 3), dim=1).reshape(n, 3)
     cam_int = torch.tensor([[1000.0, 0.0, 500.0], [0.0, 1000.0, 500.0], [0.0, 0.0, 1.0]]).repeat(n, 1, 1)
     affine = torch.tensor([[0.5, 0.0, 10.0], [0.0, 0.5, 20.0]]).repeat(n, 1, 1)
     batch = {
@@ -61,15 +75,20 @@ def synthetic(body, n_clips: int = 2, seq_len: int = 12, seed: int = 0):
         "frame_valid": torch.ones(n, dtype=torch.bool),
         "cam_from_world": ext, "cam_int": cam_int, "affine_trans": affine,
         "img_size": torch.full((n, 2), 256.0),
+        "bbox_center": torch.tensor([480.0, 520.0]) + 20.0 * torch.randn(n, 2),
+        "bbox_scale": torch.full((n, 2), 300.0) + 10.0 * torch.randn(n, 2),
     }
     return smplx_out, tokens, blocks, batch
 
 
-def make_refiner(randomize: bool, depth_smooth_sec: float = 0.0) -> TemporalRefiner:
+def make_refiner(randomize: bool, root_smooth_sec: float = 0.0, pose_smooth_sec: float = 0.0,
+                 camera_context: bool = False, learn_smoothing: bool = False) -> TemporalRefiner:
     torch.manual_seed(1)
     refiner = TemporalRefiner(DECODER_DIM, ("pose", "contact", "motion", "force"),
                               num_contact_tokens=6, dim=64, num_layers=2, num_heads=4,
-                              window=0.5, depth_smooth_sec=depth_smooth_sec, dropout=0.0)
+                              window=0.5, root_smooth_sec=root_smooth_sec,
+                              pose_smooth_sec=pose_smooth_sec, learn_smoothing=learn_smoothing,
+                              camera_context=camera_context, dropout=0.0)
     if randomize:
         for head in refiner.heads.values():
             torch.nn.init.normal_(head[2].weight, std=0.02)
@@ -129,9 +148,11 @@ def test_identity_at_init(body):
     assert all(torch.count_nonzero(out["motion"][k]) == 0 for k in ("vel", "acc", "ang_vel", "ang_acc"))
 
 
-def test_world_frame_independence(body):
+@pytest.mark.parametrize("camera_context", [False, True])
+def test_world_frame_independence(body, camera_context):
     smplx_out, tokens, blocks, batch = synthetic(body)
-    refiner = make_refiner(randomize=True, depth_smooth_sec=0.2)
+    refiner = make_refiner(randomize=True, root_smooth_sec=0.2, pose_smooth_sec=0.08,
+                           camera_context=camera_context)
     out = refiner(smplx_out, tokens, blocks, batch, body)
     assert torch.count_nonzero(out["contact"]["logits"]) > 0      # the heads are live
     assert (out["smplx"]["joints_cam"] - smplx_out["joints_cam"]).abs().max() > 1e-4
@@ -160,18 +181,25 @@ def test_world_frame_independence(body):
     assert torch.allclose(out2["motion"]["frame"], rot0 @ out["motion"]["frame"], atol=1e-4)
 
 
-def test_depth_smoothing_keeps_the_bearing(body):
+def test_root_smoothing_is_in_the_world(body):
+    # A body at rest in the world seen by a moving camera: its camera-frame pelvis moves with
+    # the camera, and the smoothing must leave the WORLD position exactly fixed (smoothing
+    # the camera coordinates instead would blur the camera's motion into it).
     smplx_out, tokens, blocks, batch = synthetic(body)
-    smplx_out["pelvis_cam"][:, 2] += 0.3 * torch.randn(smplx_out["pelvis_cam"].shape[0])
-    out = make_refiner(randomize=False, depth_smooth_sec=0.3)(smplx_out, tokens, blocks, batch, body)
-    ray_in = smplx_out["pelvis_cam"][:, :2] / smplx_out["pelvis_cam"][:, 2:]
-    ray_out = out["smplx"]["pelvis_cam"][:, :2] / out["smplx"]["pelvis_cam"][:, 2:]
-    assert torch.allclose(ray_in, ray_out, atol=1e-5)
-    # Smoothing reduces the frame-to-frame depth roughness.
-    seq_len = batch["seq_len"]
-    z_in = smplx_out["pelvis_cam"][:, 2].view(-1, seq_len)
-    z_out = out["smplx"]["pelvis_cam"][:, 2].view(-1, seq_len)
-    assert (z_out[:, 1:] - z_out[:, :-1]).abs().mean() < (z_in[:, 1:] - z_in[:, :-1]).abs().mean()
+    ext = batch["cam_from_world"]
+    p_w = torch.tensor([0.5, -0.2, 1.0])
+    at_rest = ext[:, :3, :3] @ p_w + ext[:, :3, 3]
+    smplx_out["pelvis_cam"] = at_rest.clone()
+    out = make_refiner(randomize=False, root_smooth_sec=0.3)(smplx_out, tokens, blocks, batch, body)
+    assert torch.allclose(out["smplx"]["pelvis_world"], p_w.expand_as(out["smplx"]["pelvis_world"]),
+                          atol=1e-5)
+    # Per-frame noise on the camera-frame pelvis is reduced in the world.
+    torch.manual_seed(3)
+    smplx_out["pelvis_cam"] = at_rest + 0.05 * torch.randn_like(at_rest)
+    out = make_refiner(randomize=False, root_smooth_sec=0.3)(smplx_out, tokens, blocks, batch, body)
+    err_in = (out["smplx"]["pelvis_world_in"] - p_w).norm(dim=-1).mean()
+    raw_w = torch.einsum("bji,bj->bi", ext[:, :3, :3], smplx_out["pelvis_cam"] - ext[:, :3, 3])
+    assert err_in < 0.5 * (raw_w - p_w).norm(dim=-1).mean()
 
 
 def test_gradients_reach_the_tokens(body):
@@ -187,6 +215,51 @@ def test_gradients_reach_the_tokens(body):
     assert all(p.grad is not None for p in refiner.heads["pose"].parameters())
 
 
+def test_polar_projection_matches_procrustes():
+    torch.manual_seed(3)
+    base = roma.random_rotmat(500)
+    noisy = torch.stack([base @ roma.rotvec_to_rotmat(0.15 * torch.randn(500, 3))
+                         for _ in range(5)]).mean(0)
+    projected = project_rotation(noisy)
+    assert torch.allclose(projected, roma.special_procrustes(noisy), atol=1e-5)
+    eye = torch.eye(3).expand(500, 3, 3)
+    assert torch.allclose(projected.transpose(-1, -2) @ projected, eye, atol=1e-5)
+
+
+def test_pose_smoothing_fixes_a_constant_pose(body):
+    """Smoothing is a fixed point on a still body; on a jittery one it damps the rotations."""
+    smplx_out, tokens, blocks, batch = synthetic(body, n_clips=1, seq_len=20)
+    still = {k: (v[:1].expand_as(v).clone() if torch.is_tensor(v) else v) for k, v in smplx_out.items()}
+    batch_still = dict(batch)
+    batch_still["cam_from_world"] = batch["cam_from_world"][:1].expand_as(batch["cam_from_world"]).clone()
+    out = make_refiner(randomize=False, pose_smooth_sec=0.1)(still, tokens, blocks, batch_still, body)
+    assert torch.allclose(out["smplx"]["root_rot"], still["root_rot"], atol=1e-5)
+    assert torch.allclose(out["smplx"]["body_rot"], still["body_rot"], atol=1e-5)
+    assert torch.allclose(out["smplx"]["pelvis_cam"], still["pelvis_cam"], atol=1e-5)
+    seconds = batch["frame_pos_sec"][None]
+    valid = torch.ones(1, 20, dtype=torch.bool)
+    rot = smplx_out["root_rot"][None]
+    smooth = smooth_rotations(rot, seconds, valid, 0.1)
+    step = lambda r: roma.rotmat_to_rotvec(r[0, :-1].transpose(-1, -2) @ r[0, 1:]).norm(dim=-1).mean()
+    assert step(smooth) < step(rot)
+
+
+def test_video_interleaved_sampler():
+    videos = [f"v{i % 7}" for i in range(50)] + ["v_long"] * 30
+    world, batch = 2, 4
+    samplers = [VideoInterleavedSampler(videos, batch, num_replicas=world, rank=r, seed=1)
+                for r in range(world)]
+    per_rank = [list(s) for s in samplers]
+    assert all(len(idx) == len(samplers[0]) for idx in per_rank)
+    seen = sorted(i for idx in per_rank for i in idx)
+    assert len(seen) == len(set(seen)) == (len(videos) // (world * batch)) * world * batch
+    # The first step's global block (8 clips) comes from 8 distinct videos.
+    block = [videos[i] for r in range(world) for i in per_rank[r][:batch]]
+    assert len(set(block)) == world * batch
+    samplers[0].set_epoch(1)
+    assert list(samplers[0]) != per_rank[0]                     # a new epoch, a new deal
+
+
 def test_receptive_field_is_local(body):
     """A frame far outside the window x layers horizon cannot influence a frame."""
     smplx_out, tokens, blocks, batch = synthetic(body, n_clips=1, seq_len=60)
@@ -198,3 +271,37 @@ def test_receptive_field_is_local(body):
     logits, logits2 = out["contact"]["logits"], out2["contact"]["logits"]
     assert torch.allclose(logits[:20], logits2[:20], atol=1e-5)   # frames < 0.8 s: untouched
     assert (logits[-1] - logits2[-1]).abs().max() > 1e-4
+
+
+def test_gaussian_smooth_per_channel_widths_match_scalars():
+    torch.manual_seed(3)
+    seconds = (torch.arange(10, dtype=torch.float32) / 25.0)[None]
+    valid = torch.ones(1, 10, dtype=torch.bool)
+    x = torch.randn(1, 10, 3, 4)
+    widths = torch.tensor([0.05, 0.1, 0.2])
+    per_channel = gaussian_smooth(x, seconds, valid, widths)
+    for j, w in enumerate(widths.tolist()):
+        assert torch.allclose(per_channel[:, :, j], gaussian_smooth(x[:, :, j], seconds, valid, w), atol=1e-6)
+    assert torch.allclose(gaussian_smooth(x, seconds, valid, torch.tensor([0.1])),
+                          gaussian_smooth(x, seconds, valid, 0.1), atol=1e-6)
+
+
+def test_learnable_smoothing_starts_at_the_config_widths_and_gets_gradients(body):
+    smplx_out, tokens, blocks, batch = synthetic(body)
+    fixed = make_refiner(randomize=False, root_smooth_sec=0.1, pose_smooth_sec=0.08)
+    learn = make_refiner(randomize=False, root_smooth_sec=0.1, pose_smooth_sec=0.08, learn_smoothing=True)
+    names = {n for n, _ in learn.named_parameters()}
+    assert {"log_root_sigma", "log_pose_sigma"} <= names and learn.log_pose_sigma.shape == (22,)
+    out_fixed = fixed(smplx_out, tokens, blocks, batch, body)["smplx"]
+    out_learn = learn(smplx_out, tokens, blocks, batch, body)["smplx"]
+    assert torch.allclose(out_fixed["joints_world"], out_learn["joints_world"], atol=1e-5)
+    scalars = learn.smoothing_scalars()
+    assert abs(scalars["smoothing/root_sigma"] - 0.1) < 1e-6
+    assert abs(scalars["smoothing/joint_sigma_mean"] - 0.08) < 1e-6
+    out_learn["joints_world"].pow(2).sum().backward()
+    assert learn.log_root_sigma.grad is not None and torch.isfinite(learn.log_root_sigma.grad).all()
+    # Leaf joints (feet, head) move no joint position, so their widths see no gradient here.
+    grad = learn.log_pose_sigma.grad
+    assert grad is not None and torch.isfinite(grad).all() and int((grad != 0).sum()) >= 18
+    with pytest.raises(ValueError):
+        make_refiner(randomize=False, root_smooth_sec=0.0, pose_smooth_sec=0.08, learn_smoothing=True)

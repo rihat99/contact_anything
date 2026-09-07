@@ -1,0 +1,5 @@
+# Round 4 arm B: arm A (configs/stage2_v4.yaml) WITHOUT the RNEA force-consistency loss. Isolates what the
+# physics residual buys the forces, the pose and the contacts.
+base: configs/stage2_v4.yaml
+force_consistency: {enabled: false}
+output: {exp_name: stage2_v4_nofc}

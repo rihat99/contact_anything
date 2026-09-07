@@ -6,16 +6,32 @@ WORLD-space motion, encodes it frame by frame in a way that is independent of
 the world frame, runs a local temporal transformer over the frames, and decodes
 corrections — again without any reference to the world frame:
 
-1. **Depth smoothing** (``depth_smooth_sec``): Gaussian smoothing of the pelvis
-   LOG depth along time in camera coordinates, bearing kept, so the body stays
-   on its image ray. Depth is the per-frame model's dominant noise.
-2. **Lift** with the frame extrinsics: ``p_w = R^T (p_c - t)``,
+1. **Lift** with the frame extrinsics: ``p_w = R^T (p_c - t)``,
    ``R_world_root = R^T R_cam_root``; betas averaged over the clip.
-3. **Per-frame token** = 21 body-joint positions in the ROOT frame, the root's
-   linear and angular velocity in the BODY frame (finite differences of the
-   lifted trajectory), the frame spacing, the mean betas, the projected frozen
-   pose token and the projected six contact tokens. No absolute position, no
-   heading: a rigid re-definition of the world leaves every input unchanged.
+2. **Root smoothing** (``root_smooth_sec``): Gaussian smoothing of the WORLD
+   pelvis position along time, AFTER the lift. Camera coordinates carry the
+   camera's own motion: smoothing the depth there strips that motion from the
+   signal and the lift no longer cancels it (2026-09-06 decomposition: jitter
+   30 vs the GT floor of 7 on moving cameras; the floor is reached when the
+   raw root is smoothed after the lift instead).
+   **Pose smoothing** (``pose_smooth_sec``, a shorter Gaussian): the world
+   root rotation and the parent-local joint rotations (weighted matrix mean
+   projected back onto SO(3)). The per-frame model's rotation noise is white
+   and much faster than the motion, so a sigma of a few frames removes most of
+   the rotation jitter without touching the pose (scripts/analyze_stage1.py
+   ``--pose-sigmas``). ``learn_smoothing`` makes both widths parameters (one for
+   the root position, one per rotation), trained by every loss through the
+   smoothed input.
+3. **Per-frame token** = 21 body-joint positions in the ROOT frame (FK of the
+   smoothed pose), the root's linear and angular velocity in the BODY frame
+   (finite differences of the lifted trajectory), the frame spacing, the mean
+   betas, optionally the **camera context** (``camera_context``: the direction
+   from the pelvis to the camera in the body frame, the pelvis log depth, the
+   crop box's bearing and angular size — the per-frame depth error is a
+   function of the crop geometry and lies along that direction), the projected
+   frozen pose token and the projected six contact tokens. No absolute
+   position, no heading: a rigid re-definition of the world leaves every input
+   unchanged (the camera moves with it).
 4. **Temporal transformer**: :class:`~model.rope.CrossModalRopeModule` with a
    single slot — RoPE positions are seconds, a hard ``window`` per layer bounds
    the receptive field to ``num_layers x window``.
@@ -28,11 +44,12 @@ corrections — again without any reference to the world frame:
    with the extrinsics — the output dict has the :class:`~model.heads.SmplxHead`
    keys, so the existing SMPL-X loss and pose metrics apply unchanged.
 
-At initialisation the refiner is exactly "per-frame model + depth smoothing":
+At initialisation the refiner is exactly "per-frame model + smoothing":
 the RoPE blocks are identities and every head is zero.
 """
 from __future__ import annotations
 
+import math
 from typing import Optional, Sequence
 
 import roma
@@ -41,8 +58,8 @@ import torch.nn as nn
 from torch import Tensor
 
 from model.rope import CrossModalRopeModule
-from utils.geometry import (project_to_crop, ray_to_translation, rot6d_to_rotmat,
-                            rotmat_to_rot6d, smplx_q, translation_to_ray)
+from utils.geometry import (project_to_crop, rot6d_to_rotmat, rotmat_to_rot6d, smplx_q,
+                            translation_to_ray)
 
 OUTPUTS = ("pose", "contact", "motion", "force")
 NUM_BODY_JOINTS = 22
@@ -53,6 +70,14 @@ _DT_SCALE = 25.0
 #: Geometry features per frame: 21 root-frame joint positions (the pelvis IS the root, so
 #: its row is identically zero and omitted), root linear + angular velocity, dt, 10 betas.
 _GEOMETRY_DIM = 3 * (NUM_BODY_JOINTS - 1) + 3 + 3 + 1 + 10
+#: Camera-context features: pelvis->camera direction in the body frame (3), pelvis log
+#: depth (1), crop-box bearing (2) and angular size (1).
+_CAMERA_DIM = 3 + 1 + 2 + 1
+#: Attribute names of the learnable smoothing widths (``learn_smoothing``); the trainer
+#: gives them their own optimizer group (``optim.smoothing_lr_scale``).
+SMOOTHING_PARAM_NAMES = ("log_root_sigma", "log_pose_sigma")
+#: Bounds of the learnable log-widths: 1 ms .. 10 s.
+_LOG_SIGMA_MIN, _LOG_SIGMA_MAX = math.log(1e-3), math.log(10.0)
 
 
 # ------------------------------------------------------------------ time series helpers
@@ -62,23 +87,59 @@ def _trailing(mask: Tensor, like: Tensor) -> Tensor:
     return mask.reshape(*mask.shape, *([1] * (like.dim() - 2)))
 
 
-def gaussian_smooth(x: Tensor, seconds: Tensor, valid: Tensor, sigma: float) -> Tensor:
+def gaussian_smooth(x: Tensor, seconds: Tensor, valid: Tensor, sigma: float | Tensor) -> Tensor:
     """Masked Gaussian smoothing along time.
 
     :param x: ``[n, T, ...]`` series.
     :param seconds: ``[n, T]`` frame times.
     :param valid: ``[n, T]`` bool; invalid frames never contribute to others.
-    :param sigma: kernel width in seconds (``<= 0`` returns ``x``).
+    :param sigma: kernel width in seconds: a float (``<= 0`` returns ``x``), or a
+        tensor of ``J`` widths, one per channel of ``x``'s third axis (``x`` read
+        as ``[n, T, J, ...]``; a one-element tensor is one width for all of ``x``).
+        The output is differentiable w.r.t. a tensor ``sigma``.
     """
-    if sigma <= 0.0:
-        return x
+    if not torch.is_tensor(sigma):
+        if sigma <= 0.0:
+            return x
+        sigma = torch.tensor(float(sigma), dtype=x.dtype, device=x.device)
     n, t = seconds.shape
-    dt = seconds[:, :, None] - seconds[:, None, :]
-    weights = torch.exp(-0.5 * (dt / sigma) ** 2) * valid[:, None, :].to(x.dtype)
-    eye = torch.eye(t, dtype=x.dtype, device=x.device)[None]
+    channels = sigma.numel()
+    dt = seconds[:, :, None] - seconds[:, None, :]                              # [n, T, T]
+    weights = torch.exp(-0.5 * (dt[..., None] / sigma.reshape(1, 1, 1, -1)) ** 2)   # [n, T, T, J]
+    weights = weights * valid[:, None, :, None].to(x.dtype)
+    eye = torch.eye(t, dtype=x.dtype, device=x.device)[None, :, :, None]
     weights = torch.maximum(weights, eye)                    # a frame always sees itself
-    weights = weights / weights.sum(dim=-1, keepdim=True)
-    return torch.bmm(weights, x.reshape(n, t, -1)).reshape(x.shape)
+    weights = weights / weights.sum(dim=2, keepdim=True)
+    series = x.reshape(n, t, channels, -1)
+    return torch.einsum("ntsj,nsjc->ntjc", weights, series).reshape(x.shape)
+
+
+def project_rotation(mat: Tensor, iterations: int = 5) -> Tensor:
+    """Nearest rotation to a non-singular ``(..., 3, 3)`` matrix (its polar factor).
+
+    Higham's scaled Newton iteration ``X <- (g X + X^-T / g) / 2`` with
+    ``g = |det X|^(-1/3)``: quadratically convergent to the orthogonal polar
+    factor from any non-singular start, ~1e-6 in five steps. A batched 3x3
+    inverse instead of the batched SVD of :func:`roma.special_procrustes`,
+    which is serial on the GPU (seconds for a few thousand matrices).
+    """
+    x = mat
+    for _ in range(iterations):
+        gamma = torch.linalg.det(x).abs().clamp(min=1e-12).pow(-1.0 / 3.0)[..., None, None]
+        x = 0.5 * (gamma * x + torch.linalg.inv(x).transpose(-1, -2) / gamma)
+    return x
+
+
+def smooth_rotations(rot: Tensor, seconds: Tensor, valid: Tensor, sigma: float | Tensor) -> Tensor:
+    """Masked Gaussian smoothing of rotations ``[n, T, ..., 3, 3]``.
+
+    The Gaussian-weighted mean of the matrices, projected back onto SO(3)
+    (:func:`project_rotation`) — the chordal mean, exact for small spreads.
+    ``sigma`` as in :func:`gaussian_smooth` (a float ``<= 0`` returns ``rot``).
+    """
+    if not torch.is_tensor(sigma) and sigma <= 0.0:
+        return rot
+    return project_rotation(gaussian_smooth(rot, seconds, valid, sigma))
 
 
 def _shifted(x: Tensor, valid: Tensor, seconds: Tensor):
@@ -170,7 +231,15 @@ class TemporalRefiner(nn.Module):
     :param dropout: dropout inside attention / FFN.
     :param window: attention half-width per layer, seconds.
     :param time_scale: RoPE rotation units per second.
-    :param depth_smooth_sec: pelvis log-depth Gaussian sigma, seconds (0 = off).
+    :param root_smooth_sec: Gaussian sigma (s) of the world pelvis position
+        after the lift (0 = off).
+    :param pose_smooth_sec: Gaussian sigma (s) of the root / joint rotation
+        smoothing (0 = off).
+    :param learn_smoothing: make the widths trainable — one log-sigma for the
+        root position and one per rotation (root + 21 joints), initialised from
+        the two ``*_smooth_sec`` values (both must be > 0). The kernel shape
+        stays Gaussian; only its width per channel is learned.
+    :param camera_context: append the camera-context features to the token.
     :param pose_token: feed the frozen pose token (projected).
     :param pose_token_dim: pose-token projection width.
     :param contact_token_dim: per-contact-token projection width.
@@ -188,7 +257,10 @@ class TemporalRefiner(nn.Module):
         dropout: float = 0.1,
         window: float = 0.5,
         time_scale: float = 25.0,
-        depth_smooth_sec: float = 0.0,
+        root_smooth_sec: float = 0.0,
+        pose_smooth_sec: float = 0.0,
+        learn_smoothing: bool = False,
+        camera_context: bool = False,
         pose_token: bool = True,
         pose_token_dim: int = 256,
         contact_token_dim: int = 64,
@@ -199,7 +271,18 @@ class TemporalRefiner(nn.Module):
             raise ValueError(f"outputs must be a non-empty subset of {OUTPUTS}; got {outputs}")
         self.outputs = tuple(o for o in OUTPUTS if o in outputs)
         self.num_contact_tokens = int(num_contact_tokens)
-        self.depth_smooth_sec = float(depth_smooth_sec)
+        self.root_smooth_sec = float(root_smooth_sec)
+        self.pose_smooth_sec = float(pose_smooth_sec)
+        self.learn_smoothing = bool(learn_smoothing)
+        if self.learn_smoothing:
+            if not (self.root_smooth_sec > 0.0 and self.pose_smooth_sec > 0.0):
+                raise ValueError(
+                    "learn_smoothing needs positive root_smooth_sec / pose_smooth_sec as the "
+                    "initial widths")
+            self.log_root_sigma = nn.Parameter(torch.full((1,), math.log(self.root_smooth_sec)))
+            self.log_pose_sigma = nn.Parameter(
+                torch.full((NUM_BODY_JOINTS,), math.log(self.pose_smooth_sec)))
+        self.camera_context = bool(camera_context)
         self.time_scale = float(time_scale)
 
         self.proj_pose_token = nn.Linear(decoder_dim, pose_token_dim) if pose_token else None
@@ -208,9 +291,10 @@ class TemporalRefiner(nn.Module):
         token_dim = (pose_token_dim if pose_token else 0) + self.num_contact_tokens * contact_token_dim
         # Two LayerNorms: the 80 geometry numbers and the ~640 projected token channels are
         # normalised separately, so neither group's scale rides on the other's width.
-        self.geometry_norm = nn.LayerNorm(_GEOMETRY_DIM)
+        geometry_dim = _GEOMETRY_DIM + (_CAMERA_DIM if self.camera_context else 0)
+        self.geometry_norm = nn.LayerNorm(geometry_dim)
         self.token_norm = nn.LayerNorm(token_dim) if token_dim > 0 else None
-        self.input_proj = nn.Linear(_GEOMETRY_DIM + token_dim, dim)
+        self.input_proj = nn.Linear(geometry_dim + token_dim, dim)
         self.temporal = CrossModalRopeModule(
             dim=dim, num_slots=1, num_layers=num_layers, num_heads=num_heads,
             mlp_ratio=mlp_ratio, dropout=dropout, window=window, time_scale=time_scale)
@@ -225,6 +309,31 @@ class TemporalRefiner(nn.Module):
             self.heads[name] = head
         self.register_buffer("identity_6d", torch.tensor(_IDENTITY_6D), persistent=False)
 
+    # ------------------------------------------------------------------ smoothing
+
+    def smoothing_sigmas(self) -> tuple[float | Tensor, float | Tensor, float | Tensor]:
+        """Kernel widths in seconds: (root position, root rotation, the 21 joint rotations).
+
+        Floats from the config when fixed; tensors ``(1,)``, ``(1,)``, ``(21,)`` of the
+        clamped learnable widths under ``learn_smoothing``.
+        """
+        if not self.learn_smoothing:
+            return self.root_smooth_sec, self.pose_smooth_sec, self.pose_smooth_sec
+        pose = self.log_pose_sigma.clamp(_LOG_SIGMA_MIN, _LOG_SIGMA_MAX).exp()
+        root = self.log_root_sigma.clamp(_LOG_SIGMA_MIN, _LOG_SIGMA_MAX).exp()
+        return root, pose[:1], pose[1:]
+
+    def smoothing_scalars(self) -> dict[str, float]:
+        """The learned widths for the train log (empty when the widths are fixed)."""
+        if not self.learn_smoothing:
+            return {}
+        with torch.no_grad():
+            root, root_rot, joints = self.smoothing_sigmas()
+        return {"smoothing/root_sigma": float(root), "smoothing/root_rot_sigma": float(root_rot),
+                "smoothing/joint_sigma_min": float(joints.min()),
+                "smoothing/joint_sigma_mean": float(joints.mean()),
+                "smoothing/joint_sigma_max": float(joints.max())}
+
     # ------------------------------------------------------------------ forward
 
     def forward(self, smplx_out: dict, tokens: Tensor, blocks: dict, batch: dict, body) -> dict:
@@ -235,12 +344,12 @@ class TemporalRefiner(nn.Module):
         :param blocks: token-block bounds (``blocks["contact"]`` when present).
         :param batch: collated batch (``seq_len``, ``frame_pos_sec``,
             ``frame_valid``, ``cam_from_world``, ``cam_int``, ``affine_trans``,
-            ``img_size``).
+            ``img_size``, ``bbox_center``, ``bbox_scale``).
         :param body: the head's BetterHuman SMPL-X body (22 or 52 joints).
         :returns: ``{"smplx", "contact", "force", "motion"}`` — ``smplx`` in the
             SmplxHead layout plus ``pelvis_world`` / ``root_rot_world`` /
-            ``joints_world`` and the un-refined ``pelvis_world_in`` /
-            ``root_rot_world_in``; absent heads are ``None``.
+            ``joints_world`` and the smoothed, un-refined ``pelvis_world_in`` /
+            ``root_rot_world_in`` / ``joints_world_in``; absent heads are ``None``.
         """
         n_frames = tokens.shape[0]
         seq_len = int(batch["seq_len"])
@@ -257,32 +366,52 @@ class TemporalRefiner(nn.Module):
         hand_rot = smplx_out["hand_rot"]
         hand_rot = None if hand_rot is None else hand_rot.float()
         betas = smplx_out["betas"].float()
-        joints_cam = smplx_out["joints_cam"].float()
 
-        # 1. depth smoothing in camera coordinates, bearing kept.
-        ray = translation_to_ray(pelvis_cam)
-        log_z = gaussian_smooth(ray[:, 2].view(n_clips, seq_len), seconds, valid,
-                                self.depth_smooth_sec).reshape(n_frames)
-        pelvis_s = ray_to_translation(torch.stack([ray[:, 0], ray[:, 1], log_z], dim=-1))
-
-        # 2. lift to world; clip-mean betas.
+        # 1. lift the pelvis to the world and smooth it THERE: camera coordinates carry the
+        #    camera's own motion, smoothing them strips it from the signal and the lift no
+        #    longer cancels it (2026-09-06: jitter 30 -> the GT floor on moving cameras).
+        root_sigma, root_rot_sigma, joint_sigma = self.smoothing_sigmas()
         rot_wc = rot_cw.transpose(1, 2)
-        p_w = (rot_wc @ (pelvis_s - t_cw)[..., None])[..., 0]
-        rot_wr = rot_wc @ root_rot_cam
+        p_w = (rot_wc @ (pelvis_cam - t_cw)[..., None])[..., 0]
+        p_w = gaussian_smooth(p_w.view(n_clips, seq_len, 3), seconds, valid,
+                              root_sigma).reshape(n_frames, 3)
+        pelvis_s = (rot_cw @ p_w[..., None])[..., 0] + t_cw          # the smoothed root, per camera
+
+        # 2. smooth the rotations in the world / parent-local frames; clip-mean betas.
+        rot_wr = smooth_rotations((rot_wc @ root_rot_cam).view(n_clips, seq_len, 3, 3), seconds,
+                                  valid, root_rot_sigma).reshape(n_frames, 3, 3)
+        body_rot = smooth_rotations(body_rot.view(n_clips, seq_len, NUM_BODY_JOINTS - 1, 3, 3),
+                                    seconds, valid, joint_sigma
+                                    ).reshape(n_frames, NUM_BODY_JOINTS - 1, 3, 3)
         w = valid.to(torch.float32)[..., None]
         betas_clip = (betas.view(n_clips, seq_len, -1) * w).sum(dim=1) / w.sum(dim=1).clamp(min=1.0)
         betas_mean = betas_clip[:, None].expand(n_clips, seq_len, -1).reshape(n_frames, -1)
+        shaped = body.with_shape(betas=betas_mean)
+        joints_world_in = shaped.fk(smplx_q(p_w, rot_wr, body_rot, hand_rot)).joint_pose_world[..., 1:, :3]
 
         # 3. world-independent per-frame features.
         joints_root = torch.einsum(
-            "bji,bkj->bki", root_rot_cam, joints_cam[:, 1:NUM_BODY_JOINTS] - pelvis_cam[:, None])
+            "bji,bkj->bki", rot_wr, joints_world_in[:, 1:NUM_BODY_JOINTS] - p_w[:, None])
         vel_w = time_derivative(p_w.view(n_clips, seq_len, 3), seconds, valid).reshape(n_frames, 3)
         vel_b = (rot_wr.transpose(1, 2) @ vel_w[..., None])[..., 0]
         ang_b = angular_velocity(rot_wr.view(n_clips, seq_len, 3, 3), seconds, valid)
         dt = local_dt(seconds, valid).reshape(n_frames, 1) * _DT_SCALE
-        geometry = torch.cat(
-            [joints_root.reshape(n_frames, -1), vel_b, ang_b.reshape(n_frames, 3), dt, betas_mean],
-            dim=-1)
+        geometry = [joints_root.reshape(n_frames, -1), vel_b, ang_b.reshape(n_frames, 3), dt,
+                    betas_mean]
+        if self.camera_context:
+            # The camera seen from the body: where the per-frame depth error points, and how
+            # far / how large the crop was (the CLIFF lift's inputs). All frame-independent.
+            root_rot_cam_s = rot_cw @ rot_wr
+            to_camera = -pelvis_s / pelvis_s.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            cam_dir_b = (root_rot_cam_s.transpose(1, 2) @ to_camera[..., None])[..., 0]
+            cam_int = batch["cam_int"].float()
+            focal = cam_int[:, 0, 0].clamp(min=1.0)
+            centre = batch["bbox_center"].float()
+            box_bearing = (centre - cam_int[:, :2, 2]) / focal[:, None]
+            box_size = batch["bbox_scale"].float()[:, 0] / focal
+            log_z = torch.log(pelvis_s[:, 2].clamp(min=1e-3))
+            geometry += [cam_dir_b, log_z[:, None], box_bearing, box_size[:, None]]
+        geometry = torch.cat(geometry, dim=-1)
         feats = [self.geometry_norm(geometry)]
         token_feats = []
         if self.proj_pose_token is not None:
@@ -315,7 +444,7 @@ class TemporalRefiner(nn.Module):
 
         # 6. FK in the world, then into every camera.
         q_world = smplx_q(p_w2, rot_wr2, body_rot2, hand_rot)
-        joints_world = body.with_shape(betas=betas_mean).fk(q_world).joint_pose_world[..., 1:, :3]
+        joints_world = shaped.fk(q_world).joint_pose_world[..., 1:, :3]
         joints_cam2 = torch.einsum("bij,bkj->bki", rot_cw, joints_world) + t_cw[:, None]
         pelvis_cam2 = (rot_cw @ p_w2[..., None])[..., 0] + t_cw
         root_rot_cam2 = rot_cw @ rot_wr2
@@ -331,7 +460,7 @@ class TemporalRefiner(nn.Module):
             "q_cam": smplx_q(pelvis_cam2, root_rot_cam2, body_rot2, hand_rot),
             "joints_cam": joints_cam2, "kp2d_full": kp2d_full, "kp2d_crop": kp2d_crop,
             "pelvis_world": p_w2, "root_rot_world": rot_wr2, "joints_world": joints_world,
-            "pelvis_world_in": p_w, "root_rot_world_in": rot_wr,
+            "pelvis_world_in": p_w, "root_rot_world_in": rot_wr, "joints_world_in": joints_world_in,
         }
         contact = force = motion = None
         if "contact" in raw:
@@ -352,5 +481,6 @@ class TemporalRefiner(nn.Module):
         return {"smplx": smplx, "contact": contact, "force": force, "motion": motion}
 
 
-__all__ = ["TemporalRefiner", "OUTPUTS", "gaussian_smooth", "time_derivative",
+__all__ = ["TemporalRefiner", "OUTPUTS", "SMOOTHING_PARAM_NAMES", "gaussian_smooth",
+           "smooth_rotations", "project_rotation", "time_derivative",
            "angular_velocity", "local_dt", "stencil_valid"]

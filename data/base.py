@@ -28,6 +28,9 @@ key                  type / shape                meaning
                                                  are validated per scene)
 ``key``              str                         ``"{scene}#{oid}@{frame_index}"``
 ``embedding``        bf16 ``(1280, 32, 32)``     frozen-backbone cache (optional)
+``pose_token``       bf16 ``(1024,)``            frozen final pose-token cache (optional;
+                                                 the frozen base never runs, so the frame
+                                                 carries no image / mask / embedding)
 ``contact_gt``       float ``(6,)``              six-group contact label (0/1)
 ``contact_valid``    float ``(6,)``              1 where the label is supervised
 ``contact_conf``     float ``(6,)``              label confidence in ``[0, 1]``
@@ -38,7 +41,8 @@ plus, per requested signal group (``load``):
 ``forces``
     ``force_gt`` ``(6, 3)`` body-weight units in the body-root frame,
     ``force_contact`` ``(6,)`` bool, ``force_lever`` ``(6, 3)`` metres in the
-    same frame, ``force_conf`` float, ``force_valid`` bool.
+    same frame, ``force_conf`` float, ``force_valid`` bool, ``gravity_world``
+    ``(3,)`` the scene's fitted unit down vector (world).
 ``smplx``
     ``smplx_joints_world`` ``(52, 3)`` metres (row 0 = pelvis, 22 body joints then
     the 30 finger joints), ``smplx_root_rot`` ``(3, 3)`` world-from-root,

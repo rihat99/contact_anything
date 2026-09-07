@@ -58,8 +58,8 @@ class ContactAnything(nn.Module):
         as ``checkpoint`` / ``frozen`` are the builder's business).
     :param refiner: :class:`~model.refiner.TemporalRefiner` config or ``None``
         — ``{outputs, dim, num_layers, num_heads, mlp_ratio, dropout, window,
-        time_scale, depth_smooth_sec, pose_token, pose_token_dim,
-        contact_token_dim}``; needs ``smplx``.
+        time_scale, root_smooth_sec, pose_smooth_sec, camera_context, pose_token,
+        pose_token_dim, contact_token_dim}``; needs ``smplx``.
     """
 
     def __init__(
@@ -134,7 +134,10 @@ class ContactAnything(nn.Module):
                 dropout=float(refiner["dropout"]),
                 window=float(refiner["window"]),
                 time_scale=float(refiner["time_scale"]),
-                depth_smooth_sec=float(refiner["depth_smooth_sec"]),
+                root_smooth_sec=float(refiner["root_smooth_sec"]),
+                pose_smooth_sec=float(refiner["pose_smooth_sec"]),
+                learn_smoothing=bool(refiner["learn_smoothing"]),
+                camera_context=bool(refiner["camera_context"]),
                 pose_token=bool(refiner["pose_token"]),
                 pose_token_dim=int(refiner["pose_token_dim"]),
                 contact_token_dim=int(refiner["contact_token_dim"]),
@@ -191,8 +194,10 @@ class ContactAnything(nn.Module):
         """Forward one collated batch (flattened clips, ``[B_clips * T, ...]``).
 
         Consumes the collate layout: flat per-frame geometry ``[B, ...]`` (no
-        person dimension), optional ``embedding`` (cached backbone output), and
-        the ``seq_len`` / ``frame_pos_sec`` / ``frame_valid`` clip fields.
+        person dimension), optional ``embedding`` (cached backbone output) or
+        ``pose_token`` (cached final pose token — the frozen base is skipped and
+        ``out["mhr"]`` is ``None``), and the ``seq_len`` / ``frame_pos_sec`` /
+        ``frame_valid`` clip fields.
 
         :returns: ``{"mhr", "contact", "force", "motion", "smplx", "tokens",
             "blocks"}`` — head outputs are ``None`` for disabled branches;
@@ -200,27 +205,38 @@ class ContactAnything(nn.Module):
             ``{"forces"} [B, K, 3]``, ``motion`` the refiner's body-frame
             velocities / accelerations.
         """
-        embedding = batch.get("embedding")          # optional: the cached backbone path
-        img = batch["img"] if embedding is None else None
-        batch_size = (img if embedding is None else embedding).shape[0]
-
         learned = [b for b in (self.contact_tokens, self.force_tokens) if b is not None]
-        out = self.wrapper(
-            img=img,
-            embedding=embedding,
-            bbox_center=batch["bbox_center"],
-            bbox_scale=batch["bbox_scale"],
-            ori_img_size=batch["ori_img_size"],
-            img_size=batch["img_size"],
-            affine_trans=batch["affine_trans"],
-            cam_int=batch["cam_int"],
-            mask=batch["mask"],
-            mask_score=batch["mask_score"],
-            blocks=[b.as_extra_block(batch_size) for b in learned],
-        )
-        tokens = out["tokens"]
-        bounds = dict(out["blocks"])
-        bounds["pose"] = (0, 1)
+        if "pose_token" in batch:
+            # Pose-token cache: the frozen base is a fixed function of the
+            # person-frame and its final pose token is all this build reads,
+            # so the backbone + decoder never run (no MHR readout either).
+            if learned or self.cross_modal_temporal is not None:
+                raise RuntimeError(
+                    "a cached pose token cannot feed learned decoder tokens or the "
+                    "cross-modal block — those need the live decoder")
+            tokens = batch["pose_token"].float()[:, None, :]              # [B, 1, C]
+            bounds = {"pose": (0, 1)}
+            out = {"mhr": None}
+        else:
+            embedding = batch.get("embedding")      # optional: the cached backbone path
+            img = batch["img"] if embedding is None else None
+            batch_size = (img if embedding is None else embedding).shape[0]
+            out = self.wrapper(
+                img=img,
+                embedding=embedding,
+                bbox_center=batch["bbox_center"],
+                bbox_scale=batch["bbox_scale"],
+                ori_img_size=batch["ori_img_size"],
+                img_size=batch["img_size"],
+                affine_trans=batch["affine_trans"],
+                cam_int=batch["cam_int"],
+                mask=batch["mask"],
+                mask_score=batch["mask_score"],
+                blocks=[b.as_extra_block(batch_size) for b in learned],
+            )
+            tokens = out["tokens"]
+            bounds = dict(out["blocks"])
+            bounds["pose"] = (0, 1)
 
         if self.cross_modal_temporal is not None:
             slices = [bounds[m] for m in self.cross_modal_modalities]

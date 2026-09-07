@@ -531,6 +531,15 @@ class SAM3DBody(BaseModel):
 
         # We're doing intermediate model predictions
         def token_to_pose_output_fn(tokens, prev_pose_output, layer_idx):
+            # --- efficiency hook (autocast_bf16) ---
+            # The MHR / camera readout and the keypoint projection stay fp32 even
+            # when the decoder runs under bf16 autocast: the interm keypoints are
+            # grid-sample LOCATIONS (bf16 would quantise them to ~1 crop pixel).
+            with torch.autocast("cuda", enabled=False):
+                return _token_to_pose_output_fp32(tokens.float(), prev_pose_output, layer_idx)
+            # --- end efficiency hook ---
+
+        def _token_to_pose_output_fp32(tokens, prev_pose_output, layer_idx):
             # Get the pose token
             pose_token = tokens[:, 0]
 

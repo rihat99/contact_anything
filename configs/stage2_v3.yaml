@@ -1,0 +1,41 @@
+# Stage 2, round 3 (docs/refiner.md "Round 3"): the round-2 recipe with the root handled in the
+# WORLD frame. The 2026-09-06 decomposition showed the round-2 residual jitter (20 vs the GT floor
+# of 7) was root position only and was MADE by smoothing the depth / bearing in camera coordinates
+# on moving cameras (the smoothing strips the camera's motion from the signal, the lift then no
+# longer cancels it); the raw stage-1 root smoothed 0.10 s AFTER the lift sits at the floor.
+#  * `root_smooth_sec` 0.10 on the lifted world pelvis; nothing is smoothed in camera coordinates;
+#  * the per-frame camera-frame pelvis Huber replaced by the two-scale world anchor: `root_bias`
+#    (Huber on the clip-mean error, knee 0.1 m) + `root_shape` (Huber on the per-frame deviation
+#    from that mean, knee 0.02 m: the trajectory shape at the depth wander's scale);
+#  * 10 epochs as a quick check (round 2 ran 50); everything else as round 2 (64 clips per step).
+base: configs/base.yaml
+model:
+  decoder_checkpointing: true
+  contact: {enabled: true}
+  smplx: {enabled: true, hands: true, checkpoint: output/stage1_20260905_180319/best.pth, frozen: true}
+  refiner:
+    enabled: true
+    outputs: [pose, contact, motion, force]
+    num_layers: 3
+    window: 0.5
+    root_smooth_sec: 0.10
+    pose_smooth_sec: 0.08
+    camera_context: true
+data:
+  frames_per_batch: 480               # 8 clips x 60 frames per GPU (~33 GB with decoder_checkpointing)
+  clip: {frames: 60, stride: auto, jitter: true}
+  interleave_videos: true
+  eval_max_frames: 120
+contact_supervision: {enabled: true, weight: 5.0}
+force_supervision: {enabled: true}
+smplx_supervision:
+  enabled: true
+  loss: {kp2d: 0.0, kp3d: 10.0, orient: 1.0, pose: 2.0, hand_pose: 0.0, betas: 0.0, cam: 0.0, root_bias: 2.0, root_shape: 2.0}
+motion_supervision:
+  enabled: true
+  scale: {vel: 0.4, acc: 1.2, ang_vel: 0.57, ang_acc: 1.8}   # GT RMS on 150 train scenes (scripts/analyze_stage1.py)
+  loss: {vel: 1.0, acc: 1.0, ang_vel: 1.0, ang_acc: 1.0, pose_vel: 1.0, pose_acc: 0.2, pose_ang_vel: 1.0, pose_ang_acc: 0.5, huber_delta: 1.0}
+contact_consistency: {enabled: true, weight: 0.5}
+optim: {lr: 0.0003, weight_decay: 0.01, epochs: 10, accumulate_steps: 2, warmup_steps: 100, lr_min: 1.0e-06}
+output: {exp_name: stage2_v3, monitor: metric_pose/mpjpe, save_freq: 5, frozen_metrics: output/stage2_v2_20260905_234616/eval.json}
+                                      # the `frozen` TB line = round 2's final model (the row to beat)

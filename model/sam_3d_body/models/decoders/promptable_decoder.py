@@ -6,6 +6,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 
 from ..modules.transformer import build_norm_layer, TransformerDecoderLayer
 
@@ -126,8 +127,24 @@ class PromptableDecoder(nn.Module):
             assert token_to_pose_output_fn is not None
             all_pose_outputs = []
 
+        # --- efficiency hook (checkpoint_layers) ---
+        # Recompute each layer in the backward instead of storing its activations
+        # (the two-way cross-attention over the 1024 image tokens dominates the
+        # per-frame memory). Attribute absent -> old behaviour.
+        _checkpoint = bool(getattr(self, "checkpoint_layers", False)) and torch.is_grad_enabled()
+        # --- end efficiency hook ---
         for layer_idx, layer in enumerate(self.layers):
-            if hand_embeddings is None:
+            if hand_embeddings is None and _checkpoint:
+                token_embedding, image_embedding = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    token_embedding,
+                    image_embedding,
+                    token_augment,
+                    image_augment,
+                    token_mask,
+                    use_reentrant=False,
+                )
+            elif hand_embeddings is None:
                 token_embedding, image_embedding = layer(
                     token_embedding,
                     image_embedding,

@@ -120,6 +120,17 @@ def embedding_path(
             / f"{object_id:02d}" / f"{position:06d}.npy")
 
 
+def pose_token_path(token_dir: str | Path, scene: str) -> Path:
+    """Cache file of one scene's frozen SAM 3D Body pose tokens.
+
+    ``<token_dir>/<shard>/<scene>.npz`` with ``tokens (P, N, C)`` — an int16 bit
+    view of the bf16 final pose token (sequence index 0) of every valid
+    person-frame, zeros elsewhere — ``valid (P, N)``, ``object_ids (P,)`` and
+    ``img_wh (N, 2)``. Written by ``scripts/data/precompute_pose_tokens.py``.
+    """
+    return Path(token_dir) / scene_shard(scene) / f"{scene}.npz"
+
+
 def rows_by_object_id(
     array: np.ndarray, source_ids: np.ndarray, wanted_ids: np.ndarray,
     scene: str, what: str,

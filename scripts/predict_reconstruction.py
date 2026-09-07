@@ -1,31 +1,37 @@
-"""Predict contacts and 3D forces on BetterVideoReconstruction out-trees.
+"""Predict contacts, 3D forces and the refined SMPL-X body on BetterVideoReconstruction out-trees.
 
-For every scene ``<out-root>/<stem>/`` with pipeline inputs
-(``sam3/bboxes.npz``, ``geometry/transform.npz``) the source video is decoded to
-frames and the checkpoint is run over :class:`data.reconstruction.
-ReconstructionSceneDataset`'s clips — tiled windows of the config's clip length
-at stride 1, so every frame of a window-sized valid run is predicted. Rows no
-window covers stay NaN.
+For every scene ``<out-root>/<stem>/`` with pipeline inputs (``sam3/bboxes.npz``,
+``geometry/transform.npz``) the source video is decoded to frames and the checkpoint
+runs over :class:`data.reconstruction.ReconstructionSceneDataset` under the
+``scripts/predict_test.py`` protocol: every contiguous tracked run of every person at
+the config's clip stride (``auto`` = the per-scene ~25 fps stride), tiled into
+``--max-frames``-row windows overlapping by ``--overlap`` rows, each row keeping the
+window it sits deepest inside. Rows no window covers (source frames between stride
+steps) stay NaN. Labels are not needed — the tree only has to carry cameras and boxes.
 
-Two files are written into ``<stem>/predictions/``:
+Files written into ``<stem>/predictions/`` (arrays ``[P, N, ...]`` over the tree's
+people and frames, NaN / False where not predicted):
 
 ``contacts.npz``
-    per-group probabilities and thresholded booleans.
+    six-group probabilities, thresholded booleans and the anchors' pixels.
 ``forces.npz`` (``--force-name``)
-    per-group 3D forces in body-weight units, in the head's body-root frame
-    plus a world-frame copy rotated by the kindyn root quaternion
-    (``human_optim/kindyn_1.npz`` ``q[..., 3:7]``,
-    xyzw, world-from-root), so that tree must have run the dynamics stage; a
-    ``local_world_aligned`` head is rotated by the axis flip into the OpenCV
-    camera and then by ``cam_from_world``.
+    ``forces`` in the refiner's body frame and ``forces_world`` — rotated with the
+    model's OWN world-from-body root, i.e. into the world of ``geometry/transform.npz``
+    (a decoder-level force head is rotated with the per-frame SMPL-X root instead) —
+    plus the camera-frame anchors, body-weight units.
+``smplx.npz``
+    the refined body in the ``predict_test.py`` layout: ``q_cam``, ``betas``,
+    ``joints_cam``, ``joints_world``, ``pelvis_cam``, ``covered``.
 
-Group order is the kindyn one everywhere: ``left_hand, right_hand, left_foot
-(toe), right_foot, left_ankle (heel), right_ankle``.
+Group order is the kindyn one everywhere: ``left_hand, right_hand, left_foot (toe),
+right_foot, left_ankle (heel), right_ankle``; the anchors are the refined body's
+SMPL-X wrist / toe / ankle joints.
 
-    python scripts/predict_reconstruction.py \
-        --config output/<run>/config.yaml --checkpoint output/<run>/best.pth \
-        --out-root ../BetterVideoReconstruction/out \
-        --videos ../BetterVideoReconstruction/data
+    python scripts/predict_reconstruction.py --config configs/stage2_v2_force.yaml \
+        --checkpoint output/<run>/last.pth \
+        --out-root ../BetterVideoReconstruction-dev/peter/out_climb_wall_2_single \
+        --videos ../BetterVideoReconstruction-dev/peter/climb_wall_2 \
+        --video-pattern "{scene}/cam_left.mp4" --force-name forces_sup.npz
 """
 from __future__ import annotations
 
@@ -41,11 +47,14 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import _render_common as rc                                     # noqa: E402
-from data.climbing_videos.kindyn import quat_xyzw_to_matrix     # noqa: E402
-from data.climbing_videos.scene import rows_by_object_id        # noqa: E402
+from data.base import Clip                                      # noqa: E402
 from data.reconstruction import ReconstructionSceneDataset, extract_frames  # noqa: E402
 from model.loss import KINDYN_GROUP_NAMES                       # noqa: E402
+from model.loss.contact_consistency import GROUP_JOINTS         # noqa: E402
+from predict_test import Q_FULL, pad_hands, windows             # noqa: E402
 from train.predict import load_model                            # noqa: E402
+
+NUM_GROUPS = len(KINDYN_GROUP_NAMES)
 
 
 def checkpoint_epoch(path: str | None) -> int:
@@ -55,86 +64,124 @@ def checkpoint_epoch(path: str | None) -> int:
     return int(torch.load(path, map_location="cpu", weights_only=False)["epoch"])
 
 
-def predict_scene(model, ds, cfg: dict, device: str) -> dict:
-    """Run every clip of one out-tree. ``-> {probs, forces, kp2d, kp3d_cam}``.
+def project_rows(points_cam: np.ndarray, cam_int: np.ndarray) -> np.ndarray:
+    """Per-row pinhole projection: ``(B, K, 3)`` camera points with ``(B, 3, 3)`` intrinsics."""
+    z = np.clip(points_cam[..., 2:3], 1e-6, None)
+    focal = cam_int[:, None, [0, 1], [0, 1]]
+    centre = cam_int[:, None, :2, 2]
+    return points_cam[..., :2] / z * focal + centre
 
-    Arrays are ``[P, N, ...]`` over the tree's people and frames; rows no clip
-    covered stay NaN.
-    """
-    data = ds.scene_data(ds.scene)
+
+def predict_scene(model, ds: ReconstructionSceneDataset, cfg: dict, device: str,
+                  max_rows: int, overlap: int) -> dict:
+    """Run the tiled windows of one out-tree; scatter the rows into per-frame arrays."""
+    scene = ds.scene
+    data = ds.scene_data(scene)
     n_people, n_frames = data["valid_mask"].shape
-    n_contact = model.contact_tokens.num_tokens if model.contact_tokens else 0
-    n_force = model.force_tokens.num_tokens if model.force_tokens else 0
+    stride = ds.scene_stride(scene)
+    n_joints = model.head_smplx.num_joints
+    has_contact, has_force = model.has_contact, model.has_force
+    nan = lambda *shape: np.full((n_people, n_frames, *shape), np.nan, np.float32)  # noqa: E731
     out = {
-        "probs": np.full((n_people, n_frames, n_contact), np.nan, np.float32),
-        "forces": np.full((n_people, n_frames, n_force, 3), np.nan, np.float32),
-        "kp2d": np.full((n_people, n_frames, 70, 2), np.nan, np.float32),
-        "kp3d_cam": np.full((n_people, n_frames, 70, 3), np.nan, np.float32),
+        "q_cam": nan(Q_FULL), "betas": nan(10), "joints_cam": nan(n_joints, 3),
+        "joints_world": nan(n_joints, 3), "pelvis_cam": nan(3),
+        "anchor_cam": nan(NUM_GROUPS, 3), "anchor_2d": nan(NUM_GROUPS, 2),
+        "covered": np.zeros((n_people, n_frames), bool),
+        "stride": np.int32(stride),
     }
+    if has_contact:
+        out["probs"] = nan(NUM_GROUPS)
+    if has_force:
+        out["forces"], out["forces_world"] = nan(NUM_GROUPS, 3), nan(NUM_GROUPS, 3)
+    # Distance of the kept prediction from its window's edge (rows); a later window
+    # overwrites a row only from deeper inside itself.
+    depth = np.full((n_people, n_frames), -1, np.int64)
+    clips = []
+    for person in range(n_people):
+        for start, n_rows in windows(data["valid_mask"][person], stride, max_rows, overlap):
+            clips.append(Clip(scene, person, start, n_rows, 1))
+    ds.clips = clips
     for clip, batch, output in rc.clip_batches(ds, cfg, model, device):
-        mhr = output["mhr"]
-        kp2d = rc.to_numpy(mhr["pred_keypoints_2d"])
-        kp3d_cam = rc.to_numpy(mhr["pred_keypoints_3d"] + mhr["pred_cam_t"][:, None, :])
-        probs = (rc.to_numpy(output["contact"]["probs"])
-                 if output["contact"] is not None else None)
-        forces = (rc.to_numpy(output["force"]["forces"])
-                  if output["force"] is not None else None)
-        for row, position in enumerate(batch["frame_index"].tolist()):
-            out["kp2d"][clip.person, position] = kp2d[row]
-            out["kp3d_cam"][clip.person, position] = kp3d_cam[row]
+        sx = output["smplx"]
+        ext = batch["cam_from_world"]
+        q = pad_hands(rc.to_numpy(sx["q_cam"]))
+        betas, joints = rc.to_numpy(sx["betas"]), rc.to_numpy(sx["joints_cam"])
+        pelvis = rc.to_numpy(sx["pelvis_cam"])
+        if "joints_world" in sx:
+            joints_world = rc.to_numpy(sx["joints_world"])
+        else:                                       # per-frame head: lift with the tree's cameras
+            rot_wc = ext[:, :3, :3].transpose(1, 2)
+            joints_world = rc.to_numpy(torch.einsum(
+                "bij,bkj->bki", rot_wc, sx["joints_cam"] - ext[:, None, :3, 3]))
+        anchor_cam = joints[:, list(GROUP_JOINTS)]
+        anchor_2d = project_rows(anchor_cam, rc.to_numpy(batch["cam_int"]))
+        probs = rc.to_numpy(output["contact"]["probs"]) if has_contact else None
+        forces = forces_world = None
+        if has_force:
+            fr = output["force"]
+            frame = fr.get("frame")                 # refiner: world-from-body of its forces
+            if frame is None:                       # decoder head: the kindyn root-frame convention
+                frame = ext[:, :3, :3].transpose(1, 2) @ sx["root_rot"]
+            forces = rc.to_numpy(fr["forces"])
+            forces_world = np.einsum("bij,bkj->bki", rc.to_numpy(frame), forces)
+        rows = batch["frame_index"].tolist()
+        p = clip.person
+        for row, position in enumerate(rows):
+            d = min(row, len(rows) - 1 - row)
+            if d <= depth[p, position]:
+                continue
+            depth[p, position] = d
+            out["q_cam"][p, position] = q[row]
+            out["betas"][p, position] = betas[row]
+            out["joints_cam"][p, position] = joints[row]
+            out["joints_world"][p, position] = joints_world[row]
+            out["pelvis_cam"][p, position] = pelvis[row]
+            out["anchor_cam"][p, position] = anchor_cam[row]
+            out["anchor_2d"][p, position] = anchor_2d[row]
+            out["covered"][p, position] = True
             if probs is not None:
-                out["probs"][clip.person, position] = probs[row]
+                out["probs"][p, position] = probs[row]
             if forces is not None:
-                out["forces"][clip.person, position] = forces[row]
+                out["forces"][p, position] = forces[row]
+                out["forces_world"][p, position] = forces_world[row]
+    out["windows"] = np.array([(c.person, c.start, c.frames) for c in clips], np.int32)
     return out
 
 
-def provenance(ds, video: Path, checkpoint: str, epoch: int, cfg: dict,
-               clip_frames: int) -> dict:
-    """The identity block both npz files carry (BetterVideoReconstruction reads it)."""
+def provenance(ds, preds: dict, video: Path, checkpoint: str, epoch: int, cfg: dict,
+               max_rows: int, overlap: int) -> dict:
+    """The identity block every file carries (BetterVideoReconstruction reads it).
+
+    ``valid_mask`` is the PREDICTED coverage (tracked rows at the clip stride), so a
+    consumer never draws an uncovered row.
+    """
     data = ds.scene_data(ds.scene)
     return {
         "limbs": np.asarray(list(KINDYN_GROUP_NAMES)),
         "object_ids": data["object_ids"].astype(np.int32),
         "frame_indices": data["frame_indices"].astype(np.int32),
-        "valid_mask": data["valid_mask"],
+        "valid_mask": preds["covered"],
+        "tracked": np.asarray(data["valid_mask"], bool),
         "fps": np.float32(data["fps"]),
+        "stride": preds["stride"],
         "source_video": str(video),
         "checkpoint": checkpoint,
         "checkpoint_epoch": np.int32(epoch),
         "exp_name": str(cfg["output"]["exp_name"]),
-        "windows": (f"tiled windows T={clip_frames} stride=1 over invalid-free "
-                    f"runs; uncovered rows are NaN"),
+        "windows": (f"tiled windows of {max_rows} rows overlapping {overlap} at stride "
+                    f"{int(preds['stride'])} over tracked runs; each row keeps the window it "
+                    f"sits deepest inside; uncovered rows are NaN"),
     }
-
-
-def world_forces(forces: np.ndarray, out_dir: Path, ds, scene: str
-                 ) -> tuple[np.ndarray, dict]:
-    """Rotate body-root-frame forces to the world frame. ``-> (forces_world, extra keys)``."""
-    data = ds.scene_data(scene)
-    kindyn = np.load(out_dir / "human_optim" / "kindyn_1.npz", allow_pickle=True)
-    q = rows_by_object_id(np.asarray(kindyn["q"], np.float32), kindyn["object_ids"],
-                          data["object_ids"], scene, "kindyn")      # [P, N, nq]
-    valid = rows_by_object_id(np.asarray(kindyn["valid_mask"], bool),
-                              kindyn["object_ids"], data["object_ids"], scene, "kindyn")
-    if q.shape[1] != forces.shape[1]:
-        raise ValueError(
-            f"{scene}: kindyn covers {q.shape[1]} frames but the tree has "
-            f"{forces.shape[1]}")
-    world = np.einsum("pnij,pnkj->pnki",
-                      quat_xyzw_to_matrix(q[..., 3:7]), forces).astype(np.float32)
-    world[~valid] = np.nan                       # no root orientation on those rows
-    return world, {"root_rotation_source":
-                   "human_optim/kindyn_1.npz q[...,3:7] xyzw world-from-root"}
 
 
 def run_scene(args, model, cfg: dict, scene: str, video: Path, work_root: Path,
               epoch: int) -> None:
     out_dir = args.out_root / scene
     pred_dir = out_dir / "predictions"
-    targets = {"contact": pred_dir / "contacts.npz", "force": pred_dir / args.force_name}
-    wanted = ([targets["contact"]] if model.contact_tokens is not None else []) + \
-             ([targets["force"]] if model.force_tokens is not None else [])
+    targets = {"contact": pred_dir / "contacts.npz", "force": pred_dir / args.force_name,
+               "smplx": pred_dir / "smplx.npz"}
+    wanted = [targets["smplx"]] + ([targets["contact"]] if model.has_contact else []) + \
+             ([targets["force"]] if model.has_force else [])
     if args.skip_existing and all(path.is_file() for path in wanted):
         print(f"{scene}: predictions exist, skipping")
         return
@@ -143,39 +190,49 @@ def run_scene(args, model, cfg: dict, scene: str, video: Path, work_root: Path,
     frames_dir = work_root / scene
     print(f"{scene}: extracting {n_frames} frames …")
     extract_frames(video, frames_dir, n_frames)
-    clip_frames = min(int(cfg["data"]["clip"]["frames"]), n_frames)
+    max_rows = int(args.max_frames)
     ds = ReconstructionSceneDataset(out_dir, frames_dir, scene=scene,
-                                    clip_frames=clip_frames, stride=1)
-    preds = predict_scene(model, ds, cfg, args.device)
+                                    clip_frames=max_rows, stride=cfg["data"]["clip"]["stride"])
+    preds = predict_scene(model, ds, cfg, args.device, max_rows, int(args.overlap))
     pred_dir.mkdir(parents=True, exist_ok=True)
-    identity = provenance(ds, video, str(args.checkpoint), epoch, cfg, clip_frames)
+    identity = provenance(ds, preds, video, str(args.checkpoint), epoch, cfg,
+                          max_rows, int(args.overlap))
+    covered = int(preds["covered"].sum())
+    print(f"  {covered}/{int(ds.scene_data(scene)['valid_mask'].sum())} tracked person-frames "
+          f"predicted (stride {int(preds['stride'])}, {len(preds['windows'])} windows)")
 
-    if model.contact_tokens is not None:
+    np.savez_compressed(
+        targets["smplx"], q_cam=preds["q_cam"], betas=preds["betas"],
+        joints_cam=preds["joints_cam"], joints_world=preds["joints_world"],
+        pelvis_cam=preds["pelvis_cam"], covered=preds["covered"],
+        hands=np.bool_(model.head_smplx.hands), **identity)
+
+    if model.has_contact:
         probs = preds["probs"]
-        anchors = preds["kp2d"][:, :, list(model.contact_tokens.keypoint_indices)]
         contacts = np.where(np.isfinite(probs), probs >= args.threshold, False)
         np.savez_compressed(
             targets["contact"], probs=probs, contacts=contacts.astype(bool),
-            threshold=np.float32(args.threshold), anchor_points_2d=anchors, **identity)
-        print(f"  contacts.npz: {int(np.isfinite(probs).all(-1).sum())} predicted "
-              f"person-frames, contact fraction "
+            threshold=np.float32(args.threshold), anchor_points_2d=preds["anchor_2d"],
+            **identity)
+        print(f"  contacts.npz: contact fraction "
               f"{float(contacts[np.isfinite(probs)].mean()):.3f}")
 
-    if model.force_tokens is not None:
-        forces = preds["forces"]
-        anchors = preds["kp2d"][:, :, list(model.force_tokens.keypoint_indices)]
-        anchor_cam = preds["kp3d_cam"][:, :, list(model.force_tokens.keypoint_indices)]
-        forces_world, extra = world_forces(forces, out_dir, ds, scene)
-        if model.contact_tokens is not None:
-            extra["contact_probs"] = preds["probs"]
+    if model.has_force:
+        extra = {"contact_probs": preds["probs"]} if model.has_contact else {}
         np.savez_compressed(
-            targets["force"], forces=forces, forces_world=forces_world,
-            anchor_points_2d=anchors, anchor_cam=anchor_cam, units="body_weight",
-            force_frame="root", **extra, **identity)
-        magnitude = np.linalg.norm(forces, axis=-1)
-        magnitude = magnitude[np.isfinite(magnitude)]
-        print(f"  {targets['force'].name}: mean |f| {float(magnitude.mean()):.3f} bw, "
-              f"frac >0.05 bw {float((magnitude > 0.05).mean()):.3f}")
+            targets["force"], forces=preds["forces"], forces_world=preds["forces_world"],
+            anchor_points_2d=preds["anchor_2d"], anchor_cam=preds["anchor_cam"],
+            units="body_weight", force_frame="refiner_body",
+            root_rotation_source="the model's own world-from-body root (refiner input frame)",
+            **extra, **identity)
+        magnitude = np.linalg.norm(preds["forces"], axis=-1)
+        finite = np.isfinite(magnitude)
+        line = f"  {targets['force'].name}: mean |f| {float(magnitude[finite].mean()):.3f} bw"
+        if model.has_contact:
+            on = finite & (preds["probs"] >= args.threshold)
+            line += (f", limbs with p>={args.threshold:g}: {float(magnitude[on].mean()):.3f} bw, "
+                     f"others {float(magnitude[finite & ~on].mean()):.3f} bw")
+        print(line)
 
     shutil.rmtree(frames_dir, ignore_errors=True)
 
@@ -196,6 +253,10 @@ def main() -> int:
     parser.add_argument("--force-name", default="forces.npz",
                         help="filename of the force predictions inside predictions/")
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--max-frames", type=int, default=240,
+                        help="window length in rows (~18 GiB peak at 240)")
+    parser.add_argument("--overlap", type=int, default=120,
+                        help="rows shared by consecutive windows")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--work-dir", type=Path, default=None,
                         help="frame-extraction scratch dir (default: a temp dir)")
@@ -204,6 +265,8 @@ def main() -> int:
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    if not 0 <= args.overlap < args.max_frames:
+        raise SystemExit(f"--overlap {args.overlap} must be in [0, --max-frames {args.max_frames})")
 
     scenes = args.scenes or sorted(
         d.name for d in args.out_root.iterdir()
@@ -219,19 +282,21 @@ def main() -> int:
 
     checkpoint = None if str(args.checkpoint).lower() == "none" else args.checkpoint
     model, cfg = load_model(args.config, checkpoint, args.device)
-    if model.contact_tokens is None and model.force_tokens is None:
-        raise SystemExit("this build has neither a contact nor a force head — "
-                         "there is nothing to predict")
+    if model.head_smplx is None:
+        raise SystemExit("this build has no SMPL-X head — the anchors need the body")
     epoch = checkpoint_epoch(checkpoint)
+    print(f"{len(scenes)} scene(s) on {args.device}; checkpoint {checkpoint} (epoch {epoch}); "
+          f"contact={model.has_contact} force={model.has_force}; windows {args.max_frames} rows, "
+          f"overlap {args.overlap}")
     work_root = args.work_dir or Path(tempfile.mkdtemp(prefix="predict_reconstruction_"))
     work_root.mkdir(parents=True, exist_ok=True)
     failures = []
     for index, scene in enumerate(scenes, start=1):
-        print(f"[{index}/{len(scenes)}] {scene}")
+        print(f"[{index}/{len(scenes)}] {scene}", flush=True)
         try:
             run_scene(args, model, cfg, scene, videos[scene], work_root, epoch)
         except Exception as error:          # a broken scene must not kill the batch
-            print(f"  FAILED — {error}")
+            print(f"  FAILED — {type(error).__name__}: {error}", flush=True)
             failures.append(scene)
     if args.work_dir is None:
         shutil.rmtree(work_root, ignore_errors=True)

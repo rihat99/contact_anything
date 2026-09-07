@@ -12,10 +12,17 @@ replaced BEFORE the loss rather than multiplied out afterwards: ``NaN * 0`` is
 still ``NaN``, and an untracked video frame carries no meaningful logit.
 
 Plain binary cross-entropy: calibrated probabilities, constant gradient scale
-(what WHAM / GVHMR / TRACE use for their contact heads).
+(what WHAM / GVHMR / TRACE use for their contact heads). ``class_weights``
+(``{positive: [6], negative: [6]}``, per group) multiplies the rows on top:
+``positive`` is the false-NEGATIVE penalty (a positive row's BCE), ``negative``
+the false-POSITIVE one. The six groups are far from balanced on the train
+labels (hands 78-81 % positive, toes 60 %, heels 3.4-3.7 %), and a plain BCE
+learns the heels as "never" (test F1 exactly 0 through round 3). The weights
+enter numerator AND mass, so they reweight rows without changing the term's
+scale; the metrics stay unweighted.
 
 Metrics are micro P / R / F1 / IoU at threshold 0.5 over the whole split, plus
-per-group F1 — a micro score otherwise hides a weak heel behind four strong
+per-group P / R / F1 — a micro score otherwise hides a weak heel behind four strong
 limbs — and ``precision_at_r90``: the micro precision at the operating point
 whose recall is 0.9, interpolated on the 0.02..0.9 threshold curve (NaN when
 no curve point brackets that recall).
@@ -52,6 +59,17 @@ class ContactLoss(Loss):
         cs = cfg["contact_supervision"]
         self.weight = float(cs["weight"])
         self.use_confidence = bool(cs["confidence_weights"])
+        self.class_weights = None
+        if cs["class_weights"] is not None:
+            pos = torch.tensor([float(w) for w in cs["class_weights"]["positive"]],
+                               dtype=self.dtype, device=self.device)
+            neg = torch.tensor([float(w) for w in cs["class_weights"]["negative"]],
+                               dtype=self.dtype, device=self.device)
+            if pos.numel() != NUM_KINDYN_GROUPS or neg.numel() != NUM_KINDYN_GROUPS:
+                raise ValueError(
+                    "contact_supervision.class_weights.positive / negative need "
+                    f"{NUM_KINDYN_GROUPS} entries each (kindyn group order)")
+            self.class_weights = (pos, neg)
 
     def __call__(self, out: dict, batch: dict, *, train: bool) -> LossResult:
         logits = out["contact"]["logits"].to(self.device, self.dtype)
@@ -65,11 +83,15 @@ class ContactLoss(Loss):
                 f"{tuple(gt.shape)} — the contact head's token count and the "
                 f"dataset's group count must agree")
 
+        weight = mask
+        if self.class_weights is not None:
+            pos, neg = self.class_weights
+            weight = mask * (gt * pos[None, :] + (1.0 - gt) * neg[None, :])
         # An ignored element must not reach the loss at all: NaN * 0 is NaN.
         safe = torch.where(mask > 0, logits, torch.zeros_like(logits))
         per_element = F.binary_cross_entropy_with_logits(safe, gt, reduction="none")
-        numerator = self.weight * (per_element * mask).sum()
-        mass = float(mask.sum())
+        numerator = self.weight * (per_element * weight).sum()
+        mass = float(weight.sum())
         anchor = safe.sum() * 0.0
 
         detached = logits.detach()
@@ -93,7 +115,9 @@ class ContactLoss(Loss):
         out = {key: micro[key] for key in ("f1", "precision", "recall", "iou")}
         out["precision_at_r90"] = precision_at_recall(curve, CURVE_RECALL)
         for group, row in zip(KINDYN_GROUP_NAMES, counts):
-            out[f"groups/{group}_f1"] = prf1(row)["f1"]
+            scores = prf1(row)
+            for key in ("f1", "precision", "recall"):
+                out[f"groups/{group}_{key}"] = scores[key]
         return out
 
 

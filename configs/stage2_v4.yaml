@@ -1,0 +1,58 @@
+# Stage 2, round 4 — arm A "full" (2026-09-06 evening, five arms of 15 epochs chained on GPUs 0/1/4/7):
+# the round-3 recipe (configs/stage2_v3.yaml) with ONE loss change and ONE physics change:
+#  * contact BCE `class_weights`: a missed HEEL contact costs 5x (train positive rate 3.4-3.7 %, neg/pos 27;
+#    heel F1 was exactly 0 through round 3); hands and toes stay uniform BCE;
+#  * the RNEA force-consistency loss ON from epoch 0 with NO pre-smoothing (`smooth_sec: 0` — the refined
+#    motion is already smoothed at the refiner's input) at round 2 phase 2's weights 5 / 25 (round 3 itself
+#    ran without the RNEA loss; the 8 / 40 of the first round-4 attempts is dropped with the rest).
+# Every other weight = round 3: contact 5, vector-Huber force loss with non-contact L1 1 and confidence power 1,
+# world-root smoothing 0.10 / 0.08 s FIXED, root_bias / root_shape anchors, derivative matching,
+# contact_consistency 0.5, 64 clips per step. The three earlier round-4 attempts of 2026-09-06 (contact 10 /
+# non-contact 5 / RNEA 8/40, force magnitude+direction split, confidence_power 0.5, hand/toe class weights,
+# learnable smoothing widths) were dropped: the contact rebalance was judged wrong and the learnable widths
+# over-smoothed (root 0.10 -> 0.20 s by epoch 7, MPJPE 56.26 -> 57.20). Runs of those attempts are in the trash.
+# Arms (each a tiny override of this file, run in this order after A): stage2_v4_nofc (B: no RNEA loss),
+# stage2_v4_nomotion (C: no motion losses — neither head prediction nor pose-derivative matching — and hence no
+# motion head), stage2_v4_noforce (D: no force head, no force losses), stage2_v4_nosmooth (E: no root / pose
+# smoothing before the temporal block).
+base: configs/base.yaml
+model:
+  decoder_checkpointing: true
+  contact: {enabled: true}
+  smplx: {enabled: true, hands: true, checkpoint: output/stage1_20260905_180319/best.pth, frozen: true}
+  refiner:
+    enabled: true
+    outputs: [pose, contact, motion, force]
+    num_layers: 3
+    window: 0.5
+    root_smooth_sec: 0.10
+    pose_smooth_sec: 0.08
+    learn_smoothing: false
+    camera_context: true
+data:
+  frames_per_batch: 480               # 8 clips x 60 frames per GPU (~33 GB with decoder_checkpointing)
+  clip: {frames: 60, stride: auto, jitter: true}
+  interleave_videos: true
+  eval_max_frames: 120
+contact_supervision:
+  enabled: true
+  weight: 5.0
+  class_weights:                      # LH, RH, L toe, R toe, L heel, R heel
+    positive: [1.0, 1.0, 1.0, 1.0, 5.0, 5.0]    # false-negative penalty: heels only
+    negative: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+force_supervision: {enabled: true}    # base defaults = round 3: vector Huber 1, non-contact L1 1, confidence power 1
+smplx_supervision:
+  enabled: true
+  loss: {kp2d: 0.0, kp3d: 10.0, orient: 1.0, pose: 2.0, hand_pose: 0.0, betas: 0.0, cam: 0.0, root_bias: 2.0, root_shape: 2.0}
+motion_supervision:
+  enabled: true
+  scale: {vel: 0.4, acc: 1.2, ang_vel: 0.57, ang_acc: 1.8}   # GT RMS on 150 train scenes (scripts/analyze_stage1.py)
+  loss: {vel: 1.0, acc: 1.0, ang_vel: 1.0, ang_acc: 1.0, pose_vel: 1.0, pose_acc: 0.2, pose_ang_vel: 1.0, pose_ang_acc: 0.5, huber_delta: 1.0}
+contact_consistency: {enabled: true, weight: 0.5}
+force_consistency:
+  enabled: true
+  smooth_sec: 0.0                     # no Gaussian smoothing between the temporal block and the RNEA residual
+  loss: {force: 5.0, torque: 25.0}    # round 2 phase 2's weights
+optim: {lr: 0.0003, weight_decay: 0.01, epochs: 15, accumulate_steps: 2, warmup_steps: 100, lr_min: 1.0e-06}
+output: {exp_name: stage2_v4, monitor: metric_pose/mpjpe, save_freq: 5, frozen_metrics: output/stage2_v3_20260906_124223/eval.json}
+                                      # the `frozen` TB line = round 3's final model (the row to beat)

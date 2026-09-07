@@ -65,6 +65,39 @@ def save(
     )
 
 
+def _check_spec(path, saved_state: dict, model: nn.Module) -> None:
+    """Raise with the full diff unless the saved trainable ``(name, shape)`` set matches."""
+    saved = _spec(saved_state)
+    current = _spec(trainable_state_dict(model))
+    missing = sorted(set(current) - set(saved))
+    unexpected = sorted(set(saved) - set(current))
+    reshaped = sorted(
+        f"{name}: checkpoint {saved[name]} vs model {current[name]}"
+        for name in set(saved) & set(current) if saved[name] != current[name]
+    )
+    if missing or unexpected or reshaped:
+        raise RuntimeError(
+            f"{path}: trainable architecture mismatch — refusing to load.\n"
+            f"  in the model but not the checkpoint ({len(missing)}): {missing}\n"
+            f"  in the checkpoint but not the model ({len(unexpected)}): {unexpected}\n"
+            f"  shape mismatches ({len(reshaped)}): {reshaped}")
+
+
+def load_weights(path: str | Path, model: nn.Module) -> dict:
+    """Load a checkpoint's trainable weights into ``model`` (a warm start).
+
+    The same strict ``(name, shape)`` check as :func:`load`; the optimizer,
+    schedule and counters are NOT restored — the caller starts a fresh run
+    from these weights (the checkpoint's weights are its EMA weights).
+    """
+    ckpt = torch.load(Path(path), map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict) or "state_dict" not in ckpt:
+        raise RuntimeError(f"{path}: not a training checkpoint (no state_dict).")
+    _check_spec(path, ckpt["state_dict"], model)
+    model.load_state_dict(ckpt["state_dict"], strict=False)
+    return ckpt
+
+
 def load(
     path: str | Path,
     model: nn.Module,
@@ -81,22 +114,7 @@ def load(
     ckpt = torch.load(Path(path), map_location=map_location, weights_only=False)
     if not isinstance(ckpt, dict) or "state_dict" not in ckpt:
         raise RuntimeError(f"{path}: not a training checkpoint (no state_dict).")
-
-    saved = _spec(ckpt["state_dict"])
-    current = _spec(trainable_state_dict(model))
-    missing = sorted(set(current) - set(saved))
-    unexpected = sorted(set(saved) - set(current))
-    reshaped = sorted(
-        f"{name}: checkpoint {saved[name]} vs model {current[name]}"
-        for name in set(saved) & set(current) if saved[name] != current[name]
-    )
-    if missing or unexpected or reshaped:
-        raise RuntimeError(
-            f"{path}: trainable architecture mismatch — refusing to load.\n"
-            f"  in the model but not the checkpoint ({len(missing)}): {missing}\n"
-            f"  in the checkpoint but not the model ({len(unexpected)}): {unexpected}\n"
-            f"  shape mismatches ({len(reshaped)}): {reshaped}")
-
+    _check_spec(path, ckpt["state_dict"], model)
     model.load_state_dict(ckpt["state_dict"], strict=False)
     if optimizer is not None:
         optimizer.load_state_dict(ckpt["optimizer"])

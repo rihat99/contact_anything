@@ -14,6 +14,10 @@ Three questions the stage-2 design depends on (docs/refiner.md):
 3. **GT motion scales** — RMS of the kindyn world joint velocity / acceleration
    and root angular velocity / acceleration after the ``--label-smooth`` label
    smoothing (the ``motion_supervision.scale`` numbers).
+4. **Pose-smoothing calibration** (``--pose-sigmas``, on top of ``--depth-sigma``):
+   Gaussian smoothing of the world root rotation, the root-frame joint positions
+   and the camera bearing — the refiner's ``pose_smooth_sec`` — reported as
+   camera-frame MPJPE, world pelvis error, accel and lifted jitter.
 
 Series are handled per contiguous covered run of one person at the dump stride;
 derivatives use the refiner's own helpers so the numbers match the loss.
@@ -25,6 +29,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import roma
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -73,10 +78,48 @@ def smooth_depth(pelvis_cam: np.ndarray, seconds: np.ndarray, sigma: float) -> n
                      pelvis_cam[:, 1] / pelvis_cam[:, 2] * z, z], axis=-1)
 
 
-def analyze_split(files: list[Path], sigmas: list[float], label_smooth: float) -> dict:
+def smooth_rotations(rot: np.ndarray, seconds: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian smoothing of ``(T, 3, 3)`` rotations: weighted mean, projected to SO(3)."""
+    if sigma <= 0:
+        return rot
+    t = torch.as_tensor(seconds, dtype=torch.float32)[None]
+    valid = torch.ones_like(t, dtype=torch.bool)
+    mean = gaussian_smooth(torch.as_tensor(rot, dtype=torch.float32)[None], t, valid, sigma)[0]
+    return roma.special_procrustes(mean).numpy()
+
+
+def smooth_series(x: np.ndarray, seconds: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian smoothing of a ``(T, ...)`` series along time."""
+    if sigma <= 0:
+        return x
+    t = torch.as_tensor(seconds, dtype=torch.float32)[None]
+    valid = torch.ones_like(t, dtype=torch.bool)
+    return gaussian_smooth(torch.as_tensor(x, dtype=torch.float32)[None], t, valid, sigma)[0].numpy()
+
+
+def smooth_pose(joints: np.ndarray, pelvis: np.ndarray, root_rot: np.ndarray, ext: np.ndarray,
+                seconds: np.ndarray, sigma: float) -> np.ndarray:
+    """The refiner's pose smoothing on a dump run: world root rotation, root-frame joint
+    positions (a proxy for the joint rotations) and the camera bearing, each Gaussian-smoothed
+    with ``sigma``. ``pelvis`` is the (depth-smoothed) camera pelvis. Returns camera joints."""
+    rot_cw = ext[:, :3, :3]
+    rot_wr = np.einsum("tji,tjk->tik", rot_cw, root_rot)                 # R^T R_cam_root
+    joints_root = np.einsum("tji,tkj->tki", root_rot, joints - pelvis[:, None])
+    ray = pelvis[:, :2] / pelvis[:, 2:3]
+    ray_s = smooth_series(ray, seconds, sigma)
+    pelvis_s = np.concatenate([ray_s * pelvis[:, 2:3], pelvis[:, 2:3]], axis=-1)
+    rot_wr_s = smooth_rotations(rot_wr, seconds, sigma)
+    root_rot_s = np.einsum("tij,tjk->tik", rot_cw, rot_wr_s)
+    joints_root_s = smooth_series(joints_root, seconds, sigma)
+    return np.einsum("tij,tkj->tki", root_rot_s, joints_root_s) + pelvis_s[:, None]
+
+
+def analyze_split(files: list[Path], sigmas: list[float], label_smooth: float,
+                  pose_sigmas: list[float] = (), depth_sigma: float = 0.0) -> dict:
     acc = {"mpjpe": [], "pelvis_err": [], "depth_err": [], "depth_bias": [],
            "jitter": [], "gt_jitter": [], "frames": 0, "runs": 0}
     sweep = {s: {"pelvis_world": [], "joint_world": [], "jitter": []} for s in sigmas}
+    pose_sweep = {s: {"mpjpe": [], "pelvis_world": [], "accel": [], "jitter": []} for s in pose_sigmas}
     motion_sq = {"vel": [0.0, 0], "acc": [0.0, 0], "ang_vel": [0.0, 0], "ang_acc": [0.0, 0]}
     for path in files:
         dump = dict(np.load(path))
@@ -109,6 +152,24 @@ def analyze_split(files: list[Path], sigmas: list[float], label_smooth: float) -
                     sweep[s]["pelvis_world"].append(np.linalg.norm(world[:, 0] - gt_world[:, 0], axis=-1))
                     sweep[s]["joint_world"].append(np.linalg.norm(world - gt_world, axis=-1).mean(-1))
                     sweep[s]["jitter"].append(jitter(world, fps_eff))
+                # pose-smoothing sweep (root rotation + root-frame joints + bearing) on top of
+                # the depth smoothing the refiner applies
+                if pose_sigmas:
+                    pelvis_d = smooth_depth(pelvis, seconds, depth_sigma)
+                    base_joints = joints + (pelvis_d - pelvis)[:, None]
+                    dt = np.median(np.diff(seconds))
+                    for s in pose_sigmas:
+                        cam_s = smooth_pose(base_joints, pelvis_d, dump["root_rot_cam"][person, rows],
+                                            ext, seconds, s)
+                        pj_s = cam_s - cam_s[:, list(HIPS)].mean(1, keepdims=True)
+                        pose_sweep[s]["mpjpe"].append(np.linalg.norm(pj_s - gj, axis=-1).mean(-1))
+                        world_s = lift(cam_s, ext)
+                        pose_sweep[s]["pelvis_world"].append(
+                            np.linalg.norm(world_s[:, 0] - gt_world[:, 0], axis=-1))
+                        acc_err = ((pj_s[2:] - 2 * pj_s[1:-1] + pj_s[:-2])
+                                   - (gj[2:] - 2 * gj[1:-1] + gj[:-2])) / dt ** 2
+                        pose_sweep[s]["accel"].append(np.linalg.norm(acc_err, axis=-1).mean(-1))
+                        pose_sweep[s]["jitter"].append(jitter(world_s, fps_eff))
                 # GT motion scales
                 t = torch.as_tensor(seconds, dtype=torch.float32)[None]
                 valid = torch.ones_like(t, dtype=torch.bool)
@@ -129,6 +190,8 @@ def analyze_split(files: list[Path], sigmas: list[float], label_smooth: float) -
     summary["sweep"] = {s: {k: float(np.concatenate(v).mean()) for k, v in d.items()}
                         for s, d in sweep.items()}
     summary["motion_rms"] = {k: (sq / n) ** 0.5 if n else float("nan") for k, (sq, n) in motion_sq.items()}
+    summary["pose_sweep"] = {s: {k: float(np.concatenate(v).mean()) for k, v in d.items()}
+                             for s, d in pose_sweep.items()}
     return summary
 
 
@@ -140,13 +203,19 @@ def main() -> int:
                         help="depth-smoothing sigmas (seconds) to sweep")
     parser.add_argument("--label-smooth", type=float, default=0.12,
                         help="motion_supervision.label_smooth_sec used for the GT scales")
+    parser.add_argument("--pose-sigmas", default="",
+                        help="pose-smoothing sigmas (seconds) to sweep, e.g. 0,0.04,0.08,0.12")
+    parser.add_argument("--depth-sigma", type=float, default=0.25,
+                        help="depth smoothing applied before the pose-smoothing sweep")
     args = parser.parse_args()
     sigmas = [float(s) for s in args.sigmas.split(",")]
+    pose_sigmas = [float(s) for s in args.pose_sigmas.split(",") if s]
     splits = [(name, path) for name, path in (("train", args.train), ("test", args.test)) if path]
     if not splits:
         raise SystemExit("pass --train and/or --test")
 
-    results = {name: analyze_split(sorted(path.glob("*.npz")), sigmas, args.label_smooth)
+    results = {name: analyze_split(sorted(path.glob("*.npz")), sigmas, args.label_smooth,
+                                   pose_sigmas, args.depth_sigma)
                for name, path in splits}
     print("\n## per-frame model, camera frame (mm; jitter 10 m/s^3)\n")
     print("| split | runs | frames | mpjpe | pelvis_err | depth_err | depth_bias | lifted jitter | gt jitter |")
@@ -167,6 +236,19 @@ def main() -> int:
             cells += [f"{1000 * d['pelvis_world']:.1f}", f"{1000 * d['joint_world']:.1f}",
                       f"{d['jitter']:.1f}"]
         print(f"| {s:g} | " + " | ".join(cells) + " |")
+    if pose_sigmas:
+        print(f"\n## pose smoothing sweep after depth sigma {args.depth_sigma:g} s "
+              "(camera mpjpe mm | world pelvis mm | accel m/s^2 | lifted jitter)\n")
+        print("| sigma (s) | " + " | ".join(
+            f"{name} mpjpe | {name} pelvis | {name} accel | {name} jitter" for name in results) + " |")
+        print("|---|" + "---|" * (4 * len(results)))
+        for s in pose_sigmas:
+            cells = []
+            for r in results.values():
+                d = r["pose_sweep"][s]
+                cells += [f"{1000 * d['mpjpe']:.2f}", f"{1000 * d['pelvis_world']:.1f}",
+                          f"{d['accel']:.2f}", f"{d['jitter']:.1f}"]
+            print(f"| {s:g} | " + " | ".join(cells) + " |")
     print(f"\n## GT motion RMS after {args.label_smooth:g} s label smoothing (motion_supervision.scale)\n")
     for name, r in results.items():
         rms = r["motion_rms"]

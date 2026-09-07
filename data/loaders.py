@@ -1,8 +1,12 @@
 """DataLoaders over clip datasets: batch budget, DDP sharding, epoch handoff.
 
 Training draws ``frames_per_batch // clip.frames`` clips per batch (per GPU), so
-memory stays flat as ``T`` changes. Evaluation runs the whole-scene protocol:
-one clip per batch, sharded across ranks without padding, in dataset order.
+memory stays flat as ``T`` changes. With ``data.interleave_videos`` the clips of
+one epoch are dealt out round-robin over the SOURCE VIDEOS
+(:class:`VideoInterleavedSampler`), so the global batch of a step comes from as
+many different videos as it has clips; otherwise clips are drawn uniformly at
+random. Evaluation runs the whole-scene protocol: one clip per batch, sharded
+across ranks without padding, in dataset order.
 
 Workers are re-forked every epoch (``persistent_workers=False``) so the
 stateless window jitter sees the epoch :func:`set_epoch` just set; the re-fork
@@ -12,6 +16,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
+import numpy as np
 from torch.utils.data import ConcatDataset, DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
@@ -36,6 +41,79 @@ class DistributedEvalSampler(Sampler[int]):
     def __len__(self) -> int:
         remaining = len(self.dataset) - self.rank
         return max(0, (remaining + self.num_replicas - 1) // self.num_replicas)
+
+
+def clip_videos(dataset) -> list[str]:
+    """Source-video id of every clip of a (concatenated) clip dataset.
+
+    Scene ids are ``<video_id>_<idx:04d>`` (the corpus DB's convention), so
+    the video is everything before the last underscore.
+    """
+    parts = dataset.datasets if isinstance(dataset, ConcatDataset) else [dataset]
+    return [clip.scene.rsplit("_", 1)[0] for part in parts for clip in part.clips]
+
+
+class VideoInterleavedSampler(Sampler[int]):
+    """Epoch permutation that spreads consecutive clips over distinct source videos.
+
+    Per epoch the clips of each video are shuffled, then dealt out in rounds: a
+    round visits every video that still has clips (in a fresh random order) and
+    takes one clip from each. Consecutive positions of the resulting stream come
+    from different videos for as long as enough videos remain, so a batch of
+    ``B`` clips — or, under DDP, the ``world x B`` clips of one step — samples
+    ``B`` (``world x B``) different videos whenever the corpus allows. Every
+    clip is visited exactly once per epoch (``drop_last`` aside).
+
+    Under DDP the stream is cut into blocks of ``world x batch_size``; rank
+    ``r`` takes the ``r``-th slice of ``batch_size`` of every block, so the
+    per-rank batches of one step are disjoint slices of one video-diverse
+    block. Deterministic in ``(seed, epoch)``.
+
+    :param videos: the source video of every dataset index.
+    :param batch_size: clips per rank per step.
+    :param num_replicas: DDP world size.
+    :param rank: this rank.
+    :param seed: permutation seed.
+    """
+
+    def __init__(self, videos: Sequence[str], batch_size: int, *, num_replicas: int = 1,
+                 rank: int = 0, seed: int = 0):
+        self.videos = list(videos)
+        self.batch_size = int(batch_size)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.seed = int(seed)
+        self.epoch = 0
+        if not 0 <= self.rank < self.num_replicas:
+            raise ValueError(f"rank {self.rank} outside [0, {self.num_replicas})")
+        block = self.batch_size * self.num_replicas
+        self.num_blocks = len(self.videos) // block
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _stream(self) -> np.ndarray:
+        rng = np.random.default_rng([self.seed, self.epoch])
+        groups: dict[str, list[int]] = {}
+        for index, video in enumerate(self.videos):
+            groups.setdefault(video, []).append(index)
+        queues = {video: list(rng.permutation(indices)) for video, indices in groups.items()}
+        stream: list[int] = []
+        while queues:
+            for video in rng.permutation(sorted(queues)):
+                stream.append(int(queues[video].pop()))
+                if not queues[video]:
+                    del queues[video]
+        return np.asarray(stream, dtype=np.int64)
+
+    def __iter__(self):
+        block = self.batch_size * self.num_replicas
+        stream = self._stream()[: self.num_blocks * block].reshape(self.num_blocks, block)
+        mine = stream[:, self.rank * self.batch_size:(self.rank + 1) * self.batch_size]
+        return iter(mine.reshape(-1).tolist())
+
+    def __len__(self) -> int:
+        return self.num_blocks * self.batch_size
 
 
 def set_epoch(loader: DataLoader, epoch: int) -> None:
@@ -72,7 +150,10 @@ def build_loaders(
     def loader(datasets: Sequence[ClipDataset], batch_size: int, shuffle: bool):
         dataset = (datasets[0] if len(datasets) == 1 else ConcatDataset(datasets))
         sampler = None
-        if world_size > 1:
+        if shuffle and bool(dcfg["interleave_videos"]):
+            sampler = VideoInterleavedSampler(
+                clip_videos(dataset), batch_size, num_replicas=world_size, rank=rank, seed=seed)
+        elif world_size > 1:
             sampler = (
                 DistributedSampler(dataset, num_replicas=world_size, rank=rank,
                                    shuffle=True, seed=seed, drop_last=True)

@@ -1,0 +1,6 @@
+# Evaluation / prediction twin of configs/stage2_v4_notokens.yaml: the same build read through the LIVE frozen
+# pass (embedding cache -> decoder) instead of the pose-token cache, so its numbers are computed exactly like
+# the other arms' (the cached token carries bf16 storage + TF32 shape noise: ~0.5 % of the token norm, up to a
+# few mm on single joints). Not a training config.
+base: configs/stage2_v4_notokens.yaml
+data: {pose_token_cache: false}

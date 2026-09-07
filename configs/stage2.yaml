@@ -1,3 +1,6 @@
+# RETIRED 2026-09-06: written for the camera-coordinate depth smoothing (`depth_smooth_sec`) and the
+# per-frame `pelvis` anchor, both removed with round 3 (configs/stage2_v3.yaml) — this yaml no longer
+# validates; the run's own output/<run>/config.yaml is the record of what it trained with.
 # Stage 2 of the two-stage pipeline (docs/refiner.md): the world-space temporal refiner.
 # Frozen SAM3D decoder WITH the six learned contact tokens (they train here — contact is a
 # stage-2 output), the FROZEN stage-1 SMPL-X / CLIFF head as the per-frame body, and the refiner

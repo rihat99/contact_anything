@@ -69,6 +69,7 @@ class ClimbingVideosDataset(ClipDataset):
         contact_level: int = 1,
         load: Iterable[str] = (),
         embedding_dir: Optional[str | Path] = None,
+        pose_token_dir: Optional[str | Path] = None,
         full_scenes: bool = False,
         max_frames: Optional[int] = None,
         camera_filter: str = "all",
@@ -84,6 +85,9 @@ class ClimbingVideosDataset(ClipDataset):
                 f"unknown signal group(s) {sorted(unknown)}; "
                 f"choose from {sorted(SIGNAL_GROUPS)}")
         self.embedding_dir = None if embedding_dir is None else Path(embedding_dir)
+        self.pose_token_dir = None if pose_token_dir is None else Path(pose_token_dir)
+        if self.pose_token_dir is not None and self.embedding_dir is not None:
+            raise ValueError("pose_token_dir supersedes embedding_dir; give one")
         if scenes is None:
             scenes = self.list_scenes(self.root, split, camera_filter)
         super().__init__(
@@ -96,11 +100,41 @@ class ClimbingVideosDataset(ClipDataset):
         data = scene_io.load_scene(self.root, scene, self.split, self.contact_level)
         human_dir, object_ids = data["human_dir"], data["object_ids"]
         n = len(data["frame_indices"])
+        if self.pose_token_dir is not None:
+            data.update(self._load_pose_tokens(scene, object_ids, n, data["valid_mask"]))
         if "forces" in self.load:
             data.update(kindyn.load_forces(scene, human_dir, object_ids, n))
         if "smplx" in self.load:
             data.update(kindyn.load_smplx(scene, human_dir, object_ids, n))
         return data
+
+    def _load_pose_tokens(
+        self, scene: str, object_ids: np.ndarray, n: int, valid_mask: np.ndarray,
+    ) -> dict:
+        """The scene's cached frozen pose tokens (int16 bf16 bits) and image sizes."""
+        path = scene_io.pose_token_path(self.pose_token_dir, scene)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"{scene}: no pose-token cache at {path} "
+                "(scripts/data/precompute_pose_tokens.py)")
+        cache = np.load(path)
+        tokens = scene_io.rows_by_object_id(
+            np.asarray(cache["tokens"], np.int16), cache["object_ids"], object_ids,
+            scene, "pose-token cache")                                  # [P, N, C]
+        cached_valid = scene_io.rows_by_object_id(
+            np.asarray(cache["valid"], bool), cache["object_ids"], object_ids,
+            scene, "pose-token cache")                                  # [P, N]
+        img_wh = np.asarray(cache["img_wh"], np.int64)                  # [N, 2]
+        if tokens.shape[1] != n or img_wh.shape != (n, 2):
+            raise ValueError(
+                f"{scene}: pose-token cache covers {tokens.shape[1]} frames / "
+                f"img_wh {img_wh.shape}; the scene has {n}")
+        missing = valid_mask & ~cached_valid
+        if missing.any():
+            raise ValueError(
+                f"{scene}: {int(missing.sum())} valid person-frames have no cached "
+                "pose token — the cache is stale; re-run precompute_pose_tokens.py")
+        return {"pose_token": tokens, "img_wh": img_wh}
 
     # ------------------------------------------------------------------ frames
 
@@ -110,15 +144,19 @@ class ClimbingVideosDataset(ClipDataset):
     ) -> dict:
         oid = int(data["object_ids"][person])
         valid = bool(data["valid_mask"][person, position])
-        image = img_wh = None
+        image = img_wh = mask = None
         frame_path = data["frames_dir"] / f"{position:06d}.jpg"
-        if self.embedding_dir is None:
+        if self.pose_token_dir is not None:
+            img_wh = tuple(int(v) for v in data["img_wh"][position])    # (W, H)
+        elif self.embedding_dir is None:
             image = np.array(Image.open(frame_path).convert("RGB"), np.uint8)
         else:
             with Image.open(frame_path) as im:
                 img_wh = im.size                                        # (W, H)
-        mask_path = data["mask_dir"] / f"{oid:02d}" / f"frame_{position:06d}.png"
-        mask = np.array(Image.open(mask_path), np.uint8) if mask_path.is_file() else None
+        if self.pose_token_dir is None:
+            mask_path = data["mask_dir"] / f"{oid:02d}" / f"frame_{position:06d}.png"
+            mask = (np.array(Image.open(mask_path), np.uint8)
+                    if mask_path.is_file() else None)
 
         frame = {
             "image": image,
@@ -137,7 +175,12 @@ class ClimbingVideosDataset(ClipDataset):
             "contact_valid": data["contact_valid"][person, position],   # [6]
             "contact_conf": data["contact_conf"][person, position],     # [6]
         }
-        if self.embedding_dir is not None:
+        if self.pose_token_dir is not None:
+            frame["geometry_only"] = True
+            frame["pose_token"] = torch.from_numpy(
+                np.ascontiguousarray(data["pose_token"][person, position])
+            ).view(torch.bfloat16)
+        elif self.embedding_dir is not None:
             bits = np.load(
                 scene_io.embedding_path(self.embedding_dir, scene, oid, position))
             frame["embedding"] = torch.from_numpy(bits).view(torch.bfloat16)
@@ -147,6 +190,7 @@ class ClimbingVideosDataset(ClipDataset):
             frame["force_lever"] = data["force_lever"][person, position]     # [6, 3]
             frame["force_conf"] = float(data["force_conf"][person, position])
             frame["force_valid"] = valid and bool(data["force_valid"][person, position])
+            frame["gravity_world"] = data["gravity_world"]                    # [3] per scene
         if "smplx" in self.load:
             frame["smplx_joints_world"] = data["smplx_joints_world"][person, position]
             frame["smplx_root_rot"] = data["smplx_root_rot"][person, position]   # [3, 3]

@@ -25,6 +25,9 @@ SCHEMA_PATH = REPO_ROOT / "configs" / "base.yaml"
 
 _MODALITY_ORDER = ("pose", "contact", "force")
 _REFINER_OUTPUTS = ("pose", "contact", "motion", "force")
+#: The six kindyn contact / force groups (:data:`model.loss.NUM_KINDYN_GROUPS`, not imported:
+#: the model package is heavy and the config layer stays import-light).
+NUM_KINDYN_GROUPS = 6
 _MONITOR_MAX = ("f1", "iou", "precision", "recall", "pearson")
 _MONITOR_MIN = ("mae", "err", "loss", "mpjpe", "pve", "accel", "rte", "jitter", "bias",
                 "mag", "dlogz", "rmse")
@@ -85,16 +88,19 @@ def monitor_mode(monitor: str) -> str:
 def enabled_losses(cfg: dict) -> list[str]:
     """Names of the enabled losses, in :func:`model.loss.build_losses` order."""
     sections = (("contact", "contact_supervision"), ("force", "force_supervision"),
-                ("smplx", "smplx_supervision"), ("motion", "motion_supervision"))
+                ("smplx", "smplx_supervision"), ("motion", "motion_supervision"),
+                ("contact_consistency", "contact_consistency"),
+                ("force_consistency", "force_consistency"))
     return [name for name, section in sections if cfg[section]["enabled"]]
 
 
 def signal_needs(cfg: dict) -> set[str]:
     """Optional dataset signal groups the enabled losses require."""
     needs: set[str] = set()
-    if cfg["force_supervision"]["enabled"]:
-        needs.add("forces")
-    if cfg["smplx_supervision"]["enabled"] or cfg["motion_supervision"]["enabled"]:
+    if cfg["force_supervision"]["enabled"] or cfg["force_consistency"]["enabled"]:
+        needs.add("forces")             # force_consistency: the scene gravity + the GT floor
+    if (cfg["smplx_supervision"]["enabled"] or cfg["motion_supervision"]["enabled"]
+            or cfg["contact_consistency"]["enabled"] or cfg["force_consistency"]["enabled"]):
         needs.add("smplx")
     if "force" in refiner_outputs(cfg):
         needs.add("smplx")          # the kindyn root rotation re-frames the force GT
@@ -152,6 +158,18 @@ def validate(cfg: dict) -> None:
 
     if smplx["camera"] not in ("cliff", "ray"):
         raise ValueError(f"model.smplx.camera must be 'cliff' or 'ray'; got {smplx['camera']!r}")
+
+    if cfg["data"]["pose_token_cache"]:
+        # The cache replaces the whole frozen pass: nothing that needs the live
+        # decoder (learned token blocks, the cross-modal block) can be built.
+        if contact_on or force_on or cross_modal["enabled"]:
+            raise ValueError(
+                "data.pose_token_cache skips the frozen decoder: model.contact, "
+                "model.force and model.cross_modal_temporal must be off")
+        if not (smplx["enabled"] and model["refiner"]["enabled"]):
+            raise ValueError(
+                "data.pose_token_cache needs a consumer of the pose token: enable "
+                "model.smplx and model.refiner")
     sup = cfg["smplx_supervision"]
     if sup["kp2d_space"] not in ("crop", "image"):
         raise ValueError(
@@ -203,8 +221,15 @@ def validate(cfg: dict) -> None:
             raise ValueError("model.refiner.window must be positive")
         if not float(refiner["time_scale"]) > 0.0:
             raise ValueError("model.refiner.time_scale must be positive")
-        if float(refiner["depth_smooth_sec"]) < 0.0:
-            raise ValueError("model.refiner.depth_smooth_sec must be >= 0")
+        if float(refiner["root_smooth_sec"]) < 0.0:
+            raise ValueError("model.refiner.root_smooth_sec must be >= 0")
+        if float(refiner["pose_smooth_sec"]) < 0.0:
+            raise ValueError("model.refiner.pose_smooth_sec must be >= 0")
+        if bool(refiner["learn_smoothing"]) and not (
+                float(refiner["root_smooth_sec"]) > 0.0 and float(refiner["pose_smooth_sec"]) > 0.0):
+            raise ValueError(
+                "model.refiner.learn_smoothing needs root_smooth_sec and pose_smooth_sec > 0 "
+                "(they initialise the learnable widths)")
         if int(refiner["dim"]) % int(refiner["num_heads"]) != 0:
             raise ValueError("model.refiner.dim must be divisible by num_heads")
         # Every head must receive a loss (DDP runs with find_unused_parameters=False).
@@ -226,6 +251,23 @@ def validate(cfg: dict) -> None:
     if cfg["force_supervision"]["enabled"] and not (force_on or "force" in outputs):
         raise ValueError(
             "force_supervision.enabled requires model.force.enabled or a refiner 'force' output")
+    force_sup = cfg["force_supervision"]
+    if force_sup["enabled"]:
+        if float(force_sup["confidence_power"]) < 0.0:
+            raise ValueError("force_supervision.confidence_power must be >= 0")
+        if float(force_sup["loss"]["direction_min_bw"]) < 0.0:
+            raise ValueError("force_supervision.loss.direction_min_bw must be >= 0")
+        if any(float(force_sup["loss"][k]) < 0.0 for k in
+               ("force", "magnitude", "direction", "noncontact", "sum_force", "sum_torque")):
+            raise ValueError("force_supervision.loss weights must be >= 0")
+    class_weights = cfg["contact_supervision"]["class_weights"]
+    if cfg["contact_supervision"]["enabled"] and class_weights is not None:
+        for side in ("positive", "negative"):
+            values = class_weights[side]
+            if len(values) != NUM_KINDYN_GROUPS or any(float(v) < 0.0 for v in values):
+                raise ValueError(
+                    f"contact_supervision.class_weights.{side} must be {NUM_KINDYN_GROUPS} "
+                    "non-negative values (kindyn group order)")
     # A decoder-level head with no loss never receives a gradient (DDP hard-errors).
     if contact_on and "contact" not in outputs and not cfg["contact_supervision"]["enabled"]:
         raise ValueError(
@@ -244,10 +286,35 @@ def validate(cfg: dict) -> None:
         weights = {k: float(v) for k, v in motion["loss"].items() if k != "huber_delta"}
         if any(w < 0.0 for w in weights.values()) or not any(w > 0.0 for w in weights.values()):
             raise ValueError("motion_supervision.loss weights must be >= 0 with at least one > 0")
+        if any(w > 0.0 for k, w in weights.items() if k.startswith("pose_")) and "pose" not in outputs:
+            raise ValueError(
+                "motion_supervision.loss.pose_* match the derivatives of the REFINED pose: they "
+                "need a refiner 'pose' output")
         if int(cfg["data"]["clip"]["frames"]) < 5:
             raise ValueError(
                 "motion_supervision needs data.clip.frames >= 5 (acceleration rows need two "
                 "valid neighbours on each side)")
+    physics = cfg["force_consistency"]
+    if physics["enabled"]:
+        if not {"pose", "force"} <= outputs:
+            raise ValueError("force_consistency needs refiner 'pose' and 'force' outputs")
+        if "contact" not in outputs and bool(physics["gate_by_contact"]):
+            raise ValueError("force_consistency.gate_by_contact needs a refiner 'contact' output")
+        if float(physics["smooth_sec"]) < 0.0:
+            raise ValueError("force_consistency.smooth_sec must be >= 0")
+        weights = {k: float(physics["loss"][k]) for k in ("force", "torque")}
+        if any(w < 0.0 for w in weights.values()) or not any(w > 0.0 for w in weights.values()):
+            raise ValueError("force_consistency.loss.force / torque must be >= 0 with one > 0")
+        if int(cfg["data"]["clip"]["frames"]) < 5:
+            raise ValueError("force_consistency needs data.clip.frames >= 5 (a +-2 stencil)")
+    consistency = cfg["contact_consistency"]
+    if consistency["enabled"]:
+        if "pose" not in outputs:
+            raise ValueError("contact_consistency needs a refiner 'pose' output")
+        if not float(consistency["weight"]) > 0.0:
+            raise ValueError("contact_consistency.weight must be positive")
+        if int(cfg["data"]["clip"]["frames"]) < 3:
+            raise ValueError("contact_consistency needs data.clip.frames >= 3 (a central stencil)")
 
     optim = cfg["optim"]
     betas = optim["betas"]
@@ -257,6 +324,10 @@ def validate(cfg: dict) -> None:
         raise ValueError(f"optim.ema must lie in [0, 1); got {optim['ema']}")
     if int(optim["warmup_steps"]) < 0:
         raise ValueError("optim.warmup_steps must be >= 0")
+    if int(optim["accumulate_steps"]) < 1:
+        raise ValueError("optim.accumulate_steps must be >= 1")
+    if not float(optim["smoothing_lr_scale"]) > 0.0:
+        raise ValueError("optim.smoothing_lr_scale must be positive")
 
     monitor = str(cfg["output"]["monitor"])
     groups = sorted({METRIC_GROUPS.get(name, name) for name in enabled_losses(cfg)})

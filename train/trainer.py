@@ -12,6 +12,11 @@ loss are packed into ONE float64 vector and all-reduced once per step. A batch
 whose terms all have zero global mass carries no gradient, so its optimizer
 step is skipped (AdamW's decay would otherwise still move the weights).
 
+``optim.accumulate_steps`` micro-batches are summed into one optimizer step
+(each micro-batch's global weighted mean divided by the count, so the step is
+the mean of the micro-batch means); ``step`` counts optimizer steps and the
+schedule advances once per optimizer step.
+
 Evaluation is stats-based: each loss returns an additive float64 sufficient-
 statistics vector, summed over batches, all-reduced once, and turned into
 metrics by the loss itself. Tags follow :mod:`train.logger`'s layout:
@@ -35,6 +40,7 @@ from tqdm import tqdm
 from data.collate import batch_to_device
 from data.loaders import set_epoch
 from model.loss import Loss
+from model.refiner import SMOOTHING_PARAM_NAMES
 from train import checkpoint as ckpt_io
 from train.config import monitor_mode
 from train.logger import Logger
@@ -53,6 +59,8 @@ def build_scheduler(optimizer: torch.optim.Optimizer, optim_cfg: dict,
     """
     total = int(optim_cfg["epochs"]) * int(steps_per_epoch)
     warmup = int(optim_cfg["warmup_steps"])
+    if total < 1:
+        raise ValueError("the schedule needs at least one optimizer step per run")
     lr_min = float(optim_cfg["lr_min"])
     if warmup < 0:
         raise ValueError(f"optim.warmup_steps must be >= 0; got {warmup}")
@@ -165,6 +173,9 @@ class Trainer:
 
         optim_cfg = cfg["optim"]
         self.epochs = int(optim_cfg["epochs"])
+        self.accumulate = int(optim_cfg["accumulate_steps"])
+        if self.accumulate < 1:
+            raise ValueError("optim.accumulate_steps must be >= 1")
         self.grad_clip = float(optim_cfg["grad_clip"])
         self._clip_groups = [
             ps for _, child in self.model.named_children()
@@ -173,12 +184,15 @@ class Trainer:
         self._ema_init(float(optim_cfg["ema"]))
         if self.train_loader is None:
             raise ValueError("training needs a non-empty train split")
-        self.scheduler = build_scheduler(self.optimizer, optim_cfg,
-                                         len(self.train_loader))
+        self.scheduler = build_scheduler(
+            self.optimizer, optim_cfg, self._optimizer_steps_per_epoch())
 
         out_cfg = cfg["output"]
         self.log_freq = int(out_cfg["log_freq"])
         self.save_freq = int(out_cfg["save_freq"])
+        self.eval_every = int(out_cfg["eval_every"])
+        if self.eval_every < 1:
+            raise ValueError("output.eval_every must be >= 1")
         self.monitor = str(out_cfg["monitor"])
         self.monitor_mode = monitor_mode(self.monitor)
 
@@ -222,17 +236,29 @@ class Trainer:
 
     # ------------------------------------------------------------------ setup
 
+    def _optimizer_steps_per_epoch(self) -> int:
+        """Micro-batches per epoch rounded UP to whole optimizer steps (a partial
+        accumulation window at the end of an epoch still steps)."""
+        return -(-len(self.train_loader) // self.accumulate)
+
     def _build_optimizer(self, optim_cfg: dict) -> torch.optim.Optimizer:
         """AdamW over the trainable parameters; no weight decay on biases / norm
         weights / any other ``ndim <= 1`` parameter (the usual transformer recipe).
-        ``param_groups[0]`` (the decayed weights) is the logged lr.
+        ``param_groups[0]`` (the decayed weights) is the logged lr. The refiner's
+        learnable smoothing widths (log-sigmas) form a third group at ``lr x
+        optim.smoothing_lr_scale``: Adam moves a log-width by ~lr per step, and at
+        the base lr a 600-step run could not change a width by more than ~20 %.
         """
-        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        named = [(n, p) for n, p in self.model.named_parameters() if p.requires_grad]
+        smoothing = [p for n, p in named if n.rsplit(".", 1)[-1] in SMOOTHING_PARAM_NAMES]
+        rest = [p for n, p in named if n.rsplit(".", 1)[-1] not in SMOOTHING_PARAM_NAMES]
         lr = float(optim_cfg["lr"])
         wd = float(optim_cfg["weight_decay"])
         groups = [
-            {"params": [p for p in trainable if p.ndim > 1], "lr": lr, "weight_decay": wd},
-            {"params": [p for p in trainable if p.ndim <= 1], "lr": lr, "weight_decay": 0.0},
+            {"params": [p for p in rest if p.ndim > 1], "lr": lr, "weight_decay": wd},
+            {"params": [p for p in rest if p.ndim <= 1], "lr": lr, "weight_decay": 0.0},
+            {"params": smoothing, "lr": lr * float(optim_cfg["smoothing_lr_scale"]),
+             "weight_decay": 0.0},
         ]
         return torch.optim.AdamW(
             [g for g in groups if g["params"]], lr=lr, weight_decay=wd,
@@ -327,77 +353,101 @@ class Trainer:
     # ------------------------------------------------------------------ train
 
     def train_epoch(self) -> float:
-        """One pass over the train loader; returns the mean step loss."""
+        """One pass over the train loader; returns the mean optimizer-step loss."""
         self.model.train()
         running, steps, skipped = 0.0, 0, 0
         window_frames, window_start = 0, time.perf_counter()
+        n_micro = len(self.train_loader)
         pbar = tqdm(self.train_loader, desc=f"epoch {self.epoch}", disable=not self.is_main)
-        for batch in pbar:
+        self.optimizer.zero_grad(set_to_none=True)
+        micro, step_total, step_terms, step_active = 0, 0.0, {}, False
+        contact_stats = None
+        for index, batch in enumerate(pbar):
             batch = batch_to_device(batch, self.device)
             window_frames += int(batch["bbox_center"].shape[0])
+            last_micro = (micro + 1 == self.accumulate) or (index + 1 == n_micro)
 
-            out = self.module(batch)
-            results = {loss.name: loss(out, batch, train=True) for loss in self.losses}
-            layout = self._layout(results)
-            masses = self._global_masses(results, layout)
-            total = self._total(results, layout, masses)
+            # Non-final micro-batches skip DDP's gradient all-reduce; the final
+            # one reduces the accumulated gradients.
+            sync = contextlib.nullcontext()
+            if self.distributed and not last_micro:
+                sync = self.module.no_sync()
+            with sync:
+                out = self.module(batch)
+                results = {loss.name: loss(out, batch, train=True) for loss in self.losses}
+                layout = self._layout(results)
+                masses = self._global_masses(results, layout)
+                total = self._total(results, layout, masses) / self.accumulate
 
-            finite = torch.tensor(int(bool(torch.isfinite(total).item())),
-                                  device=self.device, dtype=torch.int32)
-            if self.distributed:
-                dist.all_reduce(finite, op=dist.ReduceOp.MIN)
-            if not bool(finite.item()):
-                raise FloatingPointError(
-                    f"non-finite loss at epoch={self.epoch} step={self.step}; "
-                    "the optimizer step was not executed")
+                finite = torch.tensor(int(bool(torch.isfinite(total).item())),
+                                      device=self.device, dtype=torch.int32)
+                if self.distributed:
+                    dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+                if not bool(finite.item()):
+                    raise FloatingPointError(
+                        f"non-finite loss at epoch={self.epoch} step={self.step}; "
+                        "the optimizer step was not executed")
+                if bool(masses.sum().item() > 0):
+                    total.backward()
+                    step_active = True
 
-            self.optimizer.zero_grad(set_to_none=True)
+            step_total += float(total.item())
+            for name, result in results.items():
+                for term, value in result.terms.items():
+                    acc = step_terms.setdefault(f"{name}.{term}", [0.0, 0])
+                    if value.mass > 0:
+                        acc[0] += float(value.numerator.detach()) / value.mass
+                    acc[1] += 1
+            if "contact" in results:
+                contact_stats = results["contact"].stats
+            micro += 1
+            if not last_micro:
+                continue
+
             lr = self.optimizer.param_groups[0]["lr"]
-            active = bool(masses.sum().item() > 0)
-            if active:
-                total.backward()
+            if step_active:
                 grad_norm = self._clip_grads()
                 self.optimizer.step()
                 self._ema_update()
             else:
                 skipped += 1
                 grad_norm = 0.0
-            # Every batch advances the schedule, so its counter equals self.step
-            # and the cosine reaches lr_min at the last batch even when some
-            # batches carried no supervision.
+            self.optimizer.zero_grad(set_to_none=True)
+            # Every optimizer step advances the schedule, so its counter equals
+            # self.step and the cosine reaches lr_min at the last step even when
+            # some steps carried no supervision.
             self.scheduler.step()
 
-            running += float(total.item())
+            running += step_total
             steps += 1
             if self.step % self.log_freq == 0:
                 now = time.perf_counter()
                 scalars = {
-                    "loss_train/total": float(total.item()),
+                    "loss_train/total": step_total,
                     "optim/lr": lr,
                     "optim/grad_norm": grad_norm,
                     "optim/frames_per_sec": (
                         self.world_size * window_frames / max(now - window_start, 1e-9)),
                 }
                 window_frames, window_start = 0, now
-                # Per-term means only; the losses' per-batch diagnostic scalars
-                # stay out of tensorboard (loss and metric cards only).
-                for name, result in results.items():
-                    for term, value in result.terms.items():
-                        scalars[f"loss_train/{name}.{term}"] = (
-                            float(value.numerator.detach()) / value.mass
-                            if value.mass > 0 else 0.0)
+                # Per-term means (averaged over the step's micro-batches) only; the
+                # losses' per-batch diagnostic scalars stay out of tensorboard.
+                for key, (num, count) in step_terms.items():
+                    scalars[f"loss_train/{key}"] = num / max(count, 1)
+                if self.model.refiner is not None:
+                    scalars.update(self.model.refiner.smoothing_scalars())
                 self.logger.log(scalars, self.step)
-
-            if self.is_main and self.step % self.log_freq == 0:
-                postfix = {"loss": f"{float(total.item()):.3f}"}
-                if "contact" in results:
-                    contact = next(l for l in self.losses if l.name == "contact")
-                    postfix["f1"] = f"{contact.metrics(results['contact'].stats)['f1']:.3f}"
-                pbar.set_postfix(**postfix)
+                if self.is_main:
+                    postfix = {"loss": f"{step_total:.3f}"}
+                    if contact_stats is not None:
+                        contact = next(l for l in self.losses if l.name == "contact")
+                        postfix["f1"] = f"{contact.metrics(contact_stats)['f1']:.3f}"
+                    pbar.set_postfix(**postfix)
             self.step += 1
+            micro, step_total, step_terms, step_active = 0, 0.0, {}, False
 
         if skipped and self.is_main:
-            print(f"  [{skipped} batches without supervision — optimizer step skipped]")
+            print(f"  [{skipped} optimizer steps without supervision — skipped]")
         return running / max(steps, 1)
 
     # ------------------------------------------------------------------- eval
@@ -421,6 +471,16 @@ class Trainer:
             start = time.perf_counter()
             train_loss = self.train_epoch()
             elapsed = time.perf_counter() - start
+            if (epoch + 1) % self.eval_every != 0 and epoch + 1 != self.epochs:
+                # No evaluation this epoch: keep the rolling checkpoint and move on.
+                if self.is_main:
+                    print(f"epoch {epoch:3d}  train loss {train_loss:.4f}  ({elapsed:.1f}s)")
+                    self._save("last.pth")
+                self.logger.log({"optim/epoch_time_sec": elapsed, "loss_train/epoch": train_loss},
+                                self.step)
+                if self.distributed:
+                    dist.barrier()
+                continue
             metrics = self.evaluate()
 
             if self.is_main:

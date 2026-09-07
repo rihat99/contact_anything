@@ -75,6 +75,16 @@ def process_frame(frame: dict, transform, transform_imageless=None) -> dict:
         raise RuntimeError(
             f"frame {frame['key']} has invalid xyxy bbox {bbox.tolist()}")
     imageless = img is None and frame["img_wh"] is not None
+    if imageless and frame.get("geometry_only", False):
+        # Pose-token cache path: the frozen base never runs, so only the crop
+        # geometry is needed — no mask is warped and none is emitted.
+        if transform_imageless is None:
+            raise RuntimeError(
+                f"frame {frame['key']} is geometry-only but no imageless transform "
+                "was given")
+        out = transform_imageless(dict(bbox=bbox, bbox_format="xyxy"))
+        out["ori_img_size"] = np.array(frame["img_wh"])                 # [W, H]
+        return out
     has_mask = mask is not None
     if mask is None:
         w, h = frame["img_wh"] if imageless else (img.shape[1], img.shape[0])

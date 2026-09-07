@@ -19,6 +19,14 @@ Every quantity is divided by its ``scale`` (the GT RMS, config) before a Huber
 of width ``huber_delta`` in those standardized units, so the four terms start on
 an equal footing. Metrics: RMSE in physical units and the pooled Pearson
 correlation over all components, per quantity.
+
+**Pose-derivative matching** (``loss.pose_*`` weights): the same four targets
+are also matched by the finite differences of the REFINED trajectory itself
+(``out["smplx"]["joints_world"]`` / ``root_rot_world``, raw central differences,
+no smoothing on the prediction side), so the pose head is rewarded for a
+trajectory whose velocity and acceleration are the GT's — a derivative-level
+objective a per-frame position Huber does not provide. Reported as
+``pose_<quantity>_rmse`` / ``_pearson`` next to the head's numbers.
 """
 from __future__ import annotations
 
@@ -34,32 +42,38 @@ from model.refiner import (NUM_BODY_JOINTS, angular_velocity, gaussian_smooth,
 from utils.metrics import pearson_from_stats
 
 QUANTITIES = ("vel", "acc", "ang_vel", "ang_acc")
+#: The two predictions matched against the targets: the motion head, and the
+#: finite differences of the refined pose (``pose_<quantity>`` terms / metrics).
+SOURCES = ("head", "pose")
 _STATS = ("se", "sum_p", "sum_g", "sum_pg", "sum_pp", "sum_gg", "n")
+
+
+def _tag(source: str, quantity: str) -> str:
+    return quantity if source == "head" else f"pose_{quantity}"
 
 
 class MotionLoss(Loss):
     """Standardized Huber on the four motion quantities of the refiner."""
 
     name = "motion"
-    stat_names = tuple(f"{q}/{s}" for q in QUANTITIES for s in _STATS)
+    stat_names = tuple(f"{_tag(src, q)}/{s}" for src in SOURCES for q in QUANTITIES for s in _STATS)
 
     def __init__(self, cfg: dict, model, device: torch.device | str) -> None:
         super().__init__(cfg, model, device)
         section = cfg["motion_supervision"]
         self.sigma = float(section["label_smooth_sec"])
         self.scale = {q: float(section["scale"][q]) for q in QUANTITIES}
-        self.weights = {q: float(section["loss"][q]) for q in QUANTITIES}
+        self.weights = {_tag(src, q): float(section["loss"][_tag(src, q)])
+                        for src in SOURCES for q in QUANTITIES}
         self.delta = float(section["loss"]["huber_delta"])
-        self.term_names = tuple(q for q in QUANTITIES if self.weights[q] > 0.0)
+        self.term_names = tuple(t for t in self.weights if self.weights[t] > 0.0)
 
-    def targets(self, batch: dict, frame: Tensor) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-        """GT motion in the predicted body frame and the per-row validity masks.
+    def targets(self, batch: dict, n_frames: int) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+        """GT motion in the WORLD frame and the per-row validity masks.
 
-        :param frame: ``(B, 3, 3)`` world-from-body of the prediction.
         :returns: ``({quantity: target}, {quantity: mask (B,) bool})``.
         """
         seq_len = int(batch["seq_len"])
-        n_frames = frame.shape[0]
         n_clips = n_frames // seq_len
         seconds = batch["frame_pos_sec"].to(self.device, self.dtype).view(n_clips, seq_len)
         valid = (batch["smplx_valid"] & batch["frame_valid"]).to(self.device).view(n_clips, seq_len)
@@ -79,12 +93,11 @@ class MotionLoss(Loss):
         ang_w = gaussian_smooth((root @ ang_body[..., None])[..., 0], seconds, first, self.sigma)
         ang_acc_w = gaussian_smooth(time_derivative(ang_w, seconds, first), seconds, second, self.sigma)
 
-        to_body = frame.transpose(1, 2)                                      # body-from-world
         targets = {
-            "vel": torch.einsum("bij,bkj->bki", to_body, vel_w.reshape(n_frames, NUM_BODY_JOINTS, 3)),
-            "acc": torch.einsum("bij,bkj->bki", to_body, acc_w.reshape(n_frames, NUM_BODY_JOINTS, 3)),
-            "ang_vel": (to_body @ ang_w.reshape(n_frames, 3, 1))[..., 0],
-            "ang_acc": (to_body @ ang_acc_w.reshape(n_frames, 3, 1))[..., 0],
+            "vel": vel_w.reshape(n_frames, NUM_BODY_JOINTS, 3),
+            "acc": acc_w.reshape(n_frames, NUM_BODY_JOINTS, 3),
+            "ang_vel": ang_w.reshape(n_frames, 3),
+            "ang_acc": ang_acc_w.reshape(n_frames, 3),
         }
         steps = seconds[:, 1:] - seconds[:, :-1]
         dt = float(steps[steps > 0].median()) if bool((steps > 0).any()) else 0.0
@@ -94,28 +107,66 @@ class MotionLoss(Loss):
         masks = {"vel": rows_vel, "acc": rows_acc, "ang_vel": rows_vel, "ang_acc": rows_acc}
         return targets, masks
 
+    def pose_derivatives(self, out: dict, batch: dict) -> dict[str, Tensor]:
+        """World velocity / acceleration of the refined joints and root, by raw central
+        finite differences of ``out["smplx"]`` (graph-live: this is the pose head's signal)."""
+        smplx = out["smplx"]
+        joints = smplx["joints_world"][:, :NUM_BODY_JOINTS].to(self.device, self.dtype)
+        root = smplx["root_rot_world"].to(self.device, self.dtype)
+        n_frames = joints.shape[0]
+        seq_len = int(batch["seq_len"])
+        n_clips = n_frames // seq_len
+        seconds = batch["frame_pos_sec"].to(self.device, self.dtype).view(n_clips, seq_len)
+        valid = batch["frame_valid"].to(self.device).view(n_clips, seq_len)
+        joints = joints.view(n_clips, seq_len, NUM_BODY_JOINTS, 3)
+        root = root.view(n_clips, seq_len, 3, 3)
+        vel = time_derivative(joints, seconds, valid)
+        acc = time_derivative(vel, seconds, valid)
+        ang = (root @ angular_velocity(root, seconds, valid)[..., None])[..., 0]   # world frame
+        ang_acc = time_derivative(ang, seconds, valid)
+        return {"vel": vel.reshape(n_frames, NUM_BODY_JOINTS, 3),
+                "acc": acc.reshape(n_frames, NUM_BODY_JOINTS, 3),
+                "ang_vel": ang.reshape(n_frames, 3), "ang_acc": ang_acc.reshape(n_frames, 3)}
+
     def __call__(self, out: dict, batch: dict, *, train: bool) -> LossResult:
         motion = out["motion"]
-        pred = {q: motion[q].to(self.device, self.dtype) for q in QUANTITIES}
-        anchor = sum(p.sum() for p in pred.values()) * 0.0
-        # The frame is a fixed input of the loss: a trainable pose path must never lower this
-        # term by rotating its root instead of fixing the motion.
-        targets, masks = self.targets(batch, motion["frame"].detach().to(self.device, self.dtype))
+        head = {q: motion[q].to(self.device, self.dtype) for q in QUANTITIES}
+        n_frames = head["vel"].shape[0]
+        anchor = sum(p.sum() for p in head.values()) * 0.0
+        targets_world, masks = self.targets(batch, n_frames)
+        # The head predicts in its body frame; the frame is a fixed input of the loss (a
+        # trainable pose path must never lower this term by rotating its root instead of
+        # fixing the motion), so the WORLD targets are rotated into it.
+        to_body = motion["frame"].detach().to(self.device, self.dtype).transpose(1, 2)
+        preds = {"head": head}
+        targets = {"head": {
+            q: (torch.einsum("bij,bkj->bki", to_body, t) if t.dim() == 3
+                else (to_body @ t[..., None])[..., 0]) for q, t in targets_world.items()}}
+        if any(self.weights[_tag("pose", q)] > 0.0 for q in QUANTITIES):
+            preds["pose"] = self.pose_derivatives(out, batch)
+            targets["pose"] = targets_world
+            anchor = anchor + sum(p.sum() for p in preds["pose"].values()) * 0.0
 
         raw: dict[str, tuple[Tensor, float]] = {}
         stats = []
-        for q in QUANTITIES:
-            p, g = pred[q].reshape(pred[q].shape[0], -1), targets[q].reshape(pred[q].shape[0], -1)
-            mask = masks[q].to(self.dtype)
-            if self.weights[q] > 0.0:
-                huber = F.smooth_l1_loss(p / self.scale[q], g / self.scale[q],
-                                         reduction="none", beta=self.delta).mean(dim=-1)
-                raw[q] = (self.weights[q] * (huber * mask).sum(), float(mask.sum()))
-            with torch.no_grad():
-                pm, gm = p.detach() * mask[:, None], g * mask[:, None]
-                stats += [float(((pm - gm) ** 2).sum()), float(pm.sum()), float(gm.sum()),
-                          float((pm * gm).sum()), float((pm * pm).sum()), float((gm * gm).sum()),
-                          float(mask.sum() * p.shape[1])]
+        for src in SOURCES:
+            for q in QUANTITIES:
+                tag = _tag(src, q)
+                if src not in preds:
+                    stats += [0.0] * len(_STATS)
+                    continue
+                p = preds[src][q].reshape(n_frames, -1)
+                g = targets[src][q].reshape(n_frames, -1)
+                mask = masks[q].to(self.dtype)
+                if self.weights[tag] > 0.0:
+                    huber = F.smooth_l1_loss(p / self.scale[q], g / self.scale[q],
+                                             reduction="none", beta=self.delta).mean(dim=-1)
+                    raw[tag] = (self.weights[tag] * (huber * mask).sum(), float(mask.sum()))
+                with torch.no_grad():
+                    pm, gm = p.detach() * mask[:, None], g * mask[:, None]
+                    stats += [float(((pm - gm) ** 2).sum()), float(pm.sum()), float(gm.sum()),
+                              float((pm * gm).sum()), float((pm * pm).sum()), float((gm * gm).sum()),
+                              float(mask.sum() * p.shape[1])]
         return LossResult(
             terms=self._terms(raw, anchor),
             scalars={"n_rows": float(masks["vel"].sum())},
@@ -123,11 +174,14 @@ class MotionLoss(Loss):
 
     def metrics(self, stats: Tensor) -> dict[str, float]:
         out = {}
-        for i, q in enumerate(QUANTITIES):
-            se, sp, sg, spg, spp, sgg, n = (float(v) for v in stats[7 * i:7 * i + 7])
-            out[f"{q}_rmse"] = math.sqrt(se / n) if n > 0 else float("nan")
-            out[f"{q}_pearson"] = pearson_from_stats(sp, sg, spg, spp, sgg, n)
+        k = len(_STATS)
+        for i, tag in enumerate(_tag(src, q) for src in SOURCES for q in QUANTITIES):
+            se, sp, sg, spg, spp, sgg, n = (float(v) for v in stats[k * i:k * i + k])
+            if n <= 0:
+                continue                      # the pose terms are off: no metric rows
+            out[f"{tag}_rmse"] = math.sqrt(se / n)
+            out[f"{tag}_pearson"] = pearson_from_stats(sp, sg, spg, spp, sgg, n)
         return out
 
 
-__all__ = ["MotionLoss", "QUANTITIES"]
+__all__ = ["MotionLoss", "QUANTITIES", "SOURCES"]

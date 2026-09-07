@@ -55,8 +55,13 @@ def build_datasets(
             stride=clip["stride"],
             seed=int(dcfg["seed"]),
             load=set(needs),
+            # The pose-token cache supersedes the embedding cache: the frozen
+            # base never runs, so no embedding, image or mask is loaded.
             embedding_dir=(root / "features" / "embedding"
-                           if bool(dcfg["embedding_cache"]) else None),
+                           if bool(dcfg["embedding_cache"])
+                           and not bool(dcfg["pose_token_cache"]) else None),
+            pose_token_dir=(root / "features" / "pose_token"
+                            if bool(dcfg["pose_token_cache"]) else None),
             camera_filter=str(spec["camera"]),
         )
         cls = DATASETS[name]

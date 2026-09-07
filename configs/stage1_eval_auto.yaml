@@ -1,0 +1,5 @@
+# Evaluation-only twin of configs/stage1.yaml under the stage-2 reference protocol (one clip per (scene, person),
+# auto stride, 120-row cap) so the raw per-frame stage-1 body — no smoothing, no refiner — is scored exactly like
+# the round-4 arms (camera-frame + lifted world metrics). Not a training config.
+base: configs/stage1.yaml
+data: {clip: {stride: auto}, eval_max_frames: 120}

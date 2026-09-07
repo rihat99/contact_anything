@@ -70,9 +70,15 @@ def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> 
 
     :returns: ``force_gt (P, N, 6, 3)``, ``force_contact (P, N, 6)`` bool,
         ``force_lever (P, N, 6, 3)`` metres, ``force_valid (P, N)``,
-        ``force_conf (P, N)``.
+        ``force_conf (P, N)``, ``gravity_world (3,)`` the scene's fitted unit
+        DOWN vector in world coordinates.
     """
     kindyn = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
+    gravity_world = np.asarray(kindyn["gravity_world"], np.float32).reshape(-1)
+    if gravity_world.shape != (3,) or not np.isfinite(gravity_world).all() or not (
+            0.99 < float(np.linalg.norm(gravity_world)) < 1.01):
+        raise ValueError(f"{scene}: gravity_world is not a finite unit 3-vector: {gravity_world}")
+    gravity_world = gravity_world / np.linalg.norm(gravity_world)
     kindyn_ids = np.asarray(kindyn["object_ids"])
     frame_names = [str(x) for x in kindyn["contact_frame_names"]]
     parents = np.asarray(kindyn["contact_frame_parents"], np.int64).reshape(-1)
@@ -162,6 +168,7 @@ def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> 
         "force_lever": lever.astype(np.float32),
         "force_valid": force_valid,
         "force_conf": force_conf,
+        "gravity_world": gravity_world.astype(np.float32),
     }
 
 

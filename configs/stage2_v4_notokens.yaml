@@ -1,0 +1,11 @@
+# Round 4 arm F: arm A (configs/stage2_v4.yaml) WITHOUT the six contact tokens in the SAM 3D Body decoder —
+# the decoder is the untouched frozen upstream model and the refiner's per-frame token loses its 6 x 64
+# contact-token features (it keeps the projected pose token, the stage-1 body, the camera context). With no
+# learned decoder token the frozen pass is a fixed function of the person-frame, so training reads the cached
+# final pose token (`data.pose_token_cache`, features/pose_token) and never runs the backbone / decoder.
+# Isolates what the contact tokens' image attention buys the contacts (the refiner otherwise sees the image
+# only through the pose token).
+base: configs/stage2_v4.yaml
+model: {contact: {enabled: false}}
+data: {pose_token_cache: true}
+output: {exp_name: stage2_v4_notokens}
