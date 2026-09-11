@@ -1,6 +1,7 @@
 # The two-stage pipeline: per-frame body, world-space temporal refiner
 
-*Concept page. Configs: `configs/stage1.yaml`, `configs/stage2.yaml` (round 1),
+*Concept page. Configs: `configs/stage1.yaml`, `configs/stage2.yaml` (round 1; 2026-09-08: in the trash with `stage2_v2*.yaml`; the round-3/4 configs
+and every `output/stage2_*` run followed on 2026-09-11, `/data3/rikhat.akizhanov/trash/cleanup_20260911/` — the round-3 `eval.json` stays as `output/round3_refiner_eval.json`, the final model's tensorboard reference),
 `configs/stage2_v2.yaml` (round 2). Code: `model/refiner.py`, `model/loss/motion.py`,
 `model/loss/contact_consistency.py`. Measurement scripts: `scripts/dump_stage1.py`,
 `scripts/analyze_stage1.py`.*

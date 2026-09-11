@@ -58,8 +58,8 @@ class ContactAnything(nn.Module):
         as ``checkpoint`` / ``frozen`` are the builder's business).
     :param refiner: :class:`~model.refiner.TemporalRefiner` config or ``None``
         — ``{outputs, dim, num_layers, num_heads, mlp_ratio, dropout, window,
-        time_scale, root_smooth_sec, pose_smooth_sec, camera_context, pose_token,
-        pose_token_dim, contact_token_dim}``; needs ``smplx``.
+        time_scale, root_smooth_sec, pose_smooth_sec, learn_smoothing, token,
+        camera_context, pose_token, pose_token_dim, contact_token_dim}``; needs ``smplx``.
     """
 
     def __init__(
@@ -137,6 +137,7 @@ class ContactAnything(nn.Module):
                 root_smooth_sec=float(refiner["root_smooth_sec"]),
                 pose_smooth_sec=float(refiner["pose_smooth_sec"]),
                 learn_smoothing=bool(refiner["learn_smoothing"]),
+                token=dict(refiner["token"]),
                 camera_context=bool(refiner["camera_context"]),
                 pose_token=bool(refiner["pose_token"]),
                 pose_token_dim=int(refiner["pose_token_dim"]),

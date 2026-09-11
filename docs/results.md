@@ -282,3 +282,20 @@ kernels wide) with a floor of ~50. The remaining jitter is per-frame rotation / 
 of the pose readout, created in the backbone feature maps (averaging the frozen pose token over
 ~0.1 s gives 14 with no training — `temporal_block_2026-09-04.md` §2). Explicit smoothing reaches
 9-10 but is excluded by the user.
+
+## Round 5 (2026-09-07 evening) — `docs/round5_2026-09-07.md`
+
+Seed replicates, the C1 smoother ladder against the fixed-Gaussian front, the Phase −1 audits,
+token channels, the joint model, the fixed-camera track and the invariance diagnostics; the
+claim-by-claim status is the table at the end of `docs/plan.md`. The final model's runs are
+`output_2/final*`; the 10 remaining arm runs went to `/data3/rikhat.akizhanov/trash/cleanup_20260911/`
+with the round-1–4 `output/stage2_*` runs and their configs.
+
+## Round 6 (2026-09-11) — `docs/round6_2026-09-11.md`
+
+Where the contact signal comes from, on the final recipe (F1 0.927 / 0.926 over two seeds):
+static per-frame input 0.888 (motion is worth +0.039), camera-frame instead of lifted velocity
+channels 0.926 (no change), no pose token 0.922 on both seeds (the image token is worth +0.005,
+all precision), confidence weights off 0.914 (precision up, recall down). Label anatomy: the limb
+labels carry no image evidence, and the confidence weights mute the still-and-free rows where the
+image-side gains live. Runs and configs in the trash; paired intervals in `output_2/audits/r6/`.

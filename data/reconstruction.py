@@ -3,7 +3,7 @@
 Reads a raw pipeline output tree directly: ``sam3/bboxes.npz`` (per-person xyxy
 boxes), ``sam3/<oid:02d>/frame_*.png`` person masks,
 ``geometry/transform.npz`` (per-frame ``intrinsics_px_orig`` and metric
-``cam_from_world``) and ``human_optim/contacts_1.npz`` for ``valid_mask``/``fps``
+``cam_from_world``), ``human_optim/contacts_1.npz`` for ``valid_mask``/``fps`` and ``human_optim/kindyn_1.npz`` for ``gravity_world`` (when present)
 (falling back to ``sam3d/params.npz`` when the contacts stage has not run).
 Video frames are extracted with the same sequential OpenCV decode + JPEG-95
 re-encode the corpus tree uses (:func:`extract_frames`), so frame ``k`` of the
@@ -23,6 +23,7 @@ import numpy as np
 from PIL import Image
 
 from .base import ClipDataset
+from .climbing_videos.kindyn import _gravity
 
 FRAME_JPEG_QUALITY = 95
 
@@ -133,6 +134,12 @@ class ReconstructionSceneDataset(ClipDataset):
             & (bbox[..., 2] > bbox[..., 0])
             & (bbox[..., 3] > bbox[..., 1]))
 
+        # The scene's fitted down vector (the refiner's gravity token channel) comes from
+        # the dynamics stage; a tree without one cannot feed a gravity-token model.
+        kindyn_path = self.out_dir / "human_optim" / "kindyn_1.npz"
+        gravity_world = (_gravity(scene, np.load(kindyn_path, allow_pickle=True))
+                         if kindyn_path.is_file() else None)
+
         scene_data = {
             "object_ids": object_ids,
             "frame_indices": np.arange(n_frames, dtype=np.int64),
@@ -141,6 +148,7 @@ class ReconstructionSceneDataset(ClipDataset):
             "extrinsics": extrinsics,
             "valid_mask": valid_mask,
             "fps": fps,
+            "gravity_world": gravity_world,
         }
         return scene_data
 
@@ -165,4 +173,6 @@ class ReconstructionSceneDataset(ClipDataset):
             "frame_valid": True,
             "key": f"{scene}#{oid}@{position}",
         }
+        if data["gravity_world"] is not None:
+            frame["gravity_world"] = data["gravity_world"]
         return frame

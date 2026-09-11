@@ -44,6 +44,7 @@ plus, per requested signal group (``load``):
     same frame, ``force_conf`` float, ``force_valid`` bool, ``gravity_world``
     ``(3,)`` the scene's fitted unit down vector (world).
 ``smplx``
+    ``gravity_world`` ``(3,)`` (the same scene vector as above),
     ``smplx_joints_world`` ``(52, 3)`` metres (row 0 = pelvis, 22 body joints then
     the 30 finger joints), ``smplx_root_rot`` ``(3, 3)`` world-from-root,
     ``smplx_body_rot`` ``(21, 3, 3)`` and ``smplx_hand_rot`` ``(30, 3, 3)``

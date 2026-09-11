@@ -1,9 +1,0 @@
-# Round 4 arm G: arm A (configs/stage2_v4.yaml) with the temporal block's receptive field cut to ONE frame —
-# `window` 0.01 s is below every sampled frame gap of the corpus (>= 1/60 s at the auto stride), so each
-# frame's tokens attend only themselves in all three layers (the mask always keeps the diagonal). The
-# per-frame token, the input smoothing and every loss are arm A's, so the arm isolates what cross-frame
-# attention buys on top of the per-frame refiner (the token still carries the smoothed trajectory's
-# body-frame root velocity / angular velocity and the camera context).
-base: configs/stage2_v4.yaml
-model: {refiner: {window: 0.01}}
-output: {exp_name: stage2_v4_window1}

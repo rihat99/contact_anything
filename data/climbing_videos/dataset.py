@@ -192,6 +192,7 @@ class ClimbingVideosDataset(ClipDataset):
             frame["force_valid"] = valid and bool(data["force_valid"][person, position])
             frame["gravity_world"] = data["gravity_world"]                    # [3] per scene
         if "smplx" in self.load:
+            frame["gravity_world"] = data["gravity_world"]
             frame["smplx_joints_world"] = data["smplx_joints_world"][person, position]
             frame["smplx_root_rot"] = data["smplx_root_rot"][person, position]   # [3, 3]
             frame["smplx_body_rot"] = data["smplx_body_rot"][person, position]   # [21, 3, 3]

@@ -65,6 +65,10 @@ model:
     learn_smoothing: false            # train the widths: one log-sigma for the root position + one per rotation (root and
                                       # the 21 joints), initialised from the two *_smooth_sec values (both must be > 0);
                                       # their optimizer group runs at optim.lr x optim.smoothing_lr_scale
+    token:                            # extra frame-independent token channels
+      local_rotations: false          # parent-local 6D rotations of the 21 joints
+      gravity: false                  # the scene's down vector in the body frame (needs the kindyn gravity: smplx GT)
+      raw_minus_mean: false           # root position and root-frame joints minus their 5-frame local mean
     camera_context: false             # append the camera seen from the body (pelvis->camera direction in the body frame,
                                       # log depth, crop-box bearing and angular size) to the per-frame token
     pose_token: true                  # feed the frozen pose token (projected to pose_token_dim) into the per-frame token
@@ -73,7 +77,9 @@ model:
 
 data:
   datasets: [configs/datasets/climbing_videos.yaml]
-  embedding_cache: true               # corpus loaders emit the cached bf16 backbone embedding; the backbone is skipped
+  embedding_cache: false              # corpus loaders emit a cached bf16 backbone embedding (features/embedding, built by
+                                      # scripts/data/precompute_embeddings.py) and skip the backbone; the cache was deleted
+                                      # 2026-09-11 (753 GB), so live-decoder runs decode frames and run the backbone
   pose_token_cache: false             # read the cached frozen FINAL pose token instead (features/pose_token, built by the
                                       # GVHMR worktree's scripts/data/precompute_pose_tokens.py) and never run the frozen
                                       # base: no image, mask or embedding is loaded (supersedes embedding_cache). Legal only
@@ -141,6 +147,9 @@ smplx_supervision:                    # kindyn SMPL-X GT (camera frame) for mode
 motion_supervision:                   # refiner `motion` output vs kindyn world joints / root finite-differenced
   enabled: false                      # (Gaussian label smoothing), every vector expressed in the predicted body frame
   label_smooth_sec: 0.12              # sigma (s) of the GT velocity smoothing (acceleration = smoothed derivative of it)
+  stencil: legacy                     # legacy: v* = G(D q), a* = G(D v*) vs raw central differences of the prediction
+                                      # (a* is effectively a 0.17 s Gaussian) | aligned: ONE Gaussian on the GT trajectory,
+                                      # then the SAME stencils on both sides (central velocity, tight second difference)
   scale: {vel: 0.3, acc: 1.5, ang_vel: 0.5, ang_acc: 2.5}   # GT RMS per quantity (m/s, m/s^2, rad/s, rad/s^2):
                                       # predictions and targets are divided by these before the Huber
   loss:

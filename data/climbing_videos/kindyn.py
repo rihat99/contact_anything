@@ -65,6 +65,15 @@ def quat_xyzw_to_matrix(quat: np.ndarray) -> np.ndarray:
 
 # ------------------------------------------------------------------ forces
 
+def _gravity(scene: str, kindyn) -> np.ndarray:
+    """The scene's fitted unit DOWN vector (world), ``(3,)`` float32."""
+    gravity_world = np.asarray(kindyn["gravity_world"], np.float32).reshape(-1)
+    if gravity_world.shape != (3,) or not np.isfinite(gravity_world).all() or not (
+            0.99 < float(np.linalg.norm(gravity_world)) < 1.01):
+        raise ValueError(f"{scene}: gravity_world is not a finite unit 3-vector: {gravity_world}")
+    return (gravity_world / np.linalg.norm(gravity_world)).astype(np.float32)
+
+
 def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> dict:
     """Six-group GT contact forces in body-weight units, body-root frame.
 
@@ -74,11 +83,7 @@ def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> 
         DOWN vector in world coordinates.
     """
     kindyn = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
-    gravity_world = np.asarray(kindyn["gravity_world"], np.float32).reshape(-1)
-    if gravity_world.shape != (3,) or not np.isfinite(gravity_world).all() or not (
-            0.99 < float(np.linalg.norm(gravity_world)) < 1.01):
-        raise ValueError(f"{scene}: gravity_world is not a finite unit 3-vector: {gravity_world}")
-    gravity_world = gravity_world / np.linalg.norm(gravity_world)
+    gravity_world = _gravity(scene, kindyn)
     kindyn_ids = np.asarray(kindyn["object_ids"])
     frame_names = [str(x) for x in kindyn["contact_frame_names"]]
     parents = np.asarray(kindyn["contact_frame_parents"], np.int64).reshape(-1)
@@ -168,7 +173,7 @@ def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> 
         "force_lever": lever.astype(np.float32),
         "force_valid": force_valid,
         "force_conf": force_conf,
-        "gravity_world": gravity_world.astype(np.float32),
+        "gravity_world": gravity_world,
     }
 
 
@@ -199,8 +204,9 @@ def load_smplx(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> d
     corpus-wide). Invalid rows are zeroed / set to the identity so nothing
     downstream ever multiplies a NaN by a zero mask.
 
-    :returns: ``smplx_joints_world (P, N, 52, 3)`` metres (22 body joints,
-        then the 30 finger joints), ``smplx_root_rot (P, N, 3, 3)``
+    :returns: ``gravity_world (3,)`` the scene's fitted unit down vector (the same
+        value :func:`load_forces` returns), ``smplx_joints_world (P, N, 52, 3)``
+        metres (22 body joints, then the 30 finger joints), ``smplx_root_rot (P, N, 3, 3)``
         world-from-root, ``smplx_body_rot (P, N, 21, 3, 3)`` parent-local
         joints 1..21, ``smplx_hand_rot (P, N, 30, 3, 3)`` parent-local finger
         joints, ``smplx_betas (P, 10)`` per person, ``smplx_valid (P, N)`` bool.
@@ -242,6 +248,7 @@ def load_smplx(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> d
     hand_rot = np.where(valid[..., None, None, None], hand_rot, eye)
     joints = np.where(valid[..., None, None], joints, 0.0)
     return {
+        "gravity_world": _gravity(scene, kindyn),
         "smplx_joints_world": joints.astype(np.float32),
         "smplx_root_rot": root_rot.astype(np.float32),
         "smplx_body_rot": body_rot.astype(np.float32),

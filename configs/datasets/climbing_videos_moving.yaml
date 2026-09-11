@@ -1,0 +1,4 @@
+name: climbing_videos
+root: /data3/rikhat.akizhanov/better/data/ClimbingVideos
+contact_level: 1
+camera: moving         # the complement of climbing_videos_static.yaml (751 train / 92 test scenes)

@@ -1,0 +1,3 @@
+base: configs/final.yaml
+data: {seed: 1}
+output: {exp_name: final_s1}

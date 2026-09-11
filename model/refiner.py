@@ -1,37 +1,29 @@
-"""World-space temporal refiner — stage 2 behind the per-frame model (docs/refiner.md).
+"""World-space temporal refiner behind the per-frame model (docs/refiner.md, docs/architecture_2.md).
 
-The per-frame model (frozen SAM3D decoder + the frozen stage-1 SMPL-X / CLIFF
-heads) gives a camera-frame body per frame. This module turns the clip into a
-WORLD-space motion, encodes it frame by frame in a way that is independent of
-the world frame, runs a local temporal transformer over the frames, and decodes
+The per-frame model (frozen SAM3D decoder + the SMPL-X / CLIFF heads) gives a
+camera-frame body per frame. This module turns the clip into a WORLD-space
+motion, encodes it frame by frame in a way that is independent of the world
+frame, runs a local temporal transformer over the frames, and decodes
 corrections — again without any reference to the world frame:
 
 1. **Lift** with the frame extrinsics: ``p_w = R^T (p_c - t)``,
    ``R_world_root = R^T R_cam_root``; betas averaged over the clip.
-2. **Root smoothing** (``root_smooth_sec``): Gaussian smoothing of the WORLD
-   pelvis position along time, AFTER the lift. Camera coordinates carry the
-   camera's own motion: smoothing the depth there strips that motion from the
-   signal and the lift no longer cancels it (2026-09-06 decomposition: jitter
-   30 vs the GT floor of 7 on moving cameras; the floor is reached when the
-   raw root is smoothed after the lift instead).
-   **Pose smoothing** (``pose_smooth_sec``, a shorter Gaussian): the world
-   root rotation and the parent-local joint rotations (weighted matrix mean
-   projected back onto SO(3)). The per-frame model's rotation noise is white
-   and much faster than the motion, so a sigma of a few frames removes most of
-   the rotation jitter without touching the pose (scripts/analyze_stage1.py
-   ``--pose-sigmas``). ``learn_smoothing`` makes both widths parameters (one for
-   the root position, one per rotation), trained by every loss through the
-   smoothed input.
-3. **Per-frame token** = 21 body-joint positions in the ROOT frame (FK of the
-   smoothed pose), the root's linear and angular velocity in the BODY frame
-   (finite differences of the lifted trajectory), the frame spacing, the mean
-   betas, optionally the **camera context** (``camera_context``: the direction
-   from the pelvis to the camera in the body frame, the pelvis log depth, the
-   crop box's bearing and angular size — the per-frame depth error is a
-   function of the crop geometry and lies along that direction), the projected
-   frozen pose token and the projected six contact tokens. No absolute
-   position, no heading: a rigid re-definition of the world leaves every input
-   unchanged (the camera moves with it).
+2. **Input smoothing** (``root_smooth_sec`` / ``pose_smooth_sec``, the round-4
+   recipe; 0 = off): Gaussian smoothing of the WORLD pelvis position after the
+   lift (never in camera coordinates — those carry the camera's own motion and
+   the lift no longer cancels it) and of the world root rotation and the
+   parent-local joint rotations (matrix means projected onto SO(3)).
+   ``learn_smoothing`` makes the widths parameters.
+3. **Per-frame token** = 21 body-joint positions in the ROOT frame, the root's
+   linear and angular velocity in the BODY frame, the frame spacing, the mean
+   betas, optionally the camera context (``camera_context``: pelvis->camera
+   direction in the body frame, log depth, crop-box bearing and angular size),
+   optionally (``token``) the parent-local 6D joint rotations, the gravity
+   direction in the body frame and the ``raw - 5-frame-mean`` channels of the
+   root position and the root-frame joints (the noisiness, made visible), the
+   projected frozen pose token and the projected contact tokens. Nothing refers
+   to the world frame: a rigid re-definition of the world leaves every input
+   unchanged.
 4. **Temporal transformer**: :class:`~model.rope.CrossModalRopeModule` with a
    single slot — RoPE positions are seconds, a hard ``window`` per layer bounds
    the receptive field to ``num_layers x window``.
@@ -44,8 +36,8 @@ corrections — again without any reference to the world frame:
    with the extrinsics — the output dict has the :class:`~model.heads.SmplxHead`
    keys, so the existing SMPL-X loss and pose metrics apply unchanged.
 
-At initialisation the refiner is exactly "per-frame model + smoothing":
-the RoPE blocks are identities and every head is zero.
+At initialisation the refiner is exactly "per-frame model + smoothing": the
+RoPE blocks are identities and every head is zero.
 """
 from __future__ import annotations
 
@@ -73,6 +65,8 @@ _GEOMETRY_DIM = 3 * (NUM_BODY_JOINTS - 1) + 3 + 3 + 1 + 10
 #: Camera-context features: pelvis->camera direction in the body frame (3), pelvis log
 #: depth (1), crop-box bearing (2) and angular size (1).
 _CAMERA_DIM = 3 + 1 + 2 + 1
+#: Half-width (frames) of the mean the ``raw - mean`` token channels subtract.
+_RAW_MEAN_RADIUS = 2
 #: Attribute names of the learnable smoothing widths (``learn_smoothing``); the trainer
 #: gives them their own optimizer group (``optim.smoothing_lr_scale``).
 SMOOTHING_PARAM_NAMES = ("log_root_sigma", "log_pose_sigma")
@@ -170,6 +164,43 @@ def time_derivative(x: Tensor, seconds: Tensor, valid: Tensor) -> Tensor:
     return torch.where(_trailing(dt > 0, x), deriv, torch.zeros_like(deriv))
 
 
+def second_difference(x: Tensor, seconds: Tensor, valid: Tensor) -> Tensor:
+    """Centred second difference of ``x`` ``[n, T, ...]`` at the frame (span ``+-1``).
+
+    ``2 ((x[t+1] - x[t]) / h_f - (x[t] - x[t-1]) / h_b) / (h_b + h_f)``; zero where a
+    neighbour is missing (rows are masked by :func:`stencil_valid` downstream).
+    """
+    lo, hi, t_lo, t_hi, prev_ok, next_ok = _shifted(x, valid, seconds)
+    h_b = (seconds - t_lo).clamp(min=1e-6)
+    h_f = (t_hi - seconds).clamp(min=1e-6)
+    fwd = (hi - x) / _trailing(h_f, x)
+    bwd = (x - lo) / _trailing(h_b, x)
+    acc = 2.0 * (fwd - bwd) / _trailing(h_b + h_f, x)
+    return torch.where(_trailing(prev_ok & next_ok, x), acc, torch.zeros_like(acc))
+
+
+def angular_acceleration(rot: Tensor, seconds: Tensor, valid: Tensor) -> Tensor:
+    """Body-frame angular acceleration of world-from-body rotations ``[n, T, 3, 3]``.
+
+    The forward and backward step rates ``log(R_t^T R_{t+-1}) / h`` are the two
+    adjacent midpoint velocities; their difference over the half-span
+    ``(h_b + h_f) / 2`` is the centred second difference (span ``+-1``, the
+    rotational twin of :func:`second_difference`). Zero where a neighbour is missing.
+    """
+    n, t = seconds.shape
+    zeros = torch.zeros(n, 1, 3, dtype=rot.dtype, device=rot.device)
+    if t < 3:
+        return zeros.expand(n, t, 3)
+    inc = roma.rotmat_to_rotvec(rot[:, :-1].transpose(-1, -2) @ rot[:, 1:])   # [n, T-1, 3]
+    dt = (seconds[:, 1:] - seconds[:, :-1]).clamp(min=1e-6)
+    ok = valid[:, 1:] & valid[:, :-1]
+    rate = inc / dt[..., None]
+    span = 0.5 * (dt[:, 1:] + dt[:, :-1])
+    acc = (rate[:, 1:] - rate[:, :-1]) / span[..., None]                      # frames 1..T-2
+    acc = torch.where((ok[:, 1:] & ok[:, :-1])[..., None], acc, torch.zeros_like(acc))
+    return torch.cat([zeros, acc, zeros], dim=1)
+
+
 def local_dt(seconds: Tensor, valid: Tensor) -> Tensor:
     """Per-frame spacing ``[n, T]``: mean step to the valid neighbours (0 if none)."""
     _, _, t_lo, t_hi, prev_ok, next_ok = _shifted(seconds, valid, seconds)
@@ -216,6 +247,31 @@ def stencil_valid(valid: Tensor, radius: int) -> Tensor:
     return out
 
 
+def neighbours(x: Tensor, valid: Tensor, radius: int) -> tuple[Tensor, Tensor]:
+    """The ``+- radius`` neighbours of every frame of ``x`` ``[n, T, ...]``.
+
+    :returns: ``(stack [n, T, 2 radius + 1, ...], mask [n, T, 2 radius + 1])`` —
+        offsets ``-radius .. radius`` in order; a neighbour outside the clip or
+        invalid is masked (its value is a clamped copy of the frame's own).
+    """
+    n, t = valid.shape
+    index = torch.arange(t, device=x.device)[:, None] + torch.arange(
+        -radius, radius + 1, device=x.device)[None, :]                        # [T, 2r+1]
+    inside = (index >= 0) & (index < t)
+    index = index.clamp(0, t - 1)
+    mask = valid[:, index] & inside[None]                                     # [n, T, 2r+1]
+    mask[:, :, radius] = True                                # a frame always sees itself
+    stack = x[:, index]                                                       # [n, T, 2r+1, ...]
+    return stack, mask
+
+
+def local_mean(x: Tensor, valid: Tensor, radius: int) -> Tensor:
+    """Mean of ``x`` ``[n, T, ...]`` over the valid ``+- radius`` neighbours (self included)."""
+    stack, mask = neighbours(x, valid, radius)
+    weight = mask.to(x.dtype).reshape(*mask.shape, *([1] * (x.dim() - 2)))
+    return (stack * weight).sum(dim=2) / weight.sum(dim=2).clamp(min=1.0)
+
+
 # ------------------------------------------------------------------ the module
 
 class TemporalRefiner(nn.Module):
@@ -231,14 +287,15 @@ class TemporalRefiner(nn.Module):
     :param dropout: dropout inside attention / FFN.
     :param window: attention half-width per layer, seconds.
     :param time_scale: RoPE rotation units per second.
-    :param root_smooth_sec: Gaussian sigma (s) of the world pelvis position
-        after the lift (0 = off).
-    :param pose_smooth_sec: Gaussian sigma (s) of the root / joint rotation
-        smoothing (0 = off).
-    :param learn_smoothing: make the widths trainable — one log-sigma for the
-        root position and one per rotation (root + 21 joints), initialised from
-        the two ``*_smooth_sec`` values (both must be > 0). The kernel shape
-        stays Gaussian; only its width per channel is learned.
+    :param root_smooth_sec: input Gaussian sigma (s) of the world pelvis
+        position after the lift (0 = off).
+    :param pose_smooth_sec: input Gaussian sigma (s) of the root / joint
+        rotation smoothing (0 = off).
+    :param learn_smoothing: make the input widths trainable — one log-sigma
+        for the root position and one per rotation (root + 21 joints),
+        initialised from the two ``*_smooth_sec`` values (both must be > 0).
+    :param token: extra token channels, ``{local_rotations, gravity,
+        raw_minus_mean}`` (bools).
     :param camera_context: append the camera-context features to the token.
     :param pose_token: feed the frozen pose token (projected).
     :param pose_token_dim: pose-token projection width.
@@ -260,6 +317,7 @@ class TemporalRefiner(nn.Module):
         root_smooth_sec: float = 0.0,
         pose_smooth_sec: float = 0.0,
         learn_smoothing: bool = False,
+        token: Optional[dict] = None,
         camera_context: bool = False,
         pose_token: bool = True,
         pose_token_dim: int = 256,
@@ -282,6 +340,10 @@ class TemporalRefiner(nn.Module):
             self.log_root_sigma = nn.Parameter(torch.full((1,), math.log(self.root_smooth_sec)))
             self.log_pose_sigma = nn.Parameter(
                 torch.full((NUM_BODY_JOINTS,), math.log(self.pose_smooth_sec)))
+        token = {"local_rotations": False, "gravity": False, "raw_minus_mean": False, **(token or {})}
+        self.token_local_rotations = bool(token["local_rotations"])
+        self.token_gravity = bool(token["gravity"])
+        self.token_raw_minus_mean = bool(token["raw_minus_mean"])
         self.camera_context = bool(camera_context)
         self.time_scale = float(time_scale)
 
@@ -289,9 +351,12 @@ class TemporalRefiner(nn.Module):
         self.proj_contact_tokens = (nn.Linear(decoder_dim, contact_token_dim)
                                     if self.num_contact_tokens > 0 else None)
         token_dim = (pose_token_dim if pose_token else 0) + self.num_contact_tokens * contact_token_dim
-        # Two LayerNorms: the 80 geometry numbers and the ~640 projected token channels are
+        # Two LayerNorms: the geometry numbers and the projected token channels are
         # normalised separately, so neither group's scale rides on the other's width.
         geometry_dim = _GEOMETRY_DIM + (_CAMERA_DIM if self.camera_context else 0)
+        geometry_dim += 6 * (NUM_BODY_JOINTS - 1) if self.token_local_rotations else 0
+        geometry_dim += 3 if self.token_gravity else 0
+        geometry_dim += 3 + 3 * (NUM_BODY_JOINTS - 1) if self.token_raw_minus_mean else 0
         self.geometry_norm = nn.LayerNorm(geometry_dim)
         self.token_norm = nn.LayerNorm(token_dim) if token_dim > 0 else None
         self.input_proj = nn.Linear(geometry_dim + token_dim, dim)
@@ -303,16 +368,20 @@ class TemporalRefiner(nn.Module):
                  "motion": 6 * NUM_BODY_JOINTS + 6, "force": 3 * NUM_GROUPS}
         self.heads = nn.ModuleDict()
         for name in self.outputs:
-            head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, sizes[name]))
-            nn.init.zeros_(head[2].weight)
-            nn.init.zeros_(head[2].bias)
-            self.heads[name] = head
+            self.heads[name] = self._zero_head(dim, sizes[name])
         self.register_buffer("identity_6d", torch.tensor(_IDENTITY_6D), persistent=False)
+
+    @staticmethod
+    def _zero_head(dim: int, out: int) -> nn.Sequential:
+        head = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, out))
+        nn.init.zeros_(head[2].weight)
+        nn.init.zeros_(head[2].bias)
+        return head
 
     # ------------------------------------------------------------------ smoothing
 
     def smoothing_sigmas(self) -> tuple[float | Tensor, float | Tensor, float | Tensor]:
-        """Kernel widths in seconds: (root position, root rotation, the 21 joint rotations).
+        """Input kernel widths in seconds: (root position, root rotation, the 21 joint rotations).
 
         Floats from the config when fixed; tensors ``(1,)``, ``(1,)``, ``(21,)`` of the
         clamped learnable widths under ``learn_smoothing``.
@@ -344,7 +413,8 @@ class TemporalRefiner(nn.Module):
         :param blocks: token-block bounds (``blocks["contact"]`` when present).
         :param batch: collated batch (``seq_len``, ``frame_pos_sec``,
             ``frame_valid``, ``cam_from_world``, ``cam_int``, ``affine_trans``,
-            ``img_size``, ``bbox_center``, ``bbox_scale``).
+            ``img_size``, ``bbox_center``, ``bbox_scale``; ``gravity_world`` with
+            the gravity token channel).
         :param body: the head's BetterHuman SMPL-X body (22 or 52 joints).
         :returns: ``{"smplx", "contact", "force", "motion"}`` — ``smplx`` in the
             SmplxHead layout plus ``pelvis_world`` / ``root_rot_world`` /
@@ -392,10 +462,10 @@ class TemporalRefiner(nn.Module):
         # 3. world-independent per-frame features.
         joints_root = torch.einsum(
             "bji,bkj->bki", rot_wr, joints_world_in[:, 1:NUM_BODY_JOINTS] - p_w[:, None])
+        dt = local_dt(seconds, valid).reshape(n_frames, 1) * _DT_SCALE
         vel_w = time_derivative(p_w.view(n_clips, seq_len, 3), seconds, valid).reshape(n_frames, 3)
         vel_b = (rot_wr.transpose(1, 2) @ vel_w[..., None])[..., 0]
         ang_b = angular_velocity(rot_wr.view(n_clips, seq_len, 3, 3), seconds, valid)
-        dt = local_dt(seconds, valid).reshape(n_frames, 1) * _DT_SCALE
         geometry = [joints_root.reshape(n_frames, -1), vel_b, ang_b.reshape(n_frames, 3), dt,
                     betas_mean]
         if self.camera_context:
@@ -411,6 +481,19 @@ class TemporalRefiner(nn.Module):
             box_size = batch["bbox_scale"].float()[:, 0] / focal
             log_z = torch.log(pelvis_s[:, 2].clamp(min=1e-3))
             geometry += [cam_dir_b, log_z[:, None], box_bearing, box_size[:, None]]
+        if self.token_local_rotations:
+            geometry.append(rotmat_to_rot6d(body_rot).reshape(n_frames, -1))
+        if self.token_gravity:
+            # The scene's down vector seen from the body: pitch / roll relative to gravity
+            # (a heading relative to gravity would need a world reference, so none is given).
+            gravity_w = batch["gravity_world"].to(device, torch.float32)
+            geometry.append((rot_wr.transpose(1, 2) @ gravity_w[..., None])[..., 0])
+        if self.token_raw_minus_mean:
+            p_mean = local_mean(p_w.view(n_clips, seq_len, 3), valid, _RAW_MEAN_RADIUS)
+            dp_w = p_w - p_mean.reshape(n_frames, 3)
+            dp_b = (rot_wr.transpose(1, 2) @ dp_w[..., None])[..., 0]
+            j_mean = local_mean(joints_root.reshape(n_clips, seq_len, -1), valid, _RAW_MEAN_RADIUS)
+            geometry += [dp_b, joints_root.reshape(n_frames, -1) - j_mean.reshape(n_frames, -1)]
         geometry = torch.cat(geometry, dim=-1)
         feats = [self.geometry_norm(geometry)]
         token_feats = []
@@ -481,6 +564,7 @@ class TemporalRefiner(nn.Module):
         return {"smplx": smplx, "contact": contact, "force": force, "motion": motion}
 
 
-__all__ = ["TemporalRefiner", "OUTPUTS", "SMOOTHING_PARAM_NAMES", "gaussian_smooth",
-           "smooth_rotations", "project_rotation", "time_derivative",
-           "angular_velocity", "local_dt", "stencil_valid"]
+__all__ = ["TemporalRefiner", "OUTPUTS", "SMOOTHING_PARAM_NAMES",
+           "gaussian_smooth", "smooth_rotations", "project_rotation", "time_derivative",
+           "second_difference", "angular_velocity", "angular_acceleration", "local_dt",
+           "stencil_valid", "neighbours", "local_mean"]

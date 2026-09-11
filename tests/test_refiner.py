@@ -77,17 +77,23 @@ def synthetic(body, n_clips: int = 2, seq_len: int = 12, seed: int = 0):
         "img_size": torch.full((n, 2), 256.0),
         "bbox_center": torch.tensor([480.0, 520.0]) + 20.0 * torch.randn(n, 2),
         "bbox_scale": torch.full((n, 2), 300.0) + 10.0 * torch.randn(n, 2),
+        "gravity_world": torch.tensor([0.0, -1.0, 0.0]).expand(n, 3).clone(),
     }
     return smplx_out, tokens, blocks, batch
 
 
+ALL_TOKEN = {"local_rotations": True, "gravity": True, "raw_minus_mean": True}
+
+
 def make_refiner(randomize: bool, root_smooth_sec: float = 0.0, pose_smooth_sec: float = 0.0,
-                 camera_context: bool = False, learn_smoothing: bool = False) -> TemporalRefiner:
+                 camera_context: bool = False, learn_smoothing: bool = False,
+                 token: dict | None = None) -> TemporalRefiner:
     torch.manual_seed(1)
     refiner = TemporalRefiner(DECODER_DIM, ("pose", "contact", "motion", "force"),
                               num_contact_tokens=6, dim=64, num_layers=2, num_heads=4,
                               window=0.5, root_smooth_sec=root_smooth_sec,
                               pose_smooth_sec=pose_smooth_sec, learn_smoothing=learn_smoothing,
+                              token=token,
                               camera_context=camera_context, dropout=0.0)
     if randomize:
         for head in refiner.heads.values():
@@ -148,11 +154,12 @@ def test_identity_at_init(body):
     assert all(torch.count_nonzero(out["motion"][k]) == 0 for k in ("vel", "acc", "ang_vel", "ang_acc"))
 
 
-@pytest.mark.parametrize("camera_context", [False, True])
-def test_world_frame_independence(body, camera_context):
+@pytest.mark.parametrize("camera_context, token", [
+    (False, None), (True, None), (True, ALL_TOKEN), (False, ALL_TOKEN)])
+def test_world_frame_independence(body, camera_context, token):
     smplx_out, tokens, blocks, batch = synthetic(body)
     refiner = make_refiner(randomize=True, root_smooth_sec=0.2, pose_smooth_sec=0.08,
-                           camera_context=camera_context)
+                           camera_context=camera_context, token=token)
     out = refiner(smplx_out, tokens, blocks, batch, body)
     assert torch.count_nonzero(out["contact"]["logits"]) > 0      # the heads are live
     assert (out["smplx"]["joints_cam"] - smplx_out["joints_cam"]).abs().max() > 1e-4
@@ -166,6 +173,7 @@ def test_world_frame_independence(body, camera_context):
     g_inv[:3, 3] = -rot0.T @ t0
     moved = dict(batch)
     moved["cam_from_world"] = batch["cam_from_world"] @ g_inv
+    moved["gravity_world"] = batch["gravity_world"] @ rot0.T      # the down vector moves with the world
     out2 = refiner(smplx_out, tokens, blocks, moved, body)
 
     for key in ("joints_cam", "pelvis_cam", "root_rot", "body_rot", "q_cam", "kp2d_crop", "betas"):
@@ -305,3 +313,4 @@ def test_learnable_smoothing_starts_at_the_config_widths_and_gets_gradients(body
     assert grad is not None and torch.isfinite(grad).all() and int((grad != 0).sum()) >= 18
     with pytest.raises(ValueError):
         make_refiner(randomize=False, root_smooth_sec=0.0, pose_smooth_sec=0.08, learn_smoothing=True)
+

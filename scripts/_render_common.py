@@ -102,8 +102,12 @@ def build_dataset(
     """One scene as clips: the whole-scene eval clip per person, or train tiles.
 
     ``max_frames`` caps the eval clip and is inert on the train split, whose
-    clips are ``data.clip.frames`` long by construction.
+    clips are ``data.clip.frames`` long by construction. A refiner whose token
+    carries the gravity channel needs the kindyn ``smplx`` group loaded.
     """
+    refiner = cfg["model"]["refiner"]
+    if refiner["enabled"] and bool(refiner["token"]["gravity"]):
+        load = set(load) | {"smplx"}
     return ClimbingVideosDataset(
         root,
         scenes=[scene],

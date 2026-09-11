@@ -170,8 +170,8 @@ def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
         from model.loss.contact_consistency import ContactConsistencyLoss
         losses.append(ContactConsistencyLoss(cfg, model, device))
     if cfg["force_consistency"]["enabled"]:
-        _require(net.refiner is not None and {"pose", "force"} <= set(net.refiner.outputs),
-                 "force_consistency", "refiner 'pose' and 'force' outputs")
+        _require(net.refiner is not None and "force" in net.refiner.outputs,
+                 "force_consistency", "a refiner 'force' output")
         from model.loss.force_consistency import ForceConsistencyLoss
         losses.append(ForceConsistencyLoss(cfg, model, device))
     return losses

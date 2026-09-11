@@ -1,6 +1,0 @@
-# Round 4 arm E: arm A (configs/stage2_v4.yaml) WITHOUT the Gaussian smoothing of the lifted world root (0.10 s)
-# and of the root / joint rotations (0.08 s) before the temporal block: the block sees the raw stage-1 body and
-# has to do the denoising itself (the RNEA residual then differentiates the raw motion).
-base: configs/stage2_v4.yaml
-model: {refiner: {root_smooth_sec: 0.0, pose_smooth_sec: 0.0}}
-output: {exp_name: stage2_v4_nosmooth}

@@ -20,6 +20,15 @@ of width ``huber_delta`` in those standardized units, so the four terms start on
 an equal footing. Metrics: RMSE in physical units and the pooled Pearson
 correlation over all components, per quantity.
 
+``stencil: aligned`` replaces the double smoothing by ONE Gaussian on the GT
+trajectory (positions; rotations as projected matrix means) followed by the
+same stencils the prediction side uses — central velocity, tight centred second
+difference (span +-1), the rotational twins :func:`~model.refiner.angular_velocity`
+/ :func:`~model.refiner.angular_acceleration` — so target and estimator are the
+same operator on two trajectories (the 2026-09-07 audit: the legacy acceleration
+target is effectively a 0.17 s Gaussian against a raw second difference, 0.35x
+the estimator's RMS). ``legacy`` is the round-4 recipe above.
+
 **Pose-derivative matching** (``loss.pose_*`` weights): the same four targets
 are also matched by the finite differences of the REFINED trajectory itself
 (``out["smplx"]["joints_world"]`` / ``root_rot_world``, raw central differences,
@@ -37,8 +46,9 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from model.loss import Loss, LossResult
-from model.refiner import (NUM_BODY_JOINTS, angular_velocity, gaussian_smooth,
-                           stencil_valid, time_derivative)
+from model.refiner import (NUM_BODY_JOINTS, angular_acceleration, angular_velocity,
+                           gaussian_smooth, second_difference, smooth_rotations, stencil_valid,
+                           time_derivative)
 from utils.metrics import pearson_from_stats
 
 QUANTITIES = ("vel", "acc", "ang_vel", "ang_acc")
@@ -62,6 +72,9 @@ class MotionLoss(Loss):
         super().__init__(cfg, model, device)
         section = cfg["motion_supervision"]
         self.sigma = float(section["label_smooth_sec"])
+        self.stencil = str(section["stencil"])
+        if self.stencil not in ("legacy", "aligned"):
+            raise ValueError(f"motion_supervision.stencil must be legacy | aligned; got {self.stencil!r}")
         self.scale = {q: float(section["scale"][q]) for q in QUANTITIES}
         self.weights = {_tag(src, q): float(section["loss"][_tag(src, q)])
                         for src in SOURCES for q in QUANTITIES}
@@ -87,11 +100,21 @@ class MotionLoss(Loss):
         # kernel, so the loss masks them too: radius = ceil(2 sigma / dt).
         first = stencil_valid(valid, 1)
         second = stencil_valid(valid, 2)
-        vel_w = gaussian_smooth(time_derivative(joints, seconds, valid), seconds, first, self.sigma)
-        acc_w = gaussian_smooth(time_derivative(vel_w, seconds, first), seconds, second, self.sigma)
-        ang_body = angular_velocity(root, seconds, valid)                    # GT body frame
-        ang_w = gaussian_smooth((root @ ang_body[..., None])[..., 0], seconds, first, self.sigma)
-        ang_acc_w = gaussian_smooth(time_derivative(ang_w, seconds, first), seconds, second, self.sigma)
+        if self.stencil == "aligned":
+            # ONE Gaussian on the trajectory, then the same stencils the prediction side uses
+            # (central velocity, tight centred second difference): target and estimator agree.
+            joints_s = gaussian_smooth(joints, seconds, valid, self.sigma)
+            root_s = smooth_rotations(root, seconds, valid, self.sigma)
+            vel_w = time_derivative(joints_s, seconds, valid)
+            acc_w = second_difference(joints_s, seconds, valid)
+            ang_w = (root_s @ angular_velocity(root_s, seconds, valid)[..., None])[..., 0]
+            ang_acc_w = (root_s @ angular_acceleration(root_s, seconds, valid)[..., None])[..., 0]
+        else:
+            vel_w = gaussian_smooth(time_derivative(joints, seconds, valid), seconds, first, self.sigma)
+            acc_w = gaussian_smooth(time_derivative(vel_w, seconds, first), seconds, second, self.sigma)
+            ang_body = angular_velocity(root, seconds, valid)                    # GT body frame
+            ang_w = gaussian_smooth((root @ ang_body[..., None])[..., 0], seconds, first, self.sigma)
+            ang_acc_w = gaussian_smooth(time_derivative(ang_w, seconds, first), seconds, second, self.sigma)
 
         targets = {
             "vel": vel_w.reshape(n_frames, NUM_BODY_JOINTS, 3),
@@ -121,9 +144,13 @@ class MotionLoss(Loss):
         joints = joints.view(n_clips, seq_len, NUM_BODY_JOINTS, 3)
         root = root.view(n_clips, seq_len, 3, 3)
         vel = time_derivative(joints, seconds, valid)
-        acc = time_derivative(vel, seconds, valid)
         ang = (root @ angular_velocity(root, seconds, valid)[..., None])[..., 0]   # world frame
-        ang_acc = time_derivative(ang, seconds, valid)
+        if self.stencil == "aligned":
+            acc = second_difference(joints, seconds, valid)
+            ang_acc = (root @ angular_acceleration(root, seconds, valid)[..., None])[..., 0]
+        else:
+            acc = time_derivative(vel, seconds, valid)
+            ang_acc = time_derivative(ang, seconds, valid)
         return {"vel": vel.reshape(n_frames, NUM_BODY_JOINTS, 3),
                 "acc": acc.reshape(n_frames, NUM_BODY_JOINTS, 3),
                 "ang_vel": ang.reshape(n_frames, 3), "ang_acc": ang_acc.reshape(n_frames, 3)}

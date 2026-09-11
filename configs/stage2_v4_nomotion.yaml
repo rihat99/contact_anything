@@ -1,7 +1,0 @@
-# Round 4 arm C: arm A (configs/stage2_v4.yaml) WITHOUT the motion losses — neither the motion-head prediction
-# terms nor the pose-derivative matching — so the `motion` refiner output goes too (an unsupervised head is
-# illegal by config). Isolates what the derivative supervision buys the refined pose / jitter (RNEA stays).
-base: configs/stage2_v4.yaml
-model: {refiner: {outputs: [pose, contact, force]}}
-motion_supervision: {enabled: false}
-output: {exp_name: stage2_v4_nomotion}

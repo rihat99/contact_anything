@@ -1,0 +1,43 @@
+# Final model (2026-09-08), the recipe round 5 measured best (docs/architecture_2.md, docs/round5_2026-09-07.md):
+#   frozen stage-1 body + fixed Gaussian in the world (root 0.10 s, rotations 0.08 s) = THE body (no pose head:
+#   every learned pose correction measured worse than the Gaussian alone), the token channels (gravity, local
+#   rotations, raw - local mean: force MAE 0.192 -> 0.183), the round-4 temporal block (window 0.5 s x 3 layers),
+#   contact / motion / force heads with plain supervised losses (no RNEA, no stillness: nothing measurable),
+#   aligned derivative stencils (the legacy central differences are Nyquist-blind), heel class weight 1
+#   (the x5 weight fired at the base rate, 3/4 wrong), 64 clips per optimizer step, cached pose tokens.
+# Self-contained: every key below is an override of configs/base.yaml.
+base: configs/base.yaml
+model:
+  decoder_checkpointing: true
+  contact: {enabled: false}                # no decoder contact tokens: the refiner's contact head is the output
+  smplx: {enabled: true, hands: true, checkpoint: output/stage1_20260905_180319/best.pth, frozen: true}
+  refiner:
+    enabled: true
+    outputs: [contact, motion, force]
+    num_layers: 3
+    root_smooth_sec: 0.10
+    pose_smooth_sec: 0.08
+    token: {local_rotations: true, gravity: true, raw_minus_mean: true}
+    camera_context: true
+data:
+  pose_token_cache: true                   # frozen FINAL pose tokens from features/pose_token (no image, no decoder)
+  frames_per_batch: 480                    # 8 x 60-frame clips per GPU; x accumulate_steps 8 = 64 clips per step
+  interleave_videos: true
+  eval_max_frames: 120
+contact_supervision:
+  weight: 5.0
+  class_weights: {positive: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0], negative: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]}
+force_supervision: {enabled: true}
+smplx_supervision:                         # the body is frozen: these terms only score it (metric_pose/*)
+  enabled: true
+  loss: {kp2d: 0.0, kp3d: 10.0, pose: 2.0, betas: 0.0, cam: 0.0, root_bias: 2.0, root_shape: 2.0}
+motion_supervision:
+  enabled: true
+  stencil: aligned
+  scale: {vel: 0.4, acc: 1.2, ang_vel: 0.57, ang_acc: 1.8}
+optim: {lr: 3.0e-4, weight_decay: 0.01, epochs: 15, accumulate_steps: 8, warmup_steps: 100, lr_min: 1.0e-6}
+output:
+  dir: ./output_2
+  exp_name: final
+  monitor: metric_contact/f1
+  frozen_metrics: output/round3_refiner_eval.json   # the round-3 refiner's eval.json as the tensorboard reference line

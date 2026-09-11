@@ -209,6 +209,10 @@ def validate(cfg: dict) -> None:
                 "model.refiner needs a FROZEN per-frame body (model.smplx.frozen with a "
                 "stage-1 checkpoint): a trainable pose path under the motion / force losses "
                 "is the shrinkage shortcut")
+        if bool(refiner["token"]["gravity"]) and not cfg["smplx_supervision"]["enabled"]:
+            raise ValueError(
+                "model.refiner.token.gravity reads the kindyn gravity, which loads with the smplx "
+                "GT group: enable smplx_supervision")
         if int(refiner["num_layers"]) < 1:
             raise ValueError("model.refiner.num_layers must be >= 1")
         if cross_modal["enabled"]:
@@ -296,8 +300,8 @@ def validate(cfg: dict) -> None:
                 "valid neighbours on each side)")
     physics = cfg["force_consistency"]
     if physics["enabled"]:
-        if not {"pose", "force"} <= outputs:
-            raise ValueError("force_consistency needs refiner 'pose' and 'force' outputs")
+        if "force" not in outputs:
+            raise ValueError("force_consistency needs a refiner 'force' output")
         if "contact" not in outputs and bool(physics["gate_by_contact"]):
             raise ValueError("force_consistency.gate_by_contact needs a refiner 'contact' output")
         if float(physics["smooth_sec"]) < 0.0:

@@ -27,6 +27,24 @@ smoothing, world lift with the camera extrinsics, a world-independent per-frame 
 RoPE transformer, and zero-init heads for the pose offset, contact, motion and forces. Contact is
 trained in stage 2 only. Tests: `tests/test_refiner.py` (CPU).
 
+**2026-09-08 — round 5 and the final model (`docs/architecture_2.md`).** `configs/final.yaml`
+(self-contained on `base.yaml`) is the recipe: the frozen stage-1 body + the fixed Gaussian in
+the world IS the pose (no pose head — every learned correction measured worse), the token
+channels `model.refiner.token`, `motion_supervision.stencil: aligned`, contact / motion / force
+heads on cached pose tokens, 64 clips per step; `final_rnea.yaml` adds the RNEA residual
+(force direction −1°, off-contact force ×2). Runs `output_2/final*`; the round-5 arms are
+written up in `docs/round5_2026-09-07.md` (seed spread: F1 0.002, MPJPE 0.02 mm — smaller
+differences are noise).
+
+**2026-09-11 — round 6 (`docs/round6_2026-09-11.md`) and cleanup.** Contact on the final recipe
+is static pose (F1 0.888) + world motion (+0.039); the frozen pose token is worth +0.005 (two
+seeds, precision); the velocity channels' frame (lifted vs camera) does not matter; the limb
+labels carry no image evidence and the confidence weights mute the rows where the image would
+decide (`scripts/diag_label_anatomy.py`). Every run except stage 1 and `output_2/final*`, the
+round-3/4/5/6 configs and the two round-6 token options (`velocity`, `velocity_frame`) went to
+`/data3/rikhat.akizhanov/trash/cleanup_20260911/`; the round-3 refiner's `eval.json` stays as
+`output/round3_refiner_eval.json` (the final model's tensorboard reference line).
+
 ## Environment
 
 ```
@@ -64,9 +82,14 @@ $PYTHON scripts/analyze_stage1.py --train output/<stage1>/dump_train --test outp
     --pose-sigmas 0,0.05,0.08,0.12 --depth-sigma 0.25
 #   -> train/test gap, depth_smooth_sec sweep, pose_smooth_sec sweep, motion_supervision.scale
 #   numbers; then set model.smplx.checkpoint in the stage-2 config and train it:
-CUDA_VISIBLE_DEVICES=0,4,5,6 $CONDA/bin/torchrun --standalone --nproc-per-node=4 scripts/train.py --config configs/stage2_v2.yaml
-#   (round 2: 8 x 60-frame clips per GPU with decoder_checkpointing, accumulate_steps 2 -> 64 clips/step)
-$PYTHON -m pytest tests/ -q                                  # refiner unit tests (CPU, ~10 s)
+CUDA_VISIBLE_DEVICES=0,1,2,3 $CONDA/bin/torchrun --standalone --nproc-per-node=4 scripts/train.py --config configs/final.yaml
+#   (8 x 60-frame clips per GPU on cached pose tokens, accumulate_steps 8 -> 64 clips/step, ~15 min for 15 epochs)
+$PYTHON scripts/eval_table.py output_2/final_*                          # one table over several runs' eval.json
+$PYTHON scripts/paired_ci.py output_2/final_20260908_104420 output_2/final_rnea_20260908_110221 --protocol capped
+#   (video-clustered paired bootstrap over predict_test.py dumps: differences to the first run with 95 % intervals)
+$PYTHON scripts/diag_invariance.py --config configs/final.yaml --checkpoint output_2/<run>/last.pth   # reverse / shuffle / decimate / window
+$PYTHON scripts/diag_sigma_sweep.py --config configs/final.yaml --checkpoint none                    # stage 1 + Gaussian over sigma
+$PYTHON -m pytest tests/ -q                                  # refiner unit tests (CPU, ~35 s)
 
 # Renders (mp4 per test scene; shard scenes over ranks with torchrun)
 $PYTHON scripts/render_video.py --config configs/baseline.yaml --checkpoint output/<run>/best.pth \
@@ -102,12 +125,12 @@ CUDA_VISIBLE_DEVICES=0 $PYTHON scripts/data/precompute_embeddings.py --split all
 | `data/` | `base.py` = `ClipDataset` ABC (windowing, jitter, full-scene eval) **and the frame schema** (module docstring); `climbing_videos/` (`scene.py` DB + labels, `kindyn.py` forces + SMPL-X GT, `dataset.py`); `reconstruction.py` (label-free BVR out-trees); `collate.py`, `loaders.py`, `transforms.py`. |
 | `train/` | `config.py` (schema = `configs/base.yaml`, cross-key checks, `signal_needs`), `trainer.py` (DDP-exact weighted means, EMA, per-module clipping, per-step warm-up + cosine), `checkpoint.py` (trainable-only, strict), `logger.py` (tensorboard + `tee_output`), `predict.py` (`load_model`). |
 | `utils/` | `geometry.py` (camera parametrizations, projection, world lift), `gvhmr_metrics.py`, `metrics.py`, `distributed.py`. |
-| `scripts/` | Thin CLIs (above); `_render_common.py` shares the scene / clip plumbing and the drawing helpers; `dump_stage1.py` + `analyze_stage1.py` are the stage-1 diagnostics. |
+| `scripts/` | Thin CLIs (above); `_render_common.py` shares the scene / clip plumbing and the drawing helpers; `dump_stage1.py` + `analyze_stage1.py` are the stage-1 diagnostics; `eval_table.py`, `paired_ci.py`, `diag_invariance.py`, `diag_sigma_sweep.py` (round-5 scoring / diagnostics), `audit_targets.py` + `audit_rnea.py` (the 2026-09-07 target / RNEA audits, results in `output_2/audits/`), `diag_label_anatomy.py` (round-6 label anatomy over prediction dumps), `force_corr_share.py`. |
 | `tests/` | `test_refiner.py`: world-frame independence (with / without camera context), identity at init, pose smoothing (polar projection, still-body fixed point), receptive-field locality, gradient flow, the video-interleaved sampler (CPU, BetterHuman body). |
 | `viewer/` | viser results viewer (`scripts/view_results.py`, `docs/viewer.md`). |
-| `configs/` | `base.yaml` (the schema, every key with its default), `stage1.yaml`, `stage2.yaml` (round 1), `stage2_v2.yaml` (round 2: smoothing, camera context, derivative objectives, 64-clip steps), `stage2_v2_force.yaml` (round 2 phase 2: warm start + RNEA force consistency), `baseline.yaml`, `static_ray.yaml`, `datasets/*.yaml`. |
-| `docs/` | `refiner.md` (the two-stage pipeline: design + results), `results.md` (every recorded number, incl. the trashed runs), `viewer.md`, `history/` (the 2026-09-03/05 round write-ups; their code is gone). |
-| `output/` | Run directories `<exp_name>_<stamp>/` (`best.pth`, `last.pth`, `config.yaml`, `tensorboard/`), the frozen-baseline jsons, `logs/`. |
+| `configs/` | `base.yaml` (the schema, every key with its default), `final.yaml` (+ `final_s1.yaml` seed 1, `final_rnea.yaml`), `stage1.yaml` (+ `stage1_eval_auto.yaml`, its eval twin under the refiner protocol), `baseline.yaml`, `static_ray.yaml`, `datasets/*.yaml` (`all` / `static` / `moving` camera subsets). |
+| `docs/` | `architecture_2.md` (the final model: what and why), `round5_2026-09-07.md` / `round6_2026-09-11.md` (rounds 5-6 measurements), `refiner.md` (the two-stage pipeline: rounds 1-4), `plan.md`, `results.md` (every recorded number, incl. the trashed runs), `viewer.md`, `history/` (earlier round write-ups and the round-5 proposal; their code is gone). |
+| `output/` `output_2/` | Run directories `<exp_name>_<stamp>/` (`best.pth`, `last.pth`, `config.yaml`, `eval.json`, `predictions/`, `tensorboard/`), the frozen-baseline jsons, `logs/`; `output_2/` holds the final model's runs (`final*`) and the round-5/6 audit outputs (`audits/`). |
 
 ## Architecture
 
@@ -230,7 +253,7 @@ frames_per_batch, num_workers, seed, clip.{frames, stride, jitter}, interleave_v
 eval_max_frames}` (`interleave_videos` deals an epoch's clips out round-robin over the source
 videos so a step's global batch spans as many videos as clips), the six loss sections
 (`motion_supervision` needs a refiner `motion` output, its `loss.pose_*` and
-`contact_consistency` a refiner `pose` output, `force_consistency` the `pose` + `force` outputs;
+`contact_consistency` a refiner `pose` output, `force_consistency` the `force` output (with no `pose` output the residual regularises the forces on the fixed body);
 every refiner output needs its loss enabled — DDP has no unused-parameter tolerance),
 `optim.{lr, weight_decay, epochs, accumulate_steps, warmup_steps, lr_min, grad_clip, betas, ema}`
 (`accumulate_steps` micro-batches per optimizer step; no decay on 1-d params and per-module
