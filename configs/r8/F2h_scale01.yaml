@@ -1,0 +1,7 @@
+# Round 8 arm F2h: F2 (force head + RNEA loss on the shared trunk) with head_grad_scale 0.1 — the
+# C2h coupling that kept the contact and recovered the smoothness, now with forces.
+base: configs/r8/F2_rnealoss.yaml
+model:
+  refiner:
+    head_grad_scale: 0.1
+output: {exp_name: F2h_scale01}

@@ -13,6 +13,8 @@ The corpus is read directly from its pipeline tree (no exported dataset):
   automatic contact labels with per-joint confidence (train).
 * ``features/annotation/<shard>/<scene>/annotation.npz`` — the manual tri-state
   labels of the test split.
+* ``features/geocalib/<shard>/<scene>/gravity.npz`` — the scene's world down
+  vector and the ``source`` that produced it (:func:`gravity_path`).
 
 Labels are folded 52 -> 22 SMPL-X body joints (each hand ORs its wrist and 15
 finger joints) and then onto the six kindyn contact/force groups. Train labels
@@ -118,6 +120,16 @@ def embedding_path(
     """
     return (Path(embedding_dir) / scene_shard(scene) / scene
             / f"{object_id:02d}" / f"{position:06d}.npy")
+
+
+def gravity_path(root: str | Path, scene: str) -> Path:
+    """The scene's GeoCalib gravity file, ``features/geocalib/<shard>/<scene>/gravity.npz``.
+
+    It holds the world down vector kindyn copies into ``kindyn_1.npz`` and the
+    ``source`` that produced it, which
+    :func:`data.climbing_videos.kindyn.gravity_measured` reads.
+    """
+    return Path(root) / "features" / "geocalib" / scene_shard(scene) / scene / "gravity.npz"
 
 
 def pose_token_path(token_dir: str | Path, scene: str) -> Path:

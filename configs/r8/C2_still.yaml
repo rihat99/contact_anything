@@ -1,0 +1,5 @@
+# Round 8 arm C2: C1 + contact consistency with the forward stencil (in-contact extremity speed,
+# L1 x label x confidence, gradient into the pose path).
+base: configs/r8/C1_contact.yaml
+contact_consistency: {enabled: true, weight: 1.0, confidence_weights: true, stencil: forward}
+output: {exp_name: C2_still}

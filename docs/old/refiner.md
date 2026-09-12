@@ -11,7 +11,7 @@ and every `output/stage2_*` run followed on 2026-09-11, `/data3/rikhat.akizhanov
 Every 2026-08/09 attempt to improve the per-frame pose with a temporal model over the frozen
 decoder's image tokens failed the same way: the tokens carry no velocity information beyond the
 pose readout, a temporal block over them degenerates to clip pooling, and velocity losses on the
-pose path collapse into shrinkage (`docs/history/`). The per-frame SMPL-X head on the frozen pose
+pose path collapse into shrinkage (`docs/old/history/`). The per-frame SMPL-X head on the frozen pose
 token remains the best pose model we have (57.6 mm MPJPE vs 61.1 for the frozen MHR refit). Its
 one large, structured error is the pelvis depth, which jitters frame to frame (lifted jitter ~110
 against a GT of ~7, 10 m/s³ units), and that noise is nearly removed by smoothing the depth alone.
@@ -555,7 +555,7 @@ All with the split force loss, `confidence_power` 0.5, the six-group class weigh
 ## Evaluation protocol
 
 `scripts/evaluate.py` on the annotated test scenes, one clip per (scene, person), the longest valid
-run at the `auto` stride capped at `data.eval_max_frames`. Stage-1 numbers in `docs/results.md`
+run at the `auto` stride capped at `data.eval_max_frames`. Stage-1 numbers in `docs/old/results.md`
 style require `stride: auto` (the stage-1 training config strides its own per-epoch test clips by
 5). Reference rows for every stage-2 result: stage 1 raw, stage 1 + depth smoothing + clip-mean betas
 (the untrained refiner), then the trained refiner.
@@ -583,8 +583,8 @@ at epoch 13 by an external SIGTERM and resumed exactly from `last.pth` (`--resum
 
 | model | mpjpe | pa | pve | accel | pelvis_err | depth_err | lifted jitter | gt jitter | wa_mpjpe100 | w_mpjpe100 | rte | hand / pa |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| frozen SAM3D refit (docs/results.md) | 61.07 | 44.06 | 78.08 | 11.93 | – | – | – | – | – | – | – | – |
-| per-frame probe 2026-09-02 (docs/results.md) | 57.60 | 38.86 | 74.74 | 11.15 | – | – | – | – | – | – | – | – |
+| frozen SAM3D refit (docs/old/results.md) | 61.07 | 44.06 | 78.08 | 11.93 | – | – | – | – | – | – | – | – |
+| per-frame probe 2026-09-02 (docs/old/results.md) | 57.60 | 38.86 | 74.74 | 11.15 | – | – | – | – | – | – | – | – |
 | **stage 1, epoch 10** | **56.28** | **38.49** | **72.61** | 11.07 | 119.9 | 113.7 | 109.2 | 7.2 | 82.5 | 138.3 | 4.73 | 32.7 / 3.9 |
 
 ### Stage-1 diagnostics (`scripts/analyze_stage1.py`, transcript `output/logs/stage1_analyze.log`)

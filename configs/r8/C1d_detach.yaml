@@ -1,0 +1,9 @@
+# Round 8 arm C1d: C1 with head_grad_scale 0 (detached heads) — the contact and gravity heads read a stop-gradient of the
+# trunk and their fed-back values are detached, so only the pose losses shape the trunk. C1 / G1
+# cost +4 / +1.6 jitter with MPJPE unchanged: are the heads shaping the trunk, and does contact
+# survive as a probe?
+base: configs/r8/C1_contact.yaml
+model:
+  refiner:
+    head_grad_scale: 0.0
+output: {exp_name: C1d_detach}

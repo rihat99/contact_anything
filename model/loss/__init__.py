@@ -142,7 +142,7 @@ class Loss(ABC):
 
 def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
     """Instantiate every enabled loss, in a fixed order (contact, force, smplx, motion,
-    contact_consistency, force_consistency, gaussian_reference).
+    contact_consistency, force_consistency, gravity, gaussian_reference).
 
     The order is what makes the trainer's packed mass all-reduce identical on
     every rank.
@@ -183,6 +183,10 @@ def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
         _require(_refines(net, "force"), "force_consistency", "a refiner 'force' output")
         from model.loss.force_consistency import ForceConsistencyLoss
         losses.append(ForceConsistencyLoss(cfg, model, device))
+    if cfg["gravity_supervision"]["enabled"]:
+        _require(_refines(net, "gravity"), "gravity_supervision", "a refiner 'gravity' output")
+        from model.loss.gravity import GravityLoss
+        losses.append(GravityLoss(cfg, model, device))
     if cfg["gaussian_reference"]["enabled"]:
         _require(_refines(net, "pose"),
                  "gaussian_reference", "a refiner 'pose' output (the body it regularises)")

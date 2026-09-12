@@ -102,10 +102,13 @@ class ClimbingVideosDataset(ClipDataset):
         n = len(data["frame_indices"])
         if self.pose_token_dir is not None:
             data.update(self._load_pose_tokens(scene, object_ids, n, data["valid_mask"]))
+        gravity_path = scene_io.gravity_path(self.root, scene)
         if "forces" in self.load:
-            data.update(kindyn.load_forces(scene, human_dir, object_ids, n))
+            data.update(kindyn.load_forces(scene, human_dir, object_ids, n,
+                                           gravity_path=gravity_path))
         if "smplx" in self.load:
-            data.update(kindyn.load_smplx(scene, human_dir, object_ids, n))
+            data.update(kindyn.load_smplx(scene, human_dir, object_ids, n,
+                                          gravity_path=gravity_path))
         return data
 
     def _load_pose_tokens(
@@ -191,8 +194,10 @@ class ClimbingVideosDataset(ClipDataset):
             frame["force_conf"] = float(data["force_conf"][person, position])
             frame["force_valid"] = valid and bool(data["force_valid"][person, position])
             frame["gravity_world"] = data["gravity_world"]                    # [3] per scene
+            frame["gravity_measured"] = bool(data["gravity_measured"])        # per scene
         if "smplx" in self.load:
             frame["gravity_world"] = data["gravity_world"]
+            frame["gravity_measured"] = bool(data["gravity_measured"])
             frame["smplx_joints_world"] = data["smplx_joints_world"][person, position]
             frame["smplx_root_rot"] = data["smplx_root_rot"][person, position]   # [3, 3]
             frame["smplx_body_rot"] = data["smplx_body_rot"][person, position]   # [21, 3, 3]

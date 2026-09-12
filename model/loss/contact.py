@@ -21,6 +21,14 @@ learns the heels as "never" (test F1 exactly 0 through round 3). The weights
 enter numerator AND mass, so they reweight rows without changing the term's
 scale; the metrics stay unweighted.
 
+``layer_weight`` adds deep supervision: the same weighted BCE on every
+INTERMEDIATE layer's logits of an iterative refiner
+(``out["contact"]["logits_layers"][:-1]``; the last entry IS ``logits``), pooled
+into ONE ``bce_layer`` term — numerators and masses summed over the layers — at
+``layer_weight`` times the section's ``weight``. Every layer reads the same
+labels, so the term is the final BCE repeated, and the metrics stay the final
+layer's.
+
 Metrics are micro P / R / F1 / IoU at threshold 0.5 over the whole split, plus
 per-group P / R / F1 — a micro score otherwise hides a weak heel behind four strong
 limbs — and ``precision_at_r90``: the micro precision at the operating point
@@ -48,7 +56,6 @@ class ContactLoss(Loss):
     """Confidence-weighted BCE on the six contact logits."""
 
     name = "contact"
-    term_names = ("bce",)
     stat_names = tuple(
         f"{group}/{count}" for group in KINDYN_GROUP_NAMES for count in COUNT_NAMES
     ) + tuple(
@@ -59,6 +66,8 @@ class ContactLoss(Loss):
         cs = cfg["contact_supervision"]
         self.weight = float(cs["weight"])
         self.use_confidence = bool(cs["confidence_weights"])
+        self.layer_weight = float(cs["layer_weight"])
+        self.term_names = ("bce",) + (("bce_layer",) if self.layer_weight > 0.0 else ())
         self.class_weights = None
         if cs["class_weights"] is not None:
             pos = torch.tensor([float(w) for w in cs["class_weights"]["positive"]],
@@ -87,12 +96,20 @@ class ContactLoss(Loss):
         if self.class_weights is not None:
             pos, neg = self.class_weights
             weight = mask * (gt * pos[None, :] + (1.0 - gt) * neg[None, :])
-        # An ignored element must not reach the loss at all: NaN * 0 is NaN.
-        safe = torch.where(mask > 0, logits, torch.zeros_like(logits))
-        per_element = F.binary_cross_entropy_with_logits(safe, gt, reduction="none")
-        numerator = self.weight * (per_element * weight).sum()
-        mass = float(weight.sum())
-        anchor = safe.sum() * 0.0
+        numerator, mass, anchor = _bce(logits, gt, mask, weight)
+        raw = {"bce": (self.weight * numerator, mass)}
+        if self.layer_weight > 0.0:
+            # Deep supervision: the same BCE on every INTERMEDIATE layer, pooled into one
+            # term (the last entry of logits_layers is `logits`, already supervised).
+            layer_num = torch.zeros((), device=self.device, dtype=self.dtype)
+            layer_mass = 0.0
+            for tensor in out["contact"]["logits_layers"][:-1]:
+                num, rows, layer_anchor = _bce(
+                    tensor.to(self.device, self.dtype), gt, mask, weight)
+                layer_num = layer_num + num
+                layer_mass += rows
+                anchor = anchor + layer_anchor
+            raw["bce_layer"] = (self.layer_weight * self.weight * layer_num, layer_mass)
 
         detached = logits.detach()
         stats = torch.cat(
@@ -102,7 +119,7 @@ class ContactLoss(Loss):
                    "pos_rate": float((torch.sigmoid(detached) > THRESHOLD)
                                      .to(self.dtype).mean())}
         return LossResult(
-            terms=self._terms({"bce": (numerator, mass)}, anchor),
+            terms=self._terms(raw, anchor),
             scalars=scalars,
             stats=stats.to(self.device),
         )
@@ -119,6 +136,18 @@ class ContactLoss(Loss):
             for key in ("f1", "precision", "recall"):
                 out[f"groups/{group}_{key}"] = scores[key]
         return out
+
+
+def _bce(logits: Tensor, gt: Tensor, mask: Tensor, weight: Tensor
+         ) -> tuple[Tensor, float, Tensor]:
+    """Weighted BCE ``(numerator, mass, graph anchor)`` of ONE set of logits.
+
+    Ignored elements are replaced by zero BEFORE the loss (``NaN * 0`` is still
+    ``NaN``), and the anchor is that masked tensor's zero.
+    """
+    safe = torch.where(mask > 0, logits, torch.zeros_like(logits))
+    per_element = F.binary_cross_entropy_with_logits(safe, gt, reduction="none")
+    return (per_element * weight).sum(), float(weight.sum()), safe.sum() * 0.0
 
 
 def precision_at_recall(curve: Tensor, recall: float) -> float:

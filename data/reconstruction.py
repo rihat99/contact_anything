@@ -4,7 +4,8 @@ Reads a raw pipeline output tree directly: ``sam3/bboxes.npz`` (per-person xyxy
 boxes), ``sam3/<oid:02d>/frame_*.png`` person masks,
 ``geometry/transform.npz`` (per-frame ``intrinsics_px_orig`` and metric
 ``cam_from_world``), ``human_optim/contacts_1.npz`` for ``valid_mask``/``fps`` and ``human_optim/kindyn_1.npz`` for ``gravity_world`` (when present)
-(falling back to ``sam3d/params.npz`` when the contacts stage has not run).
+(falling back to ``sam3d/params.npz`` when the contacts stage has not run), with
+``geocalib/gravity.npz`` saying whether that gravity was measured (absent = not).
 Video frames are extracted with the same sequential OpenCV decode + JPEG-95
 re-encode the corpus tree uses (:func:`extract_frames`), so frame ``k`` of the
 tree is row ``k`` of every feature array.
@@ -23,7 +24,7 @@ import numpy as np
 from PIL import Image
 
 from .base import ClipDataset
-from .climbing_videos.kindyn import _gravity
+from .climbing_videos.kindyn import _gravity, gravity_measured
 
 FRAME_JPEG_QUALITY = 95
 
@@ -135,10 +136,15 @@ class ReconstructionSceneDataset(ClipDataset):
             & (bbox[..., 3] > bbox[..., 1]))
 
         # The scene's fitted down vector (the refiner's gravity token channel) comes from
-        # the dynamics stage; a tree without one cannot feed a gravity-token model.
+        # the dynamics stage; a tree without one cannot feed a gravity-token model. Whether
+        # that vector is a MEASUREMENT is geocalib's to say; a tree without the geocalib
+        # file is treated as unmeasured rather than trusted.
         kindyn_path = self.out_dir / "human_optim" / "kindyn_1.npz"
-        gravity_world = (_gravity(scene, np.load(kindyn_path, allow_pickle=True))
-                         if kindyn_path.is_file() else None)
+        gravity_file = self.out_dir / "geocalib" / "gravity.npz"
+        gravity_world = measured = None
+        if kindyn_path.is_file():
+            gravity_world = _gravity(scene, np.load(kindyn_path, allow_pickle=True))
+            measured = gravity_file.is_file() and gravity_measured(gravity_file)
 
         scene_data = {
             "object_ids": object_ids,
@@ -149,6 +155,7 @@ class ReconstructionSceneDataset(ClipDataset):
             "valid_mask": valid_mask,
             "fps": fps,
             "gravity_world": gravity_world,
+            "gravity_measured": measured,
         }
         return scene_data
 
@@ -175,4 +182,5 @@ class ReconstructionSceneDataset(ClipDataset):
         }
         if data["gravity_world"] is not None:
             frame["gravity_world"] = data["gravity_world"]
+            frame["gravity_measured"] = bool(data["gravity_measured"])
         return frame

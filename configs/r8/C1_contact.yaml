@@ -1,0 +1,8 @@
+# Round 8 arm C1: G1 + the contact head (one token per frame, read after every layer, deep BCE,
+# the probabilities fed back to the next layer). Confidence-weighted BCE, no class weights.
+base: configs/r8/G1_gravity.yaml
+model:
+  refiner:
+    outputs: [pose, gravity, contact]
+contact_supervision: {enabled: true, confidence_weights: true, weight: 1.0, layer_weight: 0.5}
+output: {exp_name: C1_contact, monitor: metric_contact/f1}

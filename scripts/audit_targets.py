@@ -1,4 +1,4 @@
-"""docs/plan.md Phase -1 item 1 — derivative-target consistency, gradient conflict, shrinkage.
+"""docs/old/plan.md Phase -1 item 1 — derivative-target consistency, gradient conflict, shrinkage.
 
 On the round-4 arm F checkpoint (cached-token path), test split: (1) the current derivative
 targets vs the derivatives of ONE consistently smoothed GT trajectory vs the raw ones (RMS,
@@ -440,7 +440,7 @@ def write_report(args, cfg, dump, acc, sweep, best, spec1, spec3, records, scene
     (args.out / "RESULTS.md").write_text("\n".join(out))
 
 
-HEADER = """# Target-consistency audit (docs/plan.md Phase -1 item 1)
+HEADER = """# Target-consistency audit (docs/old/plan.md Phase -1 item 1)
 
 Config `{cfg}`, checkpoint `{ckpt}` — round-4 arm F on the cached pose-token path.
 Test split, first {scenes} scenes = {clips} clips (the evaluation protocol: one clip per

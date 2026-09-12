@@ -142,6 +142,11 @@ class ContactAnything(nn.Module):
                 iterative=bool(refiner["iterative"]),
                 feedback_delta=bool(refiner["feedback_delta"]),
                 camera_context=bool(refiner["camera_context"]),
+                camera_axes=bool(refiner["camera_axes"]),
+                residual_feedback=bool(refiner["residual_feedback"]),
+                frame_mask_p=float(refiner["frame_mask_p"]),
+                head_grad_scale=float(refiner["head_grad_scale"]),
+                smplx_model_path=self.head_smplx.model_path,
                 pose_token=bool(refiner["pose_token"]),
                 pose_token_dim=int(refiner["pose_token_dim"]),
                 contact_token_dim=int(refiner["contact_token_dim"]),
@@ -279,7 +284,7 @@ class ContactAnything(nn.Module):
                 img_size=batch["img_size"],
             )
 
-        motion_output = None
+        motion_output = gravity_output = None
         if self.refiner is not None:
             refined = self.refiner(smplx_output, tokens, bounds, batch,
                                    body=self.head_smplx.body(tokens.device))
@@ -289,12 +294,14 @@ class ContactAnything(nn.Module):
             if refined["force"] is not None:
                 force_output = refined["force"]
             motion_output = refined["motion"]
+            gravity_output = refined["gravity"]
 
         return {
             "mhr": out["mhr"],
             "contact": contact_output,
             "force": force_output,
             "motion": motion_output,
+            "gravity": gravity_output,
             "smplx": smplx_output,
             "tokens": tokens,
             "blocks": bounds,

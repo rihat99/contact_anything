@@ -1,6 +1,6 @@
 # Baseline: the temporal-tokens recipe (2026-09-02/03) — cross-modal RoPE block over the pose
 # token + six contact tokens, SMPL-X head with hands, 8 clips x 60 frames per step at lr 2e-4.
-# Reference numbers (docs/results.md, run `hands`): 61.0 mm MPJPE / 42.0 PA / F1 0.919 in 5 epochs.
+# Reference numbers (docs/old/results.md, run `hands`): 61.0 mm MPJPE / 42.0 PA / F1 0.919 in 5 epochs.
 base: configs/base.yaml
 model:
   cross_modal_temporal: {enabled: true, modalities: [pose, contact]}

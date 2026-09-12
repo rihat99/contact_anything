@@ -42,9 +42,13 @@ plus, per requested signal group (``load``):
     ``force_gt`` ``(6, 3)`` body-weight units in the body-root frame,
     ``force_contact`` ``(6,)`` bool, ``force_lever`` ``(6, 3)`` metres in the
     same frame, ``force_conf`` float, ``force_valid`` bool, ``gravity_world``
-    ``(3,)`` the scene's fitted unit down vector (world).
+    ``(3,)`` the scene's fitted unit down vector (world), ``gravity_measured``
+    bool — whether that vector is a MEASUREMENT (geocalib's ``ground`` /
+    ``geocalib`` source) rather than the first camera's down axis
+    (``fallback_down``); constant within a scene.
 ``smplx``
-    ``gravity_world`` ``(3,)`` (the same scene vector as above),
+    ``gravity_world`` ``(3,)`` and ``gravity_measured`` (the same scene values as
+    above),
     ``smplx_joints_world`` ``(52, 3)`` metres (row 0 = pelvis, 22 body joints then
     the 30 finger joints), ``smplx_root_rot`` ``(3, 3)`` world-from-root,
     ``smplx_body_rot`` ``(21, 3, 3)`` and ``smplx_hand_rot`` ``(30, 3, 3)``

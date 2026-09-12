@@ -49,6 +49,16 @@ the term's scale. That knob exists because with uniform weights the legs
 collapse to exactly zero: the hands dominate both the contact rate and the GT
 magnitude.
 
+``layer_weight`` adds deep supervision: the four PER-LIMB terms (``force`` /
+``magnitude`` / ``direction`` / ``noncontact``; not the sums, which are a
+statement about one body's whole wrench) are repeated on every INTERMEDIATE
+layer's forces of an iterative refiner (``out["force"]["forces_layers"][:-1]``;
+the last entry IS ``forces``) and pooled per term into ``<term>_layer``,
+numerators and masses summed over the layers, at ``layer_weight`` times the
+term's own weight. Every layer predicts in the SAME body frame
+(``out["force"]["frame"]``) and the row masks come from the GT, so the whole GT
+side is built once. Metrics stay the final layer's.
+
 ``force_supervision.confidence`` weights every term's rows by kindyn's per-frame
 solve confidence raised to ``confidence_power`` (1 = the raw confidence, 0.5
 compresses it — the corpus confidence is 0.99 at the median and 0.54 at p5, so
@@ -70,6 +80,9 @@ from model.loss import Loss, LossResult
 from utils.metrics import mean_from_stats
 
 _TERM_NAMES = ("force", "magnitude", "direction", "noncontact", "sum_force", "sum_torque")
+#: The PER-LIMB terms, which read one layer's forces alone, so deep supervision
+#: (``layer_weight``) can repeat them on the refiner's intermediate layers.
+LAYER_TERM_NAMES = ("force", "magnitude", "direction", "noncontact")
 #: Floor of the predicted norm inside the direction cosine (bw): bounds the gradient
 #: at ``1 / DIRECTION_EPS_BW`` per row and defines the term at a zero prediction.
 DIRECTION_EPS_BW = 0.05
@@ -98,6 +111,11 @@ class ForceLoss(Loss):
         if not self.term_names:
             raise ValueError(
                 "force_supervision: every loss weight is 0 — disable the section instead")
+        self.layer_weight = float(section["layer_weight"])
+        #: The subset deep supervision repeats on every intermediate layer.
+        self.layer_terms = tuple(n for n in LAYER_TERM_NAMES if self.weights[n] != 0.0)
+        if self.layer_weight > 0.0:
+            self.term_names += tuple(f"{n}_layer" for n in self.layer_terms)
         self.huber_delta = float(loss_cfg["huber_delta_bw"])
         self.huber_delta_bwm = float(loss_cfg["huber_delta_bwm"])
         self.outlier_bw = float(loss_cfg["outlier_bw"])
@@ -107,6 +125,53 @@ class ForceLoss(Loss):
             None if group_weights is None
             else torch.tensor([float(w) for w in group_weights],
                               dtype=self.dtype, device=self.device))
+
+    def _limb_terms(self, pred: Tensor, gt: Tensor, unit_gt: Tensor, mag_gt: Tensor,
+                    row_weights: tuple[Tensor, Tensor, Tensor]
+                    ) -> dict[str, tuple[Tensor, float]]:
+        """The four PER-LIMB terms (:data:`LAYER_TERM_NAMES`) of ONE prediction, un-weighted.
+
+        The GT side and the row weights ``(in-contact, direction, off-contact)`` are the
+        same for every layer — a layer changes nothing but ``pred``.
+        """
+        w_contact, w_direction, w_free = row_weights
+        mag_pred = _norm(pred)
+        huber = F.smooth_l1_loss(
+            pred, gt, reduction="none", beta=self.huber_delta).sum(dim=-1)
+        huber_mag = F.smooth_l1_loss(
+            mag_pred, mag_gt, reduction="none", beta=self.huber_delta)
+        # cos(f_pred, f_gt) with the predicted norm floored: finite at f_pred = 0, where
+        # the gradient is -u_gt / eps (the zero-init head's way off its start).
+        cosine = (pred * unit_gt).sum(dim=-1) / mag_pred.clamp(min=DIRECTION_EPS_BW)
+        return {
+            "force": ((huber * w_contact).sum(), float(w_contact.sum())),
+            "magnitude": ((huber_mag * w_contact).sum(), float(w_contact.sum())),
+            "direction": (((1.0 - cosine) * w_direction).sum(), float(w_direction.sum())),
+            "noncontact": ((mag_pred * w_free).sum(), float(w_free.sum())),
+        }
+
+    def layer_raw(self, layers: list[Tensor], gt: Tensor, unit_gt: Tensor, mag_gt: Tensor,
+                  row_weights: tuple[Tensor, Tensor, Tensor]
+                  ) -> tuple[dict[str, tuple[Tensor, float]], Tensor]:
+        """Deep supervision (``layer_weight``): :meth:`_limb_terms` on the INTERMEDIATE layers.
+
+        One ``<term>_layer`` per term, the layers pooled (numerators and masses summed), at
+        ``layer_weight`` times the term's own weight; plus the layers' graph anchor.
+        """
+        sums = {name: torch.zeros((), device=self.device, dtype=self.dtype)
+                for name in self.layer_terms}
+        masses = {name: 0.0 for name in self.layer_terms}
+        anchor = torch.zeros((), device=self.device, dtype=self.dtype)
+        for tensor in layers:
+            pred = tensor.to(self.device, self.dtype)
+            raw = self._limb_terms(pred, gt, unit_gt, mag_gt, row_weights)
+            anchor = anchor + pred.sum() * 0.0
+            for name in self.layer_terms:
+                numerator, mass = raw[name]
+                sums[name] = sums[name] + self.weights[name] * numerator
+                masses[name] += mass
+        return ({f"{name}_layer": (self.layer_weight * sums[name], masses[name])
+                 for name in self.layer_terms}, anchor)
 
     def __call__(self, out: dict, batch: dict, *, train: bool) -> LossResult:
         pred = out["force"]["forces"].to(self.device, self.dtype)  # (B,K,3)
@@ -156,20 +221,10 @@ class ForceLoss(Loss):
             w_contact = w_contact * self.group_weights[None, :]
             w_direction = w_direction * self.group_weights[None, :]
 
-        huber = F.smooth_l1_loss(
-            pred, gt, reduction="none", beta=self.huber_delta).sum(dim=-1)
-        huber_mag = F.smooth_l1_loss(
-            mag_pred, mag_gt, reduction="none", beta=self.huber_delta)
-        # cos(f_pred, f_gt) with the predicted norm floored: finite at f_pred = 0, where
-        # the gradient is -u_gt / eps (the zero-init head's way off its start).
         unit_gt = gt / mag_gt.clamp(min=1e-6)[..., None]
-        cosine = (pred * unit_gt).sum(dim=-1) / mag_pred.clamp(min=DIRECTION_EPS_BW)
-        raw: dict[str, tuple[Tensor, float]] = {
-            "force": ((huber * w_contact).sum(), float(w_contact.sum())),
-            "magnitude": ((huber_mag * w_contact).sum(), float(w_contact.sum())),
-            "direction": (((1.0 - cosine) * w_direction).sum(), float(w_direction.sum())),
-            "noncontact": ((mag_pred * w_free).sum(), float(w_free.sum())),
-        }
+        row_weights = (w_contact, w_direction, w_free)
+        raw: dict[str, tuple[Tensor, float]] = self._limb_terms(
+            pred, gt, unit_gt, mag_gt, row_weights)
 
         # Net force / net torque over ALL six groups per eligible row.
         sum_rows = valid & ~outlier.any(dim=-1)
@@ -211,6 +266,11 @@ class ForceLoss(Loss):
                  if self.weights[name] != 0.0}
         weighted = {name: (self.weights[name] * numerator, mass)
                     for name, (numerator, mass) in terms.items()}
+        if self.layer_weight > 0.0:
+            layer_terms, layer_anchor = self.layer_raw(
+                out["force"]["forces_layers"][:-1], gt, unit_gt, mag_gt, row_weights)
+            weighted.update(layer_terms)
+            anchor = anchor + layer_anchor
         return LossResult(terms=self._terms(weighted, anchor),
                           scalars=scalars, stats=stats)
 

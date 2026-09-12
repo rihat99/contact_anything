@@ -2,7 +2,7 @@
 
     python scripts/analyze_stage1.py --train output/<run>/dump_train --test output/<run>/dump_test
 
-Three questions the stage-2 design depends on (docs/refiner.md):
+Three questions the stage-2 design depends on (docs/old/refiner.md):
 
 1. **Train / test gap of the per-frame model** — the refiner trains on stage-1
    predictions of scenes stage 1 was trained on. Camera-frame MPJPE (hips-mean

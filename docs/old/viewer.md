@@ -105,7 +105,7 @@ aligned) and absolute pelvis error against the GT over the frames both are valid
 (real predictions only, never the held rows). The formula is `metric_pose/mpjpe`
 / `pelvis_err`'s (bit-identical on the frozen json), but the FRAME SET is not the
 evaluation protocol's: the viewer averages every valid frame of the whole scene,
-`docs/results.md` one clip per person capped at `eval_max_frames` (120 rows).
+`docs/old/results.md` one clip per person capped at `eval_max_frames` (120 rows).
 Over the 16 static scenes the whole-scene numbers run higher — frozen 59.9 vs
 57.9 mm MPJPE and 119 vs 105 mm pelvis, tb_projzero 76.0 vs 72.8 mm — so compare
 sources within the viewer, not a viewer number against the results table.

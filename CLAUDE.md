@@ -16,9 +16,9 @@ the physics / Newton force losses, the ray depth priors and pose-token inputs, t
 smoothness / matching losses, the block variants, the contact-loss knobs, the token-masking
 and 2D-keypoint inputs). Pre-cleanup code is in git (`dev` before this commit) and under
 `/data3/rikhat.akizhanov/trash/simplify_20260905/`; the earlier rounds' write-ups moved to
-`docs/history/`. There is **no backwards compatibility** with older configs or checkpoints.
+`docs/old/history/`. There is **no backwards compatibility** with older configs or checkpoints.
 
-**2026-09-05 — the two-stage pipeline (`docs/refiner.md`).** The pose is no longer improved with
+**2026-09-05 — the two-stage pipeline (`docs/old/refiner.md`).** The pose is no longer improved with
 image-side temporal models. **Stage 1** (`configs/stage1.yaml`) is the per-frame SMPL-X + CLIFF
 model alone (no contact tokens, no temporal block), trained once and frozen. **Stage 2**
 (`configs/stage2.yaml`) appends the contact tokens to the frozen decoder and runs the
@@ -27,16 +27,16 @@ smoothing, world lift with the camera extrinsics, a world-independent per-frame 
 RoPE transformer, and zero-init heads for the pose offset, contact, motion and forces. Contact is
 trained in stage 2 only. Tests: `tests/test_refiner.py` (CPU).
 
-**2026-09-08 — round 5 and the final model (`docs/architecture_2.md`).** `configs/final.yaml`
+**2026-09-08 — round 5 and the final model (`docs/old/architecture_2.md`).** `configs/final.yaml`
 (self-contained on `base.yaml`) is the recipe: the frozen stage-1 body + the fixed Gaussian in
 the world IS the pose (no pose head — every learned correction measured worse), the token
 channels `model.refiner.token`, `motion_supervision.stencil: aligned`, contact / motion / force
 heads on cached pose tokens, 64 clips per step; `final_rnea.yaml` adds the RNEA residual
 (force direction −1°, off-contact force ×2). Runs `output_2/final*`; the round-5 arms are
-written up in `docs/round5_2026-09-07.md` (seed spread: F1 0.002, MPJPE 0.02 mm — smaller
+written up in `docs/old/round5_2026-09-07.md` (seed spread: F1 0.002, MPJPE 0.02 mm — smaller
 differences are noise).
 
-**2026-09-11 — round 6 (`docs/round6_2026-09-11.md`) and cleanup.** Contact on the final recipe
+**2026-09-11 — round 6 (`docs/old/round6_2026-09-11.md`) and cleanup.** Contact on the final recipe
 is static pose (F1 0.888) + world motion (+0.039); the frozen pose token is worth +0.005 (two
 seeds, precision); the velocity channels' frame (lifted vs camera) does not matter; the limb
 labels carry no image evidence and the confidence weights mute the rows where the image would
@@ -45,7 +45,7 @@ round-3/4/5/6 configs and the two round-6 token options (`velocity`, `velocity_f
 `/data3/rikhat.akizhanov/trash/cleanup_20260911/`; the round-3 refiner's `eval.json` stays as
 `output/round3_refiner_eval.json` (the final model's tensorboard reference line).
 
-**2026-09-12 — round 7 (`docs/round7_2026-09-11.md`): the block smooths the body itself.** The
+**2026-09-12 — round 7 (`docs/old/round7_2026-09-11.md`): the block smooths the body itself.** The
 refiner's input Gaussians are replaced by the temporal block: one-sided (Nyquist-visible)
 forward-difference velocity losses on the raw GT (`motion_supervision.stencil: forward`, no
 acceleration term), one-sided rate channels for the root and every joint (`token.one_sided_velocity`,
@@ -56,6 +56,22 @@ in-band acceleration r 0.77 vs 0.70. Central differences were the root cause (ze
 Nyquist); acceleration losses of every kind (pointwise, RMS, smoothed-target, band-limited) do not
 help; the pelvis error (110 mm) is stage-1 low-frequency bias. Runs `output_3/`, configs
 `configs/smooth/`. Contact and force heads were OFF this round.
+
+**2026-09-12 — round 8 (`docs/round8_2026-09-12.md`): gravity, contacts and forces on the smooth
+body.** The GT gravity channel is gone (`token.gravity` was never needed for the pose); the refiner
+predicts gravity itself (`camera_axes` + a per-layer `gravity` head: a body-frame correction on the
+camera's down axis, unit votes pooled per clip; `gravity_supervision` on the scenes whose corpus
+gravity was MEASURED — 40 % of the corpus gravity is the first camera's down axis, and the two
+measurements disagree by 10–20°, so the head's 1° gain over the camera axis is inside the target
+noise). Contact / force heads read every layer and feed back; the contact and gravity gradients cost
+the shared trunk 3.5 / 1 jitter units, so `model.refiner.head_grad_scale: 0.3` scales what the heads
+send into the trunk (0 = probes: pose intact, F1 −0.05). `contact_consistency` (forward stencil) puts
+the in-contact speed at the GT floor for +0.25 mm; the RNEA residual as a LOSS (`force_consistency`,
+`model/physics.py`) is the one force change that helps (angle 22 → 20.5°), the residual as per-layer
+FEEDBACK (`residual_feedback`) adds nothing on top, `frame_mask_p` 0.1 is a null result. Recipe
+`configs/r8/F2m_scale03.yaml` (run `output_3/F2m_scale03_20260912_154016`): 53.9 mm / jitter 6.0 /
+F1 0.924 / force MAE 0.179 / angle 20.6° on the 107-scene split (the test split and 56 annotations
+changed mid-round; P_k30 re-scored there 53.9 / 5.6). Arm configs `configs/r8/`, runs `output_3/`.
 
 ## Environment
 
@@ -109,7 +125,7 @@ $PYTHON scripts/render_video.py --config configs/baseline.yaml --checkpoint outp
 $PYTHON scripts/render_smplx_video.py --config configs/baseline.yaml --checkpoint output/<run>/best.pth \
     --scenes 5 --out output/<run>/render_pose             # GT | frozen MHR | SMPL-X head panels
 
-# Results viewer (docs/viewer.md): dump a run's whole-scene test predictions once, then serve
+# Results viewer (docs/old/viewer.md): dump a run's whole-scene test predictions once, then serve
 # every run's predicted | GT | frozen SMPL-X bodies plus contact markers and force arrows
 # (predicted and GT) in viser (port 8082 is the BVR viewer's)
 $PYTHON scripts/predict_test.py --config configs/baseline.yaml --checkpoint output/<run>/best.pth
@@ -131,17 +147,18 @@ CUDA_VISIBLE_DEVICES=0 $PYTHON scripts/data/precompute_embeddings.py --split all
 | `model/sam_3d_body/` | Vendored SAM 3D Body fork. Our additions are delimited by `# --- <name> hook ---` comments: the extra-token-block hook (append learned blocks behind the asymmetric mask, per-layer update callbacks, expose the final sequence) and the efficiency hooks (precomputed embeddings, `backbone_no_grad`, `detach_interm_preds`). |
 | `model/wrapper.py` | `SAM3DBodyWrapper`: builds / freezes / eval-pins the base; `forward(img|embedding, geometry, blocks)` → final tokens, block bounds, the frozen MHR readout. |
 | `model/tokens.py` `rope.py` `heads.py` | `LearnedTokenBlock` (token embeddings + anchored posemb/feat update), `CrossModalRopeModule` (the temporal brick), `ContactHead` / `ForceHead` (per-token FFNs), `SmplxHead`. |
-| `model/refiner.py` | `TemporalRefiner` (stage 2): depth + pose smoothing → world lift → world-independent token (+ camera context) → RoPE transformer → zero-init pose / contact / motion / force heads → FK back into every camera; plus the masked time-series helpers (`gaussian_smooth`, `smooth_rotations` / `project_rotation`, `time_derivative`, `angular_velocity`). |
+| `model/refiner.py` | `TemporalRefiner` (stage 2): depth + pose smoothing → world lift → world-independent token (+ camera context, camera axes) → RoPE transformer, iterative with per-layer pose / contact / motion / force / gravity heads and feedback (`residual_feedback` = the RNEA residual, `head_grad_scale`, `frame_mask_p`) → FK back into every camera; plus the masked time-series helpers (`gaussian_smooth`, `smooth_rotations` / `project_rotation`, `time_derivative`, `angular_velocity`). |
+| `model/physics.py` | `RootWrench`: BetterRobot RNEA root-wrench residual of a world SMPL-X trajectory under six extremity forces (shared by `force_consistency` and the refiner's residual feedback). |
 | `model/network.py` `build.py` | `ContactAnything` composes the above; `build_model(cfg, device)` maps the yaml sections onto it and applies `model.smplx.checkpoint` / `frozen`. |
-| `model/loss/` | One `Loss` interface (`__init__.py`) and one file per term: `contact` (BCE), `force`, `smplx` (+ every pose metric), `motion` (refiner velocities / accelerations + pose-derivative matching), `contact_consistency` (in-contact stillness of the refined extremities), `force_consistency` (RNEA root-wrench residual, BetterRobot + BetterHuman). |
+| `model/loss/` | One `Loss` interface (`__init__.py`) and one file per term: `contact` (BCE), `force`, `smplx` (+ every pose metric), `motion` (refiner velocities / accelerations + pose-derivative matching), `contact_consistency` (in-contact stillness of the refined extremities, forward stencil), `force_consistency` (RNEA root-wrench residual, BetterRobot + BetterHuman), `gravity` (the predicted down vector vs the corpus gravity on measured scenes). |
 | `data/` | `base.py` = `ClipDataset` ABC (windowing, jitter, full-scene eval) **and the frame schema** (module docstring); `climbing_videos/` (`scene.py` DB + labels, `kindyn.py` forces + SMPL-X GT, `dataset.py`); `reconstruction.py` (label-free BVR out-trees); `collate.py`, `loaders.py`, `transforms.py`. |
 | `train/` | `config.py` (schema = `configs/base.yaml`, cross-key checks, `signal_needs`), `trainer.py` (DDP-exact weighted means, EMA, per-module clipping, per-step warm-up + cosine), `checkpoint.py` (trainable-only, strict), `logger.py` (tensorboard + `tee_output`), `predict.py` (`load_model`). |
 | `utils/` | `geometry.py` (camera parametrizations, projection, world lift), `gvhmr_metrics.py`, `metrics.py`, `distributed.py`. |
 | `scripts/` | Thin CLIs (above); `_render_common.py` shares the scene / clip plumbing and the drawing helpers; `dump_stage1.py` + `analyze_stage1.py` are the stage-1 diagnostics; `eval_table.py`, `paired_ci.py`, `diag_invariance.py`, `diag_sigma_sweep.py` (round-5 scoring / diagnostics), `audit_targets.py` + `audit_rnea.py` (the 2026-09-07 target / RNEA audits, results in `output_2/audits/`), `diag_label_anatomy.py` (round-6 label anatomy over prediction dumps), `force_corr_share.py`. |
 | `tests/` | `test_refiner.py`: world-frame independence (with / without camera context), identity at init, pose smoothing (polar projection, still-body fixed point), receptive-field locality, gradient flow, the video-interleaved sampler (CPU, BetterHuman body). |
-| `viewer/` | viser results viewer (`scripts/view_results.py`, `docs/viewer.md`). |
-| `configs/` | `base.yaml` (the schema, every key with its default), `final.yaml` (+ `final_s1.yaml` seed 1, `final_rnea.yaml`), `stage1.yaml` (+ `stage1_eval_auto.yaml`, its eval twin under the refiner protocol), `baseline.yaml`, `static_ray.yaml`, `datasets/*.yaml` (`all` / `static` / `moving` camera subsets). |
-| `docs/` | `architecture_2.md` (the final model: what and why), `round5_2026-09-07.md` / `round6_2026-09-11.md` (rounds 5-6 measurements), `refiner.md` (the two-stage pipeline: rounds 1-4), `plan.md`, `results.md` (every recorded number, incl. the trashed runs), `viewer.md`, `history/` (earlier round write-ups and the round-5 proposal; their code is gone). |
+| `viewer/` | viser results viewer (`scripts/view_results.py`, `docs/old/viewer.md`). |
+| `configs/` | `base.yaml` (the schema, every key with its default), `smooth/` (round 7: `P_k30.yaml` = the pose-only body), `r8/` (round 8: the ladder G0 → F2m; `F2m_scale03.yaml` = the current recipe), `final.yaml` (+ `final_s1.yaml` seed 1, `final_rnea.yaml`), `stage1.yaml` (+ `stage1_eval_auto.yaml`, its eval twin under the refiner protocol), `baseline.yaml`, `static_ray.yaml`, `datasets/*.yaml` (`all` / `static` / `moving` camera subsets). |
+| `docs/` | `architecture.md` (the current model in plain words), `results.md` (what worked and what did not, in easy words), `round8_plan.md` + `round8_2026-09-12.md` (the round-8 design and write-up); `old/` holds every earlier document: `architecture_2.md` (the round-5 model), `round5` / `round6` / `round7` write-ups, `refiner.md` (the two-stage pipeline: rounds 1-4), `plan.md`, `results.md` (every recorded number, incl. the trashed runs), `viewer.md`, `history/`. |
 | `output/` `output_2/` | Run directories `<exp_name>_<stamp>/` (`best.pth`, `last.pth`, `config.yaml`, `eval.json`, `predictions/`, `tensorboard/`), the frozen-baseline jsons, `logs/`; `output_2/` holds the final model's runs (`final*`) and the round-5/6 audit outputs (`audits/`). |
 
 ## Architecture
@@ -184,7 +201,7 @@ CUDA_VISIBLE_DEVICES=0 $PYTHON scripts/data/precompute_embeddings.py --split all
    and by `predict_reconstruction.py`'s anchor pixels). The frozen model's own SMPL-X numbers
    come from the corpus refit `features/sam3d/<shard>/<scene>/smplx_params.npz`, scored offline
    by `scripts/eval_frozen_smplx.py` and drawn as the `frozen` tensorboard run.
-5. **Temporal refiner** (`model.refiner`, stage 2; `docs/refiner.md`) — behind the frozen
+5. **Temporal refiner** (`model.refiner`, stage 2; `docs/old/refiner.md`) — behind the frozen
    per-frame body. World lift with `cam_from_world`, THEN Gaussian smoothing of the world
    pelvis position (`root_smooth_sec`; never in camera coordinates — those carry the camera's
    motion and the lift then fails to cancel it, the round-2 jitter source) and a shorter
@@ -299,14 +316,14 @@ frozen_metrics}`.
 
 ## Results so far
 
-`docs/results.md` holds every recorded number. Headlines (108-scene test, one clip per
+`docs/old/results.md` holds every recorded number. Headlines (108-scene test, one clip per
 person, 120-frame cap): frozen SAM3D refit 61.1 mm MPJPE / 44.1 PA / accel 11.9; the
 `baseline.yaml` recipe (as run `hands`, 5 epochs) 61.0 / 42.0 / F1 0.919; the per-frame SMPL-X
 probe 57.6 / 38.9 (no temporal block). On the 16-scene static subset the lifted-trajectory
 jitter is 126 for the frozen model vs a GT floor of 6.35; the best non-smoothing run reached 52.
 The temporal block over image tokens never learned to denoise the per-frame pose (see
-`docs/history/`), which is why the pipeline pivoted to the two-stage refiner — its results live
-in `docs/refiner.md`.
+`docs/old/history/`), which is why the pipeline pivoted to the two-stage refiner — its results live
+in `docs/old/refiner.md`.
 
 ## Conventions
 

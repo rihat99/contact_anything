@@ -4,7 +4,7 @@ Every item is an experiment arm on the `configs/temporal_tokens_b8_lr2.yaml` rec
 tokens + SMPL-X head + one RoPE temporal block; 8 clips/step, lr 2e-4, 5 epochs). Baseline =
 the recorded `output/temporal_tokens_b8_lr2_20260902_203707` (trained WITHOUT the optimizer
 hygiene bundle that is now the `base.yaml` default, so every delta folds the bundle in).
-Results: `docs/results.md`.
+Results: `docs/old/results.md`.
 
 ## 1. Hands in the SMPL-X head — `configs/hands.yaml`
 

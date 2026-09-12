@@ -1,0 +1,9 @@
+# Round 8 arm C2h: C2 (contact head + stillness loss) with head_grad_scale 0.1 — the contact and
+# gravity heads send a tenth of their gradient into the trunk. C1 (shared) cost +4 jitter, C2's
+# stillness loss recovered most of it at +0.2 mm, C1d (detached probe) kept the pose but lost
+# 0.05 F1: is a weak coupling enough for contact and harmless for the pose?
+base: configs/r8/C2_still.yaml
+model:
+  refiner:
+    head_grad_scale: 0.1
+output: {exp_name: C2h_scale01}

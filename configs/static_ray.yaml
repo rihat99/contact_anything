@@ -1,7 +1,7 @@
 # Static-camera subset with the ray camera head: the pelvis is regressed as (bearing, log depth)
 # about a fixed 3.5 m, so the crop box never enters the depth; the absolute anchors are the
 # image-space kp2d term plus the log-depth / bearing Huber terms (no CLIFF `cam` term).
-# Reference numbers (docs/results.md, static-camera round): the frozen model's lifted jitter is
+# Reference numbers (docs/old/results.md, static-camera round): the frozen model's lifted jitter is
 # 126 on this 16-scene test set (GT 6.35); the earlier ray runs (with the now-removed frozen
 # depth prior and camera token inputs) reached 52-57.
 base: configs/base.yaml

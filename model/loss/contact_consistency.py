@@ -3,21 +3,27 @@
 Reads ``out["smplx"]["joints_world"]`` (the refiner's world joints) at the six
 extremity joints of the kindyn groups — wrists 20 / 21, big toes 10 / 11, heels
 7 / 8 in :data:`~model.loss.KINDYN_GROUP_NAMES` order — and penalises their
-world SPEED (raw central finite difference over the clip's real frame spacing,
-m/s) on limb-frames whose contact label is positive: an L1 weighted by
+world SPEED over the clip's real frame spacing (m/s) on limb-frames whose
+contact label is positive: an L1 weighted by
 ``contact_valid * contact_conf`` (confidence off with ``confidence_weights:
 false``). A contact label in this corpus is a motion-gated "stable contact"
 (stillness with hysteresis in the estimator), so the target of zero speed is
 the label's own definition; the GT's residual in-contact speed (0.13 m/s mean on
 train, heavy-tailed) is reported as the floor.
 
+``stencil: forward`` (the default) measures the speed as
+``|x(t + 1) - x(t)| / (s(t + 1) - s(t))`` on rows whose own and next frame are
+valid — a one-sided difference, so a period-2 wobble is visible to it, which
+``stencil: central`` (``(x(t + 1) - x(t - 1)) / 2 dt``) cancels exactly. Rows are
+the stencil's own support: the forward one drops each valid run's last frame, the
+central one both its ends.
+
 Gradient reaches the pose path only (the labels are data, not the contact
 head), so this is a stillness prior on the refined pose, never a way to lower
-the loss by predicting less contact. Rows need a central stencil (both
-neighbours valid); clip ends carry no term.
+the loss by predicting less contact.
 
 Metrics: ``speed`` — mean predicted in-contact extremity speed (m/s, unweighted
-by confidence), ``gt_speed`` — the same on the kindyn GT joints.
+by confidence), ``gt_speed`` — the same stencil on the kindyn GT joints.
 """
 from __future__ import annotations
 
@@ -25,11 +31,13 @@ import torch
 from torch import Tensor
 
 from model.loss import Loss, LossResult
-from model.refiner import stencil_valid, time_derivative
+from model.refiner import forward_difference, forward_valid, stencil_valid, time_derivative
 from utils.metrics import mean_from_stats
 
 #: SMPL-X body joint of each kindyn group (LH, RH, LF toe, RF toe, LA heel, RA heel).
 GROUP_JOINTS = (20, 21, 10, 11, 7, 8)
+#: Speed stencils of ``contact_consistency.stencil``.
+STENCILS = ("forward", "central")
 
 
 class ContactConsistencyLoss(Loss):
@@ -44,6 +52,11 @@ class ContactConsistencyLoss(Loss):
         section = cfg["contact_consistency"]
         self.weight = float(section["weight"])
         self.use_confidence = bool(section["confidence_weights"])
+        self.stencil = str(section["stencil"])
+        if self.stencil not in STENCILS:
+            raise ValueError(
+                f"contact_consistency.stencil must be one of {list(STENCILS)}; "
+                f"got {self.stencil!r}")
 
     def _speed(self, joints_world: Tensor, batch: dict) -> tuple[Tensor, Tensor]:
         """``(speed (B, 6) m/s, rows (B,) bool)`` of the six extremity joints."""
@@ -53,8 +66,11 @@ class ContactConsistencyLoss(Loss):
         seconds = batch["frame_pos_sec"].to(self.device, self.dtype).view(n_clips, seq_len)
         valid = batch["frame_valid"].to(self.device).view(n_clips, seq_len)
         points = joints_world[:, list(GROUP_JOINTS)].view(n_clips, seq_len, len(GROUP_JOINTS), 3)
-        speed = time_derivative(points, seconds, valid).norm(dim=-1).reshape(n_frames, -1)
-        return speed, stencil_valid(valid, 1).reshape(n_frames)
+        if self.stencil == "forward":
+            rate, rows = forward_difference(points, seconds, valid), forward_valid(valid)
+        else:
+            rate, rows = time_derivative(points, seconds, valid), stencil_valid(valid, 1)
+        return rate.norm(dim=-1).reshape(n_frames, -1), rows.reshape(n_frames)
 
     def __call__(self, out: dict, batch: dict, *, train: bool) -> LossResult:
         joints = out["smplx"]["joints_world"].to(self.device, self.dtype)

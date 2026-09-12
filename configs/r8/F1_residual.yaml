@@ -1,0 +1,7 @@
+# Round 8 arm F1: F0 + the RNEA residual feedback (the layer's root-wrench residual under its
+# gated forces and predicted gravity, body detached / forces live, fed to the next layer).
+base: configs/r8/F0_force.yaml
+model:
+  refiner:
+    residual_feedback: true
+output: {exp_name: F1_residual}

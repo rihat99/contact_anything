@@ -16,6 +16,10 @@ group joint's offset from the pelvis in the same frame (metres).
 **SMPL-X body.** The fitted ``q`` trajectory of BetterHuman's
 ``SMPLX(use_face=False, use_hands=True, num_betas=10)`` — root = pelvis pose,
 parent-local joint quaternions — plus world joints and per-person betas.
+
+**Gravity.** Both products carry the scene's world down vector ``gravity_world``
+(copied from geocalib) and ``gravity_measured``, whether that vector is a measurement
+at all (:func:`gravity_measured`).
 """
 from __future__ import annotations
 
@@ -33,6 +37,11 @@ from .scene import (
 )
 
 GRAVITY_MAG = 9.81
+#: ``source`` values of ``features/geocalib/<shard>/<scene>/gravity.npz``.
+GRAVITY_SOURCES = ("ground", "geocalib", "fallback_down")
+#: The source that is NOT a measurement: the world frame is the first camera, so this
+#: "gravity" is that camera's own down axis.
+GRAVITY_FALLBACK_SOURCE = "fallback_down"
 #: The joint names kindyn stores for the six group columns (hands by wrist).
 KINDYN_FORCE_JOINTS = (
     "left_wrist", "right_wrist", "left_foot", "right_foot", "left_ankle", "right_ankle",
@@ -74,16 +83,48 @@ def _gravity(scene: str, kindyn) -> np.ndarray:
     return (gravity_world / np.linalg.norm(gravity_world)).astype(np.float32)
 
 
-def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> dict:
+def gravity_measured(gravity_path: Path) -> bool:
+    """Whether the scene's gravity vector was MEASURED.
+
+    ``kindyn_1.npz``'s ``gravity_world`` is a copy of the vector in
+    ``features/geocalib/<shard>/<scene>/gravity.npz``
+    (:func:`data.climbing_videos.scene.gravity_path`), whose ``source`` records how it
+    was obtained: ``ground`` (normal of a fitted ground plane) and ``geocalib`` (pooled
+    per-frame GeoCalib estimates, accepted as reliable) are measurements, while
+    ``fallback_down`` is the first camera's down axis — no measurement of gravity at
+    all, and 40 % of the corpus.
+
+    :raises FileNotFoundError: no geocalib file (a corpus feature is never optional).
+    :raises ValueError: the source is not one of :data:`GRAVITY_SOURCES`.
+    """
+    if not gravity_path.is_file():
+        raise FileNotFoundError(f"no geocalib gravity at {gravity_path}")
+    source = str(np.load(gravity_path, allow_pickle=True)["source"])
+    if source not in GRAVITY_SOURCES:
+        raise ValueError(
+            f"{gravity_path}: gravity source {source!r} is none of {list(GRAVITY_SOURCES)}")
+    return source != GRAVITY_FALLBACK_SOURCE
+
+
+def _gravity_fields(scene: str, kindyn, gravity_path: Path) -> dict:
+    """The gravity keys both loaders return: the vector and whether it was measured."""
+    return {"gravity_world": _gravity(scene, kindyn),
+            "gravity_measured": gravity_measured(gravity_path)}
+
+
+def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int, *,
+                gravity_path: Path) -> dict:
     """Six-group GT contact forces in body-weight units, body-root frame.
 
+    :param gravity_path: the scene's geocalib ``gravity.npz``
+        (:func:`data.climbing_videos.scene.gravity_path`).
     :returns: ``force_gt (P, N, 6, 3)``, ``force_contact (P, N, 6)`` bool,
         ``force_lever (P, N, 6, 3)`` metres, ``force_valid (P, N)``,
         ``force_conf (P, N)``, ``gravity_world (3,)`` the scene's fitted unit
-        DOWN vector in world coordinates.
+        DOWN vector in world coordinates, ``gravity_measured`` bool.
     """
     kindyn = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
-    gravity_world = _gravity(scene, kindyn)
+    gravity = _gravity_fields(scene, kindyn, gravity_path)
     kindyn_ids = np.asarray(kindyn["object_ids"])
     frame_names = [str(x) for x in kindyn["contact_frame_names"]]
     parents = np.asarray(kindyn["contact_frame_parents"], np.int64).reshape(-1)
@@ -173,7 +214,7 @@ def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> 
         "force_lever": lever.astype(np.float32),
         "force_valid": force_valid,
         "force_conf": force_conf,
-        "gravity_world": gravity_world,
+        **gravity,
     }
 
 
@@ -192,7 +233,8 @@ _SMPLX_BODY_Q = slice(7, 7 + 4 * (NUM_SMPLX_BODY_JOINTS - 1))
 _SMPLX_HAND_Q = slice(_SMPLX_BODY_Q.stop, _SMPLX_BODY_Q.stop + 4 * NUM_SMPLX_HAND_JOINTS)
 
 
-def load_smplx(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> dict:
+def load_smplx(scene: str, human_dir: Path, object_ids: np.ndarray, n: int, *,
+               gravity_path: Path) -> dict:
     """SMPL-X body GT from ``kindyn_1.npz`` (BetterHuman ``q`` convention).
 
     The root of ``q`` IS the pelvis pose: ``q[:3]`` equals ``joints_world[0]``
@@ -204,8 +246,11 @@ def load_smplx(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> d
     corpus-wide). Invalid rows are zeroed / set to the identity so nothing
     downstream ever multiplies a NaN by a zero mask.
 
-    :returns: ``gravity_world (3,)`` the scene's fitted unit down vector (the same
-        value :func:`load_forces` returns), ``smplx_joints_world (P, N, 52, 3)``
+    :param gravity_path: the scene's geocalib ``gravity.npz``
+        (:func:`data.climbing_videos.scene.gravity_path`).
+    :returns: ``gravity_world (3,)`` the scene's fitted unit down vector and
+        ``gravity_measured`` bool (the same values :func:`load_forces` returns),
+        ``smplx_joints_world (P, N, 52, 3)``
         metres (22 body joints, then the 30 finger joints), ``smplx_root_rot (P, N, 3, 3)``
         world-from-root, ``smplx_body_rot (P, N, 21, 3, 3)`` parent-local
         joints 1..21, ``smplx_hand_rot (P, N, 30, 3, 3)`` parent-local finger
@@ -248,7 +293,7 @@ def load_smplx(scene: str, human_dir: Path, object_ids: np.ndarray, n: int) -> d
     hand_rot = np.where(valid[..., None, None, None], hand_rot, eye)
     joints = np.where(valid[..., None, None], joints, 0.0)
     return {
-        "gravity_world": _gravity(scene, kindyn),
+        **_gravity_fields(scene, kindyn, gravity_path),
         "smplx_joints_world": joints.astype(np.float32),
         "smplx_root_rot": root_rot.astype(np.float32),
         "smplx_body_rot": body_rot.astype(np.float32),

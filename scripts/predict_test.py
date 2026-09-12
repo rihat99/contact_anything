@@ -14,7 +14,7 @@ stride), tiled into windows of ``--max-frames`` rows overlapping by
 ``--overlap`` rows; each row keeps the window it sits deepest inside (farthest
 from an edge). The defaults (240 / 120, ~18 GiB peak) put every row >= 60 rows
 inside its window; against a single whole-scene pass the tiling differs by
-<= 5 mm max / 0.3 mm mean on the joints (docs/viewer.md). Source frames between
+<= 5 mm max / 0.3 mm mean on the joints (docs/old/viewer.md). Source frames between
 stride steps are not predicted. The forward runs with TF32 like evaluate.py, so
 ``joints_cam`` is the head's own FK of ``q_cam`` to ~0.6 mm, not an fp32 one.
 

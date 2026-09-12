@@ -1,4 +1,4 @@
-"""World-space temporal refiner behind the per-frame model (docs/refiner.md, docs/architecture_2.md).
+"""World-space temporal refiner behind the per-frame model (docs/old/refiner.md, docs/old/architecture_2.md).
 
 The per-frame model (frozen SAM3D decoder + the SMPL-X / CLIFF heads) gives a
 camera-frame body per frame. This module turns the clip into a WORLD-space
@@ -37,7 +37,16 @@ corrections — again without any reference to the world frame:
    right-multiplied onto the root (body frame) and the 21 body joints
    (parent-local) plus a root shift in the body frame; motion = world velocity /
    acceleration of the 22 joints and the root's angular velocity / acceleration,
-   all expressed in the (input) body frame; forces in that same body frame.
+   all expressed in the (input) body frame; forces in that same body frame;
+   gravity = a body-frame correction on top of the camera's down axis
+   (``camera_axes``), averaged over the clip in the world and normalised — one
+   down vector per clip, so the world serves only as transport between frames.
+   Under ``iterative`` every head reads every layer, and the contact
+   probabilities, the body-frame gravity and (``residual_feedback``) the RNEA
+   root-wrench residual of the layer's body under its gated forces
+   (:class:`~model.physics.RootWrench`; body detached, forces live) are fed back
+   with the rate features. ``frame_mask_p`` replaces random input tokens by a
+   learned embedding during training (the feedback and the losses unchanged).
 6. **Decode**: FK in the world with the mean betas, then back into each camera
    with the extrinsics — the output dict has the :class:`~model.heads.SmplxHead`
    keys, so the existing SMPL-X loss and pose metrics apply unchanged.
@@ -59,7 +68,7 @@ from model.rope import CrossModalRopeModule
 from utils.geometry import (project_to_crop, rot6d_to_rotmat, rotmat_to_rot6d, smplx_q,
                             translation_to_ray)
 
-OUTPUTS = ("pose", "contact", "motion", "force")
+OUTPUTS = ("pose", "contact", "motion", "force", "gravity")
 NUM_BODY_JOINTS = 22
 NUM_GROUPS = 6
 _IDENTITY_6D = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
@@ -71,6 +80,14 @@ _GEOMETRY_DIM = 3 * (NUM_BODY_JOINTS - 1) + 3 + 3 + 1 + 10
 #: Camera-context features: pelvis->camera direction in the body frame (3), pelvis log
 #: depth (1), crop-box bearing (2) and angular size (1).
 _CAMERA_DIM = 3 + 1 + 2 + 1
+#: ``camera_axes``: the camera's down (+y) and viewing (+z) axes in the body frame.
+_CAMERA_AXES_DIM = 6
+#: ``residual_feedback``: the root-wrench residual, force (bw) + torque (bw*m).
+_RESIDUAL_DIM = 6
+#: Pooled gravity votes whose mean is shorter than this fall back to the camera axis.
+_GRAVITY_MIN_NORM = 0.1
+#: Frames a clip needs for the RNEA residual's +-2 stencil to have one interior row.
+_RESIDUAL_MIN_FRAMES = 5
 #: Feedback features of the iterative mode: the corrected trajectory's root-frame joint
 #: positions, its one-sided root linear / angular rates and its per-joint ones.
 _FEEDBACK_DIM = 3 * (NUM_BODY_JOINTS - 1) + 6 + 6 + 6 * (NUM_BODY_JOINTS - 1)
@@ -430,6 +447,17 @@ class TemporalRefiner(nn.Module):
     :param feedback_delta: add the cumulative pose correction (root shift +
         composed 6D rotation deltas) to that feedback (``iterative`` only).
     :param camera_context: append the camera-context features to the token.
+    :param camera_axes: ... plus the camera's down and viewing axes in the body
+        frame (needs ``camera_context``; the ``gravity`` output's prior).
+    :param residual_feedback: feed each layer's RNEA root-wrench residual back
+        (``iterative`` with the contact / force / gravity outputs; needs
+        ``smplx_model_path`` for the dynamics body).
+    :param frame_mask_p: training-time probability of replacing a frame's input
+        token by the learned mask embedding (0 = off).
+    :param head_grad_scale: factor on the gradient the non-pose heads (and
+        their fed-back values) send into the trunk: 1 = fully shared, 0 = the
+        heads are probes of a trunk only the pose losses shape.
+    :param smplx_model_path: BetterHuman SMPL-X model file of the dynamics body.
     :param pose_token: feed the frozen pose token (projected).
     :param pose_token_dim: pose-token projection width.
     :param contact_token_dim: per-contact-token projection width.
@@ -454,6 +482,11 @@ class TemporalRefiner(nn.Module):
         iterative: bool = False,
         feedback_delta: bool = False,
         camera_context: bool = False,
+        camera_axes: bool = False,
+        residual_feedback: bool = False,
+        frame_mask_p: float = 0.0,
+        head_grad_scale: float = 1.0,
+        smplx_model_path: Optional[str] = None,
         pose_token: bool = True,
         pose_token_dim: int = 256,
         contact_token_dim: int = 64,
@@ -497,6 +530,28 @@ class TemporalRefiner(nn.Module):
                     "joint rates back: token.one_sided_velocity and token.joint_velocity must "
                     "be on, so the input token carries the same channels")
         self.camera_context = bool(camera_context)
+        self.camera_axes = bool(camera_axes)
+        if self.camera_axes and not self.camera_context:
+            raise ValueError("camera_axes extends the camera context: it needs camera_context")
+        if "gravity" in self.outputs and not self.camera_axes:
+            raise ValueError("the gravity output corrects the camera's down axis: it needs camera_axes")
+        self.residual_feedback = bool(residual_feedback)
+        if self.residual_feedback:
+            missing = [o for o in ("contact", "force", "gravity") if o not in self.outputs]
+            if not self.iterative or missing:
+                raise ValueError(
+                    "residual_feedback runs the RNEA on every layer's body, gated forces and "
+                    f"gravity: it needs iterative and the contact / force / gravity outputs (missing {missing})")
+            if smplx_model_path is None:
+                raise ValueError("residual_feedback needs smplx_model_path for the dynamics body")
+        self.smplx_model_path = None if smplx_model_path is None else str(smplx_model_path)
+        self._wrenches: dict = {}
+        self.frame_mask_p = float(frame_mask_p)
+        if not 0.0 <= self.frame_mask_p < 1.0:
+            raise ValueError("frame_mask_p must be in [0, 1)")
+        self.head_grad_scale = float(head_grad_scale)
+        if not 0.0 <= self.head_grad_scale <= 1.0:
+            raise ValueError("head_grad_scale must be in [0, 1]")
         self.time_scale = float(time_scale)
 
         self.proj_pose_token = nn.Linear(decoder_dim, pose_token_dim) if pose_token else None
@@ -506,6 +561,7 @@ class TemporalRefiner(nn.Module):
         # Two LayerNorms: the geometry numbers and the projected token channels are
         # normalised separately, so neither group's scale rides on the other's width.
         geometry_dim = _GEOMETRY_DIM + (_CAMERA_DIM if self.camera_context else 0)
+        geometry_dim += _CAMERA_AXES_DIM if self.camera_axes else 0
         geometry_dim += 6 if self.token_one_sided_velocity else 0   # two one-sided rates, not one central
         geometry_dim += 6 * (NUM_BODY_JOINTS - 1) if self.token_joint_velocity else 0
         geometry_dim += 6 * (NUM_BODY_JOINTS - 1) if self.token_local_rotations else 0
@@ -518,16 +574,20 @@ class TemporalRefiner(nn.Module):
             dim=dim, num_slots=1, num_layers=num_layers, num_heads=num_heads,
             mlp_ratio=mlp_ratio, dropout=dropout, window=window, time_scale=time_scale)
         self.output_norm = nn.LayerNorm(dim)
+        self.mask_token = nn.Parameter(torch.zeros(dim)) if self.frame_mask_p > 0.0 else None
         self.feedback_norm = self.feedback_proj = None
         if self.iterative:
             # Zero-initialised, like the heads: at init the extra path contributes nothing.
             feedback_dim = _FEEDBACK_DIM + (_FEEDBACK_DELTA_DIM if self.feedback_delta else 0)
+            feedback_dim += NUM_GROUPS if "contact" in self.outputs else 0
+            feedback_dim += 3 if "gravity" in self.outputs else 0
+            feedback_dim += _RESIDUAL_DIM if self.residual_feedback else 0
             self.feedback_norm = nn.LayerNorm(feedback_dim)
             self.feedback_proj = nn.Linear(feedback_dim, dim)
             nn.init.zeros_(self.feedback_proj.weight)
             nn.init.zeros_(self.feedback_proj.bias)
         sizes = {"pose": 6 * NUM_BODY_JOINTS + 3, "contact": NUM_GROUPS,
-                 "motion": 6 * NUM_BODY_JOINTS + 6, "force": 3 * NUM_GROUPS}
+                 "motion": 6 * NUM_BODY_JOINTS + 6, "force": 3 * NUM_GROUPS, "gravity": 3}
         self.heads = nn.ModuleDict()
         for name in self.outputs:
             self.heads[name] = self._zero_head(dim, sizes[name])
@@ -583,7 +643,8 @@ class TemporalRefiner(nn.Module):
 
     def _feedback(self, pelvis_world: Tensor, rot_wr: Tensor, body_rot: Tensor,
                   joints_world: Tensor, pelvis_in: Tensor, rot_wr_in: Tensor,
-                  body_rot_in: Tensor, seconds: Tensor, valid: Tensor) -> Tensor:
+                  body_rot_in: Tensor, seconds: Tensor, valid: Tensor,
+                  extra: Sequence[Tensor] = ()) -> Tensor:
         """The corrected trajectory's own features, projected into the residual stream.
 
         The channels the input token carries (root-frame joint positions, the one-sided
@@ -593,6 +654,8 @@ class TemporalRefiner(nn.Module):
         the input body frame and the composed root / joint rotation deltas as 6D — rates
         are blind to the slow drift the layers have already accumulated, and the
         correction measured against the un-refined trajectory is frame-independent too.
+        ``extra`` holds the layer's head feedback (contact probabilities, body-frame
+        gravity, root-wrench residual), each ``[B, k]`` and body-relative.
         """
         n_frames = pelvis_world.shape[0]
         vel_b, ang_b = one_sided_root_rates(pelvis_world, rot_wr, seconds, valid)
@@ -603,7 +666,74 @@ class TemporalRefiner(nn.Module):
             feats += [(to_in @ (pelvis_world - pelvis_in)[..., None])[..., 0],
                       rotmat_to_rot6d(to_in @ rot_wr),
                       rotmat_to_rot6d(body_rot_in.transpose(2, 3) @ body_rot).reshape(n_frames, -1)]
+        feats += list(extra)
         return self.feedback_proj(self.feedback_norm(torch.cat(feats, dim=-1)))
+
+    def _scale_grad(self, x: Tensor) -> Tensor:
+        """``x`` unchanged in value, its gradient scaled by ``head_grad_scale``."""
+        s = self.head_grad_scale
+        if s >= 1.0:
+            return x
+        if s <= 0.0:
+            return x.detach()
+        return x * s + x.detach() * (1.0 - s)
+
+    # ------------------------------------------------------------------ gravity / physics
+
+    @staticmethod
+    def pool_gravity(delta_b: Tensor, rot_wr: Tensor, down_cam_w: Tensor, n_clips: int,
+                     seq_len: int, valid: Tensor) -> Tensor:
+        """One unit down vector per clip, expanded to its frames ``[B, 3]`` (world).
+
+        Per frame, the camera's down axis plus the head's body-frame correction
+        ``delta_b`` (zero at init), normalised so every frame votes with a unit vector;
+        then the masked clip mean, normalised again. A mean that (nearly) cancels falls
+        back to the pooled camera axis, so the output is always a unit vector. The world
+        enters only as the transport between the frames' body frames.
+        """
+        n_frames = delta_b.shape[0]
+        w = valid.to(delta_b.dtype).reshape(n_clips, seq_len, 1)
+        count = w.sum(dim=1).clamp(min=1.0)
+
+        def clip_mean(vectors: Tensor) -> Tensor:
+            unit = vectors / vectors.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            return (unit.view(n_clips, seq_len, 3) * w).sum(dim=1) / count
+
+        prior = clip_mean(down_cam_w)
+        pooled = clip_mean(down_cam_w + (rot_wr @ delta_b[..., None])[..., 0])
+        degenerate = pooled.norm(dim=-1, keepdim=True) < _GRAVITY_MIN_NORM
+        pooled = torch.where(degenerate, prior, pooled)
+        pooled = pooled / pooled.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        return pooled[:, None].expand(n_clips, seq_len, 3).reshape(n_frames, 3)
+
+    def _wrench(self, device: torch.device):
+        if device not in self._wrenches:
+            from model.physics import RootWrench
+            self._wrenches[device] = RootWrench(self.smplx_model_path, device)
+        return self._wrenches[device]
+
+    def _residual(self, pelvis_world: Tensor, rot_wr: Tensor, body_rot: Tensor,
+                  betas_clip: Tensor, forces_b: Tensor, frame_in: Tensor, probs: Tensor,
+                  gravity_w: Tensor, seconds: Tensor, valid: Tensor) -> Tensor:
+        """The layer's root-wrench residual ``[B, 6]`` (root frame; 0 outside the stencil).
+
+        Body, betas, gravity and the contact gate are detached; the forces are live.
+        """
+        n_clips, seq_len = seconds.shape
+        n_frames = pelvis_world.shape[0]
+        if seq_len < _RESIDUAL_MIN_FRAMES:
+            # No interior row exists; a graph-connected zero keeps the forces on the path.
+            return forces_b.reshape(n_frames, -1)[:, :1].expand(n_frames, _RESIDUAL_DIM) * 0.0
+        gated = forces_b * probs.detach()[..., None]
+        forces_world = torch.einsum("bij,bkj->bki", frame_in.detach(), gated)
+        res_f, res_t, rows = self._wrench(pelvis_world.device).residual(
+            pelvis_world.detach().view(n_clips, seq_len, 3),
+            rot_wr.detach().view(n_clips, seq_len, 3, 3),
+            body_rot.detach().view(n_clips, seq_len, NUM_BODY_JOINTS - 1, 3, 3),
+            betas_clip.detach(), forces_world.view(n_clips, seq_len, NUM_GROUPS, 3),
+            gravity_w.detach().view(n_clips, seq_len, 3)[:, 0], seconds, valid)
+        residual = torch.cat([res_f, res_t], dim=-1) * rows.to(res_f.dtype)[..., None]
+        return residual.reshape(n_frames, _RESIDUAL_DIM)
 
     # ------------------------------------------------------------------ forward
 
@@ -618,7 +748,7 @@ class TemporalRefiner(nn.Module):
             ``img_size``, ``bbox_center``, ``bbox_scale``; ``gravity_world`` with
             the gravity token channel).
         :param body: the head's BetterHuman SMPL-X body (22 or 52 joints).
-        :returns: ``{"smplx", "contact", "force", "motion"}`` — ``smplx`` in the
+        :returns: ``{"smplx", "contact", "force", "motion", "gravity"}`` — ``smplx`` in the
             SmplxHead layout plus ``pelvis_world`` / ``root_rot_world`` /
             ``joints_world``, the per-layer world joints ``joints_world_layers``
             (one entry unless ``iterative``, the last one IS ``joints_world``)
@@ -689,6 +819,11 @@ class TemporalRefiner(nn.Module):
             box_size = batch["bbox_scale"].float()[:, 0] / focal
             log_z = torch.log(pelvis_s[:, 2].clamp(min=1e-3))
             geometry += [cam_dir_b, log_z[:, None], box_bearing, box_size[:, None]]
+            if self.camera_axes:
+                # Rows of cam-from-root = the camera's axes in the body frame: its down (+y)
+                # axis is the gravity prior, its viewing (+z) axis the tilt's other half.
+                geometry += [root_rot_cam_s[:, 1, :], root_rot_cam_s[:, 2, :]]
+        down_cam_w = rot_wc[:, :, 1]                              # camera +y axis in the world
         if self.token_local_rotations:
             geometry.append(rotmat_to_rot6d(body_rot).reshape(n_frames, -1))
         if self.token_joint_velocity:
@@ -722,6 +857,9 @@ class TemporalRefiner(nn.Module):
         if token_feats:
             feats.append(self.token_norm(torch.cat(token_feats, dim=-1)))
         x = self.input_proj(torch.cat(feats, dim=-1))
+        if self.training and self.mask_token is not None:
+            dropped = torch.rand(n_frames, device=device) < self.frame_mask_p
+            x = torch.where(dropped[:, None], self.mask_token[None].to(x.dtype), x)
 
         # 4. temporal transformer (one slot per frame), 5. the pose offset in the body /
         #    parent-local frames and 6. FK in the world. Under `iterative` the three steps
@@ -730,6 +868,21 @@ class TemporalRefiner(nn.Module):
         n_layers = self.temporal.num_layers
         states: list[tuple[Tensor, Tensor, Tensor, Tensor]] = []
         rot_wr2, body_rot2, p_w2 = rot_wr, body_rot, p_w
+        head_names = [name for name in self.outputs if name != "pose"]
+        per_layer: dict[str, list[Tensor]] = {name: [] for name in head_names}
+
+        def read_heads(hidden: Tensor) -> dict[str, Tensor]:
+            # The pooled gravity also depends on the body's rotation: scale that path too, or
+            # the gravity loss would still reach the pose path through the lift.
+            hidden, rot = self._scale_grad(hidden), self._scale_grad(rot_wr2)
+            raw = {name: self.heads[name](hidden) for name in head_names}
+            if "gravity" in raw:
+                raw["gravity"] = self.pool_gravity(raw["gravity"], rot, down_cam_w,
+                                                   n_clips, seq_len, valid)
+            for name, value in raw.items():
+                per_layer[name].append(value)
+            return raw
+
         if self.iterative:
             tables = self.temporal.prepare(x[:, None], seq_len, batch["frame_pos_sec"],
                                            batch["frame_valid"])
@@ -741,9 +894,21 @@ class TemporalRefiner(nn.Module):
                     self.heads["pose"](hidden), p_w2, rot_wr2, body_rot2)
                 states.append((p_w2, rot_wr2, body_rot2,
                                world_joints(shaped, p_w2, rot_wr2, body_rot2, hand_rot)))
+                raw = read_heads(hidden)
                 if layer + 1 < n_layers:
+                    fed = {k: self._scale_grad(v) for k, v in raw.items()}
+                    extra = []
+                    if "contact" in fed:
+                        extra.append(torch.sigmoid(fed["contact"]))
+                    if "gravity" in fed:
+                        extra.append((rot_wr2.transpose(1, 2) @ fed["gravity"][..., None])[..., 0])
+                    if self.residual_feedback:
+                        extra.append(self._residual(
+                            p_w2, rot_wr2, body_rot2, betas_clip,
+                            fed["force"].reshape(n_frames, NUM_GROUPS, 3), rot_wr,
+                            torch.sigmoid(fed["contact"]), fed["gravity"], seconds, valid))
                     h = h + self._feedback(*states[-1], p_w, rot_wr, body_rot,
-                                           seconds, valid)[:, None]
+                                           seconds, valid, extra)[:, None]
         else:
             x = self.temporal(x[:, None], seq_len, batch["frame_pos_sec"],
                               batch["frame_valid"])[:, 0]
@@ -753,7 +918,7 @@ class TemporalRefiner(nn.Module):
                     self.heads["pose"](hidden), p_w2, rot_wr2, body_rot2)
             states.append((p_w2, rot_wr2, body_rot2,
                            world_joints(shaped, p_w2, rot_wr2, body_rot2, hand_rot)))
-        raw = {name: head(hidden) for name, head in self.heads.items() if name != "pose"}
+            raw = read_heads(hidden)
 
         # 7. back into every camera — the intermediate layers too (deep supervision reads
         #    them; with one layer the lists are the final tensors and nothing extra runs).
@@ -786,13 +951,23 @@ class TemporalRefiner(nn.Module):
             "joints_world_in": joints_world_in,
             **{f"{key}_layers": [layer[key] for layer in layers] for key in layers[0]},
         }
-        contact = force = motion = None
+        contact = force = motion = gravity = None
         if "contact" in raw:
-            contact = {"logits": raw["contact"], "probs": torch.sigmoid(raw["contact"])}
+            contact = {"logits": raw["contact"], "probs": torch.sigmoid(raw["contact"]),
+                       "logits_layers": per_layer["contact"]}
         if "force" in raw:
             # Forces live in the INPUT body frame; `frame` lets the loss rotate the kindyn
             # GT (given in the GT root frame) into it.
-            force = {"forces": raw["force"].reshape(n_frames, NUM_GROUPS, 3), "frame": rot_wr}
+            force = {"forces": raw["force"].reshape(n_frames, NUM_GROUPS, 3), "frame": rot_wr,
+                     "forces_layers": [f.reshape(n_frames, NUM_GROUPS, 3)
+                                       for f in per_layer["force"]]}
+        if "gravity" in raw:
+            rot = self._scale_grad(rot_wr2)
+            gravity = {"world": raw["gravity"],
+                       "body": (rot.transpose(1, 2) @ raw["gravity"][..., None])[..., 0],
+                       "prior_world": self.pool_gravity(torch.zeros_like(raw["gravity"]), rot_wr2,
+                                                        down_cam_w, n_clips, seq_len, valid),
+                       "world_layers": per_layer["gravity"]}
         if "motion" in raw:
             m = raw["motion"]
             k = 3 * NUM_BODY_JOINTS
@@ -802,7 +977,8 @@ class TemporalRefiner(nn.Module):
                 "ang_vel": m[:, 2 * k:2 * k + 3], "ang_acc": m[:, 2 * k + 3:],
                 "frame": rot_wr,                                        # world-from-body
             }
-        return {"smplx": smplx, "contact": contact, "force": force, "motion": motion}
+        return {"smplx": smplx, "contact": contact, "force": force, "motion": motion,
+                "gravity": gravity}
 
 
 __all__ = ["TemporalRefiner", "OUTPUTS", "SMOOTHING_PARAM_NAMES", "world_joints",

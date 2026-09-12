@@ -1,0 +1,4 @@
+# Round 8 arm F3: F1 + the RNEA residual loss (feedback AND loss).
+base: configs/r8/F1_residual.yaml
+force_consistency: {enabled: true}
+output: {exp_name: F3_both}

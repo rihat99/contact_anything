@@ -1,0 +1,7 @@
+# Round 8 arm G0 (docs/round8_plan.md): P_k30 without the ground-truth gravity token channel.
+# Does the pose need it? (Round 5 measured the channel on forces only.)
+base: configs/smooth/P_k30.yaml
+model:
+  refiner:
+    token: {gravity: false}
+output: {exp_name: G0_nograv}

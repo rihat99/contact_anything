@@ -1,4 +1,4 @@
-"""Where do the contact models fail? (round 6 label anatomy, docs/round6_2026-09-11.md)
+"""Where do the contact models fail? (round 6 label anatomy, docs/old/round6_2026-09-11.md)
 
 Capped-protocol test rows (threshold 0.5) split by manual-vs-automatic label agreement, by the
 automatic label's confidence and by GT limb stillness (drift of the group joint over 0.35 s

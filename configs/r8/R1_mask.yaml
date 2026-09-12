@@ -1,0 +1,7 @@
+# Round 8 arm R1: F2h + frame masking (each frame's input token replaced by a learned embedding with
+# probability 0.1 during training) — does the train/test gap close without costing anything?
+base: configs/r8/F2h_scale01.yaml
+model:
+  refiner:
+    frame_mask_p: 0.1
+output: {exp_name: R1_mask}

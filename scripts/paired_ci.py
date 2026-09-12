@@ -76,8 +76,11 @@ def load_labels(root: Path, scene: str) -> dict:
     """Test contact labels + kindyn SMPL-X and force GT of one scene."""
     data = scene_io.load_scene(root, scene, "test", CONTACT_LEVEL)
     n = len(data["frame_indices"])
-    data.update(kindyn.load_smplx(scene, data["human_dir"], data["object_ids"], n))
-    data.update(kindyn.load_forces(scene, data["human_dir"], data["object_ids"], n))
+    gravity = scene_io.gravity_path(root, scene)
+    data.update(kindyn.load_smplx(scene, data["human_dir"], data["object_ids"], n,
+                                  gravity_path=gravity))
+    data.update(kindyn.load_forces(scene, data["human_dir"], data["object_ids"], n,
+                                   gravity_path=gravity))
     return data
 
 
@@ -245,7 +248,9 @@ def compute_metrics(stats: np.ndarray) -> dict[str, np.ndarray]:
 
 def collect(runs: list[Path], root: Path, protocol: str) -> tuple[dict, list[str], dict]:
     """Per-video statistics of every run, the video order, and the shared row counts."""
-    scenes = sorted(p.stem for p in (runs[0] / "predictions").glob("*.npz"))
+    # The scenes every run dumped (the test split can change between dumps).
+    scenes = sorted(set.intersection(
+        *({p.stem for p in (run / "predictions").glob("*.npz")} for run in runs)))
     videos = sorted({video_id(scene) for scene in scenes})
     order = {video: i for i, video in enumerate(videos)}
     stats = {run.name: np.zeros((len(videos), len(STAT_NAMES))) for run in runs}

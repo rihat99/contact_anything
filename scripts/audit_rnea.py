@@ -32,6 +32,7 @@ import torch
 from torch import Tensor
 
 from data.climbing_videos.kindyn import GROUPS_52, load_forces, load_smplx
+from data.climbing_videos.scene import gravity_path
 from model.loss.force_consistency import ForceConsistencyLoss, GROUP_ROBOT_JOINTS, trajectory_derivatives
 from tools.body import load_body, _DEFAULT_CONTACT_FRAMES
 from tools.human_optim.kindyn import build_dynamics_spec
@@ -341,8 +342,11 @@ def main() -> None:
                     data = {key: archive[key] for key in archive.files}
                 manifest["sources"].append({"split": split, "scene": scene, "path": str(path),
                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "keys": list(data)})
-                targets = load_smplx(scene, path.parent, data["object_ids"], int(data["num_frames"]))
-                forces = load_forces(scene, path.parent, data["object_ids"], int(data["num_frames"]))
+                gravity = gravity_path(ROOT, scene)
+                targets = load_smplx(scene, path.parent, data["object_ids"],
+                                     int(data["num_frames"]), gravity_path=gravity)
+                forces = load_forces(scene, path.parent, data["object_ids"],
+                                     int(data["num_frames"]), gravity_path=gravity)
                 for person in range(len(data["object_ids"])):
                     metadata, saved, rows = audit_person(data, person, body, dense22, loss, targets, forces)
                     metadata.update(split=split, scene=scene)

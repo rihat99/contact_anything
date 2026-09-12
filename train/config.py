@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = REPO_ROOT / "configs" / "base.yaml"
 
 _MODALITY_ORDER = ("pose", "contact", "force")
-_REFINER_OUTPUTS = ("pose", "contact", "motion", "force")
+_REFINER_OUTPUTS = ("pose", "contact", "motion", "force", "gravity")
 #: Finite-difference stencils of ``motion_supervision`` (:data:`model.loss.motion.STENCILS`).
 _STENCILS = ("legacy", "aligned", "forward")
 #: ``smplx_supervision`` terms deep supervision repeats per refiner layer
@@ -35,7 +35,7 @@ _LAYER_TERMS = ("kp3d", "orient", "pose", "root_bias", "root_shape")
 NUM_KINDYN_GROUPS = 6
 _MONITOR_MAX = ("f1", "iou", "precision", "recall", "pearson")
 _MONITOR_MIN = ("mae", "err", "loss", "mpjpe", "pve", "accel", "rte", "jitter", "bias",
-                "mag", "dlogz", "rmse")
+                "mag", "dlogz", "rmse", "angle")
 #: Tensorboard metric section of every loss (``metric_<group>/...``); a loss
 #: whose group is not its own name is listed here.
 METRIC_GROUPS = {"smplx": "pose"}
@@ -96,6 +96,7 @@ def enabled_losses(cfg: dict) -> list[str]:
                 ("smplx", "smplx_supervision"), ("motion", "motion_supervision"),
                 ("contact_consistency", "contact_consistency"),
                 ("force_consistency", "force_consistency"),
+                ("gravity", "gravity_supervision"),
                 ("gaussian_reference", "gaussian_reference"))
     return [name for name, section in sections if cfg[section]["enabled"]]
 
@@ -110,6 +111,8 @@ def signal_needs(cfg: dict) -> set[str]:
         needs.add("smplx")
     if "force" in refiner_outputs(cfg):
         needs.add("smplx")          # the kindyn root rotation re-frames the force GT
+    if cfg["gravity_supervision"]["enabled"]:
+        needs.add("smplx")          # the corpus gravity loads with the smplx GT group
     return needs
 
 
@@ -267,6 +270,11 @@ def validate(cfg: dict) -> None:
         if int(refiner["dim"]) % int(refiner["num_heads"]) != 0:
             raise ValueError("model.refiner.dim must be divisible by num_heads")
         if bool(refiner["iterative"]):
+            if int(refiner["num_layers"]) < 2:
+                raise ValueError(
+                    "model.refiner.iterative feeds every layer's correction to the next one: "
+                    "with num_layers 1 the feedback projection never runs (DDP would see an "
+                    "unused parameter) — use num_layers >= 2 or iterative false")
             if "pose" not in outputs:
                 raise ValueError(
                     "model.refiner.iterative applies the pose head after every layer: list "
@@ -284,11 +292,29 @@ def validate(cfg: dict) -> None:
                 "it needs model.refiner.iterative")
         # Every head must receive a loss (DDP runs with find_unused_parameters=False).
         needs = {"pose": "smplx_supervision", "contact": "contact_supervision",
-                 "motion": "motion_supervision", "force": "force_supervision"}
+                 "motion": "motion_supervision", "force": "force_supervision",
+                 "gravity": "gravity_supervision"}
         for output in sorted(outputs):
             if not cfg[needs[output]]["enabled"]:
                 raise ValueError(
                     f"model.refiner.outputs lists {output!r} but {needs[output]} is disabled")
+        if bool(refiner["camera_axes"]) and not bool(refiner["camera_context"]):
+            raise ValueError("model.refiner.camera_axes extends the camera context: enable camera_context")
+        if "gravity" in outputs and not bool(refiner["camera_axes"]):
+            raise ValueError(
+                "the refiner's gravity output corrects the camera's down axis: enable "
+                "model.refiner.camera_axes")
+        if bool(refiner["residual_feedback"]):
+            missing = sorted({"contact", "force", "gravity"} - outputs)
+            if not bool(refiner["iterative"]) or missing:
+                raise ValueError(
+                    "model.refiner.residual_feedback runs the RNEA on every layer's body, gated "
+                    "forces and predicted gravity: it needs model.refiner.iterative and the "
+                    f"contact / force / gravity outputs (missing {missing})")
+        if not 0.0 <= float(refiner["frame_mask_p"]) < 1.0:
+            raise ValueError("model.refiner.frame_mask_p must be in [0, 1)")
+        if not 0.0 <= float(refiner["head_grad_scale"]) <= 1.0:
+            raise ValueError("model.refiner.head_grad_scale must be in [0, 1]")
         if sup["enabled"] and float(sup["loss"]["cam"]) > 0.0:
             raise ValueError(
                 "smplx_supervision.loss.cam supervises the CLIFF proxy, which the refined "
@@ -301,6 +327,26 @@ def validate(cfg: dict) -> None:
     if cfg["force_supervision"]["enabled"] and not (force_on or "force" in outputs):
         raise ValueError(
             "force_supervision.enabled requires model.force.enabled or a refiner 'force' output")
+    if cfg["gravity_supervision"]["enabled"] and "gravity" not in outputs:
+        raise ValueError("gravity_supervision.enabled requires a refiner 'gravity' output")
+    for section, terms_on, terms in (
+            ("contact_supervision", True, "the BCE"),
+            ("force_supervision", any(float(cfg["force_supervision"]["loss"][k]) > 0.0 for k in
+                                      ("force", "magnitude", "direction", "noncontact")),
+             "the force / magnitude / direction / noncontact terms"),
+            ("gravity_supervision", True, "the cos term")):
+        weight = float(cfg[section]["layer_weight"])
+        if cfg[section]["enabled"] and weight > 0.0:
+            output = section.split("_")[0]
+            if output not in outputs:
+                raise ValueError(
+                    f"{section}.layer_weight supervises the refiner's intermediate {output} "
+                    f"outputs: list {output!r} in model.refiner.outputs")
+            _validate_layer_weight(section, weight, refiner, terms_on, terms)
+    if cfg["contact_consistency"]["stencil"] not in ("forward", "central"):
+        raise ValueError(
+            "contact_consistency.stencil must be 'forward' or 'central'; got "
+            f"{cfg['contact_consistency']['stencil']!r}")
     force_sup = cfg["force_supervision"]
     if force_sup["enabled"]:
         if float(force_sup["confidence_power"]) < 0.0:

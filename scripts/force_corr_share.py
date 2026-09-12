@@ -53,7 +53,9 @@ def pooled_sizes(run: Path, root: Path) -> tuple[np.ndarray, np.ndarray, int]:
         data = scene_io.load_scene(root, path.stem, "test", 1)
         object_ids = data["object_ids"]
         n = len(data["frame_indices"])
-        forces = kindyn.load_forces(path.stem, data["human_dir"], object_ids, n)
+        forces = kindyn.load_forces(
+            path.stem, data["human_dir"], object_ids, n,
+            gravity_path=scene_io.gravity_path(root, path.stem))
         pred_forces = scene_io.rows_by_object_id(
             np.asarray(dump["forces_world"], np.float32), dump["object_ids"], object_ids,
             path.stem, "prediction dump")                                   # [P, N, 6, 3]

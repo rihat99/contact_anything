@@ -1,0 +1,4 @@
+# Round 8: seed replicate of F2m (contact + stillness + force + RNEA loss, head_grad_scale 0.3).
+base: configs/r8/F2m_scale03.yaml
+data: {seed: 1}
+output: {exp_name: F2m_s1}

@@ -99,17 +99,31 @@ ALL_TOKEN = {"local_rotations": True, "gravity": True, "raw_minus_mean": True}
 ONE_SIDED_TOKEN = {**ALL_TOKEN, "one_sided_velocity": True, "joint_velocity": True}
 
 
+ALL_OUTPUTS = ("pose", "contact", "motion", "force", "gravity")
+
+
+def smplx_model_path() -> str:
+    cfg = yaml.safe_load((REPO / "configs" / "base.yaml").read_text())
+    return cfg["model"]["smplx"]["model_path"]
+
+
 def make_refiner(randomize: bool, root_smooth_sec: float = 0.0, pose_smooth_sec: float = 0.0,
                  camera_context: bool = False, learn_smoothing: bool = False,
                  token: dict | None = None, iterative: bool = False,
-                 feedback_delta: bool = False) -> TemporalRefiner:
+                 feedback_delta: bool = False, outputs=("pose", "contact", "motion", "force"),
+                 camera_axes: bool = False, residual_feedback: bool = False,
+                 frame_mask_p: float = 0.0, head_grad_scale: float = 1.0) -> TemporalRefiner:
     torch.manual_seed(1)
-    refiner = TemporalRefiner(DECODER_DIM, ("pose", "contact", "motion", "force"),
+    refiner = TemporalRefiner(DECODER_DIM, outputs,
                               num_contact_tokens=6, dim=64, num_layers=2, num_heads=4,
                               window=0.5, root_smooth_sec=root_smooth_sec,
                               pose_smooth_sec=pose_smooth_sec, learn_smoothing=learn_smoothing,
                               token=token, iterative=iterative, feedback_delta=feedback_delta,
-                              camera_context=camera_context, dropout=0.0)
+                              camera_context=camera_context, camera_axes=camera_axes,
+                              residual_feedback=residual_feedback, frame_mask_p=frame_mask_p,
+                              head_grad_scale=head_grad_scale,
+                              smplx_model_path=smplx_model_path() if residual_feedback else None,
+                              dropout=0.0)
     if randomize:
         for head in refiner.heads.values():
             torch.nn.init.normal_(head[2].weight, std=0.02)
@@ -627,3 +641,232 @@ def test_band_limited_terms_reach_the_pose():
     assert set(result.terms) == set(loss.term_names)
     result.terms["pose_ss_acc"].numerator.backward()
     assert joints.grad is not None and torch.isfinite(joints.grad).all() and joints.grad.abs().sum() > 0
+
+
+# ------------------------------------------------------------------ round 8: gravity, feedback, masking
+
+def camera_down_prior(batch: dict) -> Tensor:
+    """The pooled camera +y axis per clip (world), expanded to the frames."""
+    seq_len = int(batch["seq_len"])
+    rot_wc = batch["cam_from_world"][:, :3, :3].transpose(1, 2)
+    down = rot_wc[:, :, 1].view(-1, seq_len, 3).mean(dim=1)
+    down = down / down.norm(dim=-1, keepdim=True)
+    return down[:, None].expand(-1, seq_len, 3).reshape(-1, 3)
+
+
+def test_gravity_head_is_the_camera_axis_at_init(body):
+    smplx_out, tokens, blocks, batch = synthetic(body)
+    refiner = make_refiner(randomize=False, iterative=True, token=ONE_SIDED_TOKEN,
+                           outputs=ALL_OUTPUTS, camera_context=True, camera_axes=True,
+                           residual_feedback=True)
+    out = refiner(smplx_out, tokens, blocks, batch, body)
+    gravity = out["gravity"]
+    prior = camera_down_prior(batch)
+    assert torch.allclose(gravity["world"], prior, atol=1e-5)
+    assert torch.allclose(gravity["prior_world"], prior, atol=1e-5)
+    assert torch.allclose(gravity["world"].norm(dim=-1), torch.ones(len(prior)), atol=1e-5)
+    rot_wr = out["smplx"]["root_rot_world"]
+    assert torch.allclose(gravity["body"], (rot_wr.transpose(1, 2) @ prior[..., None])[..., 0], atol=1e-5)
+    assert len(gravity["world_layers"]) == 2 and gravity["world_layers"][-1] is gravity["world"]
+    assert len(out["contact"]["logits_layers"]) == 2 and len(out["force"]["forces_layers"]) == 2
+    assert torch.allclose(out["smplx"]["joints_cam"], smplx_out["joints_cam"], atol=1e-4)
+    with pytest.raises(ValueError):                                # the prior needs the camera axes
+        make_refiner(randomize=False, outputs=ALL_OUTPUTS, camera_context=True)
+    with pytest.raises(ValueError):                                # the axes extend the context
+        make_refiner(randomize=False, camera_axes=True)
+    with pytest.raises(ValueError):                                # the residual needs every head
+        make_refiner(randomize=False, iterative=True, token=ONE_SIDED_TOKEN,
+                     outputs=("pose", "contact", "force"), camera_context=True,
+                     camera_axes=True, residual_feedback=True)
+
+
+def test_world_frame_independence_with_gravity_and_residual_feedback(body):
+    smplx_out, tokens, blocks, batch = synthetic(body)
+    refiner = make_refiner(randomize=True, iterative=True, token=ONE_SIDED_TOKEN,
+                           outputs=ALL_OUTPUTS, camera_context=True, camera_axes=True,
+                           residual_feedback=True)
+    torch.nn.init.normal_(refiner.heads["gravity"][2].weight, std=0.5)   # a real correction
+    out = refiner(smplx_out, tokens, blocks, batch, body)
+    assert (out["gravity"]["world"] - out["gravity"]["prior_world"]).abs().max() > 1e-3
+    torch.manual_seed(7)
+    rot0 = roma.random_rotmat(1)[0]
+    t0 = torch.tensor([3.0, -2.0, 5.0])
+    g_inv = torch.eye(4)
+    g_inv[:3, :3] = rot0.T
+    g_inv[:3, 3] = -rot0.T @ t0
+    moved = dict(batch)
+    moved["cam_from_world"] = batch["cam_from_world"] @ g_inv
+    moved["gravity_world"] = batch["gravity_world"] @ rot0.T
+    out2 = refiner(smplx_out, tokens, blocks, moved, body)
+    for key in ("joints_cam", "pelvis_cam", "root_rot", "body_rot"):
+        assert torch.allclose(out["smplx"][key], out2["smplx"][key], atol=1e-4), key
+    assert torch.allclose(out["contact"]["logits"], out2["contact"]["logits"], atol=1e-4)
+    assert torch.allclose(out["force"]["forces"], out2["force"]["forces"], atol=1e-4)
+    assert torch.allclose(out["gravity"]["body"], out2["gravity"]["body"], atol=1e-4)
+    assert torch.allclose(out2["gravity"]["world"], (rot0 @ out["gravity"]["world"].T).T, atol=1e-4)
+
+
+def test_residual_feedback_detaches_the_body_and_keeps_the_forces_live(body):
+    smplx_out, tokens, blocks, batch = synthetic(body)
+    refiner = make_refiner(randomize=True, iterative=True, token=ONE_SIDED_TOKEN,
+                           outputs=ALL_OUTPUTS, camera_context=True, camera_axes=True,
+                           residual_feedback=True)
+    out = refiner(smplx_out, tokens, blocks, batch, body)
+    seq_len = int(batch["seq_len"])
+    n = len(batch["frame_valid"])
+    pelvis = out["smplx"]["pelvis_world"].detach().requires_grad_(True)
+    rot_wr = out["smplx"]["root_rot_world"].detach().requires_grad_(True)
+    body_rot = out["smplx"]["body_rot"].detach().requires_grad_(True)
+    betas = out["smplx"]["betas"].detach().view(-1, seq_len, 10)[:, 0].clone().requires_grad_(True)
+    frame_in = out["smplx"]["root_rot_world_in"].detach().clone().requires_grad_(True)
+    gravity = out["gravity"]["world"].detach().clone().requires_grad_(True)
+    forces = (0.3 * torch.randn(n, 6, 3)).requires_grad_(True)
+    probs = torch.full((n, 6), 0.8).requires_grad_(True)
+    seconds = batch["frame_pos_sec"].view(-1, seq_len)
+    valid = batch["frame_valid"].view(-1, seq_len)
+    residual = refiner._residual(pelvis, rot_wr, body_rot, betas, forces, frame_in, probs,
+                                 gravity, seconds, valid)
+    rows = valid.clone()
+    rows[:, :2] = rows[:, -2:] = False
+    assert residual.shape == (n, 6)
+    assert residual.view(-1, seq_len, 6)[~rows].abs().max() == 0        # outside the stencil
+    assert residual.view(-1, seq_len, 6)[rows].abs().max() > 0
+    residual.sum().backward()
+    assert forces.grad is not None and forces.grad.abs().sum() > 0     # forces live
+    for name, tensor in (("pelvis", pelvis), ("rot_wr", rot_wr), ("body_rot", body_rot),
+                         ("betas", betas), ("frame_in", frame_in), ("gravity", gravity),
+                         ("probs", probs)):
+        assert tensor.grad is None, name                                # everything else detached
+    rot_wr, body_rot, betas = rot_wr.detach(), body_rot.detach(), betas.detach()
+    # Too short for the +-2 stencil: a graph-connected zero.
+    short = refiner._residual(pelvis[:8].detach(), rot_wr[:8], body_rot[:8], betas[:2], forces[:8],
+                              frame_in[:8].detach(), probs[:8].detach(), gravity[:8].detach(),
+                              seconds[:, :4].reshape(2, 4), valid[:, :4].reshape(2, 4))
+    assert short.shape == (8, 6) and short.abs().max() == 0 and short.requires_grad
+    # A still body under gravity needs one body weight along -g at the root (the loss's
+    # convention): with zero forces the force residual has unit magnitude.
+    still = torch.zeros(n, 6, 3)
+    p0 = out["smplx"]["pelvis_world"].detach().view(-1, seq_len, 3)[:, :1].expand(-1, seq_len, 3).reshape(n, 3)
+    r0 = rot_wr.view(-1, seq_len, 3, 3)[:, :1].expand(-1, seq_len, 3, 3).reshape(n, 3, 3)
+    b0 = body_rot.view(-1, seq_len, 21, 3, 3)[:, :1].expand(-1, seq_len, 21, 3, 3).reshape(n, 21, 3, 3)
+    res0 = refiner._residual(p0, r0, b0, betas, still, r0, probs, out["gravity"]["world"].detach(),
+                             seconds, valid)
+    assert torch.allclose(res0.view(-1, seq_len, 6)[rows][:, :3].norm(dim=-1), torch.ones(int(rows.sum())), atol=5e-3)
+    # The forces enter in the INPUT body frame `frame_in` and the residual is read in the
+    # CURRENT root frame: on the still body the force part moves by exactly the gated sum
+    # transported between the two frames (a wrong frame would fail this).
+    torch.manual_seed(5)
+    frame_in = roma.random_rotmat(1).expand(n, 3, 3)
+    with_forces = refiner._residual(p0, r0, b0, betas, forces.detach(), frame_in, probs,
+                                    out["gravity"]["world"].detach(), seconds, valid)
+    transported = -torch.einsum("bij,bj->bi", r0.transpose(1, 2) @ frame_in,
+                                (forces.detach() * probs[..., None]).sum(dim=1))
+    delta = (with_forces - res0).view(-1, seq_len, 6)[rows][:, :3]
+    assert torch.allclose(delta, transported.view(-1, seq_len, 3)[rows], atol=1e-4)
+
+
+def test_frame_masking_only_in_training(body):
+    smplx_out, tokens, blocks, batch = synthetic(body)
+    refiner = make_refiner(randomize=True, iterative=True, token=ONE_SIDED_TOKEN, frame_mask_p=0.9)
+    torch.nn.init.normal_(refiner.mask_token, std=1.0)
+    plain = make_refiner(randomize=True, iterative=True, token=ONE_SIDED_TOKEN)
+    out_eval = refiner(smplx_out, tokens, blocks, batch, body)
+    out_plain = plain(smplx_out, tokens, blocks, batch, body)
+    assert torch.allclose(out_eval["smplx"]["joints_cam"], out_plain["smplx"]["joints_cam"], atol=1e-6)
+    refiner.train()
+    torch.manual_seed(0)
+    out_train = refiner(smplx_out, tokens, blocks, batch, body)
+    assert (out_train["smplx"]["joints_cam"] - out_eval["smplx"]["joints_cam"]).abs().max() > 1e-4
+    with pytest.raises(ValueError):
+        make_refiner(randomize=False, frame_mask_p=1.0)
+
+
+def test_gravity_loss_supervises_measured_clips_and_reports_both(body):
+    from model.loss.gravity import GravityLoss
+    cfg = base_cfg()
+    cfg["gravity_supervision"].update({"enabled": True, "weight": 2.0, "measured_only": True,
+                                       "layer_weight": 0.5})
+    loss = GravityLoss(cfg, None, "cpu")
+    seq_len, n_clips = 4, 3
+    n = seq_len * n_clips
+    torch.manual_seed(2)
+    gravity = torch.nn.functional.normalize(torch.randn(n_clips, 3), dim=-1)
+    world = torch.nn.functional.normalize(gravity + 0.3 * torch.randn(n_clips, 3), dim=-1)
+    layer0 = torch.nn.functional.normalize(torch.randn(n_clips, 3), dim=-1)
+    expand = lambda v: v[:, None].expand(n_clips, seq_len, 3).reshape(n, 3)
+    measured = torch.tensor([True, False, True]).repeat_interleave(seq_len)
+    batch = {"seq_len": seq_len, "frame_valid": torch.ones(n, dtype=torch.bool),
+             "gravity_world": expand(gravity), "gravity_measured": measured}
+    out = {"gravity": {"world": expand(world).requires_grad_(True), "prior_world": expand(gravity),
+                       "world_layers": [expand(layer0), expand(world)]}}
+    result = loss(out, batch, train=True)
+    assert loss.term_names == ("cos", "cos_layer")
+    cos = (1.0 - (world * gravity).sum(-1))
+    assert torch.allclose(result.terms["cos"].numerator, 2.0 * cos[[0, 2]].sum(), atol=1e-6)
+    assert result.terms["cos"].mass == 2.0
+    layer_cos = (1.0 - (layer0 * gravity).sum(-1))
+    assert torch.allclose(result.terms["cos_layer"].numerator, 0.5 * 2.0 * layer_cos[[0, 2]].sum(), atol=1e-6)
+    assert result.terms["cos_layer"].mass == 2.0
+    metrics = loss.metrics(result.stats)
+    angle = torch.rad2deg(torch.acos((world * gravity).sum(-1).clamp(-1, 1)))
+    assert math.isclose(metrics["angle_measured"], float(angle[[0, 2]].mean()), rel_tol=1e-5)
+    assert math.isclose(metrics["angle_fallback"], float(angle[1]), rel_tol=1e-5)
+    assert metrics["prior_angle_measured"] < 0.1 and metrics["prior_angle_fallback"] < 0.1   # acos at 1 in fp32
+    result.terms["cos"].numerator.backward()
+    assert out["gravity"]["world"].grad.abs().sum() > 0
+
+
+def test_detached_heads_leave_the_trunk_to_the_pose_losses(body):
+    smplx_out, tokens, blocks, batch = synthetic(body)
+    refiner = make_refiner(randomize=True, iterative=True, token=ONE_SIDED_TOKEN,
+                           outputs=ALL_OUTPUTS, camera_context=True, camera_axes=True,
+                           residual_feedback=True, head_grad_scale=0.0)
+    out = refiner(smplx_out, tokens, blocks, batch, body)
+    head_loss = lambda o: (o["contact"]["logits"].square().sum() + o["force"]["forces"].square().sum()
+                           + o["gravity"]["world"].sum())
+    head_loss(out).backward()
+    trunk = [p for n, p in refiner.named_parameters() if n.startswith("temporal.") or n.startswith("input_proj")]
+    assert all(p.grad is None or p.grad.abs().sum() == 0 for p in trunk)
+    # A partial scale passes exactly that fraction of the shared gradient (same values).
+    grads = {}
+    for scale in (1.0, 0.25):
+        half = make_refiner(randomize=True, iterative=True, token=ONE_SIDED_TOKEN,
+                            outputs=ALL_OUTPUTS, camera_context=True, camera_axes=True,
+                            residual_feedback=True, head_grad_scale=scale)
+        o = half(smplx_out, tokens, blocks, batch, body)
+        assert torch.allclose(o["contact"]["logits"], out["contact"]["logits"], atol=1e-6)
+        head_loss(o).backward()
+        grads[scale] = half.input_proj.weight.grad.clone()
+    # Not exactly 0.25x: paths through the fed-back values are scaled twice (s^2).
+    ratio = grads[0.25].norm() / grads[1.0].norm()
+    cosine = (grads[0.25] * grads[1.0]).sum() / (grads[0.25].norm() * grads[1.0].norm())
+    assert 0.2 < float(ratio) < 0.3 and float(cosine) > 0.99
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in refiner.heads["contact"].parameters())
+    refiner.zero_grad()
+    out = refiner(smplx_out, tokens, blocks, batch, body)
+    out["smplx"]["joints_world"].sum().backward()                  # the pose loss still trains the trunk
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in trunk)
+    assert all(p.grad is None or p.grad.abs().sum() == 0 for p in refiner.heads["contact"].parameters())
+
+
+def test_gravity_pooling_votes_with_unit_vectors_and_never_vanishes():
+    n_clips, seq_len = 2, 3
+    valid = torch.ones(n_clips, seq_len, dtype=torch.bool)
+    rot = torch.eye(3).expand(n_clips * seq_len, 3, 3)
+    down = torch.tensor([0.0, 1.0, 0.0]).expand(n_clips * seq_len, 3)
+    delta = torch.zeros(n_clips * seq_len, 3)
+    delta[0] = torch.tensor([10.0, -1.0, 0.0])                     # a huge correction on one frame
+    pooled = TemporalRefiner.pool_gravity(delta, rot, down, n_clips, seq_len, valid)
+    expected = torch.tensor([1.0, 2.0, 0.0]) / 3.0                  # mean of (1,0,0), (0,1,0), (0,1,0)
+    assert torch.allclose(pooled[0], expected / expected.norm(), atol=1e-6)
+    assert torch.allclose(pooled[3], torch.tensor([0.0, 1.0, 0.0]), atol=1e-6)
+    delta = -down.clone()                                            # every vote cancels the axis
+    delta[:seq_len] = torch.tensor([0.0, -2.0, 0.0])                 # (0,1,0) + (0,-2,0) = (0,-1,0)
+    delta[seq_len - 1] = torch.tensor([0.0, 0.0, 0.0])               # ... except one frame: (0,1,0)
+    pooled = TemporalRefiner.pool_gravity(delta, rot, down, n_clips, seq_len, valid)
+    assert torch.allclose(pooled[:seq_len].norm(dim=-1), torch.ones(seq_len), atol=1e-6)
+    assert torch.allclose(pooled[0], torch.tensor([0.0, -1.0, 0.0]), atol=1e-6)  # 2:1 majority survives
+    delta = torch.zeros(n_clips * seq_len, 3)
+    delta[seq_len:] = torch.tensor([0.0, -1.0, 0.0])                 # exactly zero votes: the axis wins
+    pooled = TemporalRefiner.pool_gravity(delta, rot, down, n_clips, seq_len, valid)
+    assert torch.allclose(pooled[seq_len], torch.tensor([0.0, 1.0, 0.0]), atol=1e-6)

@@ -47,10 +47,13 @@ model:
                                       # the lift; needs the depth / bearing or root anchors below instead of `cam`)
     checkpoint: null                  # run checkpoint whose head_smplx weights initialise this head (stage 2: the stage-1 run)
     frozen: false                     # freeze the head: its per-frame body is then a fixed INPUT of the refiner
-  refiner:                            # stage 2 (docs/refiner.md): world-space temporal refiner behind the per-frame model
+  refiner:                            # stage 2 (docs/old/refiner.md): world-space temporal refiner behind the per-frame model
     enabled: false
-    outputs: [pose, contact, motion, force]   # heads to build (subset, >= 1); `contact` / `force` here replace the
-                                      # decoder-level heads; each listed output needs its supervision section enabled
+    outputs: [pose, contact, motion, force]   # heads to build (subset of pose / contact / motion / force / gravity, >= 1);
+                                      # `contact` / `force` here replace the decoder-level heads; each listed output needs
+                                      # its supervision section enabled. Under `iterative` every head reads every layer
+                                      # (deep supervision via the sections' layer_weight) and the contact probabilities /
+                                      # body-frame gravity of layer k are fed back to layer k + 1
     dim: 512                          # token width of the temporal transformer
     num_layers: 4
     num_heads: 8
@@ -89,6 +92,23 @@ model:
                                       # `iterative` only
     camera_context: false             # append the camera seen from the body (pelvis->camera direction in the body frame,
                                       # log depth, crop-box bearing and angular size) to the per-frame token
+    camera_axes: false                # ... plus the camera's down (+y) and viewing (+z) axes in the body frame (6): the
+                                      # camera's tilt relative to the body, the strongest gravity cue that is not the
+                                      # corpus gravity (12 deg median on measured scenes). Needs camera_context; the
+                                      # `gravity` output's prior is the down axis, so that output needs this
+    residual_feedback: false          # after every layer but the last, run BetterRobot's RNEA on the layer's body
+                                      # (detached) with its gated forces applied (live) under its predicted gravity and
+                                      # feed the 6-D root-wrench residual (force in bw, torque about the pelvis in
+                                      # bw*m) back into the token stream. Needs iterative + pose, contact, force and
+                                      # gravity outputs
+    head_grad_scale: 1.0              # factor on the gradient the contact / force / gravity / motion heads (and their
+                                      # fed-back values, and the gravity pooling's body rotation) send into the trunk:
+                                      # 1 = shared trunk, 0 = the heads are probes of a trunk only the pose losses shape
+                                      # (round 8: the shared contact + gravity gradients cost 4 jitter units; a fully
+                                      # detached contact probe lost 0.05 F1)
+    frame_mask_p: 0.0                 # training-time regularisation: each frame's INPUT token (geometry + projected
+                                      # tokens) is replaced by a learned embedding with this probability; the feedback
+                                      # channels and the losses are unchanged (GVHMR-style frame masking)
     pose_token: true                  # feed the frozen pose token (projected to pose_token_dim) into the per-frame token
     pose_token_dim: 256
     contact_token_dim: 64             # per-contact-token projection width (the six tokens are concatenated)
@@ -118,10 +138,17 @@ contact_supervision:                  # confidence-weighted BCE on the six conta
   class_weights: null                 # per-group row multipliers {positive: [6], negative: [6]} in kindyn group order
                                       # (LH, RH, L toe, R toe, L heel, R heel): positive = the false-NEGATIVE penalty,
                                       # negative = the false-POSITIVE penalty (null = uniform BCE)
+  layer_weight: 0.0                   # deep supervision (iterative refiner `contact` output): the BCE repeated on the
+                                      # intermediate layers' logits (`out["contact"]["logits_layers"]`) as `bce_layer`
+                                      # at this weight x `weight`; metrics stay the final layer's
 
 force_supervision:                    # kindyn GT forces (bw units, body-root frame) on in-contact rows
   enabled: false
   confidence: true                    # weight rows by kindyn's per-frame force_confidence
+  layer_weight: 0.0                   # deep supervision (iterative refiner `force` output): the per-limb terms
+                                      # (force / magnitude / direction / noncontact) repeated on the intermediate
+                                      # layers' forces (`out["force"]["forces_layers"]`) as `<term>_layer` at this
+                                      # weight x the term's own; metrics stay the final layer's
   confidence_power: 1.0               # ... raised to this exponent (1 = as is, 0.5 = compressed low tail, 0 = flat)
   loss:
     force: 1.0                        # Huber on the force VECTORS of in-contact rows
@@ -200,7 +227,7 @@ motion_supervision:                   # refiner `motion` output vs kindyn world 
     huber_delta: 1.0
 
 force_consistency:                    # RNEA root-wrench residual of the REFINED motion under the predicted forces
-  enabled: false                      # (22-joint BetterHuman SMPL-X dynamics body, BetterRobot rnea; docs/refiner.md)
+  enabled: false                      # (22-joint BetterHuman SMPL-X dynamics body, BetterRobot rnea; docs/old/refiner.md)
   smooth_sec: 0.0                     # Gaussian sigma (s) on the refined pose before differentiation (0 = off: the refined
                                       # motion is already smoothed at the refiner's input; 0.12 in the round-2 phase 2)
   detach_pose: false                  # true = gradient to the force head only (the retired physics regime)
@@ -215,6 +242,17 @@ contact_consistency:                  # stillness of the REFINED extremities (wr
   enabled: false                      # L1 on their world speed (m/s) weighted by the contact label; gradient -> pose path
   weight: 1.0
   confidence_weights: true            # weight rows by the label confidence (as contact_supervision)
+  stencil: forward                    # speed stencil: forward = |x(t+1) - x(t)| / dt on rows whose next frame is valid
+                                      # (sees a period-2 wobble) | central = (x(t+1) - x(t-1)) / 2 dt (blind to it)
+
+gravity_supervision:                  # the refiner's `gravity` output (one unit down vector per clip) vs the corpus gravity
+  enabled: false
+  weight: 1.0                         # 1 - cos(predicted, corpus) per clip
+  measured_only: true                 # supervise only clips whose corpus gravity was MEASURED (geocalib source `ground`
+                                      # or `geocalib`); a `fallback_down` scene's gravity is the first camera's down axis,
+                                      # not a measurement. Metrics report measured and fallback clips separately either way
+  layer_weight: 0.0                   # deep supervision: the same term on the intermediate layers' estimates
+                                      # (`out["gravity"]["world_layers"]`) as `cos_layer`
 
 gaussian_reference:                   # annealed pull of the REFINED body toward the Gaussian of the refiner's own
   enabled: false                      # INPUT (the fixed round-4 kernel): a starting basin for a free pose head trained
@@ -248,6 +286,6 @@ output:
   save_freq: 5                        # extra epoch_XXXX.pth every N epochs (0 = off); last.pth is rolling
   eval_every: 1                       # evaluate (and update best.pth) every N epochs; the final epoch always evaluates
   monitor: metric_contact/f1          # loss_test/total or metric_<group>/<name>;
-                                      # *f1|*iou|*precision|*recall -> max; *err*|*loss|*mpjpe|*pve|*accel|*jitter|... -> min
+                                      # *f1|*iou|*precision|*recall -> max; *err*|*loss|*mpjpe|*pve|*accel|*jitter|*angle*|... -> min
   frozen_metrics: null                # json of frozen-baseline metrics (scripts/eval_frozen_smplx.py)
                                       # drawn as the `frozen` tensorboard run next to the live ones

@@ -151,7 +151,9 @@ def _gt_contacts_forces(corpus: Path, scene: str, object_ids: np.ndarray, n: int
     except (FileNotFoundError, ValueError, KeyError) as exc:
         print(f"[viewer] {scene}: no manual contact labels ({exc})", flush=True)
     try:
-        kd = kindyn_io.load_forces(scene, human_dir, object_ids, n)         # bw, GT root frame
+        kd = kindyn_io.load_forces(                                         # bw, GT root frame
+            scene, human_dir, object_ids, n,
+            gravity_path=scene_io.gravity_path(corpus, scene))
         raw = np.load(human_dir / "kindyn_1.npz", allow_pickle=True)
         q = scene_io.rows_by_object_id(np.asarray(raw["q"], np.float32), np.asarray(raw["object_ids"]),
                                        object_ids, scene, "kindyn")

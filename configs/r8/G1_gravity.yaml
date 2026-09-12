@@ -1,0 +1,12 @@
+# Round 8 arm G1 (docs/round8_plan.md): G0 + the camera's axes in the token + the gravity head
+# (a body-frame correction on the camera's down axis, unit votes pooled per clip), supervised on
+# the scenes whose corpus gravity was MEASURED (ground / geocalib), deep-supervised like the pose.
+# Weight 5: at 1.0 the term (1 - cos 13 deg = 0.026 per clip) was invisible next to the pose
+# terms and the head did not move in three epochs (first launch, 2026-09-12 11:38, killed).
+base: configs/r8/G0_nograv.yaml
+model:
+  refiner:
+    outputs: [pose, gravity]
+    camera_axes: true
+gravity_supervision: {enabled: true, weight: 5.0, measured_only: true, layer_weight: 0.5}
+output: {exp_name: G1_gravity}

@@ -1,0 +1,7 @@
+# Round 8 arm F2m: F2 with head_grad_scale 0.3 — the middle of the coupling trade-off (1.0: best forces,
+# jitter 7.7; 0.1: jitter 4.9, force MAE +0.010).
+base: configs/r8/F2_rnealoss.yaml
+model:
+  refiner:
+    head_grad_scale: 0.3
+output: {exp_name: F2m_scale03}

@@ -1,5 +1,5 @@
 # Final model + the RNEA root-wrench residual on the (fixed) body as a force regulariser: round 4 measured the
-# residual worth ~1 deg of force direction at the price of twice the off-contact force (docs/refiner.md).
+# residual worth ~1 deg of force direction at the price of twice the off-contact force (docs/old/refiner.md).
 base: configs/final.yaml
 force_consistency: {enabled: true, smooth_sec: 0.0, loss: {force: 5.0, torque: 25.0}}
 output: {exp_name: final_rnea}

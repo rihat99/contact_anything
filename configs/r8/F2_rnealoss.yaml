@@ -1,0 +1,4 @@
+# Round 8 arm F2: F0 + the RNEA residual LOSS (round-4 force_consistency), no feedback.
+base: configs/r8/F0_force.yaml
+force_consistency: {enabled: true}
+output: {exp_name: F2_rnealoss}

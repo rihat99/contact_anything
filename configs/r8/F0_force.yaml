@@ -1,0 +1,10 @@
+# Round 8 arm F0: C2 + the force head (six body-frame forces per frame, read after every layer,
+# deep-supervised; the round-5 vector Huber + noncontact L1 with kindyn confidence).
+base: configs/r8/C2_still.yaml
+model:
+  refiner:
+    outputs: [pose, gravity, contact, force]
+force_supervision:
+  enabled: true
+  layer_weight: 0.5
+output: {exp_name: F0_force}

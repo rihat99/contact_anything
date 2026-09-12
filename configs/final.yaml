@@ -1,4 +1,4 @@
-# Final model (2026-09-08), the recipe round 5 measured best (docs/architecture_2.md, docs/round5_2026-09-07.md):
+# Final model (2026-09-08), the recipe round 5 measured best (docs/old/architecture_2.md, docs/old/round5_2026-09-07.md):
 #   frozen stage-1 body + fixed Gaussian in the world (root 0.10 s, rotations 0.08 s) = THE body (no pose head:
 #   every learned pose correction measured worse than the Gaussian alone), the token channels (gravity, local
 #   rotations, raw - local mean: force MAE 0.192 -> 0.183), the round-4 temporal block (window 0.5 s x 3 layers),
