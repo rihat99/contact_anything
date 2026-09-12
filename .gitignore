@@ -123,7 +123,8 @@ sandbox*
 
 images
 *output/
-output_2/
+*output_2/
+output_3/
 inference_samples
 dataset/damon_mhr_contact
 reference/

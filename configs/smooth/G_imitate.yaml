@@ -1,0 +1,10 @@
+# Arm G (imitation check, gpt-6-astra's suggestion): can the block reproduce the Gaussian body at
+# all? The reference is the ONLY effective loss (weight 1 throughout; the smplx section keeps one
+# negligible term because the loss refuses an all-zero section), 10 epochs. The distance to the
+# reference (metric_gaussian_reference/root_mm, rot_deg, joints_deg) is the whole result.
+base: configs/smooth/base_smooth.yaml
+smplx_supervision: {loss: {kp3d: 0.0, pose: 0.0, orient: 1.0e-6, root_bias: 0.0, root_shape: 0.0}}
+motion_supervision: {enabled: false}
+gaussian_reference: {enabled: true, anneal_start: 1.0, anneal_end: 1.0}
+optim: {epochs: 10}
+output: {exp_name: G_imitate}

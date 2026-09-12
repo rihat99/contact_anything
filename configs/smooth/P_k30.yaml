@@ -1,0 +1,6 @@
+# Arm P: K on a 30-epoch cosine. Every iterative arm reaches its jitter minimum around epoch 20-25
+# of the 60-epoch schedule and then drifts up 1-2 units with MPJPE +0.1-0.2 mm (train overfit
+# under the decayed lr). Does the half-length schedule reach the same minimum at half the cost?
+base: configs/smooth/K_iterdeep.yaml
+optim: {epochs: 30}
+output: {exp_name: P_k30}

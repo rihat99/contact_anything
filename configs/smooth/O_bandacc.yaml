@@ -1,0 +1,12 @@
+# Arm O (acceleration for the force model, without the shrink trap): K + band-limited acceleration
+# matching (`pose_ss_acc` / `pose_ss_ang_acc`): the refined trajectory and the GT are BOTH smoothed
+# with the 0.12 s eval Gaussian before the second difference, so the loss asks for the predictable
+# band only. Arm N (all targets smoothed, prediction raw) shrank the velocity to 0.65 of the GT
+# and over-smoothed (jitter 3.2, MPJPE 56.1) — a smoothed velocity target teaches a smoothed
+# velocity; here the raw pose_vel term keeps the full-band velocity. Scales for acc / ang_acc
+# are the smoothed-target ones (base), the velocity scale stays the raw one.
+base: configs/smooth/K_iterdeep.yaml
+motion_supervision:
+  scale: {vel: 0.4, acc: 1.2, ang_vel: 0.57, ang_acc: 1.8}
+  loss: {pose_ss_acc: 0.1, pose_ss_ang_acc: 0.25}
+output: {exp_name: O_bandacc}

@@ -1,0 +1,3 @@
+# Arm A: the round's recipe as it stands — forward stencils, one-sided token rates, no reference.
+base: configs/smooth/base_smooth.yaml
+output: {exp_name: A_fwd}

@@ -1,0 +1,49 @@
+# Learned temporal smoothing (2026-09-11): the refiner's temporal block must produce the smooth
+# body ITSELF. The fixed input Gaussians are off (root_smooth_sec / pose_smooth_sec 0), the pose
+# offset head is the only output, contact and force are off, and the derivative losses use the
+# one-sided `forward` stencil on both sides — a central first difference has exactly zero response
+# to the period-2 wobble the lifted-jitter metric weighs most, so it cannot see (or fix) it. The
+# token's root rates are one-sided for the same reason. Arms: A_fwd (this), B_gaussref, C_rawmean.
+base: configs/base.yaml
+model:
+  decoder_checkpointing: true
+  contact: {enabled: false}                # no decoder contact tokens (and none for the refiner)
+  smplx: {enabled: true, hands: true, checkpoint: output/stage1_20260905_180319/best.pth, frozen: true}
+  refiner:
+    enabled: true
+    outputs: [pose]                        # the pose offset head is the whole model this round
+    num_layers: 3
+    root_smooth_sec: 0.0                   # no input smoothing: the block has to do it
+    pose_smooth_sec: 0.0
+    token: {local_rotations: true, gravity: true, raw_minus_mean: false, one_sided_velocity: true}
+    camera_context: true
+data:
+  pose_token_cache: true                   # frozen FINAL pose tokens from features/pose_token (no image, no decoder)
+  frames_per_batch: 480                    # 8 x 60-frame clips per GPU
+  interleave_videos: true
+  eval_max_frames: 120
+contact_supervision: {enabled: false}
+smplx_supervision:                         # the per-frame body is frozen; these score / anchor the refined one
+  enabled: true
+  loss: {kp2d: 0.0, kp3d: 10.0, pose: 2.0, orient: 1.0, betas: 0.0, cam: 0.0, root_bias: 2.0, root_shape: 2.0}
+motion_supervision:
+  enabled: true
+  stencil: forward
+  label_smooth_sec: 0.0                    # the target is the RAW kindyn trajectory
+  scale: {vel: 0.4, acc: 1.2, ang_vel: 0.57, ang_acc: 1.8}
+  loss:                                    # no motion head this round: only the pose derivatives
+    vel: 0.0
+    acc: 0.0
+    ang_vel: 0.0
+    ang_acc: 0.0
+    pose_vel: 1.0
+    pose_acc: 0.2
+    pose_ang_vel: 1.0
+    pose_ang_acc: 0.5
+optim: {lr: 3.0e-4, weight_decay: 0.01, epochs: 60, accumulate_steps: 1, warmup_steps: 300, lr_min: 1.0e-6, ema: 0.999}
+output:
+  dir: ./output_3
+  exp_name: smooth
+  monitor: metric_pose/lifted_jitter
+  eval_every: 1
+  frozen_metrics: output/round3_refiner_eval.json   # the round-3 refiner's eval.json as the tensorboard reference line

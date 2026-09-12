@@ -1,0 +1,9 @@
+# Arm K: I + deep supervision of the intermediate layers (`layer_weight`). In I only the last
+# layer's trajectory is in the loss, so nothing asks layer 1 for a BETTER trajectory — only the
+# composition is scored. Here every pose_* velocity term and the body terms (kp3d / orient /
+# pose / root_bias / root_shape) are also evaluated on the intermediate trajectories at half
+# weight, which is what makes a cascade a cascade.
+base: configs/smooth/I_iter.yaml
+smplx_supervision: {layer_weight: 0.5}
+motion_supervision: {layer_weight: 0.5}
+output: {exp_name: K_iterdeep}

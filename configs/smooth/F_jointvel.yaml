@@ -1,0 +1,8 @@
+# Arm F: D + per-joint one-sided angular rates in the token (`token.joint_velocity`). In D the
+# root (whose token carries its one-sided rates) reached jitter 14 within epochs while the
+# articulation (whose token carries only absolute per-frame rotations) stalled near 30 and
+# slowly shrank: the block can sum neighbours' rates but has to SUBTRACT its own absolute value
+# to filter an absolute channel.
+base: configs/smooth/D_velonly.yaml
+model: {refiner: {token: {joint_velocity: true}}}
+output: {exp_name: F_jointvel}

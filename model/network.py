@@ -59,7 +59,8 @@ class ContactAnything(nn.Module):
     :param refiner: :class:`~model.refiner.TemporalRefiner` config or ``None``
         — ``{outputs, dim, num_layers, num_heads, mlp_ratio, dropout, window,
         time_scale, root_smooth_sec, pose_smooth_sec, learn_smoothing, token,
-        camera_context, pose_token, pose_token_dim, contact_token_dim}``; needs ``smplx``.
+        iterative, feedback_delta, camera_context, pose_token, pose_token_dim,
+        contact_token_dim}``; needs ``smplx``.
     """
 
     def __init__(
@@ -138,6 +139,8 @@ class ContactAnything(nn.Module):
                 pose_smooth_sec=float(refiner["pose_smooth_sec"]),
                 learn_smoothing=bool(refiner["learn_smoothing"]),
                 token=dict(refiner["token"]),
+                iterative=bool(refiner["iterative"]),
+                feedback_delta=bool(refiner["feedback_delta"]),
                 camera_context=bool(refiner["camera_context"]),
                 pose_token=bool(refiner["pose_token"]),
                 pose_token_dim=int(refiner["pose_token_dim"]),

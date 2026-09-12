@@ -8,6 +8,11 @@
   right-multiplied by the inverse transform) leaves EVERY camera-frame and
   body-frame output identical, and moves the world outputs rigidly;
 * gradients reach the contact tokens and the pose token;
+* iterative refinement: a correction per layer, the per-layer world joints, and
+  gradients into the zero-init feedback projection (with and without the
+  cumulative-delta feedback channels);
+* deep supervision: the motion / SMPL-X ``layer_weight`` terms repeat the body's
+  own terms on the intermediate layers, pooled, with mass = rows x layers;
 * pose smoothing: the polar projection matches the Procrustes one, a constant
   trajectory is a fixed point, and frame independence survives the camera
   context features;
@@ -18,6 +23,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import roma
@@ -25,8 +31,15 @@ import torch
 import yaml
 
 from data.loaders import VideoInterleavedSampler
-from model.refiner import (TemporalRefiner, angular_velocity, gaussian_smooth, project_rotation,
-                           smooth_rotations, time_derivative)
+from model.loss.motion import MotionLoss
+from model.loss.reference import GaussianReferenceLoss
+from model.loss.smplx import SmplxLoss
+from model.refiner import (TemporalRefiner, angular_velocity, backward_angular_velocity,
+                           backward_difference, forward_angular_velocity, forward_difference,
+                           forward_valid, gaussian_smooth, project_rotation, smooth_rotations,
+                           time_derivative)
+from torch import Tensor
+
 from utils.geometry import smplx_q
 
 REPO = Path(__file__).resolve().parents[1]
@@ -83,17 +96,19 @@ def synthetic(body, n_clips: int = 2, seq_len: int = 12, seed: int = 0):
 
 
 ALL_TOKEN = {"local_rotations": True, "gravity": True, "raw_minus_mean": True}
+ONE_SIDED_TOKEN = {**ALL_TOKEN, "one_sided_velocity": True, "joint_velocity": True}
 
 
 def make_refiner(randomize: bool, root_smooth_sec: float = 0.0, pose_smooth_sec: float = 0.0,
                  camera_context: bool = False, learn_smoothing: bool = False,
-                 token: dict | None = None) -> TemporalRefiner:
+                 token: dict | None = None, iterative: bool = False,
+                 feedback_delta: bool = False) -> TemporalRefiner:
     torch.manual_seed(1)
     refiner = TemporalRefiner(DECODER_DIM, ("pose", "contact", "motion", "force"),
                               num_contact_tokens=6, dim=64, num_layers=2, num_heads=4,
                               window=0.5, root_smooth_sec=root_smooth_sec,
                               pose_smooth_sec=pose_smooth_sec, learn_smoothing=learn_smoothing,
-                              token=token,
+                              token=token, iterative=iterative, feedback_delta=feedback_delta,
                               camera_context=camera_context, dropout=0.0)
     if randomize:
         for head in refiner.heads.values():
@@ -101,6 +116,8 @@ def make_refiner(randomize: bool, root_smooth_sec: float = 0.0, pose_smooth_sec:
         for block in refiner.temporal.blocks:
             torch.nn.init.normal_(block.proj.weight, std=0.02)
             torch.nn.init.normal_(block.ffn[3].weight, std=0.02)
+        if refiner.feedback_proj is not None:
+            torch.nn.init.normal_(refiner.feedback_proj.weight, std=0.02)
     return refiner.eval()
 
 
@@ -130,6 +147,41 @@ def test_time_derivative_of_linear_series_is_the_slope():
     assert torch.allclose(d[0, [3, 5]], torch.full((2, 1), 3.0), atol=1e-4)
 
 
+def test_forward_difference_of_linear_series_is_the_slope():
+    seconds = torch.arange(8, dtype=torch.float32)[None] * 0.04
+    valid = torch.ones(1, 8, dtype=torch.bool)
+    x = 3.0 * seconds[..., None] + 1.0
+    forward = forward_difference(x, seconds, valid)
+    assert torch.allclose(forward[0, :-1], torch.full((7, 1), 3.0), atol=1e-4)
+    assert torch.count_nonzero(forward[0, -1]) == 0            # the last frame has no successor
+    assert forward_valid(valid).tolist() == [[True] * 7 + [False]]
+    backward = backward_difference(x, seconds, valid)
+    assert torch.allclose(backward[0, 1:], torch.full((7, 1), 3.0), atol=1e-4)
+    assert torch.count_nonzero(backward[0, 0]) == 0
+    # The point of the stencil: a period-2 alternation is invisible to the central difference.
+    alternating = torch.tensor([0.0, 1.0] * 4)[None, :, None]
+    assert torch.count_nonzero(time_derivative(alternating, seconds, valid)[0, 1:-1]) == 0
+    assert (forward_difference(alternating, seconds, valid)[0, :-1].abs() > 1.0).all()
+    valid[0, 4] = False                                        # a hole: both steps across it die
+    forward = forward_difference(x, seconds, valid)
+    assert torch.count_nonzero(forward[0, 3]) == 0 and torch.count_nonzero(forward[0, 4]) == 0
+    assert torch.allclose(forward[0, 5], torch.full((1,), 3.0), atol=1e-4)
+    assert forward_valid(valid).tolist() == [[True, True, True, False, False, True, True, False]]
+
+
+def test_one_sided_angular_velocity_of_constant_rate_rotation():
+    rate = torch.tensor([0.0, 0.0, 2.0])
+    seconds = torch.arange(6, dtype=torch.float32)[None] * 0.04
+    valid = torch.ones(1, 6, dtype=torch.bool)
+    rot = (roma.random_rotmat(1) @ roma.rotvec_to_rotmat(rate * seconds[0, :, None]))[None]
+    forward = forward_angular_velocity(rot, seconds, valid)
+    backward = backward_angular_velocity(rot, seconds, valid)
+    assert torch.allclose(forward[0, :-1], rate.expand(5, 3), atol=1e-4)
+    assert torch.count_nonzero(forward[0, -1]) == 0
+    assert torch.allclose(backward[0, 1:], rate.expand(5, 3), atol=1e-4)
+    assert torch.count_nonzero(backward[0, 0]) == 0
+
+
 def test_angular_velocity_of_constant_rate_rotation():
     rate = torch.tensor([0.0, 0.0, 2.0])             # rad/s about the body z axis
     seconds = torch.arange(6, dtype=torch.float32)[None] * 0.04
@@ -141,9 +193,16 @@ def test_angular_velocity_of_constant_rate_rotation():
 
 # ------------------------------------------------------------------ the module
 
-def test_identity_at_init(body):
+@pytest.mark.parametrize("iterative, token, feedback_delta", [
+    (False, None, False), (True, ONE_SIDED_TOKEN, False), (True, ONE_SIDED_TOKEN, True)])
+def test_identity_at_init(body, iterative, token, feedback_delta):
     smplx_out, tokens, blocks, batch = synthetic(body)
-    out = make_refiner(randomize=False)(smplx_out, tokens, blocks, batch, body)
+    refiner = make_refiner(randomize=False, iterative=iterative, token=token,
+                           feedback_delta=feedback_delta)
+    out = refiner(smplx_out, tokens, blocks, batch, body)
+    layers = out["smplx"]["joints_world_layers"]
+    assert len(layers) == (refiner.temporal.num_layers if iterative else 1)
+    assert layers[-1] is out["smplx"]["joints_world"]
     assert torch.allclose(out["smplx"]["joints_cam"], smplx_out["joints_cam"], atol=1e-4)
     assert torch.allclose(out["smplx"]["pelvis_cam"], smplx_out["pelvis_cam"], atol=1e-5)
     assert torch.allclose(out["smplx"]["root_rot"], smplx_out["root_rot"], atol=1e-5)
@@ -154,12 +213,17 @@ def test_identity_at_init(body):
     assert all(torch.count_nonzero(out["motion"][k]) == 0 for k in ("vel", "acc", "ang_vel", "ang_acc"))
 
 
-@pytest.mark.parametrize("camera_context, token", [
-    (False, None), (True, None), (True, ALL_TOKEN), (False, ALL_TOKEN)])
-def test_world_frame_independence(body, camera_context, token):
+@pytest.mark.parametrize("camera_context, token, iterative, feedback_delta", [
+    (False, None, False, False), (True, None, False, False), (True, ALL_TOKEN, False, False),
+    (False, ALL_TOKEN, False, False), (True, ONE_SIDED_TOKEN, False, False),
+    (False, ONE_SIDED_TOKEN, False, False), (True, ONE_SIDED_TOKEN, True, False),
+    (False, ONE_SIDED_TOKEN, True, False), (True, ONE_SIDED_TOKEN, True, True),
+    (False, ONE_SIDED_TOKEN, True, True)])
+def test_world_frame_independence(body, camera_context, token, iterative, feedback_delta):
     smplx_out, tokens, blocks, batch = synthetic(body)
     refiner = make_refiner(randomize=True, root_smooth_sec=0.2, pose_smooth_sec=0.08,
-                           camera_context=camera_context, token=token)
+                           camera_context=camera_context, token=token, iterative=iterative,
+                           feedback_delta=feedback_delta)
     out = refiner(smplx_out, tokens, blocks, batch, body)
     assert torch.count_nonzero(out["contact"]["logits"]) > 0      # the heads are live
     assert (out["smplx"]["joints_cam"] - smplx_out["joints_cam"]).abs().max() > 1e-4
@@ -221,6 +285,27 @@ def test_gradients_reach_the_tokens(body):
     assert grad is not None and torch.isfinite(grad).all()
     assert grad[:, 1:].abs().sum() > 0 and grad[:, 0].abs().sum() > 0
     assert all(p.grad is not None for p in refiner.heads["pose"].parameters())
+
+
+def test_iterative_feedback_is_live_and_gets_gradients(body):
+    """Every layer corrects the trajectory and the feedback projection is on the loss path."""
+    smplx_out, tokens, blocks, batch = synthetic(body)
+    refiner = make_refiner(randomize=True, iterative=True, token=ONE_SIDED_TOKEN)
+    torch.nn.init.constant_(refiner.heads["pose"][2].bias, 1e-3)   # a non-zero first correction
+    out = refiner(smplx_out, tokens, blocks, batch, body)
+    layers = out["smplx"]["joints_world_layers"]
+    assert len(layers) == refiner.temporal.num_layers == 2
+    assert torch.equal(layers[-1], out["smplx"]["joints_world"])
+    assert (layers[0] - layers[1]).abs().max() > 1e-5              # the second layer moves it too
+
+    out["smplx"]["joints_world"].sum().backward()
+    for name, param in refiner.feedback_proj.named_parameters():
+        assert param.grad is not None and torch.isfinite(param.grad).all()
+        assert param.grad.abs().sum() > 0, name
+    with pytest.raises(ValueError):                                # the fed-back channels must be on
+        make_refiner(randomize=False, iterative=True, token=ALL_TOKEN)
+    with pytest.raises(ValueError):                                # ... and the delta needs them too
+        make_refiner(randomize=False, iterative=False, token=ONE_SIDED_TOKEN, feedback_delta=True)
 
 
 def test_polar_projection_matches_procrustes():
@@ -314,3 +399,231 @@ def test_learnable_smoothing_starts_at_the_config_widths_and_gets_gradients(body
     with pytest.raises(ValueError):
         make_refiner(randomize=False, root_smooth_sec=0.0, pose_smooth_sec=0.08, learn_smoothing=True)
 
+
+
+# ------------------------------------------------------------------ the new loss terms
+
+def world_series(n_clips: int = 2, seq_len: int = 16, seed: int = 0):
+    """World-space random-walk pose series in the refiner's output layout (no body model)."""
+    torch.manual_seed(seed)
+    n = n_clips * seq_len
+    pelvis = torch.cumsum(0.02 * torch.randn(n_clips, seq_len, 3), dim=1).reshape(n, 3)
+    root = roma.rotvec_to_rotmat(
+        torch.cumsum(0.05 * torch.randn(n_clips, seq_len, 3), dim=1).reshape(n, 3))
+    body = roma.rotvec_to_rotmat(
+        torch.cumsum(0.05 * torch.randn(n_clips, seq_len, 21, 3), dim=1).reshape(n, 21, 3))
+    batch = {"seq_len": seq_len,
+             "frame_pos_sec": (torch.arange(seq_len, dtype=torch.float32) / 25.0).repeat(n_clips),
+             "frame_valid": torch.ones(n, dtype=torch.bool)}
+    return pelvis, root, body, batch
+
+
+def base_cfg() -> dict:
+    return yaml.safe_load((REPO / "configs" / "base.yaml").read_text())
+
+
+def test_gaussian_reference_is_zero_on_its_own_reference_and_anneals():
+    cfg = base_cfg()
+    cfg["gaussian_reference"]["enabled"] = True
+    loss = GaussianReferenceLoss(cfg, None, "cpu")
+    pelvis, root, body, batch = world_series()
+    inputs = {"pelvis_world_in": pelvis, "root_rot_world_in": root, "body_rot_in": body}
+    p_ref, r_ref, b_ref = loss.reference(inputs, batch)
+
+    on_reference = loss({"smplx": {**inputs, "pelvis_world": p_ref, "root_rot_world": r_ref,
+                                   "body_rot": b_ref}}, batch, train=True)
+    assert all(float(t.numerator) / t.mass < 1e-5 for t in on_reference.terms.values())
+    metrics = loss.metrics(on_reference.stats)
+    assert max(metrics["root_mm"], metrics["rot_deg"], metrics["joints_deg"]) < 1e-3
+    assert metrics["weight"] == 1.0
+
+    # The RAW body is at a distance, and the schedule — not the distance — scales the terms.
+    raw = {"smplx": {**inputs, "pelvis_world": pelvis, "root_rot_world": root, "body_rot": body}}
+    results = {}
+    for progress in (0.0, 0.45, 1.0):
+        loss.progress = progress
+        results[progress] = loss(raw, batch, train=True)
+    assert loss.current_weight() == 0.0
+    for term in loss.term_names:
+        full = float(results[0.0].terms[term].numerator)
+        assert full > 0.0
+        assert math.isclose(float(results[0.45].terms[term].numerator), 0.5 * full, rel_tol=1e-5)
+        assert float(results[1.0].terms[term].numerator) == 0.0
+    assert loss.metrics(results[1.0].stats)["weight"] == 0.0
+    assert math.isclose(loss.metrics(results[1.0].stats)["root_mm"],
+                        loss.metrics(results[0.0].stats)["root_mm"], rel_tol=1e-9)
+    assert loss.metrics(results[0.0].stats)["root_mm"] > 1.0      # mm away from the Gaussian
+
+
+def test_motion_loss_runs_without_a_motion_head():
+    cfg = base_cfg()
+    cfg["motion_supervision"].update(enabled=True, stencil="forward", label_smooth_sec=0.0)
+    cfg["motion_supervision"]["loss"].update(vel=0.0, acc=0.0, ang_vel=0.0, ang_acc=0.0,
+                                             pose_vel=1.0, pose_acc=0.2, pose_ang_vel=1.0,
+                                             pose_ang_acc=0.5)
+    loss = MotionLoss(cfg, None, "cpu")
+    assert loss.term_names == ("pose_vel", "pose_acc", "pose_ang_vel", "pose_ang_acc")
+
+    _, root, _, batch = world_series(seed=2)
+    n = root.shape[0]
+    joints = (0.3 * torch.randn(n, 22, 3)).requires_grad_(True)
+    batch = {**batch, "smplx_valid": torch.ones(n, dtype=torch.bool),
+             "smplx_joints_world": 0.3 * torch.randn(n, 22, 3),
+             "smplx_root_rot": roma.random_rotmat(n)}
+    result = loss({"motion": None, "smplx": {"joints_world": joints, "root_rot_world": root}},
+                  batch, train=True)
+    assert set(result.terms) == set(loss.term_names)
+    assert all(t.mass > 0 and torch.isfinite(t.numerator) for t in result.terms.values())
+    sum(t.numerator for t in result.terms.values()).backward()
+    assert joints.grad is not None and torch.isfinite(joints.grad).all() and joints.grad.abs().sum() > 0
+    assert set(loss.metrics(result.stats)) == {
+        f"{src}_{q}_{s}" for src in ("pose", "pose_s", "pose_ss") for q in ("vel", "acc", "ang_vel", "ang_acc")
+        for s in ("rmse", "pearson", "amp_ratio")}
+
+
+def test_motion_rms_terms_match_amplitude_not_value():
+    cfg = base_cfg()
+    cfg["motion_supervision"].update(enabled=True, stencil="forward", label_smooth_sec=0.0)
+    cfg["motion_supervision"]["loss"].update(vel=0.0, acc=0.0, ang_vel=0.0, ang_acc=0.0,
+                                             pose_vel=0.0, pose_acc=0.0, pose_ang_vel=0.0,
+                                             pose_ang_acc=0.0, pose_acc_rms=1.0, pose_ang_acc_rms=1.0)
+    loss = MotionLoss(cfg, None, "cpu")
+    assert loss.term_names == ("pose_acc_rms", "pose_ang_acc_rms")
+    _, root, _, batch = world_series(seed=3)
+    n = root.shape[0]
+    gt = 0.3 * torch.randn(n, 22, 3)
+    batch = {**batch, "smplx_valid": torch.ones(n, dtype=torch.bool),
+             "smplx_joints_world": gt, "smplx_root_rot": root.clone()}
+    # The same trajectory reversed in time within each clip has the same acceleration
+    # amplitude but different per-frame values: the RMS terms must be ~0 on it.
+    seq_len = int(batch["seq_len"])
+    flipped = gt.view(-1, seq_len, 22, 3).flip(1).reshape(n, 22, 3)
+    root_flipped = root.view(-1, seq_len, 3, 3).flip(1).reshape(n, 3, 3)
+    same = loss({"motion": None, "smplx": {"joints_world": gt.clone(), "root_rot_world": root.clone()}},
+                batch, train=True)
+    flip = loss({"motion": None, "smplx": {"joints_world": flipped, "root_rot_world": root_flipped}},
+                batch, train=True)
+    for term in loss.term_names:
+        assert same.terms[term].mass > 0
+        assert float(same.terms[term].numerator) < 1e-6
+        assert float(flip.terms[term].numerator) / flip.terms[term].mass < 1e-3
+    # Halving the trajectory halves its acceleration amplitude: a clearly positive term with
+    # a gradient that pushes the amplitude UP (towards the GT), never down.
+    half = (0.5 * gt).requires_grad_(True)
+    res = loss({"motion": None, "smplx": {"joints_world": half, "root_rot_world": root.clone()}},
+               batch, train=True)
+    assert float(res.terms["pose_acc_rms"].numerator) / res.terms["pose_acc_rms"].mass > 0.05
+    res.terms["pose_acc_rms"].numerator.backward()
+    assert float((half.grad * gt).sum()) < 0.0            # descent direction grows the amplitude
+
+
+# ------------------------------------------------------------------ deep supervision
+
+def gt_keys(batch: dict, joints_world: Tensor, seed: int = 11) -> dict:
+    """The kindyn GT keys the SMPL-X / motion losses read, around a world trajectory."""
+    torch.manual_seed(seed)
+    n = joints_world.shape[0]
+    return {**batch,
+            "smplx_joints_world": joints_world + 0.02 * torch.randn_like(joints_world),
+            "smplx_root_rot": roma.random_rotmat(n),
+            "smplx_body_rot": roma.rotvec_to_rotmat(0.3 * torch.randn(n, 21, 3)),
+            "smplx_hand_rot": roma.rotvec_to_rotmat(0.2 * torch.randn(n, 30, 3)),
+            "smplx_betas": torch.zeros(n, 10),
+            "smplx_valid": torch.ones(n, dtype=torch.bool)}
+
+
+def test_motion_layer_terms_pool_the_intermediate_layers():
+    cfg = base_cfg()
+    cfg["motion_supervision"].update(enabled=True, stencil="forward", label_smooth_sec=0.0,
+                                     layer_weight=0.5)
+    cfg["motion_supervision"]["loss"].update(vel=0.0, acc=0.0, ang_vel=0.0, ang_acc=0.0,
+                                             pose_vel=1.0, pose_acc=0.0, pose_ang_vel=1.0,
+                                             pose_ang_acc=0.0)
+    loss = MotionLoss(cfg, None, "cpu")
+    assert loss.term_names == ("pose_vel", "pose_ang_vel", "pose_vel_layer", "pose_ang_vel_layer")
+
+    _, root, _, batch = world_series(seed=5)
+    n = root.shape[0]
+    joints = 0.3 * torch.randn(n, 22, 3)
+    batch = {**batch, "smplx_valid": torch.ones(n, dtype=torch.bool),
+             "smplx_joints_world": 0.3 * torch.randn(n, 22, 3), "smplx_root_rot": root.clone()}
+
+    def run(layer_joints):
+        return loss({"motion": None,
+                     "smplx": {"joints_world": joints, "root_rot_world": root,
+                               "joints_world_layers": layer_joints + [joints],
+                               "root_rot_world_layers": [root] * (len(layer_joints) + 1)}},
+                    batch, train=True)
+
+    # Two intermediate layers, both equal to the final trajectory: the pooled layer term is
+    # the final term at `layer_weight`, over twice the mass.
+    result = run([joints, joints])
+    assert set(result.terms) == set(loss.term_names)
+    for quantity in ("vel", "ang_vel"):
+        base, layer = result.terms[f"pose_{quantity}"], result.terms[f"pose_{quantity}_layer"]
+        assert base.mass > 0
+        assert layer.mass == pytest.approx(2.0 * base.mass)
+        assert float(layer.numerator) == pytest.approx(1.0 * float(base.numerator), rel=1e-6)
+        assert (float(layer.numerator) / layer.mass
+                == pytest.approx(0.5 * float(base.numerator) / base.mass, rel=1e-6))
+    # A different intermediate trajectory moves the layer term and leaves the final one.
+    moved = run([joints + 0.05 * torch.randn_like(joints), joints])
+    assert float(moved.terms["pose_vel"].numerator) == pytest.approx(
+        float(result.terms["pose_vel"].numerator), rel=1e-6)
+    assert float(moved.terms["pose_vel_layer"].numerator) > float(
+        result.terms["pose_vel_layer"].numerator)
+    # The amplitude terms get their own layer twin.
+    cfg["motion_supervision"]["loss"].update(pose_acc_rms=1.0)
+    assert MotionLoss(cfg, None, "cpu").term_names[-3:] == (
+        "pose_vel_layer", "pose_ang_vel_layer", "pose_acc_rms_layer")
+
+
+def test_smplx_layer_terms_repeat_the_body_terms(body):
+    smplx_out, tokens, blocks, batch = synthetic(body)
+    refiner = make_refiner(randomize=True, iterative=True, token=ONE_SIDED_TOKEN)
+    pred = refiner(smplx_out, tokens, blocks, batch, body)["smplx"]
+    batch = gt_keys(batch, pred["joints_world"].detach())
+
+    cfg = base_cfg()
+    cfg["smplx_supervision"].update(enabled=True, layer_weight=0.5)
+    cfg["smplx_supervision"]["loss"].update(kp2d=0.0, kp3d=5.0, orient=1.0, pose=1.0,
+                                            betas=0.0, cam=0.0, root_bias=2.0, root_shape=2.0)
+    stub = SimpleNamespace(
+        head_smplx=SimpleNamespace(hands=True, num_joints=pred["joints_cam"].shape[1],
+                                   camera="ray"),
+        refiner=refiner)
+    loss = SmplxLoss(cfg, stub, "cpu")
+    assert loss.layer_terms == ("kp3d", "orient", "pose", "root_bias", "root_shape")
+
+    # Three layers, the two intermediate ones equal to the final body.
+    for key in ("joints_cam", "root_6d", "body_6d", "pelvis_world"):
+        pred[f"{key}_layers"] = [pred[key]] * 3
+    result = loss({"smplx": pred}, batch, train=True)
+    assert set(result.terms) == set(loss.term_names)
+    for name in loss.layer_terms:
+        base, layer = result.terms[name], result.terms[f"{name}_layer"]
+        assert base.mass > 0
+        assert layer.mass == pytest.approx(2.0 * base.mass)
+        assert (float(layer.numerator) / layer.mass
+                == pytest.approx(0.5 * float(base.numerator) / base.mass, rel=1e-4))
+
+
+def test_band_limited_terms_reach_the_pose():
+    cfg = base_cfg()
+    cfg["motion_supervision"].update(enabled=True, stencil="forward", label_smooth_sec=0.0)
+    cfg["motion_supervision"]["loss"].update(vel=0.0, acc=0.0, ang_vel=0.0, ang_acc=0.0,
+                                             pose_vel=1.0, pose_ss_acc=0.1, pose_ss_ang_acc=0.25)
+    loss = MotionLoss(cfg, None, "cpu")
+    assert loss.term_names == ("pose_vel", "pose_ss_acc", "pose_ss_ang_acc")
+
+    _, root, _, batch = world_series(seed=3)
+    n = root.shape[0]
+    joints = (0.3 * torch.randn(n, 22, 3)).requires_grad_(True)
+    batch = {**batch, "smplx_valid": torch.ones(n, dtype=torch.bool),
+             "smplx_joints_world": 0.3 * torch.randn(n, 22, 3),
+             "smplx_root_rot": roma.random_rotmat(n)}
+    result = loss({"motion": None, "smplx": {"joints_world": joints, "root_rot_world": root}},
+                  batch, train=True)
+    assert set(result.terms) == set(loss.term_names)
+    result.terms["pose_ss_acc"].numerator.backward()
+    assert joints.grad is not None and torch.isfinite(joints.grad).all() and joints.grad.abs().sum() > 0

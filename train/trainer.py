@@ -15,7 +15,10 @@ step is skipped (AdamW's decay would otherwise still move the weights).
 ``optim.accumulate_steps`` micro-batches are summed into one optimizer step
 (each micro-batch's global weighted mean divided by the count, so the step is
 the mean of the micro-batch means); ``step`` counts optimizer steps and the
-schedule advances once per optimizer step.
+schedule advances once per optimizer step. The same fraction of the run
+(``step / total_steps``) is written on every loss as
+:attr:`~model.loss.Loss.progress`, which is how a loss with an annealed weight
+knows where it is.
 
 Evaluation is stats-based: each loss returns an additive float64 sufficient-
 statistics vector, summed over batches, all-reduced once, and turned into
@@ -186,6 +189,8 @@ class Trainer:
             raise ValueError("training needs a non-empty train split")
         self.scheduler = build_scheduler(
             self.optimizer, optim_cfg, self._optimizer_steps_per_epoch())
+        #: Optimizer steps the run will take — the denominator of ``Loss.progress``.
+        self.total_steps = self.epochs * self._optimizer_steps_per_epoch()
 
         out_cfg = cfg["output"]
         self.log_freq = int(out_cfg["log_freq"])
@@ -247,18 +252,26 @@ class Trainer:
         ``param_groups[0]`` (the decayed weights) is the logged lr. The refiner's
         learnable smoothing widths (log-sigmas) form a third group at ``lr x
         optim.smoothing_lr_scale``: Adam moves a log-width by ~lr per step, and at
-        the base lr a 600-step run could not change a width by more than ~20 %.
+        the base lr a 600-step run could not change a width by more than ~20 %. A
+        trainable SMPL-X head (``model.smplx.frozen: false``) gets its own groups at
+        ``lr x optim.head_lr_scale`` (a warm-started head fine-tunes, it does not relearn).
         """
         named = [(n, p) for n, p in self.model.named_parameters() if p.requires_grad]
         smoothing = [p for n, p in named if n.rsplit(".", 1)[-1] in SMOOTHING_PARAM_NAMES]
-        rest = [p for n, p in named if n.rsplit(".", 1)[-1] not in SMOOTHING_PARAM_NAMES]
+        head = [p for n, p in named if n.rsplit(".", 1)[-1] not in SMOOTHING_PARAM_NAMES
+                and n.startswith("head_smplx.")]
+        rest = [p for n, p in named if n.rsplit(".", 1)[-1] not in SMOOTHING_PARAM_NAMES
+                and not n.startswith("head_smplx.")]
         lr = float(optim_cfg["lr"])
         wd = float(optim_cfg["weight_decay"])
+        head_lr = lr * float(optim_cfg["head_lr_scale"])
         groups = [
             {"params": [p for p in rest if p.ndim > 1], "lr": lr, "weight_decay": wd},
             {"params": [p for p in rest if p.ndim <= 1], "lr": lr, "weight_decay": 0.0},
             {"params": smoothing, "lr": lr * float(optim_cfg["smoothing_lr_scale"]),
              "weight_decay": 0.0},
+            {"params": [p for p in head if p.ndim > 1], "lr": head_lr, "weight_decay": wd},
+            {"params": [p for p in head if p.ndim <= 1], "lr": head_lr, "weight_decay": 0.0},
         ]
         return torch.optim.AdamW(
             [g for g in groups if g["params"]], lr=lr, weight_decay=wd,
@@ -364,6 +377,9 @@ class Trainer:
         contact_stats = None
         for index, batch in enumerate(pbar):
             batch = batch_to_device(batch, self.device)
+            # Scheduled loss weights read this; evaluation keeps the last train value.
+            for loss in self.losses:
+                loss.progress = min(self.step / max(self.total_steps, 1), 1.0)
             window_frames += int(batch["bbox_center"].shape[0])
             last_micro = (micro + 1 == self.accumulate) or (index + 1 == n_micro)
 

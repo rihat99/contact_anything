@@ -1,0 +1,11 @@
+# Arm N (acceleration quality for the force model): I with the derivative targets label-smoothed
+# at 0.12 s (the width the motion head's targets used) and a small pointwise acceleration term
+# back on (the aligned round-5 weights, base acceleration scales, which were calibrated on
+# smoothed targets). A smoothed acceleration target is predictable (pearson ~0.6 for the
+# Gaussian body), so the shrink incentive of arm A (raw targets, pearson 0.14) is much smaller.
+base: configs/smooth/I_iter.yaml
+motion_supervision:
+  label_smooth_sec: 0.12
+  scale: {vel: 0.4, acc: 1.2, ang_vel: 0.57, ang_acc: 1.8}
+  loss: {pose_acc: 0.1, pose_ang_acc: 0.25}
+output: {exp_name: N_accsmooth}

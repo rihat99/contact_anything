@@ -1,0 +1,5 @@
+# Arm B: A + the annealed Gaussian reference (the fixed round-4 kernel as a starting basin,
+# withdrawn linearly between 30 % and 60 % of the optimizer steps).
+base: configs/smooth/base_smooth.yaml
+gaussian_reference: {enabled: true}
+output: {exp_name: B_gaussref}

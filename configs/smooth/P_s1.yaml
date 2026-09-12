@@ -1,0 +1,4 @@
+# Arm P, data seed 1: the seed spread of the 30-epoch iterative deep-supervision recipe.
+base: configs/smooth/P_k30.yaml
+data: {seed: 1}
+output: {exp_name: P_s1}

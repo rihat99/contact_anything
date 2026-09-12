@@ -1,0 +1,7 @@
+# Arm J: I + the cumulative correction in the feedback (`model.refiner.feedback_delta`). I's
+# feedback carries rates only, and rates are blind to the slow drift the earlier layers already
+# accumulated — 82 % of the root error power is below 0.5 Hz. The root shift in the input body
+# frame and the composed 6D rotation deltas say how far the cascade has already moved.
+base: configs/smooth/I_iter.yaml
+model: {refiner: {feedback_delta: true}}
+output: {exp_name: J_iterdelta}

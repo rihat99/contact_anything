@@ -232,23 +232,30 @@ class CrossModalRopeModule(nn.Module):
         self.slot_embed = nn.Parameter(torch.zeros(self.num_slots, dim))
         nn.init.trunc_normal_(self.slot_embed, std=0.02)
 
-    def forward(
+    @property
+    def num_layers(self) -> int:
+        """Stacked RoPE blocks."""
+        return len(self.blocks)
+
+    def prepare(
         self,
         tokens: torch.Tensor,
         seq_len: int,
         frame_pos_sec: torch.Tensor,
         frame_valid: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Mix every modality token with every other across the clip's frames.
+    ) -> dict:
+        """Everything in a call that does not depend on the block.
 
-        :param tokens: ``[B_flat, K, C]`` with ``B_flat = B_clips * seq_len``
-            (clip-major, frame-minor), ``K`` = :attr:`num_slots`, the modality
-            blocks already concatenated in canonical order.
-        :param seq_len: frames per clip ``T``. ``T = 1`` (still images) is legal
-            and degenerates to within-frame cross-modal attention.
+        :meth:`forward` is ``prepare`` followed by one :meth:`run_block` per
+        layer; a caller that has to touch the residual stream between the
+        layers (the refiner's ``iterative`` mode) runs the same two calls
+        itself and gets the identical tables, mask and slot embedding.
+
+        :param tokens: ``[B_flat, K, C]`` — only its shape and dtype are read.
+        :param seq_len: frames per clip ``T``.
         :param frame_pos_sec: elapsed seconds per flattened frame ``[B_flat]``.
         :param frame_valid: per-frame validity ``[B_flat]`` bool.
-        :returns: updated tokens ``[B_flat, K, C]``.
+        :returns: the bundle :meth:`run_block` takes.
         """
         b_flat, num_slots, input_dim = tokens.shape
         if input_dim != self.dim:
@@ -282,7 +289,36 @@ class CrossModalRopeModule(nn.Module):
             mask = mask.repeat_interleave(num_slots, dim=2)[:, None]
 
         slot_emb = self.slot_embed.repeat(seq_len, 1)[None]  # [1, T*K, C]
-        x = tokens.reshape(n_clips, seq_len * num_slots, input_dim)
-        for block in self.blocks:
-            x = block(x, cos, sin, mask, slot_emb)
+        return {"cos": cos, "sin": sin, "mask": mask, "slot_emb": slot_emb, "seq_len": seq_len}
+
+    def run_block(self, index: int, tokens: torch.Tensor, tables: dict) -> torch.Tensor:
+        """Run block ``index`` over ``[B_flat, K, C]`` tokens with :meth:`prepare`'s tables."""
+        b_flat, num_slots, input_dim = tokens.shape
+        seq_len = tables["seq_len"]
+        x = tokens.reshape(b_flat // seq_len, seq_len * num_slots, input_dim)
+        x = self.blocks[index](x, tables["cos"], tables["sin"], tables["mask"], tables["slot_emb"])
         return x.reshape(b_flat, num_slots, input_dim)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        seq_len: int,
+        frame_pos_sec: torch.Tensor,
+        frame_valid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Mix every modality token with every other across the clip's frames.
+
+        :param tokens: ``[B_flat, K, C]`` with ``B_flat = B_clips * seq_len``
+            (clip-major, frame-minor), ``K`` = :attr:`num_slots`, the modality
+            blocks already concatenated in canonical order.
+        :param seq_len: frames per clip ``T``. ``T = 1`` (still images) is legal
+            and degenerates to within-frame cross-modal attention.
+        :param frame_pos_sec: elapsed seconds per flattened frame ``[B_flat]``.
+        :param frame_valid: per-frame validity ``[B_flat]`` bool.
+        :returns: updated tokens ``[B_flat, K, C]``.
+        """
+        tables = self.prepare(tokens, seq_len, frame_pos_sec, frame_valid)
+        x = tokens
+        for index in range(self.num_layers):
+            x = self.run_block(index, x, tables)
+        return x

@@ -154,7 +154,8 @@ def git_head() -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", required=True,
+                        help="checkpoint path, or 'none' for the untrained model (needs --out)")
     parser.add_argument("--out", type=Path, default=None,
                         help="output directory (default: <checkpoint dir>/predictions)")
     parser.add_argument("--scenes", default=None,
@@ -169,7 +170,10 @@ def main() -> int:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    model, cfg = load_model(args.config, args.checkpoint, args.device)
+    checkpoint = None if args.checkpoint.lower() == "none" else Path(args.checkpoint)
+    if checkpoint is None and args.out is None:
+        raise SystemExit("--checkpoint none needs --out")
+    model, cfg = load_model(args.config, checkpoint, args.device)
     if model.head_smplx is None:
         raise SystemExit("the config has no model.smplx head — nothing to dump")
     root, contact_level = rc.dataset_spec(cfg)
@@ -178,15 +182,17 @@ def main() -> int:
     if not 0 <= args.overlap < max_rows:
         raise SystemExit(f"--overlap {args.overlap} must be in [0, --max-frames {max_rows})")
     scenes = rc.resolve_scenes(root, "test", args.scenes, camera)
-    out_dir = args.out or args.checkpoint.resolve().parent / "predictions"
+    out_dir = args.out or checkpoint.resolve().parent / "predictions"
     out_dir.mkdir(parents=True, exist_ok=True)
-    epoch = int(torch.load(args.checkpoint, map_location="cpu", weights_only=False)["epoch"])
+    checkpoint_name = "none" if checkpoint is None else str(checkpoint.resolve())
+    epoch = -1 if checkpoint is None else int(
+        torch.load(checkpoint, map_location="cpu", weights_only=False)["epoch"])
     print(f"{len(scenes)} test scene(s) [camera={camera}] on {args.device}; "
-          f"checkpoint {args.checkpoint} (epoch {epoch}); windows {max_rows} rows, "
+          f"checkpoint {checkpoint_name} (epoch {epoch}); windows {max_rows} rows, "
           f"overlap {args.overlap}")
 
     manifest = {
-        "checkpoint": str(args.checkpoint.resolve()), "epoch": epoch,
+        "checkpoint": checkpoint_name, "epoch": epoch,
         "exp_name": str(cfg["output"]["exp_name"]), "config": str(args.config),
         "git": git_head(), "hands": bool(model.head_smplx.hands),
         "camera_head": str(model.head_smplx.camera),
@@ -207,7 +213,7 @@ def main() -> int:
             tracked=np.asarray(data["valid_mask"], bool),
             fps=np.float32(data["fps"]),
             hands=np.bool_(model.head_smplx.hands),
-            checkpoint=str(args.checkpoint.resolve()), epoch=np.int32(epoch),
+            checkpoint=checkpoint_name, epoch=np.int32(epoch),
             exp_name=str(cfg["output"]["exp_name"]))
         covered = int(pred["covered"].sum())
         tracked = int(data["valid_mask"].sum())

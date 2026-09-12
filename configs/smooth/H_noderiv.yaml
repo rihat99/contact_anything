@@ -1,0 +1,6 @@
+# Arm H (control, gpt-6-astra's request): F without any derivative loss — position terms only,
+# per-joint and root one-sided rate channels in the token. Tells whether the forward velocity
+# losses are what makes F smooth, or the token channels alone.
+base: configs/smooth/F_jointvel.yaml
+motion_supervision: {enabled: false}
+output: {exp_name: H_noderiv}

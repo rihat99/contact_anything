@@ -45,6 +45,18 @@ round-3/4/5/6 configs and the two round-6 token options (`velocity`, `velocity_f
 `/data3/rikhat.akizhanov/trash/cleanup_20260911/`; the round-3 refiner's `eval.json` stays as
 `output/round3_refiner_eval.json` (the final model's tensorboard reference line).
 
+**2026-09-12 — round 7 (`docs/round7_2026-09-11.md`): the block smooths the body itself.** The
+refiner's input Gaussians are replaced by the temporal block: one-sided (Nyquist-visible)
+forward-difference velocity losses on the raw GT (`motion_supervision.stencil: forward`, no
+acceleration term), one-sided rate channels for the root and every joint (`token.one_sided_velocity`,
+`token.joint_velocity`), iterative per-layer refinement with feedback (`model.refiner.iterative`) and
+deep supervision (`layer_weight`). Recipe `configs/smooth/P_k30.yaml` (30 epochs, `best.pth` = min
+jitter): 54.86 mm / jitter 5.9 (GT floor 6.9) vs the Gaussian body 55.5 / 2.7, paired +0.6 mm;
+in-band acceleration r 0.77 vs 0.70. Central differences were the root cause (zero response at
+Nyquist); acceleration losses of every kind (pointwise, RMS, smoothed-target, band-limited) do not
+help; the pelvis error (110 mm) is stage-1 low-frequency bias. Runs `output_3/`, configs
+`configs/smooth/`. Contact and force heads were OFF this round.
+
 ## Environment
 
 ```

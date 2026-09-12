@@ -1,0 +1,8 @@
+# Arm I: F with iterative refinement (`model.refiner.iterative`). F works because the token carries
+# the one-sided rates of the RAW stage-1 trajectory, so a smoothing correction is a signed sum of
+# the neighbours' rates — but layers 2 and 3 still read the raw rates, not those of the trajectory
+# layer 1 already corrected. Iterative runs the layers one at a time, applies the shared pose head
+# after each of them and feeds the corrected trajectory's own rates back into the residual stream.
+base: configs/smooth/F_jointvel.yaml
+model: {refiner: {iterative: true}}
+output: {exp_name: I_iter}

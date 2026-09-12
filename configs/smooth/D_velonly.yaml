@@ -1,0 +1,7 @@
+# Arm D: A with the acceleration terms OFF. In A the two acceleration terms were 60 % of the loss at
+# a target correlation of 0.14 (raw GT second differences are unpredictable frame by frame): a
+# pointwise loss on an unpredictable target is minimised by shrinking, and A's joint velocity
+# amplitude fell to 0.81 of the GT's while MPJPE rose to 63 mm.
+base: configs/smooth/base_smooth.yaml
+motion_supervision: {loss: {pose_acc: 0.0, pose_ang_acc: 0.0}}
+output: {exp_name: D_velonly}

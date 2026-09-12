@@ -1,0 +1,9 @@
+# Arm L: I with the stage-1 SMPL-X head TRAINABLE behind the iterative refiner (warm-started from
+# the stage-1 checkpoint, fine-tuned at 0.1x the refiner's lr). The refiner cannot touch the slow
+# per-frame depth / pose bias it inherits (82 % of the root error power is below 0.5 Hz); the
+# per-frame head can, if the joint losses do not overfit it (round 5's J1 overfit from epoch 7 at
+# the full lr).
+base: configs/smooth/I_iter.yaml
+model: {smplx: {frozen: false}}
+optim: {head_lr_scale: 0.1}
+output: {exp_name: L_joint}

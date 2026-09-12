@@ -1,0 +1,11 @@
+# Arm E: D (velocity terms only) + amplitude matching of the acceleration (per clip and joint RMS of
+# the tight second difference vs the raw GT's): sets the smoothness without the shrink direction
+# of the pointwise acceleration Huber (arms A / B: joint velocity 0.81 of GT, MPJPE 63 / 59).
+# Scales = per-component RMS of the RAW train GT under these stencils (scratch gt_scales.py:
+# vel 0.43, acc 4.0, ang_vel 0.67, ang_acc 4.7); the base values were calibrated on smoothed targets
+# and put the raw acceleration 3.3x past the Huber knee.
+base: configs/smooth/D_velonly.yaml
+motion_supervision:
+  scale: {vel: 0.43, acc: 4.0, ang_vel: 0.67, ang_acc: 4.7}
+  loss: {pose_acc_rms: 1.0, pose_ang_acc_rms: 1.0}
+output: {exp_name: E_accrms}

@@ -1,0 +1,4 @@
+# Arm M: I with a fourth layer — one more stage of the cascade (window 0.5 s each).
+base: configs/smooth/I_iter.yaml
+model: {refiner: {num_layers: 4}}
+output: {exp_name: M_iter4}

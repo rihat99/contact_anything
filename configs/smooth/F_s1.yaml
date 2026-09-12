@@ -1,0 +1,4 @@
+# Arm F, data seed 1 (seed spread of the winning recipe).
+base: configs/smooth/F_jointvel.yaml
+data: {seed: 1}
+output: {exp_name: F_s1}

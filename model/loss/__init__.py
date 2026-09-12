@@ -97,6 +97,11 @@ class Loss(ABC):
     #: the config). The trainer lays out its all-reduce buffers from it, so a
     #: rank that sees no batch still reduces the same shape as every other.
     term_names: tuple[str, ...] = ()
+    #: Fraction of the run's optimizer steps already taken, in ``[0, 1]``. The
+    #: trainer writes it on every loss before each train step; evaluation
+    #: leaves the last training value in place. Only a loss with a schedule
+    #: (an annealed weight) reads it.
+    progress: float = 0.0
 
     def __init__(self, cfg: dict, model, device: torch.device | str) -> None:
         self.cfg = cfg
@@ -137,7 +142,7 @@ class Loss(ABC):
 
 def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
     """Instantiate every enabled loss, in a fixed order (contact, force, smplx, motion,
-    contact_consistency, force_consistency).
+    contact_consistency, force_consistency, gaussian_reference).
 
     The order is what makes the trainer's packed mass all-reduce identical on
     every rank.
@@ -161,20 +166,33 @@ def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
         from model.loss.smplx import SmplxLoss
         losses.append(SmplxLoss(cfg, model, device))
     if cfg["motion_supervision"]["enabled"]:
-        _require(net.has_motion, "motion_supervision", "a refiner 'motion' output")
-        from model.loss.motion import MotionLoss
+        from model.loss.motion import QUANTITIES, MotionLoss
+        if any(float(cfg["motion_supervision"]["loss"][q]) > 0.0 for q in QUANTITIES):
+            _require(net.has_motion, "motion_supervision",
+                     "a refiner 'motion' output for its head terms")
+        else:
+            _require(_refines(net, "pose"), "motion_supervision",
+                     "a refiner 'pose' output (only the pose_* terms are weighted)")
         losses.append(MotionLoss(cfg, model, device))
     if cfg["contact_consistency"]["enabled"]:
-        _require(net.refiner is not None and "pose" in net.refiner.outputs,
+        _require(_refines(net, "pose"),
                  "contact_consistency", "a refiner 'pose' output (the refined world joints)")
         from model.loss.contact_consistency import ContactConsistencyLoss
         losses.append(ContactConsistencyLoss(cfg, model, device))
     if cfg["force_consistency"]["enabled"]:
-        _require(net.refiner is not None and "force" in net.refiner.outputs,
-                 "force_consistency", "a refiner 'force' output")
+        _require(_refines(net, "force"), "force_consistency", "a refiner 'force' output")
         from model.loss.force_consistency import ForceConsistencyLoss
         losses.append(ForceConsistencyLoss(cfg, model, device))
+    if cfg["gaussian_reference"]["enabled"]:
+        _require(_refines(net, "pose"),
+                 "gaussian_reference", "a refiner 'pose' output (the body it regularises)")
+        from model.loss.reference import GaussianReferenceLoss
+        losses.append(GaussianReferenceLoss(cfg, model, device))
     return losses
+
+
+def _refines(net, output: str) -> bool:
+    return net.refiner is not None and output in net.refiner.outputs
 
 
 def _require(condition: bool, section: str, requirement: str) -> None:

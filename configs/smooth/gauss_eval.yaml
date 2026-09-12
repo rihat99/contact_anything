@@ -1,0 +1,5 @@
+# Eval twin of the Gaussian body (configs/final.yaml's smoothing) under the smooth round's loss
+# sections, so its motion metrics (pose_s_* / pose_ss_*) exist: evaluate with --checkpoint none.
+base: configs/smooth/base_smooth.yaml
+model: {refiner: {root_smooth_sec: 0.10, pose_smooth_sec: 0.08}}
+output: {exp_name: gauss_eval}

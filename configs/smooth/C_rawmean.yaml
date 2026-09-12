@@ -1,0 +1,6 @@
+# Arm C: A + the `raw - 5-frame-mean` token channels (the per-frame noise handed to the block as
+# an input; round 5's S_none_tok had them and still did not subtract it, but that arm's losses
+# were central-difference ones).
+base: configs/smooth/base_smooth.yaml
+model: {refiner: {token: {raw_minus_mean: true}}}
+output: {exp_name: C_rawmean}

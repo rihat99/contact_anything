@@ -25,6 +25,11 @@ SCHEMA_PATH = REPO_ROOT / "configs" / "base.yaml"
 
 _MODALITY_ORDER = ("pose", "contact", "force")
 _REFINER_OUTPUTS = ("pose", "contact", "motion", "force")
+#: Finite-difference stencils of ``motion_supervision`` (:data:`model.loss.motion.STENCILS`).
+_STENCILS = ("legacy", "aligned", "forward")
+#: ``smplx_supervision`` terms deep supervision repeats per refiner layer
+#: (:data:`model.loss.smplx.LAYER_TERM_NAMES`).
+_LAYER_TERMS = ("kp3d", "orient", "pose", "root_bias", "root_shape")
 #: The six kindyn contact / force groups (:data:`model.loss.NUM_KINDYN_GROUPS`, not imported:
 #: the model package is heavy and the config layer stays import-light).
 NUM_KINDYN_GROUPS = 6
@@ -90,7 +95,8 @@ def enabled_losses(cfg: dict) -> list[str]:
     sections = (("contact", "contact_supervision"), ("force", "force_supervision"),
                 ("smplx", "smplx_supervision"), ("motion", "motion_supervision"),
                 ("contact_consistency", "contact_consistency"),
-                ("force_consistency", "force_consistency"))
+                ("force_consistency", "force_consistency"),
+                ("gaussian_reference", "gaussian_reference"))
     return [name for name, section in sections if cfg[section]["enabled"]]
 
 
@@ -105,6 +111,27 @@ def signal_needs(cfg: dict) -> set[str]:
     if "force" in refiner_outputs(cfg):
         needs.add("smplx")          # the kindyn root rotation re-frames the force GT
     return needs
+
+
+def _validate_layer_weight(section: str, weight: float, refiner: dict, terms_on: bool,
+                           terms: str) -> None:
+    """Deep supervision: only defined on the intermediate layers of an iterative refiner."""
+    if weight < 0.0:
+        raise ValueError(f"{section}.layer_weight must be >= 0")
+    if weight == 0.0:
+        return
+    if not (refiner["enabled"] and bool(refiner["iterative"])):
+        raise ValueError(
+            f"{section}.layer_weight supervises the INTERMEDIATE trajectories of an "
+            "iterative refiner: enable model.refiner.iterative")
+    if int(refiner["num_layers"]) < 2:
+        raise ValueError(
+            f"{section}.layer_weight needs model.refiner.num_layers >= 2 — with one layer "
+            "there is no intermediate trajectory")
+    if not terms_on:
+        raise ValueError(
+            f"{section}.layer_weight repeats {terms} on every intermediate layer: enable "
+            "at least one of them")
 
 
 def refiner_outputs(cfg: dict) -> set[str]:
@@ -185,6 +212,10 @@ def validate(cfg: dict) -> None:
             raise ValueError(
                 "smplx_supervision.loss.cam supervises the CLIFF (s, tx, ty) proxy, which "
                 "model.smplx.camera: ray does not produce — set it to 0")
+        _validate_layer_weight(
+            "smplx_supervision", float(sup["layer_weight"]), model["refiner"],
+            any(float(sup["loss"][n]) > 0.0 for n in _LAYER_TERMS),
+            "the " + " / ".join(_LAYER_TERMS) + " terms")
     if smplx["frozen"] and not smplx["enabled"]:
         raise ValueError("model.smplx.frozen requires model.smplx.enabled")
     if smplx["checkpoint"] is not None and not smplx["enabled"]:
@@ -204,11 +235,10 @@ def validate(cfg: dict) -> None:
                 f"{list(_REFINER_OUTPUTS)}; got {listed!r}")
         if not smplx["enabled"]:
             raise ValueError("model.refiner needs the per-frame body: enable model.smplx")
-        if not smplx["frozen"]:
+        if smplx["checkpoint"] is None:
             raise ValueError(
-                "model.refiner needs a FROZEN per-frame body (model.smplx.frozen with a "
-                "stage-1 checkpoint): a trainable pose path under the motion / force losses "
-                "is the shrinkage shortcut")
+                "model.refiner needs a stage-1 per-frame body: set model.smplx.checkpoint "
+                "(frozen, or trainable at optim.head_lr_scale)")
         if bool(refiner["token"]["gravity"]) and not cfg["smplx_supervision"]["enabled"]:
             raise ValueError(
                 "model.refiner.token.gravity reads the kindyn gravity, which loads with the smplx "
@@ -236,6 +266,22 @@ def validate(cfg: dict) -> None:
                 "(they initialise the learnable widths)")
         if int(refiner["dim"]) % int(refiner["num_heads"]) != 0:
             raise ValueError("model.refiner.dim must be divisible by num_heads")
+        if bool(refiner["iterative"]):
+            if "pose" not in outputs:
+                raise ValueError(
+                    "model.refiner.iterative applies the pose head after every layer: list "
+                    "'pose' in model.refiner.outputs")
+            if not (bool(refiner["token"]["one_sided_velocity"])
+                    and bool(refiner["token"]["joint_velocity"])):
+                raise ValueError(
+                    "model.refiner.iterative feeds the corrected trajectory's one-sided root "
+                    "and joint rates back into the residual stream: enable "
+                    "model.refiner.token.one_sided_velocity and token.joint_velocity so the "
+                    "input token carries the same channels")
+        elif bool(refiner["feedback_delta"]):
+            raise ValueError(
+                "model.refiner.feedback_delta adds channels to the iterative feedback: "
+                "it needs model.refiner.iterative")
         # Every head must receive a loss (DDP runs with find_unused_parameters=False).
         needs = {"pose": "smplx_supervision", "contact": "contact_supervision",
                  "motion": "motion_supervision", "force": "force_supervision"}
@@ -281,8 +327,16 @@ def validate(cfg: dict) -> None:
         raise ValueError("model.force.enabled builds a force head: enable force_supervision")
     motion = cfg["motion_supervision"]
     if motion["enabled"]:
-        if "motion" not in outputs:
-            raise ValueError("motion_supervision.enabled requires a refiner 'motion' output")
+        head_terms = any(float(motion["loss"][q]) > 0.0
+                         for q in ("vel", "acc", "ang_vel", "ang_acc"))
+        if head_terms and "motion" not in outputs:
+            raise ValueError(
+                "motion_supervision.loss.vel / acc / ang_vel / ang_acc supervise the refiner's "
+                "motion head: they need a refiner 'motion' output")
+        if str(motion["stencil"]) not in _STENCILS:
+            raise ValueError(
+                f"motion_supervision.stencil must be one of {list(_STENCILS)}; "
+                f"got {motion['stencil']!r}")
         if float(motion["label_smooth_sec"]) < 0.0:
             raise ValueError("motion_supervision.label_smooth_sec must be >= 0")
         if any(float(v) <= 0.0 for v in motion["scale"].values()):
@@ -298,6 +352,10 @@ def validate(cfg: dict) -> None:
             raise ValueError(
                 "motion_supervision needs data.clip.frames >= 5 (acceleration rows need two "
                 "valid neighbours on each side)")
+        _validate_layer_weight(
+            "motion_supervision", float(motion["layer_weight"]), refiner,
+            any(w > 0.0 for k, w in weights.items() if k.startswith("pose_")),
+            "the pose_* terms")
     physics = cfg["force_consistency"]
     if physics["enabled"]:
         if "force" not in outputs:
@@ -311,6 +369,23 @@ def validate(cfg: dict) -> None:
             raise ValueError("force_consistency.loss.force / torque must be >= 0 with one > 0")
         if int(cfg["data"]["clip"]["frames"]) < 5:
             raise ValueError("force_consistency needs data.clip.frames >= 5 (a +-2 stencil)")
+    reference = cfg["gaussian_reference"]
+    if reference["enabled"]:
+        if "pose" not in outputs:
+            raise ValueError(
+                "gaussian_reference regularises the REFINED body: it needs a refiner 'pose' output")
+        if float(reference["root_sigma_sec"]) < 0.0 or float(reference["pose_sigma_sec"]) < 0.0:
+            raise ValueError("gaussian_reference.*_sigma_sec must be >= 0")
+        if not float(reference["weight"]) > 0.0:
+            raise ValueError("gaussian_reference.weight must be positive")
+        if not float(reference["huber_delta_root"]) > 0.0:
+            raise ValueError("gaussian_reference.huber_delta_root must be positive")
+        start, end = float(reference["anneal_start"]), float(reference["anneal_end"])
+        if not 0.0 <= start <= end <= 1.0:
+            raise ValueError(
+                "gaussian_reference needs 0 <= anneal_start <= anneal_end <= 1 (fractions of the "
+                f"run's optimizer steps); got {start} / {end}")
+
     consistency = cfg["contact_consistency"]
     if consistency["enabled"]:
         if "pose" not in outputs:
@@ -332,6 +407,8 @@ def validate(cfg: dict) -> None:
         raise ValueError("optim.accumulate_steps must be >= 1")
     if not float(optim["smoothing_lr_scale"]) > 0.0:
         raise ValueError("optim.smoothing_lr_scale must be positive")
+    if not float(optim["head_lr_scale"]) > 0.0:
+        raise ValueError("optim.head_lr_scale must be positive")
 
     monitor = str(cfg["output"]["monitor"])
     groups = sorted({METRIC_GROUPS.get(name, name) for name in enabled_losses(cfg)})
