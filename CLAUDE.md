@@ -73,71 +73,115 @@ FEEDBACK (`residual_feedback`) adds nothing on top, `frame_mask_p` 0.1 is a null
 F1 0.924 / force MAE 0.179 / angle 20.6° on the 107-scene split (the test split and 56 annotations
 changed mid-round; P_k30 re-scored there 53.9 / 5.6). Arm configs `configs/r8/`, runs `output_3/`.
 
+**2026-09-13 — round 9 (`docs/round9_2026-09-13.md`): the regenerated corpus (1419 / 109 scenes; pose tokens
+rebuilt with `scripts/data/precompute_pose_tokens.py`, now in main, live backbone), an optional KNOWN-gravity
+input (`model.refiner.gravity_input`: four token channels, per-clip Bernoulli `p_given` on measured clips in
+training, `eval_given` at inference; a given clip's gravity output IS the input and the gravity loss skips
+it), and a strength-weighted joint-torque term (`force_consistency.loss.joint_torque` +
+`joint_torque_multipliers`, BVR's table, from the same RNEA on the detached body). The torque term alone
+only LOWERS THE HANDS; with the force total pinned (`force_supervision.loss.sum_force`, root residual force
+5 / δ 0.2) and the toes supervised in magnitude it re-allocates: recipe `configs/r9/D_total_feet.yaml`
+(run `output_4/D_total_feet_20260913_134817`; 53.6 mm / jitter 5.4 / F1 0.922 / force 0.163 bw (0.157 given) /
+20.5°; corpus feet 0.87 of GT (was 0.76); climb_wall_2 MAE 83 N / share 3.9 pp / corr 0.62). `predict_test.py`
+dumps read the pose-token cache (`rc.build_dataset(..., pose_tokens=True)`); renderers stay live. Arms
+`configs/r9/` (A–D + `*_given_eval` / `*_predict` twins), runs `output_4/`, docs `docs/round8_force_anatomy.md`
+(why the feet were low) and `docs/round9_2026-09-13.md`.
+
+**2026-09-14 — round 10 (`docs/round10_2026-09-14.md`): limb tokens + decoder contact tokens + gravity force
+frame.** `model.refiner.limb_tokens` runs SEVEN tokens per frame — the body token and one per kindyn group
+carrying that extremity's geometry and its DECODER CONTACT TOKEN (`model.contact` on, live decoder off the
+rebuilt `features/embedding` cache, 1.29 TB) — through alternating per-slot temporal RoPE attention and
+within-frame attention (`model/rope.py::_AlternatingBlock`); the contact / force heads read the limb tokens and
+each limb gets its own feedback. `model.refiner.force_frame: gravity` reads the forces in a gravity-aligned,
+body-headed frame (`out["force"]["frame"]` = world-from-frame; the GT hand directions concentrate 0.79 in the
+root frame vs 0.88-0.90 there). Recipe `configs/r10/L_limb.yaml` (run `output_5/L_limb_20260913_180958`, use
+`last.pth`: contact peaks at epochs 3-5, forces at the end) vs the 16-epoch control `configs/r10/D16.yaml`:
+F1 0.926 / 0.930 vs 0.920 (precision, toes, transitions +0.08), force 0.160 bw (0.157 given) / 20.7° /
+off-contact 0.026 vs 0.165 / 20.4 / 0.038, MPJPE 52.9 vs 53.7; climb_wall_2 MAE 75.4 N / F1 0.963 (optimisation
+78.6 / 0.957) with the hands fixed and the feet unchanged (share 5.5 pp). Live training is DISK-bound (5 GB of
+embeddings per step, ~23 min/epoch on four GPUs). `limb_tokens` + `head_grad_scale 0` leaves `limb_output_norm`
+unused (DDP error).
+
+**2026-09-19 — new box + cleanup.** The work moved to a machine with 8 x RTX PRO 6000 Blackwell
+(96 GB each); `/data3` is gone, the corpus and the siblings live under `/home/rikhat.akizhanov/better/`,
+and the environment is a `uv` project venv instead of the conda env. Everything up to and including
+round 9 went to `../trash/cleanup_20260919/`: the run trees `output/` `output_3/` `output_4/`, the
+configs `r8/` `r9/` `smooth/` `final*` `baseline` `static_ray` `stage1_eval_auto`, the round-5 one-off
+scripts (`audit_rnea.py`, `audit_targets.py`, `diag_sigma_sweep.py`), the `contact_anything_gvhmr`
+worktree and the branches `GVHMR` / `legacy` / `worktree-agent-*` / `origin/dev` / `origin/proposal`
+(`dev` and `legacy` were ancestors of `main`; the ones that were not — `GVHMR`, `proposal` — are
+git bundles in that same trash directory). `configs/r10/D16.yaml` was FLATTENED onto `configs/base.yaml`
+— it was the root of a 19-deep chain through the trashed rounds — and carries their rationale in its
+comments; every round-10 config resolves exactly as before. The frozen stage-1 body and the
+frozen-baseline jsons moved out of `output/` into `checkpoints/`. Two things do NOT exist on this box
+yet: the SAM 3D Body snapshot (`model.checkpoint_path` / `mhr_model_path`, re-download from
+`facebook/sam-3d-body-dinov3`) and the 1.29 TB `features/embedding` cache that `L_limb.yaml` reads
+(`features/pose_token` survived, so the cached-token arms run).
+
 ## Environment
 
 ```
-CONDA=/data3/rikhat.akizhanov/miniconda3/envs/sam3d          # python + torchrun live in $CONDA/bin
-PYTHON=$CONDA/bin/python                                     # neither is on the login PATH
+PYTHON=.venv/bin/python                                      # uv project venv: python 3.12, torch 2.13+cu129
 ```
+`uv sync` rebuilds it from `pyproject.toml` + `uv.lock`; `torchrun` is `.venv/bin/torchrun`.
 Run everything from the repo root. Scripts insert the repo root at the head of `sys.path`
 before importing (`scripts/train.py` would otherwise shadow the `train/` package).
-Corpus (read-only): `/data3/rikhat.akizhanov/better/data/ClimbingVideos`. The SMPL-X head
+Corpus (read-only): `/home/rikhat.akizhanov/better/data/ClimbingVideos`. The SMPL-X head
 needs the sibling `../BetterHuman` checkout (`better_human` + `models/smplx/SMPLX_NEUTRAL.npz`).
 
 ## Key commands
 
 ```bash
 # Train (resume: --resume auto | --resume path/to/last.pth; --limit-scenes N for smoke runs).
-# Rank 0's console goes to output/logs/<run>.log by itself; redirect anything else you launch
-# into output/logs/ too — never write files into output/ itself.
-CUDA_VISIBLE_DEVICES=0,1 $PYTHON -m torch.distributed.run --standalone --nproc-per-node=2 \
-    scripts/train.py --config configs/baseline.yaml          # or $CONDA/bin/torchrun
-$PYTHON scripts/train.py --config configs/static_ray.yaml    # single GPU
+# Rank 0's console goes to <output.dir>/logs/<run>.log by itself; redirect anything else you
+# launch into that logs/ too — never write files into the run tree itself.
+CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/torchrun --standalone --nproc-per-node=4 \
+    scripts/train.py --config configs/r10/L_limb.yaml        # the recipe (live decoder)
+$PYTHON scripts/train.py --config configs/r10/D16.yaml       # single GPU, cached pose tokens
 
 # Frozen SAM3D-as-SMPL-X baseline on the SAME test protocol -> the `frozen` tensorboard run
 # (output.frozen_metrics; recompute whenever eval_max_frames / stride / dataset change)
-$PYTHON scripts/eval_frozen_smplx.py --config configs/baseline.yaml --out output/frozen_sam3d_smplx.json
+$PYTHON scripts/eval_frozen_smplx.py --config configs/r10/D16.yaml --out checkpoints/frozen_sam3d_smplx.json
 
 # Evaluate on the annotated corpus test split (full-scene protocol; --checkpoint none = untrained,
 # which for a stage-2 config IS "stage 1 + depth smoothing"; --json writes a frozen_metrics file)
-$PYTHON scripts/evaluate.py --config configs/baseline.yaml --checkpoint output/<run>/best.pth
+$PYTHON scripts/evaluate.py --config configs/r10/L_limb.yaml --checkpoint output_5/<run>/last.pth
 
-# Two-stage pipeline: stage 1 (per-frame body), its diagnostics, then stage 2 (refiner)
-CUDA_VISIBLE_DEVICES=0,5 $CONDA/bin/torchrun --standalone --nproc-per-node=2 scripts/train.py --config configs/stage1.yaml
-$PYTHON scripts/dump_stage1.py --config configs/stage1.yaml --checkpoint output/<stage1>/best.pth --split train --scenes 150
-$PYTHON scripts/dump_stage1.py --config configs/stage1.yaml --checkpoint output/<stage1>/best.pth --split test
-$PYTHON scripts/analyze_stage1.py --train output/<stage1>/dump_train --test output/<stage1>/dump_test \
+# Two-stage pipeline: stage 1 (per-frame body, trained once and frozen in checkpoints/), its
+# diagnostics, then stage 2 (refiner). Stage 1 only needs redoing if the per-frame body changes.
+CUDA_VISIBLE_DEVICES=0,1 .venv/bin/torchrun --standalone --nproc-per-node=2 scripts/train.py --config configs/stage1.yaml
+$PYTHON scripts/dump_stage1.py --config configs/stage1.yaml --checkpoint checkpoints/<stage1>/best.pth --split train --scenes 150
+$PYTHON scripts/dump_stage1.py --config configs/stage1.yaml --checkpoint checkpoints/<stage1>/best.pth --split test
+$PYTHON scripts/analyze_stage1.py --train checkpoints/<stage1>/dump_train --test checkpoints/<stage1>/dump_test \
     --pose-sigmas 0,0.05,0.08,0.12 --depth-sigma 0.25
 #   -> train/test gap, depth_smooth_sec sweep, pose_smooth_sec sweep, motion_supervision.scale
-#   numbers; then set model.smplx.checkpoint in the stage-2 config and train it:
-CUDA_VISIBLE_DEVICES=0,1,2,3 $CONDA/bin/torchrun --standalone --nproc-per-node=4 scripts/train.py --config configs/final.yaml
-#   (8 x 60-frame clips per GPU on cached pose tokens, accumulate_steps 8 -> 64 clips/step, ~15 min for 15 epochs)
-$PYTHON scripts/eval_table.py output_2/final_*                          # one table over several runs' eval.json
-$PYTHON scripts/paired_ci.py output_2/final_20260908_104420 output_2/final_rnea_20260908_110221 --protocol capped
+#   numbers; then set model.smplx.checkpoint in the stage-2 config.
+$PYTHON scripts/eval_table.py output_5/L_*                              # one table over several runs' eval.json
+$PYTHON scripts/paired_ci.py output_5/D16_20260913_175320 output_5/L_limb_20260913_180958 --protocol capped
 #   (video-clustered paired bootstrap over predict_test.py dumps: differences to the first run with 95 % intervals)
-$PYTHON scripts/diag_invariance.py --config configs/final.yaml --checkpoint output_2/<run>/last.pth   # reverse / shuffle / decimate / window
-$PYTHON scripts/diag_sigma_sweep.py --config configs/final.yaml --checkpoint none                    # stage 1 + Gaussian over sigma
+$PYTHON scripts/diag_invariance.py --config configs/r10/L_limb.yaml --checkpoint output_5/<run>/last.pth  # reverse / shuffle / decimate / window
 $PYTHON -m pytest tests/ -q                                  # refiner unit tests (CPU, ~35 s)
 
 # Renders (mp4 per test scene; shard scenes over ranks with torchrun)
-$PYTHON scripts/render_video.py --config configs/baseline.yaml --checkpoint output/<run>/best.pth \
-    --scenes 5 --out output/<run>/render_contact --overlay-labels --gt-panel --scale 0.5
-$PYTHON scripts/render_smplx_video.py --config configs/baseline.yaml --checkpoint output/<run>/best.pth \
-    --scenes 5 --out output/<run>/render_pose             # GT | frozen MHR | SMPL-X head panels
+$PYTHON scripts/render_video.py --config configs/r10/L_limb.yaml --checkpoint output_5/<run>/last.pth \
+    --scenes 5 --out output_5/<run>/render_contact --overlay-labels --gt-panel --scale 0.5
+$PYTHON scripts/render_smplx_video.py --config configs/r10/L_limb.yaml --checkpoint output_5/<run>/last.pth \
+    --scenes 5 --out output_5/<run>/render_pose           # GT | frozen MHR | SMPL-X head panels
 
 # Results viewer (docs/old/viewer.md): dump a run's whole-scene test predictions once, then serve
 # every run's predicted | GT | frozen SMPL-X bodies plus contact markers and force arrows
 # (predicted and GT) in viser (port 8082 is the BVR viewer's)
-$PYTHON scripts/predict_test.py --config configs/baseline.yaml --checkpoint output/<run>/best.pth
+$PYTHON scripts/predict_test.py --config configs/r10/L_limb.yaml --checkpoint output_5/<run>/last.pth
 CUDA_VISIBLE_DEVICES=5 $PYTHON scripts/view_results.py --port 8090
 
 # Inference on BetterVideoReconstruction out-trees (contacts + forces, no labels needed)
-$PYTHON scripts/predict_reconstruction.py --config configs/baseline.yaml \
-    --checkpoint output/<run>/best.pth --out-root ../BetterVideoReconstruction/out --videos <videos>
+$PYTHON scripts/predict_reconstruction.py --config configs/r10/L_limb.yaml \
+    --checkpoint output_5/<run>/last.pth --out-root ../BetterVideoReconstruction/out --videos <videos>
 
 # Data preparation (scripts/data/)
 $PYTHON scripts/data/extract_frames.py                 # corpus frames/ JPEG tree
 CUDA_VISIBLE_DEVICES=0 $PYTHON scripts/data/precompute_embeddings.py --split all --shard-index 0 --num-shards 4
+$PYTHON scripts/data/precompute_pose_tokens.py         # features/pose_token (frozen FINAL pose token per frame)
 ```
 
 ## Layout
@@ -154,12 +198,13 @@ CUDA_VISIBLE_DEVICES=0 $PYTHON scripts/data/precompute_embeddings.py --split all
 | `data/` | `base.py` = `ClipDataset` ABC (windowing, jitter, full-scene eval) **and the frame schema** (module docstring); `climbing_videos/` (`scene.py` DB + labels, `kindyn.py` forces + SMPL-X GT, `dataset.py`); `reconstruction.py` (label-free BVR out-trees); `collate.py`, `loaders.py`, `transforms.py`. |
 | `train/` | `config.py` (schema = `configs/base.yaml`, cross-key checks, `signal_needs`), `trainer.py` (DDP-exact weighted means, EMA, per-module clipping, per-step warm-up + cosine), `checkpoint.py` (trainable-only, strict), `logger.py` (tensorboard + `tee_output`), `predict.py` (`load_model`). |
 | `utils/` | `geometry.py` (camera parametrizations, projection, world lift), `gvhmr_metrics.py`, `metrics.py`, `distributed.py`. |
-| `scripts/` | Thin CLIs (above); `_render_common.py` shares the scene / clip plumbing and the drawing helpers; `dump_stage1.py` + `analyze_stage1.py` are the stage-1 diagnostics; `eval_table.py`, `paired_ci.py`, `diag_invariance.py`, `diag_sigma_sweep.py` (round-5 scoring / diagnostics), `audit_targets.py` + `audit_rnea.py` (the 2026-09-07 target / RNEA audits, results in `output_2/audits/`), `diag_label_anatomy.py` (round-6 label anatomy over prediction dumps), `force_corr_share.py`. |
+| `scripts/` | Thin CLIs (above); `_render_common.py` shares the scene / clip plumbing and the drawing helpers; `dump_stage1.py` + `analyze_stage1.py` are the stage-1 diagnostics; `eval_table.py`, `paired_ci.py`, `diag_invariance.py` (scoring / diagnostics), `diag_label_anatomy.py` (round-6 label anatomy over prediction dumps), `force_corr_share.py` (Peter's corr / share on the corpus). |
 | `tests/` | `test_refiner.py`: world-frame independence (with / without camera context), identity at init, pose smoothing (polar projection, still-body fixed point), receptive-field locality, gradient flow, the video-interleaved sampler (CPU, BetterHuman body). |
 | `viewer/` | viser results viewer (`scripts/view_results.py`, `docs/old/viewer.md`). |
-| `configs/` | `base.yaml` (the schema, every key with its default), `smooth/` (round 7: `P_k30.yaml` = the pose-only body), `r8/` (round 8: the ladder G0 → F2m; `F2m_scale03.yaml` = the current recipe), `final.yaml` (+ `final_s1.yaml` seed 1, `final_rnea.yaml`), `stage1.yaml` (+ `stage1_eval_auto.yaml`, its eval twin under the refiner protocol), `baseline.yaml`, `static_ray.yaml`, `datasets/*.yaml` (`all` / `static` / `moving` camera subsets). |
-| `docs/` | `architecture.md` (the current model in plain words), `results.md` (what worked and what did not, in easy words), `round8_plan.md` + `round8_2026-09-12.md` (the round-8 design and write-up); `old/` holds every earlier document: `architecture_2.md` (the round-5 model), `round5` / `round6` / `round7` write-ups, `refiner.md` (the two-stage pipeline: rounds 1-4), `plan.md`, `results.md` (every recorded number, incl. the trashed runs), `viewer.md`, `history/`. |
-| `output/` `output_2/` | Run directories `<exp_name>_<stamp>/` (`best.pth`, `last.pth`, `config.yaml`, `eval.json`, `predictions/`, `tensorboard/`), the frozen-baseline jsons, `logs/`; `output_2/` holds the final model's runs (`final*`) and the round-5/6 audit outputs (`audits/`). |
+| `configs/` | `base.yaml` (the schema, every key with its default), `r10/` (round 10, and the only experiment configs left: `L_limb.yaml` = the recipe, `D16.yaml` = its control AND the flattened root everything else inherits from, plus the `*_given_eval` / `*_predict` / ablation twins), `stage1.yaml` (the frozen per-frame body's own recipe), `datasets/*.yaml` (`all` / `static` / `moving` camera subsets). |
+| `docs/` | `architecture.md` (the current model in plain words), `results.md` (what worked and what did not, in easy words), `round10_2026-09-14.md` (limb tokens, decoder contact tokens, gravity force frame), `round9_2026-09-13.md` + `round8_force_anatomy.md` (round 9 and the force anatomy behind it), `round8_plan.md` + `round8_2026-09-12.md` (the round-8 design and write-up); `old/` holds every earlier document: `architecture_2.md` (the round-5 model), `round5` / `round6` / `round7` write-ups, `refiner.md` (the two-stage pipeline: rounds 1-4), `plan.md`, `results.md` (every recorded number, incl. the trashed runs), `viewer.md`, `history/`. |
+| `output_5/` | Run directories `<exp_name>_<stamp>/` (`best.pth`, `last.pth`, `config.yaml`, `eval.json`, `predictions/`, `tensorboard/`) and `logs/`. Rounds 1-9 are in `../trash/cleanup_20260919/`. |
+| `checkpoints/` | Not a run tree: the frozen stage-1 body every stage-2 config loads (`stage1_20260905_180319/best.pth`) and the frozen-baseline jsons (`frozen_sam3d_smplx*.json`, `round3_refiner_eval.json`). Gitignored, never deleted. |
 
 ## Architecture
 
@@ -327,10 +372,10 @@ in `docs/old/refiner.md`.
 
 ## Conventions
 
-- Never `rm`: move to `/data3/rikhat.akizhanov/trash/<name>_<date>/`. Commit/push only on
+- Never `rm`: move to `/home/rikhat.akizhanov/better/trash/<name>_<date>/` (`../trash/`). Commit/push only on
   explicit instruction. Shared GPU box: never touch other users' processes.
-- `output/` holds run directories and the frozen-baseline jsons only; every console transcript
-  or launch log goes to `output/logs/` (the train/evaluate CLIs tee themselves there).
+- `output_5/` holds run directories only; every console transcript or launch log goes to
+  `output_5/logs/` (the train/evaluate CLIs tee themselves there).
 - Skepticism: log raw metrics and trajectories; the user owns verdicts. No validation split
   (train on all train scenes, evaluate on test only).
 - Keep the codebase pruned: no `.get()` fallbacks on schema-guaranteed keys, no history

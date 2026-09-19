@@ -18,4 +18,4 @@ smplx_supervision:
   enabled: true
   loss: {hand_pose: 0.5}
 optim: {lr: 0.0002, weight_decay: 0.01, epochs: 20, lr_min: 1.0e-06}
-output: {exp_name: stage1, monitor: metric_pose/mpjpe, frozen_metrics: output/frozen_sam3d_smplx.json}
+output: {exp_name: stage1, monitor: metric_pose/mpjpe, frozen_metrics: checkpoints/frozen_sam3d_smplx.json}

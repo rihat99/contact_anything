@@ -17,7 +17,7 @@ same way on the annotated corpus test scenes from a run's ``predictions/<scene>.
 Both are unit-free (body weights here, newtons on the boards) and use ALL rows, in contact or
 not, exactly like the board table.
 
-    python scripts/force_corr_share.py output/<run> [output/<run> ...]
+    python scripts/force_corr_share.py output_5/<run> [output_5/<run> ...]
 """
 from __future__ import annotations
 

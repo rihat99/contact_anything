@@ -1,9 +1,9 @@
 """Dump the per-frame (stage-1) body over whole scenes, with the kindyn GT alongside.
 
     python scripts/dump_stage1.py --config configs/stage1.yaml \
-        --checkpoint output/<run>/best.pth --split train --scenes 150
+        --checkpoint checkpoints/stage1_20260905_180319/best.pth --split train --scenes 150
     python scripts/dump_stage1.py --config configs/stage1.yaml \
-        --checkpoint output/<run>/best.pth --split test
+        --checkpoint checkpoints/stage1_20260905_180319/best.pth --split test
 
 Feeds ``scripts/analyze_stage1.py`` (train/test gap of the per-frame model,
 depth-smoothing calibration, GT motion scales). Every tracked person-frame at

@@ -115,6 +115,8 @@ debug/
 # Project-specific: Local tools
 .sl/
 *.lock
+# the uv lockfile IS committed: it pins the environment
+!uv.lock
 
 # Project-specific: Testing
 **/.dist_test
@@ -122,9 +124,8 @@ sandbox*
 # *.sh
 
 images
-*output/
-*output_2/
-*output_3/
+# run directories (output_5 = round 10); the live stage-1 body lives in checkpoints/
+output*/
 inference_samples
 dataset/damon_mhr_contact
 reference/

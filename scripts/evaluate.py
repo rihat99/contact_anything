@@ -1,8 +1,8 @@
 """Evaluate a checkpoint on the annotated test scenes (one clip per scene/person).
 
-    python scripts/evaluate.py --config configs/baseline.yaml \
-        --checkpoint output/<run>/best.pth
-    python scripts/evaluate.py --config configs/baseline.yaml \
+    python scripts/evaluate.py --config configs/r10/L_limb.yaml \
+        --checkpoint output_5/<run>/best.pth
+    python scripts/evaluate.py --config configs/r10/L_limb.yaml \
         --checkpoint none            # the untrained (frozen-baseline) arm
 
 Prints every ``loss_test/*`` term and ``metric_*/*`` metric the enabled losses report, and — when the contact

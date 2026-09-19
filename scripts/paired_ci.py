@@ -24,8 +24,8 @@ of per-clip scores):
 * pose — MPJPE and PA-MPJPE (mm) of the 22 body joints in the camera frame after hip-mean
   alignment (``model/loss/smplx.py::pose_metric_stats``).
 
-    python scripts/paired_ci.py output/<ref_run> output/<run> [...] \
-        --protocol whole --json output_2/audits/paired_ci/whole.json
+    python scripts/paired_ci.py output_5/<ref_run> output_5/<run> [...] \
+        --protocol whole --json output_5/audits/paired_ci/whole.json
 """
 from __future__ import annotations
 

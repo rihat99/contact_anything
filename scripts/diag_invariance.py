@@ -1,7 +1,7 @@
 """Invariance diagnostics of a trained model on the test clips (plan Phase 4).
 
-    python scripts/diag_invariance.py --config configs/final.yaml \
-        --checkpoint output_2/<run>/last.pth --json output_2/audits/invariance/<run>.json
+    python scripts/diag_invariance.py --config configs/r10/L_limb.yaml \
+        --checkpoint output_5/<run>/last.pth --json output_5/audits/invariance/<run>.json
 
 Each row re-scores the SAME checkpoint on the SAME test clips under one perturbation of the
 model's input, always against the unperturbed GT:

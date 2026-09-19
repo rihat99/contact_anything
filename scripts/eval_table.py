@@ -1,6 +1,6 @@
 """Print one metric table over several runs from their ``eval.json`` files.
 
-    python scripts/eval_table.py output_2/final_*
+    python scripts/eval_table.py output_5/L_*
 
 One row per run directory (its ``eval.json``; runs without one are listed as
 pending), the headline metrics of every branch in one line, plus the per-group

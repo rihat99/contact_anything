@@ -1,6 +1,7 @@
 """Stage-1 diagnostics from ``scripts/dump_stage1.py`` dumps.
 
-    python scripts/analyze_stage1.py --train output/<run>/dump_train --test output/<run>/dump_test
+    python scripts/analyze_stage1.py --train checkpoints/stage1_20260905_180319/dump_train \
+        --test checkpoints/stage1_20260905_180319/dump_test
 
 Three questions the stage-2 design depends on (docs/old/refiner.md):
 

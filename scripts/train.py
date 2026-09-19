@@ -1,8 +1,8 @@
 """Train the contact / force / SMPL-X branches on the climbing corpus.
 
-    python scripts/train.py --config configs/baseline.yaml
+    python scripts/train.py --config configs/r10/L_limb.yaml
     CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
-        scripts/train.py --config configs/baseline.yaml
+        scripts/train.py --config configs/r10/L_limb.yaml
 
 Rank 0's console output is mirrored to ``<output.dir>/logs/<run>.log`` (appended
 on resume), so no shell redirect is needed to keep a transcript.
