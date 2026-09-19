@@ -12,7 +12,7 @@ from data.climbing_videos.dataset import ClimbingVideosDataset
 from data.climbing_videos.scene import list_test_scenes, pose_token_path
 from data.collate import make_collate
 
-CORPUS = Path("/data3/rikhat.akizhanov/better/data/ClimbingVideos")
+CORPUS = Path("/home/rikhat.akizhanov/better/data/ClimbingVideos")
 needs_corpus = pytest.mark.skipif(
     not (CORPUS / "features" / "pose_token").is_dir(), reason="corpus pose-token cache not on this box")
 

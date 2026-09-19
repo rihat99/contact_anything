@@ -1,7 +1,7 @@
 # Trained-block diagnostics + frozen-token kernel probe (2026-09-05)
 
 Raw numbers only. Everything below was produced on GPU 5 of the shared box, from the dev
-worktree `/data3/rikhat.akizhanov/better/contact_anything_dev`, with **no training and no repo
+worktree `/home/rikhat.akizhanov/better/contact_anything_dev`, with **no training and no repo
 edits**. Scripts and logs live next to this file:
 
 | file | what |

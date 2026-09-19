@@ -31,7 +31,7 @@ sys.path.insert(0, str(REPO))
 from data.climbing_videos import scene_shard  # noqa: E402
 from data.reconstruction import extract_frames  # noqa: E402
 
-DEFAULT_CORPUS = Path("/data3/rikhat.akizhanov/better/data/ClimbingVideos")
+DEFAULT_CORPUS = Path("/home/rikhat.akizhanov/better/data/ClimbingVideos")
 SCENE_QUERY = (
     "SELECT scene_id FROM scenes WHERE human_selected=1 "
     "AND vlm_category IN (1,2) AND vlm_rope_supported=0 ORDER BY scene_id"

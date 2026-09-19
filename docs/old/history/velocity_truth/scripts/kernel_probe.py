@@ -37,7 +37,7 @@ import numpy as np
 import roma
 import torch
 
-REPO = "/data3/rikhat.akizhanov/better/contact_anything_dev"
+REPO = "/home/rikhat.akizhanov/better/contact_anything_dev"
 sys.path.insert(0, REPO)
 
 from data import build_datasets, build_loaders                      # noqa: E402

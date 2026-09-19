@@ -1,6 +1,6 @@
 """Browse every run's test-set predictions next to the GT and the frozen body in 3D.
 
-One viser server for all runs under ``output/`` that carry a
+One viser server for all runs under ``output_5/`` that carry a
 ``predictions/`` dump (``scripts/predict_test.py``): pick the run and the scene
 in the sidebar, scrub or play the frames, and switch between the two viewing
 regimes — ``camera`` (the bodies exactly as the model outputs them in the
@@ -24,12 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from viewer import view_results                          # noqa: E402
 
-CORPUS = Path("/data3/rikhat.akizhanov/better/data/ClimbingVideos")
+CORPUS = Path("/home/rikhat.akizhanov/better/data/ClimbingVideos")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--output", type=Path, default=Path("output"),
+    parser.add_argument("--output", type=Path, default=Path("output_5"),
                         help="directory holding the <run>/predictions dumps")
     parser.add_argument("--corpus", type=Path, default=CORPUS)
     parser.add_argument("--run", default=None, help="run directory name to open first")

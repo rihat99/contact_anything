@@ -1,0 +1,11 @@
+# L_body without the forces branch: no `force` output, no force supervision, no RNEA residual loss.
+# Iterative refinement and deep supervision stay as in L_body. LIVE backbone, 4 GPUs x 4 clips x
+# accumulate 2 = the recipe's 32 clips per step; 4 epochs.
+base: configs/r10/L_body.yaml
+model:
+  refiner: {outputs: [pose, gravity, contact]}
+force_supervision: {enabled: false, layer_weight: 0.0}
+force_consistency: {enabled: false}
+data: {embedding_cache: false, frames_per_batch: 240}
+optim: {epochs: 4}
+output: {exp_name: L_body_noforce}

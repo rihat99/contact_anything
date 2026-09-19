@@ -1,0 +1,8 @@
+# Round 10 arm L with the forces read in the INPUT body frame (D's `force_frame`): isolates the limb /
+# decoder tokens from the gravity frame, which on D16_notoken cost 0.002-0.005 bw and 1-1.5 deg.
+# 2 GPUs x 8 clips x accumulate 2 = the recipe's 32 clips per step.
+base: configs/r10/L_limb.yaml
+model:
+  refiner: {force_frame: body}
+data: {frames_per_batch: 480}
+output: {exp_name: L_body}

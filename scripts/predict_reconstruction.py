@@ -28,7 +28,7 @@ right_foot, left_ankle (heel), right_ankle``; the anchors are the refined body's
 SMPL-X wrist / toe / ankle joints.
 
     python scripts/predict_reconstruction.py --config configs/stage2_v2_force.yaml \
-        --checkpoint output/<run>/last.pth \
+        --checkpoint output_5/<run>/last.pth \
         --out-root ../BetterVideoReconstruction-dev/peter/out_climb_wall_2_single \
         --videos ../BetterVideoReconstruction-dev/peter/climb_wall_2 \
         --video-pattern "{scene}/cam_left.mp4" --force-name forces_sup.npz
@@ -222,8 +222,8 @@ def run_scene(args, model, cfg: dict, scene: str, video: Path, work_root: Path,
         np.savez_compressed(
             targets["force"], forces=preds["forces"], forces_world=preds["forces_world"],
             anchor_points_2d=preds["anchor_2d"], anchor_cam=preds["anchor_cam"],
-            units="body_weight", force_frame="refiner_body",
-            root_rotation_source="the model's own world-from-body root (refiner input frame)",
+            units="body_weight", force_frame=("refiner_" + model.refiner.force_frame) if model.refiner is not None else "root",
+            root_rotation_source="the model's own world-from-frame rotation (out['force']['frame'])",
             **extra, **identity)
         magnitude = np.linalg.norm(preds["forces"], axis=-1)
         finite = np.isfinite(magnitude)

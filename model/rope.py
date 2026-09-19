@@ -176,6 +176,111 @@ class _RopeBlock(nn.Module):
         return x + self.ffn(self.norm_ffn(x))
 
 
+def _self_attention(
+    x: torch.Tensor,
+    qkv: nn.Linear,
+    num_heads: int,
+    head_dim: int,
+    cos: Optional[torch.Tensor],
+    sin: Optional[torch.Tensor],
+    attn_mask: Optional[torch.Tensor],
+    dropout: float,
+) -> torch.Tensor:
+    """Multi-head self-attention of ``[B, T, C]``, RoPE-rotated when ``cos`` is given."""
+    b, t, c = x.shape
+    packed = qkv(x).reshape(b, t, 3, num_heads, head_dim)
+    q, k, v = packed.permute(2, 0, 3, 1, 4).unbind(0)       # each [B, H, T, hd]
+    if cos is not None:
+        q = rope_rotate(q, cos, sin)
+        k = rope_rotate(k, cos, sin)
+    attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout)
+    return attn.transpose(1, 2).reshape(b, t, c)
+
+
+class _AlternatingBlock(nn.Module):
+    """Pre-LN block that separates the two axes of a ``T x K`` token grid.
+
+    In order: RoPE attention along TIME within each slot (the frame keep-mask,
+    one sequence per (clip, slot)), plain attention across the ``K`` slots
+    WITHIN each frame (no RoPE — the slots share their frame's position — and no
+    mask), then one FFN. Both output projections and the FFN's last linear are
+    zero-initialised, so the block is an exact identity at init.
+
+    Parameters per block ``~16 dim^2`` (two attentions at ``4 dim^2`` each plus
+    an FFN at ``2 x mlp_ratio dim^2``), against ``~8 dim^2`` for
+    :class:`_RopeBlock`; the joint attention over ``T K`` tokens it replaces
+    costs ``(T K)^2`` logits, these two cost ``K T^2 + T K^2``.
+    """
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim {dim} not divisible by num_heads {num_heads}")
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.dropout = float(dropout)
+
+        self.norm_temporal = nn.LayerNorm(dim)
+        self.qkv_temporal = nn.Linear(dim, 3 * dim)
+        self.proj_temporal = nn.Linear(dim, dim)
+        self.norm_frame = nn.LayerNorm(dim)
+        self.qkv_frame = nn.Linear(dim, 3 * dim)
+        self.proj_frame = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(dropout)
+
+        hidden = int(dim * mlp_ratio)
+        self.norm_ffn = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim),
+            nn.Dropout(dropout),
+        )
+        for zeroed in (self.proj_temporal, self.proj_frame, self.ffn[3]):
+            nn.init.zeros_(zeroed.weight)
+            nn.init.zeros_(zeroed.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        slot_temporal: torch.Tensor,
+        slot_frame: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one block.
+
+        :param x: tokens ``[n_clips, T, K, C]``.
+        :param cos: RoPE table ``[n_clips K, 1, T, head_dim]`` (slot-major rows).
+        :param sin: RoPE table ``[n_clips K, 1, T, head_dim]``.
+        :param attn_mask: bool ``[n_clips K, 1, T, T]`` (``True`` = may attend)
+            or ``None`` for all-visible.
+        :param slot_temporal: slot identity ``[n_clips K, 1, C]`` of the
+            temporal branch, added to the LayerNormed input inside the attention
+            branch, never to the residual stream.
+        :param slot_frame: the same identity ``[1, K, C]`` for the within-frame
+            branch.
+        :returns: ``[n_clips, T, K, C]``.
+        """
+        n_clips, seq_len, num_slots, dim = x.shape
+        h = x.permute(0, 2, 1, 3).reshape(n_clips * num_slots, seq_len, dim)
+        attn = _self_attention(
+            self.norm_temporal(h) + slot_temporal, self.qkv_temporal, self.num_heads,
+            self.head_dim, cos, sin, attn_mask, self.dropout if self.training else 0.0)
+        h = h + self.proj_drop(self.proj_temporal(attn))
+
+        h = h.reshape(n_clips, num_slots, seq_len, dim).permute(0, 2, 1, 3)
+        h = h.reshape(n_clips * seq_len, num_slots, dim)
+        attn = _self_attention(
+            self.norm_frame(h) + slot_frame, self.qkv_frame, self.num_heads, self.head_dim,
+            None, None, None, self.dropout if self.training else 0.0)
+        h = h + self.proj_drop(self.proj_frame(attn))
+        h = h + self.ffn(self.norm_ffn(h))
+        return h.reshape(n_clips, seq_len, num_slots, dim)
+
+
 class CrossModalRopeModule(nn.Module):
     """RoPE self-attention over all modality tokens of a clip, across its frames.
 
@@ -199,6 +304,10 @@ class CrossModalRopeModule(nn.Module):
     :param window: attention half-width in seconds (``None`` = whole clip).
     :param time_scale: RoPE rotation units per second (``25`` makes one
         25-fps step a unit position).
+    :param alternating: build :class:`_AlternatingBlock` layers instead — one
+        RoPE attention along time per slot, then one attention across the ``K``
+        slots of a frame, then the FFN — rather than one joint attention over
+        the frame-major ``T K`` sequence.
     """
 
     def __init__(
@@ -211,6 +320,7 @@ class CrossModalRopeModule(nn.Module):
         dropout: float = 0.1,
         window: Optional[float] = 2.5,
         time_scale: float = 25.0,
+        alternating: bool = False,
     ):
         super().__init__()
         if num_slots <= 0:
@@ -223,8 +333,10 @@ class CrossModalRopeModule(nn.Module):
         self.num_slots = int(num_slots)
         self.window = None if window is None else float(window)
         self.time_scale = float(time_scale)
+        self.alternating = bool(alternating)
+        block_cls = _AlternatingBlock if self.alternating else _RopeBlock
         self.blocks = nn.ModuleList(
-            _RopeBlock(dim, num_heads, mlp_ratio, dropout) for _ in range(num_layers))
+            block_cls(dim, num_heads, mlp_ratio, dropout) for _ in range(num_layers))
         self.head_dim = dim // num_heads
         # Small init (ViT positional-embedding convention): slots are
         # distinguishable from step one without swamping the LayerNormed
@@ -236,6 +348,20 @@ class CrossModalRopeModule(nn.Module):
     def num_layers(self) -> int:
         """Stacked RoPE blocks."""
         return len(self.blocks)
+
+    def _alternating_tables(self, tokens: torch.Tensor, seconds: torch.Tensor,
+                            valid: Optional[torch.Tensor], n_clips: int, num_slots: int,
+                            seq_len: int) -> dict:
+        """:meth:`prepare`'s tables for :class:`_AlternatingBlock` (rows ``clip K + k``)."""
+        cos, sin = rope_cos_sin(seconds * self.time_scale, self.head_dim)   # [n_clips, T, hd]
+        cos = cos.to(tokens.dtype).repeat_interleave(num_slots, dim=0)[:, None]
+        sin = sin.to(tokens.dtype).repeat_interleave(num_slots, dim=0)[:, None]
+        mask = frame_keep_mask(seconds, valid, self.window)
+        if mask is not None:
+            mask = mask.repeat_interleave(num_slots, dim=0)[:, None]   # [n_clips K, 1, T, T]
+        return {"cos": cos, "sin": sin, "mask": mask,
+                "slot_temporal": self.slot_embed.repeat(n_clips, 1)[:, None],
+                "slot_frame": self.slot_embed[None], "seq_len": seq_len}
 
     def prepare(
         self,
@@ -255,7 +381,9 @@ class CrossModalRopeModule(nn.Module):
         :param seq_len: frames per clip ``T``.
         :param frame_pos_sec: elapsed seconds per flattened frame ``[B_flat]``.
         :param frame_valid: per-frame validity ``[B_flat]`` bool.
-        :returns: the bundle :meth:`run_block` takes.
+        :returns: the bundle :meth:`run_block` takes — the frame-major tables of
+            the joint attention, or (``alternating``) the slot-major ones of
+            :meth:`_alternating_tables`.
         """
         b_flat, num_slots, input_dim = tokens.shape
         if input_dim != self.dim:
@@ -270,6 +398,13 @@ class CrossModalRopeModule(nn.Module):
         n_clips = b_flat // seq_len
 
         seconds = frame_pos_sec.to(tokens.device).float().view(n_clips, seq_len)
+        valid = None
+        if frame_valid is not None:
+            valid = frame_valid.to(
+                device=tokens.device, dtype=torch.bool).view(n_clips, seq_len)
+        if self.alternating:
+            return self._alternating_tables(tokens, seconds, valid, n_clips, num_slots, seq_len)
+
         # Every token of a frame shares that frame's position: within-frame
         # pairs see offset 0 (un-rotated), across-frame pairs their relative offset.
         token_pos = seconds.repeat_interleave(num_slots, dim=1)     # [n_clips, T*K]
@@ -277,10 +412,6 @@ class CrossModalRopeModule(nn.Module):
         cos = cos.to(tokens.dtype)[:, None]                 # [n_clips, 1, T*K, hd]
         sin = sin.to(tokens.dtype)[:, None]
 
-        valid = None
-        if frame_valid is not None:
-            valid = frame_valid.to(
-                device=tokens.device, dtype=torch.bool).view(n_clips, seq_len)
         mask = frame_keep_mask(seconds, valid, self.window)
         if mask is not None:
             # [n_clips, T, T] -> [n_clips, 1, T*K, T*K]: all K tokens of a frame
@@ -295,6 +426,11 @@ class CrossModalRopeModule(nn.Module):
         """Run block ``index`` over ``[B_flat, K, C]`` tokens with :meth:`prepare`'s tables."""
         b_flat, num_slots, input_dim = tokens.shape
         seq_len = tables["seq_len"]
+        if self.alternating:
+            x = tokens.reshape(b_flat // seq_len, seq_len, num_slots, input_dim)
+            x = self.blocks[index](x, tables["cos"], tables["sin"], tables["mask"],
+                                   tables["slot_temporal"], tables["slot_frame"])
+            return x.reshape(b_flat, num_slots, input_dim)
         x = tokens.reshape(b_flat // seq_len, seq_len * num_slots, input_dim)
         x = self.blocks[index](x, tables["cos"], tables["sin"], tables["mask"], tables["slot_emb"])
         return x.reshape(b_flat, num_slots, input_dim)

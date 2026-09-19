@@ -21,9 +21,9 @@ thinner white arrow at the same joint.
 Under ``torchrun`` the scenes are sharded over ranks; every rank writes its own
 files, no process group needed.
 
-    python scripts/render_video.py --config configs/baseline.yaml \\
-        --checkpoint output/<run>/best.pth --scenes 5 \\
-        --out output/<run>/render_contact --overlay-labels --gt-panel --scale 0.5
+    python scripts/render_video.py --config configs/r10/L_limb.yaml \\
+        --checkpoint output_5/<run>/best.pth --scenes 5 \\
+        --out output_5/<run>/render_contact --overlay-labels --gt-panel --scale 0.5
 """
 from __future__ import annotations
 
@@ -118,8 +118,12 @@ def predict_scene(model, ds, cfg: dict, device: str, arms: tuple[str, ...]) -> d
                             rc.to_numpy(gt["joints"][:, :22]), rc.to_numpy(gt["valid"]) > 0)
         forces_cam = gt_forces_cam = None
         if output["force"] is not None:
-            root_rot = rc.to_numpy(smplx["root_rot"])                        # cam-from-root
-            forces_cam = np.einsum("bij,bkj->bki", root_rot, rc.to_numpy(output["force"]["forces"]))
+            frame = output["force"].get("frame")                # refiner: world-from-prediction
+            if frame is None:                                   # decoder head: the root-frame convention
+                to_cam = rc.to_numpy(smplx["root_rot"])
+            else:
+                to_cam = rc.to_numpy(batch["cam_from_world"].to(frame)[:, :3, :3] @ frame)
+            forces_cam = np.einsum("bij,bkj->bki", to_cam, rc.to_numpy(output["force"]["forces"]))
             if gt is not None and "gt_forces_cam" in out:
                 gt_force = np.where(rc.to_numpy(batch["force_contact"])[..., None] > 0,
                                     rc.to_numpy(batch["force_gt"]), np.nan)

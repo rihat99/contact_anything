@@ -38,9 +38,9 @@ from .scene import (
 
 GRAVITY_MAG = 9.81
 #: ``source`` values of ``features/geocalib/<shard>/<scene>/gravity.npz``.
-GRAVITY_SOURCES = ("ground", "geocalib", "fallback_down")
-#: The source that is NOT a measurement: the world frame is the first camera, so this
-#: "gravity" is that camera's own down axis.
+#: The geocalib gravity source that is NOT a measurement: the world frame is the first
+#: camera, so this "gravity" is that camera's own down axis. Every other source (the corpus's
+#: ``ground`` / ``geocalib``, a reconstruction tree's ``ground-plane-3view``, ...) is one.
 GRAVITY_FALLBACK_SOURCE = "fallback_down"
 #: The joint names kindyn stores for the six group columns (hands by wrist).
 KINDYN_FORCE_JOINTS = (
@@ -89,21 +89,16 @@ def gravity_measured(gravity_path: Path) -> bool:
     ``kindyn_1.npz``'s ``gravity_world`` is a copy of the vector in
     ``features/geocalib/<shard>/<scene>/gravity.npz``
     (:func:`data.climbing_videos.scene.gravity_path`), whose ``source`` records how it
-    was obtained: ``ground`` (normal of a fitted ground plane) and ``geocalib`` (pooled
-    per-frame GeoCalib estimates, accepted as reliable) are measurements, while
-    ``fallback_down`` is the first camera's down axis — no measurement of gravity at
-    all, and 40 % of the corpus.
+    was obtained: ``ground`` (normal of a fitted ground plane), ``geocalib`` (pooled
+    per-frame GeoCalib estimates, accepted as reliable) and any other estimator are
+    measurements, while :data:`GRAVITY_FALLBACK_SOURCE` is the first camera's down axis —
+    no measurement of gravity at all, and 40 % of the corpus.
 
     :raises FileNotFoundError: no geocalib file (a corpus feature is never optional).
-    :raises ValueError: the source is not one of :data:`GRAVITY_SOURCES`.
     """
     if not gravity_path.is_file():
         raise FileNotFoundError(f"no geocalib gravity at {gravity_path}")
-    source = str(np.load(gravity_path, allow_pickle=True)["source"])
-    if source not in GRAVITY_SOURCES:
-        raise ValueError(
-            f"{gravity_path}: gravity source {source!r} is none of {list(GRAVITY_SOURCES)}")
-    return source != GRAVITY_FALLBACK_SOURCE
+    return str(np.load(gravity_path, allow_pickle=True)["source"]) != GRAVITY_FALLBACK_SOURCE
 
 
 def _gravity_fields(scene: str, kindyn, gravity_path: Path) -> dict:

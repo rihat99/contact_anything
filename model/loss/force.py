@@ -64,9 +64,9 @@ solve confidence raised to ``confidence_power`` (1 = the raw confidence, 0.5
 compresses it — the corpus confidence is 0.99 at the median and 0.54 at p5, so
 the exponent only matters for the low tail; 0 = flat) — into numerator and
 mass both, so it reweights rows without changing any term's scale. The reported
-metrics stay unweighted: ``mae`` (vector error, in-contact rows), ``mag_mae``
-(``||f_pred| - |f_gt||``, same rows), ``angle_deg`` (on the direction rows) and
-``noncontact_mag``.
+metrics stay unweighted: ``mae`` and ``rmse`` (vector error, in-contact rows),
+``mag_mae`` (``||f_pred| - |f_gt||``, same rows), ``angle_deg`` (on the direction
+rows) and ``noncontact_mag``.
 """
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ class ForceLoss(Loss):
 
     name = "force"
     stat_names = ("mae_num", "mae_mass", "noncontact_num", "noncontact_mass",
-                  "mag_num", "angle_num", "angle_mass")
+                  "mag_num", "angle_num", "angle_mass", "sq_num")
 
     def __init__(self, cfg: dict, model, device: torch.device | str) -> None:
         super().__init__(cfg, model, device)
@@ -256,6 +256,7 @@ class ForceLoss(Loss):
                 float((mag_pred * off_contact).sum()), float(off_contact.sum()),
                 float((mag_err * in_contact).sum()),
                 float((angle * direction_rows).sum()), float(direction_rows.sum()),
+                float((err.square() * in_contact).sum()),
             ], dtype=torch.float64, device=self.device)
         scalars = {
             "mae": mean_from_stats(float(stats[0]), float(stats[1])),
@@ -280,6 +281,7 @@ class ForceLoss(Loss):
             "noncontact_mag": mean_from_stats(float(stats[2]), float(stats[3])),
             "mag_mae": mean_from_stats(float(stats[4]), float(stats[1])),
             "angle_deg": mean_from_stats(float(stats[5]), float(stats[6])),
+            "rmse": mean_from_stats(float(stats[7]), float(stats[1])) ** 0.5,
         }
 
 

@@ -25,7 +25,8 @@ refiner (layer k + 1 sees what layer k's forces left unbalanced).
   true contact points; the lever's moment is a knowingly accepted error).
 * **Residual**: ``tau[..., :3] / (m g)`` (body weights) and ``tau[..., 3:6] /
   (m g · 1 m)``, both in the root frame; rows need the ±2 stencil inside a valid
-  run, clip ends carry none.
+  run, clip ends carry none. The 21 body joints' torques ``tau[..., 6:] / (m g · 1 m)``
+  come back with it — what the force allocation costs the body's own actuators.
 """
 from __future__ import annotations
 
@@ -94,7 +95,8 @@ class RootWrench:
         :param seconds: ``(n, T)``; ``valid`` ``(n, T)`` bool.
         :param smooth_sec: Gaussian sigma (s) applied to the motion first (0 = none).
         :returns: ``(force residual (n, T, 3) in bw, torque residual (n, T, 3) in
-            bw·m, rows (n, T) bool)`` — residuals in the root frame.
+            bw·m, rows (n, T) bool, joint torques (n, T, nv - 6) in bw·m)`` —
+            residuals in the root frame, joint torques in BetterHuman ``q`` DOF order.
         """
         n, t = seconds.shape
         if smooth_sec > 0.0:
@@ -126,7 +128,26 @@ class RootWrench:
             [f_local, torch.zeros_like(f_local)], dim=-1))
         tau = br.rnea(robot, q, v, a, fext=fext)                             # (n, T, nv)
         rows = stencil_valid(valid, 2)
-        return tau[..., :3] / mass_g, tau[..., 3:6] / mass_g, rows
+        return tau[..., :3] / mass_g, tau[..., 3:6] / mass_g, rows, tau[..., 6:] / mass_g
+
+    def dof_weights(self, table: dict[str, float]) -> Tensor:
+        """``(nv - 6,)`` per-DOF multiplier of the joint torques from a joint-GROUP table.
+
+        The group of a joint is its name without side and index (``left_hip`` -> ``hip``,
+        ``spine2`` -> ``spine``); every body joint must be covered.
+        """
+        robot = self.body.robot
+        idx_vs, nvs = [int(i) for i in robot.idx_vs], [int(n) for n in robot.nvs]
+        weight = torch.zeros(int(robot.nv) - 6, device=self.device, dtype=self.dtype)
+        for joint_id, name in enumerate(robot.joint_names):
+            if idx_vs[joint_id] < 6:
+                continue                                                 # universe and the root
+            group = name.removeprefix("left_").removeprefix("right_").rstrip("0123456789")
+            if group not in table:
+                raise ValueError(f"joint torque multipliers: no entry for joint group {group!r} "
+                                 f"(joint {name!r}); table has {sorted(table)}")
+            weight[idx_vs[joint_id] - 6: idx_vs[joint_id] - 6 + nvs[joint_id]] = float(table[group])
+        return weight
 
 
 __all__ = ["GRAVITY", "GROUP_ROBOT_JOINTS", "RootWrench", "trajectory_derivatives"]

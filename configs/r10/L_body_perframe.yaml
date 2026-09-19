@@ -1,0 +1,11 @@
+# L_body with NO information between frames: `model.refiner.per_frame` (each frame refined on its
+# own — no velocity / dt channels, no limb rates, attention within the frame only, per-frame betas
+# and gravity vote), hence no iterative refinement and no deep supervision either. The finite-
+# difference LOSSES (motion, contact stillness, RNEA) stay as in L_body. LIVE backbone,
+# 4 GPUs x 4 clips x accumulate 2 = the recipe's 32 clips per step; 4 epochs.
+base: configs/r10/L_body_noiter.yaml
+model:
+  refiner:
+    per_frame: true
+    token: {one_sided_velocity: false, joint_velocity: false}
+output: {exp_name: L_body_perframe}

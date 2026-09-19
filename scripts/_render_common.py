@@ -97,16 +97,20 @@ def shard(items: Sequence) -> tuple[list, int, int]:
 
 def build_dataset(
     cfg: dict, root: Path, contact_level: int, scene: str, split: str,
-    load: set[str], max_frames: int,
+    load: set[str], max_frames: int, pose_tokens: bool = False,
 ) -> ClimbingVideosDataset:
     """One scene as clips: the whole-scene eval clip per person, or train tiles.
 
     ``max_frames`` caps the eval clip and is inert on the train split, whose
     clips are ``data.clip.frames`` long by construction. A refiner whose token
-    carries the gravity channel needs the kindyn ``smplx`` group loaded.
+    carries the gravity channel or takes the gravity as an input needs the kindyn
+    ``smplx`` group loaded. ``pose_tokens`` reads the precomputed pose-token cache
+    (no image, mask or frozen pass; the token is within ~0.5 % of the live one) —
+    for consumers that never touch pixels or the frozen MHR readout.
     """
     refiner = cfg["model"]["refiner"]
-    if refiner["enabled"] and bool(refiner["token"]["gravity"]):
+    if refiner["enabled"] and (bool(refiner["token"]["gravity"])
+                               or bool(refiner["gravity_input"]["enabled"])):
         load = set(load) | {"smplx"}
     return ClimbingVideosDataset(
         root,
@@ -119,7 +123,8 @@ def build_dataset(
         contact_level=contact_level,
         load=load,
         embedding_dir=(root / "features" / "embedding"
-                       if bool(cfg["data"]["embedding_cache"]) else None),
+                       if bool(cfg["data"]["embedding_cache"]) and not pose_tokens else None),
+        pose_token_dir=root / "features" / "pose_token" if pose_tokens else None,
         full_scenes=split == "test",
         max_frames=int(max_frames),
     )

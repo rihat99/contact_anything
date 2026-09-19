@@ -9,7 +9,12 @@
   intermediate layer, the sums never get a layer twin, and at ``layer_weight: 0``
   the term is gone and the base terms are bit-identical;
 * the loader's gravity source -> ``gravity_measured`` flag on the three corpus
-  sources, a missing file and an unknown source.
+  sources, a missing file and an unknown source;
+* ``force_consistency``'s joint-torque term: the per-DOF multipliers follow the
+  joint-GROUP table (and an incomplete table is refused), a static standing body
+  routes its load through whichever limbs hold it up — legs when the feet carry it,
+  shoulders and elbows when the hands do, which the strength-weighted term prices
+  two orders of magnitude apart — and the term moves the forces only, never the body.
 """
 from __future__ import annotations
 
@@ -23,10 +28,12 @@ import torch
 import torch.nn.functional as F
 import yaml
 
-from data.climbing_videos.kindyn import GRAVITY_SOURCES, gravity_measured
+from data.climbing_videos.kindyn import gravity_measured
+from model.loss import KINDYN_GROUP_NAMES
 from model.loss.contact import ContactLoss
 from model.loss.contact_consistency import GROUP_JOINTS, ContactConsistencyLoss
 from model.loss.force import LAYER_TERM_NAMES, ForceLoss
+from model.loss.force_consistency import ForceConsistencyLoss
 from model.refiner import forward_valid, stencil_valid
 
 REPO = Path(__file__).resolve().parents[1]
@@ -311,14 +318,158 @@ def write_gravity(path: Path, source: str) -> Path:
 
 
 @pytest.mark.parametrize("source, measured", [("ground", True), ("geocalib", True),
+                                              ("ground-plane-3view", True),
                                               ("fallback_down", False)])
 def test_gravity_measured_reads_the_geocalib_source(tmp_path, source, measured):
-    assert source in GRAVITY_SOURCES
     assert gravity_measured(write_gravity(tmp_path / f"{source}.npz", source)) is measured
 
 
-def test_gravity_measured_hard_fails_on_a_missing_or_unknown_source(tmp_path):
+def test_gravity_measured_hard_fails_on_a_missing_file(tmp_path):
     with pytest.raises(FileNotFoundError):
         gravity_measured(tmp_path / "absent.npz")
-    with pytest.raises(ValueError, match="gravity source"):
-        gravity_measured(write_gravity(tmp_path / "odd.npz", "assumed_up"))
+
+
+# ------------------------------------------------------------------ joint torques
+
+#: Frames of the static-body clips (the residual's +-2 stencil needs five).
+STATIC_FRAMES = 7
+#: Middle frame of such a clip — an interior row of the stencil.
+MID = STATIC_FRAMES // 2
+
+
+@pytest.fixture(scope="module")
+def torque_loss(base_cfg):
+    """``force_consistency`` with only the joint-torque term weighted (ungated forces)."""
+    cfg = copy.deepcopy(base_cfg)
+    cfg["force_consistency"].update(enabled=True, gate_by_contact=False)
+    cfg["force_consistency"]["loss"].update(force=0.0, torque=0.0, joint_torque=1.0)
+    return ForceConsistencyLoss(cfg, None, "cpu")
+
+
+def standing_body() -> dict:
+    """A motionless SMPL-X neutral body, upright at the world origin, y up."""
+    return {
+        "pelvis": torch.zeros(1, STATIC_FRAMES, 3),
+        "root_rot": torch.eye(3).expand(1, STATIC_FRAMES, 3, 3).contiguous(),
+        "body_rot": torch.eye(3).expand(1, STATIC_FRAMES, 21, 3, 3).contiguous(),
+        "betas": torch.zeros(1, 10),
+        "seconds": (torch.arange(STATIC_FRAMES, dtype=torch.float32) / FPS)[None],
+        "valid": torch.ones(1, STATIC_FRAMES, dtype=torch.bool),
+        "gravity": torch.tensor([[0.0, -1.0, 0.0]]),
+    }
+
+
+def support_forces(groups: tuple[str, ...], magnitude: float = 0.5) -> torch.Tensor:
+    """``(1, T, 6, 3)`` world forces: ``magnitude`` bw straight up on each named group."""
+    forces = torch.zeros(1, STATIC_FRAMES, len(KINDYN_GROUP_NAMES), 3)
+    for group in groups:
+        forces[:, :, KINDYN_GROUP_NAMES.index(group), 1] = magnitude
+    return forces
+
+
+def named_torque(wrench, tau: torch.Tensor, joint: str) -> float:
+    """``|tau|`` (bw·m) of one named joint at the clip's middle frame."""
+    robot = wrench.body.robot
+    start = int(robot.idx_vs[robot.joint_names.index(joint)]) - 6
+    return float(tau[0, MID, start: start + 3].norm())
+
+
+def static_residual(wrench, groups: tuple[str, ...]):
+    """The residual of the standing body held up by ``groups`` (1 bw of support in all)."""
+    body = standing_body()
+    return wrench.residual(body["pelvis"], body["root_rot"], body["body_rot"], body["betas"],
+                           support_forces(groups), body["gravity"], body["seconds"],
+                           body["valid"])
+
+
+def test_dof_weights_follow_the_joint_group_table(torque_loss, base_cfg):
+    table = base_cfg["force_consistency"]["joint_torque_multipliers"]
+    weight = torque_loss.dof_weight
+    robot = torque_loss.wrench.body.robot
+    assert weight.shape == (int(robot.nv) - 6,)
+    for joint, group in (("left_hip", "hip"), ("spine2", "spine"), ("right_wrist", "wrist"),
+                         ("left_foot", "foot"), ("head", "head")):
+        start = int(robot.idx_vs[robot.joint_names.index(joint)]) - 6
+        assert weight[start: start + 3].tolist() == pytest.approx([table[group]] * 3)
+    with pytest.raises(ValueError, match="joint group"):
+        torque_loss.wrench.dof_weights({"hip": 1.0})
+
+
+def test_static_body_routes_its_load_through_the_supported_limbs(torque_loss):
+    wrench = torque_loss.wrench
+    torques, weighted = {}, {}
+    for label, groups in (("feet", ("left_ankle", "right_ankle")),
+                          ("hands", ("left_hand", "right_hand"))):
+        res_f, _, rows, tau = static_residual(wrench, groups)
+        # One body weight of support leaves the root force balanced, so the joints carry it.
+        assert bool(rows[0, MID]) and float(res_f[0, MID].norm()) < 1e-4
+        torques[label] = {joint: named_torque(wrench, tau, joint) for joint in
+                          ("left_hip", "left_knee", "left_shoulder", "left_elbow")}
+        weighted[label] = float(torque_loss._joint_torque_sq(tau)[0, MID])
+
+    # Standing on the heels: the legs carry the weight close to their own axis.
+    assert torques["feet"]["left_hip"] < 0.05
+    assert torques["feet"]["left_knee"] < 0.05
+    # Hanging from the hands: the whole weight passes through the arms instead.
+    assert torques["hands"]["left_shoulder"] > 0.15
+    assert torques["hands"]["left_elbow"] > 0.05
+    assert torques["hands"]["left_shoulder"] > 10.0 * torques["feet"]["left_shoulder"]
+    assert torques["hands"]["left_hip"] < torques["feet"]["left_hip"]
+    # Which is what the strength-weighted term prices: the same support costs far more
+    # on the arms (wrist 17, shoulder 2.5) than on the legs (hip / knee 1.0).
+    assert weighted["hands"] > 100.0 * weighted["feet"]
+
+
+def torque_batch() -> dict:
+    """A one-clip batch of the standing body; its GT floor is the same body, unforced."""
+    body, n = standing_body(), STATIC_FRAMES
+    return {
+        "seq_len": n,
+        "frame_pos_sec": body["seconds"].reshape(n),
+        "frame_valid": body["valid"].reshape(n),
+        "gravity_world": body["gravity"].expand(n, 3),
+        "smplx_joints_world": torch.zeros(n, 22, 3),
+        "smplx_root_rot": body["root_rot"].reshape(n, 3, 3),
+        "smplx_body_rot": body["body_rot"].reshape(n, 21, 3, 3),
+        "smplx_betas": body["betas"].expand(n, 10),
+        "smplx_valid": torch.ones(n, dtype=torch.bool),
+        "force_gt": torch.zeros(n, len(KINDYN_GROUP_NAMES), 3),
+        "force_contact": torch.zeros(n, len(KINDYN_GROUP_NAMES), dtype=torch.bool),
+        "force_valid": torch.ones(n, dtype=torch.bool),
+    }
+
+
+def test_joint_torque_term_moves_only_the_forces(torque_loss):
+    body, n = standing_body(), STATIC_FRAMES
+    pose = {name: body[name].clone().requires_grad_(True)
+            for name in ("pelvis", "root_rot", "body_rot", "betas")}
+    forces = support_forces(("left_hand", "right_hand")).reshape(
+        n, len(KINDYN_GROUP_NAMES), 3).clone().requires_grad_(True)
+    out = {"smplx": {"pelvis_world": pose["pelvis"].reshape(n, 3),
+                     "root_rot_world": pose["root_rot"].reshape(n, 3, 3),
+                     "body_rot": pose["body_rot"].reshape(n, 21, 3, 3),
+                     "betas": pose["betas"].expand(n, 10)},
+           "force": {"forces": forces, "frame": torch.eye(3).expand(n, 3, 3)}}
+
+    assert torque_loss.term_names == ("joint_torque",)
+    result = torque_loss(out, torque_batch(), train=True)
+    assert set(result.terms) == {"joint_torque"}
+
+    # The term is the strength-weighted squared torque of the same (fixed) body.
+    _, _, rows, tau = static_residual(torque_loss.wrench, ("left_hand", "right_hand"))
+    mask = rows.to(torch.float32)
+    assert result.terms["joint_torque"].mass == pytest.approx(float(mask.sum()))
+    assert float(result.terms["joint_torque"].numerator) == pytest.approx(
+        float((torque_loss._joint_torque_sq(tau) * mask).sum()), rel=1e-5)
+    metrics = torque_loss.metrics(result.stats)
+    assert metrics["joint_torque"] == pytest.approx(
+        float(result.terms["joint_torque"].numerator) / result.terms["joint_torque"].mass,
+        rel=1e-5)
+    # The GT floor is the same body under the (zero) kindyn GT forces: it hangs on nothing.
+    assert 0.0 < metrics["gt_joint_torque"] < metrics["joint_torque"]
+
+    # Only the forces may move to lighten it: the body it is measured on is detached.
+    result.terms["joint_torque"].numerator.backward()
+    assert float(forces.grad.abs().sum()) > 0.0
+    for tensor in pose.values():
+        assert tensor.grad is None or float(tensor.grad.abs().sum()) == 0.0

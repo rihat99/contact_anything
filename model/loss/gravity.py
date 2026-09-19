@@ -8,8 +8,11 @@ refiner.
 
 The corpus gravity is a measurement on the ``ground`` / ``geocalib`` scenes and
 the first camera's down axis on the ``fallback_down`` ones (``gravity_measured``
-per frame); ``measured_only`` restricts the supervision to the former. The
-metrics always report both populations apart: ``angle_measured`` /
+per frame); ``measured_only`` restricts the supervision to the former. A clip
+the refiner was GIVEN its gravity on (``out["gravity"]["given"]``,
+``model.refiner.gravity_input``) is dropped from every term and metric: its
+prediction IS the target, and scoring it would only teach the head to copy its
+input. The metrics always report both populations apart: ``angle_measured`` /
 ``angle_fallback`` (mean degrees between the prediction and the corpus vector)
 and ``prior_angle_measured`` / ``prior_angle_fallback``, the same for the head's
 zero-init estimate (``out["gravity"]["prior_world"]``: the pooled camera down
@@ -44,14 +47,18 @@ class GravityLoss(Loss):
         if self.layer_weight > 0.0:
             self.term_names = ("cos", "cos_layer")
 
-    def _clips(self, batch: dict) -> tuple[Tensor, Tensor, Tensor]:
-        """Per-clip ``(gravity (n, 3), valid (n,), measured (n,))`` from the frame rows."""
+    def _clips(self, out: dict, batch: dict) -> tuple[Tensor, Tensor, Tensor]:
+        """Per-clip ``(gravity (n, 3), scored (n,), measured (n,))`` from the frame rows.
+
+        A clip is scored when it is valid and the refiner had to GUESS its gravity.
+        """
         seq_len = int(batch["seq_len"])
         n_clips = batch["frame_valid"].shape[0] // seq_len
         valid = batch["frame_valid"].to(self.device).view(n_clips, seq_len).any(dim=1)
+        given = out["gravity"]["given"].to(self.device).view(n_clips, seq_len)[:, 0]
         gravity = batch["gravity_world"].to(self.device, self.dtype).view(n_clips, seq_len, 3)[:, 0]
         measured = batch["gravity_measured"].to(self.device).view(n_clips, seq_len)[:, 0]
-        return gravity, valid, measured
+        return gravity, valid & ~given, measured
 
     def _cos_term(self, predicted: Tensor, gravity: Tensor, weight: Tensor,
                   seq_len: int) -> Tensor:
@@ -63,8 +70,8 @@ class GravityLoss(Loss):
         world = pred["world"].to(self.device, self.dtype)
         anchor = world.sum() * 0.0
         seq_len = int(batch["seq_len"])
-        gravity, valid, measured = self._clips(batch)
-        weight = valid.to(self.dtype)
+        gravity, scored, measured = self._clips(out, batch)
+        weight = scored.to(self.dtype)
         if self.measured_only:
             weight = weight * measured.to(self.dtype)
         mass = float(weight.sum())
@@ -82,8 +89,8 @@ class GravityLoss(Loss):
                 return torch.rad2deg(torch.acos(cos))
             angle = angles(world)
             prior = angles(pred["prior_world"].to(self.device, self.dtype))
-            is_measured = (valid & measured).to(torch.float64)
-            is_fallback = (valid & ~measured).to(torch.float64)
+            is_measured = (scored & measured).to(torch.float64)
+            is_fallback = (scored & ~measured).to(torch.float64)
             stats = torch.stack([
                 (angle.double() * is_measured).sum(), is_measured.sum(),
                 (angle.double() * is_fallback).sum(), is_fallback.sum(),

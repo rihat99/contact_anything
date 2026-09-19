@@ -4,8 +4,8 @@ The results viewer (``scripts/view_results.py``) reads these dumps, so every
 model — present and future — is compared through the same file: run this once
 per run with its best checkpoint.
 
-    python scripts/predict_test.py --config configs/baseline.yaml \
-        --checkpoint output/<run>/best.pth
+    python scripts/predict_test.py --config configs/r10/L_limb.yaml \
+        --checkpoint output_5/<run>/best.pth
 
 Protocol: the test split of the config's dataset yaml (its ``camera`` filter
 included). Every contiguous tracked run of every person is predicted at the
@@ -204,7 +204,8 @@ def main() -> int:
     for index, scene in enumerate(scenes, start=1):
         if args.device.startswith("cuda"):
             torch.cuda.reset_peak_memory_stats()
-        ds = rc.build_dataset(cfg, root, contact_level, scene, "test", set(), max_rows)
+        ds = rc.build_dataset(cfg, root, contact_level, scene, "test", set(), max_rows,
+                              pose_tokens=bool(cfg["data"]["pose_token_cache"]))
         pred = predict_scene(model, ds, cfg, args.device, max_rows, args.overlap)
         data = ds.scene_data(scene)
         np.savez_compressed(

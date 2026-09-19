@@ -6,7 +6,7 @@ And: how far is the transported se3 LINEAR part from the plain world-velocity di
 """
 from __future__ import annotations
 import sys
-sys.path.insert(0, '/data3/rikhat.akizhanov/better/BetterRobot/src')
+sys.path.insert(0, '/home/rikhat.akizhanov/better/BetterRobot/src')
 import numpy as np, torch
 from better_robot.lie import se3, so3
 import common as C

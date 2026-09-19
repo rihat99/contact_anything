@@ -31,11 +31,10 @@ import torch
 from torch import Tensor
 
 from model.loss import Loss, LossResult
-from model.refiner import forward_difference, forward_valid, stencil_valid, time_derivative
+from model.refiner import (GROUP_JOINTS, forward_difference, forward_valid, stencil_valid,
+                           time_derivative)
 from utils.metrics import mean_from_stats
 
-#: SMPL-X body joint of each kindyn group (LH, RH, LF toe, RF toe, LA heel, RA heel).
-GROUP_JOINTS = (20, 21, 10, 11, 7, 8)
 #: Speed stencils of ``contact_consistency.stencil``.
 STENCILS = ("forward", "central")
 

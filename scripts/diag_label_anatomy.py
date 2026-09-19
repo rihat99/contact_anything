@@ -4,7 +4,7 @@ Capped-protocol test rows (threshold 0.5) split by manual-vs-automatic label agr
 automatic label's confidence and by GT limb stillness (drift of the group joint over 0.35 s
 < 8 cm), each run's accuracy per cell; plus the train-label confidence mass over 150 scenes.
 
-    python scripts/diag_label_anatomy.py final=output_2/<run> notoken=output_2/<run> ...
+    python scripts/diag_label_anatomy.py final=output_5/<run> notoken=output_5/<run> ...
 
 Every run needs a ``predictions/`` dump (``scripts/predict_test.py``).
 """
@@ -21,7 +21,7 @@ from paired_ci import load_labels, protocol_rows, THRESHOLD, CONTACT_LEVEL   # n
 from data.climbing_videos import scene as scene_io
 from data.climbing_videos.scene import GROUP_BODY22, GROUP_NAMES, list_train_scenes
 
-ROOT = Path("/data3/rikhat.akizhanov/better/data/ClimbingVideos")
+ROOT = Path("/home/rikhat.akizhanov/better/data/ClimbingVideos")
 runs = dict(a.split("=", 1) for a in sys.argv[1:])
 scenes = sorted(p.stem for p in (Path(next(iter(runs.values()))) / "predictions").glob("*.npz"))
 BINS = [0, 0.2, 0.5, 0.8, 1.01]

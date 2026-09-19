@@ -46,7 +46,7 @@ def still_clip(n: int = 2, t: int = 9):
 def test_rest_needs_one_body_weight(loss):
     pelvis, root_rot, body_rot, betas, seconds, valid, down = still_clip()
     forces = torch.zeros(*seconds.shape, 6, 3)
-    res_f, res_t, rows = loss.residual(pelvis, root_rot, body_rot, betas, forces, down, seconds, valid)
+    res_f, res_t, rows, _ = loss.residual(pelvis, root_rot, body_rot, betas, forces, down, seconds, valid)
     assert rows[:, 2:-2].all() and not rows[:, :2].any()
     up_local = torch.einsum("ntji,nj->nti", root_rot, -down)         # -g in the root frame
     assert torch.allclose(res_f[rows], up_local[rows], atol=2e-3)    # exactly 1 bw, along -g
@@ -56,7 +56,7 @@ def test_support_at_a_foot_balances_the_force(loss):
     pelvis, root_rot, body_rot, betas, seconds, valid, down = still_clip()
     forces = torch.zeros(*seconds.shape, 6, 3)
     forces[..., 2, :] = -down[:, None]                                # 1 bw up at the left big toe
-    res_f, res_t, rows = loss.residual(pelvis, root_rot, body_rot, betas, forces, down, seconds, valid)
+    res_f, res_t, rows, _ = loss.residual(pelvis, root_rot, body_rot, betas, forces, down, seconds, valid)
     assert res_f[rows].abs().max() < 2e-3
     assert res_t[rows].norm(dim=-1).mean() > 0.05                    # the toe's lever about the pelvis
 
@@ -66,7 +66,7 @@ def test_world_frame_independence(loss):
     torch.manual_seed(3)
     forces = 0.5 * torch.randn(*seconds.shape, 6, 3)
     pelvis = pelvis + torch.cumsum(0.01 * torch.randn_like(pelvis), dim=1)
-    res_f, res_t, rows = loss.residual(pelvis, root_rot, body_rot, betas, forces, down, seconds, valid)
+    res_f, res_t, rows, _ = loss.residual(pelvis, root_rot, body_rot, betas, forces, down, seconds, valid)
     rot0 = roma.random_rotmat(1)[0]
     t0 = torch.tensor([2.0, -1.0, 0.5])
     moved = loss.residual((pelvis @ rot0.T) + t0, rot0 @ root_rot, body_rot, betas,
@@ -81,7 +81,7 @@ def test_gradients_reach_forces_and_pose(loss):
     pelvis, root_rot, body_rot, betas, seconds, valid, down = still_clip()
     forces = (0.3 * torch.randn(*seconds.shape, 6, 3)).requires_grad_(True)
     pelvis = pelvis.clone().requires_grad_(True)
-    res_f, res_t, rows = loss.residual(pelvis, root_rot, body_rot, betas, forces, down, seconds, valid)
+    res_f, res_t, rows, _ = loss.residual(pelvis, root_rot, body_rot, betas, forces, down, seconds, valid)
     (res_f[rows].square().sum() + res_t[rows].square().sum()).backward()
     assert forces.grad is not None and torch.isfinite(forces.grad).all() and forces.grad.abs().sum() > 0
     assert pelvis.grad is not None and torch.isfinite(pelvis.grad).all() and pelvis.grad.abs().sum() > 0

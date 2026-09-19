@@ -1,0 +1,11 @@
+# Round 10 arm L_cached: arm L's architecture without the image tokens — the limb tokens carry the
+# extremity geometry alone (no decoder contact token), so the run reads the cached pose token and
+# never runs the frozen base. Isolates the seven-token transformer from the image evidence.
+# 2 GPUs x 8 clips x accumulate 2.
+base: configs/r10/L_limb.yaml
+model:
+  contact: {enabled: false}
+  refiner: {force_frame: gravity}
+data: {pose_token_cache: true, embedding_cache: false}
+optim: {accumulate_steps: 2}
+output: {exp_name: L_limb_cached}

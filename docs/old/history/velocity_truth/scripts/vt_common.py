@@ -24,8 +24,8 @@ from pathlib import Path
 
 import numpy as np
 
-REPO = Path("/data3/rikhat.akizhanov/better/contact_anything_dev")
-CORPUS = Path("/data3/rikhat.akizhanov/better/data/ClimbingVideos")
+REPO = Path("/home/rikhat.akizhanov/better/contact_anything_dev")
+CORPUS = Path("/home/rikhat.akizhanov/better/data/ClimbingVideos")
 sys.path.insert(0, str(REPO))
 
 from data.climbing_videos import scene_shard                    # noqa: E402

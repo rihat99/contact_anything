@@ -1,0 +1,4 @@
+# L_body without the RNEA root-wrench / joint-torque loss: the forces are supervised only.
+base: configs/r10/L_body.yaml
+force_consistency: {enabled: false}
+output: {exp_name: L_body_nornea}

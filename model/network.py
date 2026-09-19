@@ -59,8 +59,9 @@ class ContactAnything(nn.Module):
     :param refiner: :class:`~model.refiner.TemporalRefiner` config or ``None``
         — ``{outputs, dim, num_layers, num_heads, mlp_ratio, dropout, window,
         time_scale, root_smooth_sec, pose_smooth_sec, learn_smoothing, token,
-        iterative, feedback_delta, camera_context, pose_token, pose_token_dim,
-        contact_token_dim}``; needs ``smplx``.
+        iterative, feedback_delta, camera_context, camera_axes, gravity_input,
+        pose_token, pose_token_dim, contact_token_dim, force_frame,
+        limb_tokens}``; needs ``smplx``.
     """
 
     def __init__(
@@ -143,6 +144,7 @@ class ContactAnything(nn.Module):
                 feedback_delta=bool(refiner["feedback_delta"]),
                 camera_context=bool(refiner["camera_context"]),
                 camera_axes=bool(refiner["camera_axes"]),
+                gravity_input=dict(refiner["gravity_input"]),
                 residual_feedback=bool(refiner["residual_feedback"]),
                 frame_mask_p=float(refiner["frame_mask_p"]),
                 head_grad_scale=float(refiner["head_grad_scale"]),
@@ -150,6 +152,9 @@ class ContactAnything(nn.Module):
                 pose_token=bool(refiner["pose_token"]),
                 pose_token_dim=int(refiner["pose_token_dim"]),
                 contact_token_dim=int(refiner["contact_token_dim"]),
+                force_frame=str(refiner["force_frame"]),
+                limb_tokens=bool(refiner["limb_tokens"]),
+                per_frame=bool(refiner["per_frame"]),
             )
 
     @staticmethod

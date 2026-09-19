@@ -41,7 +41,7 @@ from data.transforms import build_transform, process_frame            # noqa: E4
 from model.wrapper import SAM3DBodyWrapper                            # noqa: E402
 from train.config import load_config                                  # noqa: E402
 
-DEFAULT_ROOT = "/data3/rikhat.akizhanov/better/data/ClimbingVideos"
+DEFAULT_ROOT = "/home/rikhat.akizhanov/better/data/ClimbingVideos"
 
 
 class CropDataset(Dataset):

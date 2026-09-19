@@ -1,0 +1,6 @@
+# Round 10: D16_notoken with the forces read in the gravity-aligned frame (arm L's `force_frame`), so
+# the L_limb vs D16_notoken comparison no longer mixes the force frame with the limb / decoder tokens.
+base: configs/r10/D16_notoken.yaml
+model:
+  refiner: {force_frame: gravity}
+output: {exp_name: D16_notoken_grav}

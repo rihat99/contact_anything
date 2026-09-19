@@ -35,7 +35,7 @@ import numpy as np
 import torch
 
 #: The SMPL-X archive every model in this repo is built on (``model.smplx.model_path``).
-SMPLX_MODEL_PATH = "/data3/rikhat.akizhanov/better/BetterHuman/models/smplx/SMPLX_NEUTRAL.npz"
+SMPLX_MODEL_PATH = "/home/rikhat.akizhanov/better/BetterHuman/models/smplx/SMPLX_NEUTRAL.npz"
 NUM_JOINTS = 52
 NUM_BODY_JOINTS = 22
 Q_FULL = 211

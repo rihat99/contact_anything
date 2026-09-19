@@ -1,0 +1,6 @@
+# Round 10: the D16 control WITHOUT the frozen pose token — the refiner sees only the stage-1 body
+# (geometry, rates, camera context, given gravity); no image information enters after stage 1.
+base: configs/r10/D16.yaml
+model:
+  refiner: {pose_token: false}
+output: {exp_name: D16_notoken}

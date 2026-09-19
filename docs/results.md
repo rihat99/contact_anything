@@ -7,6 +7,27 @@ The full numbers are in `docs/round8_2026-09-12.md` (heads) and `docs/old/round7
 
 ## Where we are
 
+**Update 2026-09-14 (round 10, `docs/round10_2026-09-14.md`).** The six learned contact tokens are back in
+the frozen decoder, and the refiner now carries SEVEN tokens per frame (the body token plus one per
+extremity holding its decoder token and its own geometry) through alternating temporal / within-frame
+attention; the forces are read in a gravity-aligned frame. One arm (`configs/r10/L_limb.yaml`, use
+`last.pth`) against a 16-epoch control of the round-9 recipe: contact F1 0.926-0.930 vs 0.920 (all
+precision; transitions +0.08), force 0.160 bw (0.157 given) / 20.7° / off-contact 0.026 vs 0.165 / 20.4 /
+0.038, MPJPE 52.9 vs 53.7, jitter 5.5. climb_wall_2 boards: MAE 75.4 N (the optimisation 78.6, round 9
+83.2), F1 0.963; the hands are now right (0.90 / 1.02 of the boards) but the feet did not move (0.70 /
+0.48), so the load split is worse (5.5 pp). Costs: a 1.29 TB embedding cache and disk-bound training
+(23 min per epoch on four GPUs).
+
+**Update 2026-09-13 (round 9, `docs/round9_2026-09-13.md`).** The corpus grew to 1419 / 109 scenes, the
+model can take a KNOWN gravity as an input (or guess it), and the feet are no longer starved: the
+recipe is now `configs/r9/D_total_feet.yaml` — the round-8 model plus a strength-weighted joint-torque
+term (BVR's multipliers) with the force TOTAL pinned (supervised net force + a tight root residual) and
+the toes supervised in magnitude. Corpus: 53.6 mm / jitter 5.4 / F1 0.922 / force 0.163 bw (0.157 with
+the gravity given) / 20.5°; feet at 0.87 of the GT vertical load (was 0.76). climb_wall_2 boards:
+MAE 83 N, share error 3.9 pp, correlation 0.62 (round 8: 90 N / 7.7 pp / 0.52; the optimisation 79 N /
+0.8 pp / 0.68). Lesson: a torque prior alone only lowers the hands; it re-allocates once the total is held.
+
+
 One model (`configs/r8/F2m_scale03.yaml`) takes a climbing video with known camera poses and gives,
 per frame: a smooth SMPL-X body in the world, which of the six extremities touch the wall, the
 force on each of them, and the direction of gravity. On the test videos (107 clips, 120 frames each

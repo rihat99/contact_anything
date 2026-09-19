@@ -25,6 +25,8 @@ SCHEMA_PATH = REPO_ROOT / "configs" / "base.yaml"
 
 _MODALITY_ORDER = ("pose", "contact", "force")
 _REFINER_OUTPUTS = ("pose", "contact", "motion", "force", "gravity")
+#: Frames the refiner's ``force`` output may be read in (:data:`model.refiner.FORCE_FRAMES`).
+_FORCE_FRAMES = ("body", "gravity")
 #: Finite-difference stencils of ``motion_supervision`` (:data:`model.loss.motion.STENCILS`).
 _STENCILS = ("legacy", "aligned", "forward")
 #: ``smplx_supervision`` terms deep supervision repeats per refiner layer
@@ -113,6 +115,9 @@ def signal_needs(cfg: dict) -> set[str]:
         needs.add("smplx")          # the kindyn root rotation re-frames the force GT
     if cfg["gravity_supervision"]["enabled"]:
         needs.add("smplx")          # the corpus gravity loads with the smplx GT group
+    refiner = cfg["model"]["refiner"]
+    if refiner["enabled"] and refiner["gravity_input"]["enabled"]:
+        needs.add("smplx")          # ... and the given gravity vector is that same corpus one
     return needs
 
 
@@ -304,6 +309,14 @@ def validate(cfg: dict) -> None:
             raise ValueError(
                 "the refiner's gravity output corrects the camera's down axis: enable "
                 "model.refiner.camera_axes")
+        gravity_input = refiner["gravity_input"]
+        if gravity_input["enabled"]:
+            if "gravity" not in outputs:
+                raise ValueError(
+                    "model.refiner.gravity_input replaces the gravity estimate of the clips it "
+                    "is given on: list 'gravity' in model.refiner.outputs")
+            if not 0.0 <= float(gravity_input["p_given"]) <= 1.0:
+                raise ValueError("model.refiner.gravity_input.p_given must be in [0, 1]")
         if bool(refiner["residual_feedback"]):
             missing = sorted({"contact", "force", "gravity"} - outputs)
             if not bool(refiner["iterative"]) or missing:
@@ -311,10 +324,29 @@ def validate(cfg: dict) -> None:
                     "model.refiner.residual_feedback runs the RNEA on every layer's body, gated "
                     "forces and predicted gravity: it needs model.refiner.iterative and the "
                     f"contact / force / gravity outputs (missing {missing})")
+        if str(refiner["force_frame"]) not in _FORCE_FRAMES:
+            raise ValueError(
+                f"model.refiner.force_frame must be one of {list(_FORCE_FRAMES)}; "
+                f"got {refiner['force_frame']!r}")
+        if str(refiner["force_frame"]) == "gravity" and "gravity" not in outputs:
+            raise ValueError(
+                "model.refiner.force_frame 'gravity' reads the forces in a frame aligned with "
+                "the clip's gravity estimate: list 'gravity' in model.refiner.outputs")
         if not 0.0 <= float(refiner["frame_mask_p"]) < 1.0:
             raise ValueError("model.refiner.frame_mask_p must be in [0, 1)")
         if not 0.0 <= float(refiner["head_grad_scale"]) <= 1.0:
             raise ValueError("model.refiner.head_grad_scale must be in [0, 1]")
+        if bool(refiner["per_frame"]):
+            token = refiner["token"]
+            if bool(refiner["iterative"]) or any(bool(token[k]) for k in (
+                    "one_sided_velocity", "joint_velocity", "raw_minus_mean")):
+                raise ValueError(
+                    "model.refiner.per_frame refines every frame on its own: it needs iterative "
+                    "off and token.one_sided_velocity / joint_velocity / raw_minus_mean off")
+            if float(refiner["root_smooth_sec"]) > 0.0 or float(refiner["pose_smooth_sec"]) > 0.0:
+                raise ValueError(
+                    "model.refiner.per_frame needs root_smooth_sec and pose_smooth_sec 0 (the "
+                    "input smoothing mixes the frames)")
         if sup["enabled"] and float(sup["loss"]["cam"]) > 0.0:
             raise ValueError(
                 "smplx_supervision.loss.cam supervises the CLIFF proxy, which the refined "
@@ -410,9 +442,12 @@ def validate(cfg: dict) -> None:
             raise ValueError("force_consistency.gate_by_contact needs a refiner 'contact' output")
         if float(physics["smooth_sec"]) < 0.0:
             raise ValueError("force_consistency.smooth_sec must be >= 0")
-        weights = {k: float(physics["loss"][k]) for k in ("force", "torque")}
+        weights = {k: float(physics["loss"][k]) for k in ("force", "torque", "joint_torque")}
         if any(w < 0.0 for w in weights.values()) or not any(w > 0.0 for w in weights.values()):
-            raise ValueError("force_consistency.loss.force / torque must be >= 0 with one > 0")
+            raise ValueError(
+                "force_consistency.loss.force / torque / joint_torque must be >= 0 with one > 0")
+        if any(float(m) < 0.0 for m in physics["joint_torque_multipliers"].values()):
+            raise ValueError("force_consistency.joint_torque_multipliers must be >= 0")
         if int(cfg["data"]["clip"]["frames"]) < 5:
             raise ValueError("force_consistency needs data.clip.frames >= 5 (a +-2 stencil)")
     reference = cfg["gaussian_reference"]

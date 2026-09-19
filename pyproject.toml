@@ -1,0 +1,55 @@
+[project]
+name = "contact-anything"
+version = "0.1.0"
+description = "SAM 3D Body fork with per-joint contact, contact-force and SMPL-X pose heads, trained on climbing video clips."
+requires-python = ">=3.12"
+dependencies = [
+    # Siblings — model/physics.py imports better_robot at module scope; the
+    # contact/force heads and the viewer import better_human lazily.
+    "better-robot",
+    "better-human",
+    "torch>=2.4",
+    "torchvision",
+    "numpy>=2.0",
+    # SAM 3D Body backbone / heads
+    "timm",
+    "yacs",
+    "omegaconf",
+    "einops",
+    "roma",
+    "opencv-python",
+    "pillow",
+    "huggingface-hub",
+    "pytorch-lightning",
+    "braceexpand",
+    # training loop / logging / diagnostics
+    "wandb",
+    "tqdm",
+    "pyyaml",
+    "matplotlib",
+    # viewer/
+    "viser>=1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+# Code is run from the repo root (scripts/train.py, tests/); nothing to build.
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+better-robot = { path = "../BetterRobot", editable = true }
+better-human = { path = "../BetterHuman", editable = true }
+torch = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

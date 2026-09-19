@@ -1,0 +1,6 @@
+# Evaluation / inference twin of arm L: every measured clip is GIVEN its gravity. The arm already
+# runs the live decoder, so this is its predict twin too.
+base: configs/r10/L_limb.yaml
+model:
+  refiner:
+    gravity_input: {eval_given: true}

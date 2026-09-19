@@ -3,8 +3,8 @@
 base: null
 
 model:
-  checkpoint_path: /data3/rikhat.akizhanov/.cache/huggingface/hub/models--facebook--sam-3d-body-dinov3/snapshots/11aaa346c7204874a1cbafe3d39a979080b2c55a/model.ckpt
-  mhr_model_path: /data3/rikhat.akizhanov/.cache/huggingface/hub/models--facebook--sam-3d-body-dinov3/snapshots/11aaa346c7204874a1cbafe3d39a979080b2c55a/assets/mhr_model.pt
+  checkpoint_path: /home/rikhat.akizhanov/.cache/huggingface/hub/models--facebook--sam-3d-body-dinov3/snapshots/11aaa346c7204874a1cbafe3d39a979080b2c55a/model.ckpt
+  mhr_model_path: /home/rikhat.akizhanov/.cache/huggingface/hub/models--facebook--sam-3d-body-dinov3/snapshots/11aaa346c7204874a1cbafe3d39a979080b2c55a/assets/mhr_model.pt
   decoder_bf16: false                 # run the frozen decoder under bf16 autocast (MHR / keypoint readouts stay fp32)
   decoder_checkpointing: false        # recompute the decoder layers in the backward (activation checkpointing)
   warm_start: null                    # run checkpoint whose TRAINABLE weights initialise this run (fresh optimizer /
@@ -37,7 +37,7 @@ model:
     time_scale: 25.0                  # RoPE rotation units per second (25 = one unit per 25-fps frame)
   smplx:                              # from-scratch SMPL-X pose + camera heads on the (mixed) pose token = THE pose output
     enabled: false
-    model_path: /data3/rikhat.akizhanov/better/BetterHuman/models/smplx/SMPLX_NEUTRAL.npz
+    model_path: /home/rikhat.akizhanov/better/BetterHuman/models/smplx/SMPLX_NEUTRAL.npz
     hands: false                      # also regress the 30 finger joints (52-joint body, q 211)
     mlp_depth: 2                      # SAM3D's own head shape: C -> C -> D
     mlp_channel_div_factor: 1
@@ -96,6 +96,17 @@ model:
                                       # camera's tilt relative to the body, the strongest gravity cue that is not the
                                       # corpus gravity (12 deg median on measured scenes). Needs camera_context; the
                                       # `gravity` output's prior is the down axis, so that output needs this
+    gravity_input:                    # GIVE the clip the scene's gravity instead of letting it guess: four token
+      enabled: false                  # channels (the vector in the body frame + the flag that says it was given),
+                                      # and the `gravity` output of a given clip IS that vector — the head's votes
+                                      # are dropped there and gravity_supervision skips the clip, so the head is
+                                      # never trained to copy its input. Needs the `gravity` output
+      p_given: 0.5                    # training: probability that an ELIGIBLE clip is given its gravity (per clip,
+                                      # per step; drawn from torch's generator on the batch device)
+      measured_only: true             # eligible = the clips whose corpus gravity was MEASURED (as
+                                      # gravity_supervision.measured_only): a fallback_down scene's vector is the
+                                      # first camera's down axis, not a measurement
+      eval_given: true                # eval / inference: every eligible clip is given its gravity (no draws)
     residual_feedback: false          # after every layer but the last, run BetterRobot's RNEA on the layer's body
                                       # (detached) with its gated forces applied (live) under its predicted gravity and
                                       # feed the 6-D root-wrench residual (force in bw, torque about the pelvis in
@@ -112,6 +123,27 @@ model:
     pose_token: true                  # feed the frozen pose token (projected to pose_token_dim) into the per-frame token
     pose_token_dim: 256
     contact_token_dim: 64             # per-contact-token projection width (the six tokens are concatenated)
+    force_frame: body                 # frame the `force` head's three numbers per limb are read in:
+                                      # body (the INPUT body frame) | gravity (up = the clip's own gravity
+                                      # estimate, heading = the body's +z projected onto the horizontal
+                                      # plane, its +y when the body lies along gravity). The GT hand-force
+                                      # direction is spread in the root frame (mean resultant length 0.79,
+                                      # the trunk leans 43-49 deg) and tight in a gravity-aligned one
+                                      # (0.88-0.90). `out["force"]["frame"]` is world-from-this either way,
+                                      # so every reader of the forces is unchanged. Needs the `gravity` output
+    limb_tokens: false                # SEVEN tokens per frame instead of one: the body token (which then carries no
+                                      # contact tokens) plus one token per kindyn group holding that limb's decoder
+                                      # contact token and its extremity geometry (root-frame position, one-sided
+                                      # body-frame rates, and under camera_context its crop position and log depth
+                                      # ratio to the pelvis). The transformer alternates attention along TIME within
+                                      # each slot with attention across the seven slots of a frame; the contact and
+                                      # force heads read the limb tokens (one logit / one force each) and the limbs
+                                      # get their own zero-init feedback path under `iterative`
+    per_frame: false                  # NO information between frames: each frame is refined on its own — the token
+                                      # drops the root velocity / dt channels and the limb tokens their rates, the
+                                      # attention sees the query frame only (`window` is ignored), the betas and the
+                                      # gravity vote are per frame instead of per clip. Needs iterative off, the
+                                      # velocity / raw_minus_mean token channels off and no input smoothing
 
 data:
   datasets: [configs/datasets/climbing_videos.yaml]
@@ -235,8 +267,23 @@ force_consistency:                    # RNEA root-wrench residual of the REFINED
   loss:
     force: 1.0                        # pseudo-Huber weight of the force residual (body weights)
     torque: 5.0                       # ... of the torque residual (bw * m): the allocation channel, ~23x weaker
+    joint_torque: 0.0                 # weight of the strength-weighted joint-torque term: mean over rows of
+                                      # sum_dof w_dof * tau_dof^2 ((bw * m)^2), the 21 body joints' RNEA torques
+                                      # on a DETACHED body (only the forces may move to lighten it)
     huber_delta_force: 1.0
     huber_delta_torque: 0.5
+  joint_torque_multipliers:           # per joint GROUP (the joint name without side and index) multiplier of the
+    hip: 1.0                          # SQUARED torque: the weaker the joint, the dearer its torque, so a load the
+    knee: 1.0                         # forces may put on either the arms or the legs lands on the legs (BVR's
+    ankle: 1.7                        # [torque.multipliers] table). Every body joint must be covered
+    foot: 1.7
+    spine: 1.0
+    neck: 6.0
+    head: 6.0
+    collar: 2.5
+    shoulder: 2.5
+    elbow: 3.3
+    wrist: 17.0
 
 contact_consistency:                  # stillness of the REFINED extremities (wrists, toes, heels) while labelled in contact:
   enabled: false                      # L1 on their world speed (m/s) weighted by the contact label; gradient -> pose path

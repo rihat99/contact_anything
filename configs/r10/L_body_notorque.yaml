@@ -1,0 +1,9 @@
+# L_body without any torque term: the RNEA root-torque residual and the strength-weighted joint-torque
+# prior are both off (the root force residual stays). Iterative refinement and deep supervision as in
+# L_body. LIVE backbone, 4 GPUs x 4 clips x accumulate 2 = the recipe's 32 clips per step; 4 epochs.
+base: configs/r10/L_body.yaml
+force_consistency:
+  loss: {torque: 0.0, joint_torque: 0.0}
+data: {embedding_cache: false, frames_per_batch: 240}
+optim: {epochs: 4}
+output: {exp_name: L_body_notorque}

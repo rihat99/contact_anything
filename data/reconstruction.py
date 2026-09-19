@@ -135,16 +135,20 @@ class ReconstructionSceneDataset(ClipDataset):
             & (bbox[..., 2] > bbox[..., 0])
             & (bbox[..., 3] > bbox[..., 1]))
 
-        # The scene's fitted down vector (the refiner's gravity token channel) comes from
-        # the dynamics stage; a tree without one cannot feed a gravity-token model. Whether
-        # that vector is a MEASUREMENT is geocalib's to say; a tree without the geocalib
-        # file is treated as unmeasured rather than trusted.
+        # The scene's fitted down vector (the refiner's gravity token channel and its
+        # known-gravity input) comes from the dynamics stage; a tree without one cannot
+        # feed a model that reads the gravity. Whether that vector is a MEASUREMENT is
+        # geocalib's to say; a tree without the geocalib file is treated as unmeasured
+        # rather than trusted.
         kindyn_path = self.out_dir / "human_optim" / "kindyn_1.npz"
         gravity_file = self.out_dir / "geocalib" / "gravity.npz"
         gravity_world = measured = None
         if kindyn_path.is_file():
             gravity_world = _gravity(scene, np.load(kindyn_path, allow_pickle=True))
             measured = gravity_file.is_file() and gravity_measured(gravity_file)
+        elif gravity_file.is_file():        # no dynamics stage: the geocalib vector itself
+            gravity_world = _gravity(scene, np.load(gravity_file, allow_pickle=True))
+            measured = gravity_measured(gravity_file)
 
         scene_data = {
             "object_ids": object_ids,

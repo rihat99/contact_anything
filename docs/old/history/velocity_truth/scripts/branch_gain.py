@@ -21,7 +21,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, "/data3/rikhat.akizhanov/better/contact_anything_dev")
+sys.path.insert(0, "/home/rikhat.akizhanov/better/contact_anything_dev")
 
 from data import build_datasets                                       # noqa: E402
 from data.collate import batch_to_device                              # noqa: E402

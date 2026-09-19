@@ -1,0 +1,5 @@
+# Evaluation / inference twin of L_body_noforce: every measured clip is GIVEN its gravity.
+base: configs/r10/L_body_noforce.yaml
+model:
+  refiner:
+    gravity_input: {eval_given: true}

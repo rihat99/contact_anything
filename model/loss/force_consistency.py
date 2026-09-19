@@ -20,9 +20,16 @@ Gradient reaches the force head AND the pose path (``detach_pose: false``;
 the position and derivative losses anchor the pose). Rows need the ±2 stencil
 inside a valid run; clip ends carry no term.
 
+The same RNEA call also returns the 21 body joints' torques, on which the
+``joint_torque`` term puts a strength-weighted quadratic: a load the forces may put
+on either the arms or the legs costs less on the legs (``joint_torque_multipliers``,
+a per joint-GROUP multiplier of the SQUARED torque). That term reads a DETACHED body —
+it is a statement about the force ALLOCATION, not an invitation to fold the pose.
+
 Metrics: ``force`` / ``torque`` — mean residual magnitudes (bw, bw·m) of the
-prediction, and ``gt_force`` / ``gt_torque`` — the same residual evaluated on the
-kindyn GT trajectory with the kindyn GT forces (the floor this body model and
+prediction, ``joint_torque`` — the weighted joint-torque mean under the predicted
+forces, and ``gt_force`` / ``gt_torque`` / ``gt_joint_torque`` — the same quantities
+on the kindyn GT trajectory with the kindyn GT forces (the floor this body model and
 the joint-origin approximation allow).
 """
 from __future__ import annotations
@@ -35,6 +42,10 @@ from model.physics import GROUP_ROBOT_JOINTS, RootWrench, trajectory_derivatives
 from utils.metrics import mean_from_stats
 
 
+#: Every term this loss can emit, in report order.
+TERM_NAMES = ("force", "torque", "joint_torque")
+
+
 def pseudo_huber(x: Tensor, delta: float) -> Tensor:
     """``delta^2 (sqrt(1 + (x / delta)^2) - 1)``: quadratic near 0, linear far out, smooth."""
     return delta * delta * (torch.sqrt(1.0 + (x / delta) ** 2) - 1.0)
@@ -44,8 +55,9 @@ class ForceConsistencyLoss(Loss):
     """RNEA root-wrench residual of the refined motion under the predicted forces."""
 
     name = "force_consistency"
-    term_names = ("force", "torque")
-    stat_names = ("force_num", "mass", "torque_num", "gt_force_num", "gt_mass", "gt_torque_num")
+    term_names = TERM_NAMES
+    stat_names = ("force_num", "mass", "torque_num", "joint_torque_num",
+                  "gt_force_num", "gt_mass", "gt_torque_num", "gt_joint_torque_num")
 
     def __init__(self, cfg: dict, model, device: torch.device | str) -> None:
         super().__init__(cfg, model, device)
@@ -54,11 +66,12 @@ class ForceConsistencyLoss(Loss):
         self.detach_pose = bool(section["detach_pose"])
         self.gate = bool(section["gate_by_contact"])
         loss_cfg = section["loss"]
-        self.weights = {"force": float(loss_cfg["force"]), "torque": float(loss_cfg["torque"])}
+        self.weights = {name: float(loss_cfg[name]) for name in TERM_NAMES}
         self.delta = {"force": float(loss_cfg["huber_delta_force"]),
                       "torque": float(loss_cfg["huber_delta_torque"])}
-        self.term_names = tuple(t for t in ("force", "torque") if self.weights[t] > 0.0)
+        self.term_names = tuple(t for t in TERM_NAMES if self.weights[t] > 0.0)
         self.wrench = RootWrench(cfg["model"]["smplx"]["model_path"], self.device, self.dtype)
+        self.dof_weight = self.wrench.dof_weights(section["joint_torque_multipliers"])
 
     # ------------------------------------------------------------------ core
 
@@ -69,10 +82,14 @@ class ForceConsistencyLoss(Loss):
 
     def residual(self, pelvis: Tensor, root_rot: Tensor, body_rot: Tensor, betas: Tensor,
                  forces_world_bw: Tensor, gravity_down: Tensor, seconds: Tensor,
-                 valid: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+                 valid: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """:meth:`~model.physics.RootWrench.residual` under the loss's ``smooth_sec``."""
         return self.wrench.residual(pelvis, root_rot, body_rot, betas, forces_world_bw,
                                     gravity_down, seconds, valid, smooth_sec=self.sigma)
+
+    def _joint_torque_sq(self, tau_joint: Tensor) -> Tensor:
+        """``(n, T)`` strength-weighted squared joint torque ((bw·m)^2) of one trajectory."""
+        return (tau_joint.pow(2) * self.dof_weight).sum(-1)
 
     def _clip_inputs(self, batch: dict):
         seq_len = int(batch["seq_len"])
@@ -100,7 +117,7 @@ class ForceConsistencyLoss(Loss):
             pelvis, root_rot, body_rot, betas = (x.detach() for x in (pelvis, root_rot, body_rot, betas))
         else:
             anchor = anchor + (pelvis.sum() + root_rot.sum() + body_rot.sum()) * 0.0
-        res_f, res_t, rows = self.residual(
+        res_f, res_t, rows, tau_joint = self.residual(
             pelvis.view(n, t, 3), root_rot.view(n, t, 3, 3), body_rot.view(n, t, -1, 3, 3),
             betas, forces_world, gravity, seconds, valid)
         mask = rows.to(self.dtype)
@@ -110,10 +127,19 @@ class ForceConsistencyLoss(Loss):
             "torque": (self.weights["torque"] * (pseudo_huber(res_t, self.delta["torque"]).mean(-1) * mask).sum(), mass),
         }
         raw = {k: v for k, v in raw.items() if k in self.term_names}
+        if "joint_torque" in self.term_names:
+            # The allocation term reads a FIXED body: only the forces may move to lighten it.
+            tau_fixed = tau_joint if self.detach_pose else self.residual(
+                pelvis.detach().view(n, t, 3), root_rot.detach().view(n, t, 3, 3),
+                body_rot.detach().view(n, t, -1, 3, 3), betas.detach(),
+                forces_world, gravity, seconds, valid)[3]
+            raw["joint_torque"] = (
+                self.weights["joint_torque"] * (self._joint_torque_sq(tau_fixed) * mask).sum(), mass)
 
         with torch.no_grad():
             stats = [float((res_f.norm(dim=-1) * mask).sum()), mass,
-                     float((res_t.norm(dim=-1) * mask).sum())]
+                     float((res_t.norm(dim=-1) * mask).sum()),
+                     float((self._joint_torque_sq(tau_joint) * mask).sum())]
             stats += self._gt_stats(batch, n, t, seconds, valid, gravity)
         return LossResult(terms=self._terms(raw, anchor), scalars={"n_rows": mass},
                           stats=torch.tensor(stats, dtype=torch.float64, device=self.device))
@@ -127,20 +153,24 @@ class ForceConsistencyLoss(Loss):
         gt_forces = gt_forces * batch["force_contact"].to(self.device).to(self.dtype)[..., None]
         forces_world = torch.einsum("bij,bkj->bki", root_rot, gt_forces).view(n, t, 6, 3)
         gt_valid = (batch["smplx_valid"] & batch["force_valid"]).to(self.device).view(n, t) & valid
-        res_f, res_t, rows = self.residual(
+        res_f, res_t, rows, tau_joint = self.residual(
             joints[:, 0].view(n, t, 3), root_rot.view(n, t, 3, 3),
             batch["smplx_body_rot"].to(self.device, self.dtype).view(n, t, -1, 3, 3),
             batch["smplx_betas"].to(self.device, self.dtype).view(n, t, -1)[:, 0],
             forces_world, gravity, seconds, gt_valid)
         mask = rows.to(self.dtype)
         return [float((res_f.norm(dim=-1) * mask).sum()), float(mask.sum()),
-                float((res_t.norm(dim=-1) * mask).sum())]
+                float((res_t.norm(dim=-1) * mask).sum()),
+                float((self._joint_torque_sq(tau_joint) * mask).sum())]
 
     def metrics(self, stats: Tensor) -> dict[str, float]:
         return {"force": mean_from_stats(float(stats[0]), float(stats[1])),
                 "torque": mean_from_stats(float(stats[2]), float(stats[1])),
-                "gt_force": mean_from_stats(float(stats[3]), float(stats[4])),
-                "gt_torque": mean_from_stats(float(stats[5]), float(stats[4]))}
+                "joint_torque": mean_from_stats(float(stats[3]), float(stats[1])),
+                "gt_force": mean_from_stats(float(stats[4]), float(stats[5])),
+                "gt_torque": mean_from_stats(float(stats[6]), float(stats[5])),
+                "gt_joint_torque": mean_from_stats(float(stats[7]), float(stats[5]))}
 
 
-__all__ = ["ForceConsistencyLoss", "GROUP_ROBOT_JOINTS", "pseudo_huber", "trajectory_derivatives"]
+__all__ = ["ForceConsistencyLoss", "GROUP_ROBOT_JOINTS", "TERM_NAMES", "pseudo_huber",
+           "trajectory_derivatives"]
