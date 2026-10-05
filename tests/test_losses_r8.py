@@ -29,12 +29,14 @@ import torch.nn.functional as F
 import yaml
 
 from data.climbing_videos.kindyn import gravity_measured
+from model.contact_frames import KINDYN_GROUP_JOINTS
 from model.loss import KINDYN_GROUP_NAMES
 from model.loss.contact import ContactLoss
-from model.loss.contact_consistency import GROUP_JOINTS, ContactConsistencyLoss
+from model.loss.contact_consistency import ContactConsistencyLoss
 from model.loss.force import LAYER_TERM_NAMES, ForceLoss
 from model.loss.force_consistency import ForceConsistencyLoss
 from model.refiner import forward_valid, stencil_valid
+from utils.geometry import smplx_q
 
 REPO = Path(__file__).resolve().parents[1]
 FPS = 25.0
@@ -49,12 +51,13 @@ def base_cfg():
 
 # ------------------------------------------------------------------ contact_consistency
 
-def wobble(n_clips: int, seq_len: int, joint: int, amplitude: float) -> torch.Tensor:
-    """``(n, 22, 3)`` world joints: all at the origin but ``joint``, which flips
+def wobble(n_clips: int, seq_len: int, index: int, amplitude: float,
+           width: int = 22) -> torch.Tensor:
+    """``(n, width, 3)`` world points: all at the origin but ``index``, which flips
     between ``+-amplitude`` along x every frame (a period-2 = Nyquist wobble)."""
     sign = torch.tensor([1.0 if t % 2 == 0 else -1.0 for t in range(seq_len)]).repeat(n_clips)
-    joints = torch.zeros(n_clips * seq_len, 22, 3)
-    joints[:, joint, 0] = amplitude * sign
+    joints = torch.zeros(n_clips * seq_len, width, 3)
+    joints[:, index, 0] = amplitude * sign
     return joints
 
 
@@ -73,7 +76,8 @@ def stillness_batch(n_clips: int = 2, seq_len: int = 8) -> tuple[dict, torch.Ten
         "contact_valid": torch.ones(n, 6),
         "contact_conf": torch.ones(n, 6),
         "smplx_valid": torch.ones(n, dtype=torch.bool),
-        "smplx_joints_world": wobble(n_clips, seq_len, GROUP_JOINTS[0], 0.5 * WOBBLE_M),
+        # The GT floor is read at each slot's PARENT joint; slot 0's is the left wrist.
+        "smplx_joints_world": wobble(n_clips, seq_len, KINDYN_GROUP_JOINTS[0], 0.5 * WOBBLE_M),
     }
     return batch, valid
 
@@ -88,8 +92,8 @@ def consistency_loss(base_cfg, stencil: str) -> ContactConsistencyLoss:
 def test_forward_stencil_sees_the_wobble_the_central_one_cancels(base_cfg):
     batch, valid = stillness_batch()
     n_clips, seq_len = valid.shape
-    pred = wobble(n_clips, seq_len, GROUP_JOINTS[0], WOBBLE_M)
-    out = {"smplx": {"joints_world": pred}}
+    pred = wobble(n_clips, seq_len, 0, WOBBLE_M, width=6)
+    out = {"smplx": {"slot_points_world": pred}}
 
     forward = consistency_loss(base_cfg, "forward")(out, batch, train=True)
     central = consistency_loss(base_cfg, "central")(out, batch, train=True)
@@ -114,14 +118,13 @@ def test_forward_stencil_sees_the_wobble_the_central_one_cancels(base_cfg):
 def test_forward_stencil_gradient_reaches_the_pose(base_cfg):
     batch, valid = stillness_batch()
     n_clips, seq_len = valid.shape
-    pred = wobble(n_clips, seq_len, GROUP_JOINTS[0], WOBBLE_M).requires_grad_(True)
+    pred = wobble(n_clips, seq_len, 0, WOBBLE_M, width=6).requires_grad_(True)
     result = consistency_loss(base_cfg, "forward")(
-        {"smplx": {"joints_world": pred}}, batch, train=True)
+        {"smplx": {"slot_points_world": pred}}, batch, train=True)
     result.terms["still"].numerator.backward()
-    # Only the labelled extremity of rows the stencil supports carries gradient.
-    assert float(pred.grad[:, GROUP_JOINTS[0]].abs().sum()) > 0.0
-    unsupervised = [j for j in range(22) if j != GROUP_JOINTS[0]]
-    assert float(pred.grad[:, unsupervised].abs().sum()) == 0.0
+    # Only the labelled slot of rows the stencil supports carries gradient.
+    assert float(pred.grad[:, 0].abs().sum()) > 0.0
+    assert float(pred.grad[:, 1:].abs().sum()) == 0.0
 
 
 def test_unknown_stencil_is_rejected(base_cfg):
@@ -168,9 +171,34 @@ def test_contact_bce_matches_an_explicit_weighted_reference(base_cfg):
     neg = torch.tensor([1.0, 1.0, 1.0, 0.5, 1.0, 1.0])
     weight = conf * (gt * pos + (1.0 - gt) * neg)
     reference = F.binary_cross_entropy_with_logits(logits, gt, reduction="none")
+    # Per-slot normalisation: the sum over supervised slots of that slot's weighted mean.
+    slot_mass = weight.sum(dim=0)
+    present = slot_mass > 0
+    per_slot = (reference * weight).sum(dim=0)[present] / slot_mass[present]
     assert float(result.terms["bce"].numerator) == pytest.approx(
-        2.0 * float((reference * weight).sum()), rel=1e-6)
-    assert result.terms["bce"].mass == pytest.approx(float(weight.sum()))
+        2.0 * float(per_slot.sum()), rel=1e-6)
+    assert result.terms["bce"].mass == pytest.approx(6.0)
+
+
+def test_contact_bce_weighs_every_supervised_slot_equally(base_cfg):
+    """A slot supervised on one row weighs as much as a slot supervised on all rows."""
+    torch.manual_seed(3)
+    logits = torch.randn(12, 6, requires_grad=True)
+    gt = (torch.rand(12, 6) > 0.5).float()
+    valid = torch.ones(12, 6)
+    valid[1:, 4] = 0.0                                   # slot 4: one supervised row
+    valid[:, 5] = 0.0                                    # slot 5: unsupervised
+    batch = {"contact_gt": gt, "contact_valid": valid, "contact_conf": torch.ones(12, 6)}
+    result = ContactLoss(contact_cfg(base_cfg, 0.0), None, "cpu")(
+        contact_out(logits), batch, train=True)
+    assert result.terms["bce"].mass == pytest.approx(6.0)
+    (result.terms["bce"].numerator / result.terms["bce"].mass).backward()
+    grad = logits.grad.abs().sum(dim=0)
+    assert grad[5] == 0.0
+    # slot 4's single row carries the whole slot: its gradient is the full-slot scale
+    # (weight / K per slot), not 1/12 of it.
+    assert grad[4] == pytest.approx(
+        float((torch.sigmoid(logits[0, 4]) - gt[0, 4]).abs()) * 2.0 / 6.0, rel=1e-5)
 
 
 def test_contact_layer_terms_pool_the_intermediate_layers(base_cfg):
@@ -374,12 +402,23 @@ def named_torque(wrench, tau: torch.Tensor, joint: str) -> float:
     return float(tau[0, MID, start: start + 3].norm())
 
 
+def slot_points(wrench, body: dict) -> torch.Tensor:
+    """``(1, T, 6, 3)`` world positions of the six kindyn group joints of ``body``."""
+    n, t = body["pelvis"].shape[:2]
+    q = smplx_q(body["pelvis"].reshape(n * t, 3), body["root_rot"].reshape(n * t, 3, 3),
+                body["body_rot"].reshape(n * t, 21, 3, 3))
+    betas = body["betas"][:, None].expand(n, t, 10).reshape(n * t, 10)
+    joints = wrench.body.with_shape(betas=betas).fk(q).joint_pose_world[..., 1:, :3]
+    return joints[:, list(KINDYN_GROUP_JOINTS)].view(n, t, 6, 3)
+
+
 def static_residual(wrench, groups: tuple[str, ...]):
     """The residual of the standing body held up by ``groups`` (1 bw of support in all)."""
     body = standing_body()
+    parent22 = torch.tensor(KINDYN_GROUP_JOINTS, dtype=torch.long)
     return wrench.residual(body["pelvis"], body["root_rot"], body["body_rot"], body["betas"],
-                           support_forces(groups), body["gravity"], body["seconds"],
-                           body["valid"])
+                           support_forces(groups), slot_points(wrench, body), parent22,
+                           body["gravity"], body["seconds"], body["valid"])
 
 
 def test_dof_weights_follow_the_joint_group_table(torque_loss, base_cfg):
@@ -428,7 +467,7 @@ def torque_batch() -> dict:
         "frame_pos_sec": body["seconds"].reshape(n),
         "frame_valid": body["valid"].reshape(n),
         "gravity_world": body["gravity"].expand(n, 3),
-        "smplx_joints_world": torch.zeros(n, 22, 3),
+        "smplx_joints_world": torch.zeros(n, 52, 3),
         "smplx_root_rot": body["root_rot"].reshape(n, 3, 3),
         "smplx_body_rot": body["body_rot"].reshape(n, 21, 3, 3),
         "smplx_betas": body["betas"].expand(n, 10),
@@ -445,10 +484,12 @@ def test_joint_torque_term_moves_only_the_forces(torque_loss):
             for name in ("pelvis", "root_rot", "body_rot", "betas")}
     forces = support_forces(("left_hand", "right_hand")).reshape(
         n, len(KINDYN_GROUP_NAMES), 3).clone().requires_grad_(True)
+    points = slot_points(torque_loss.wrench, standing_body()).reshape(n, 6, 3)
     out = {"smplx": {"pelvis_world": pose["pelvis"].reshape(n, 3),
                      "root_rot_world": pose["root_rot"].reshape(n, 3, 3),
                      "body_rot": pose["body_rot"].reshape(n, 21, 3, 3),
-                     "betas": pose["betas"].expand(n, 10)},
+                     "betas": pose["betas"].expand(n, 10),
+                     "slot_points_world": points},
            "force": {"forces": forces, "frame": torch.eye(3).expand(n, 3, 3)}}
 
     assert torque_loss.term_names == ("joint_torque",)

@@ -176,6 +176,13 @@ def gt_source(kindyn_path: Path, object_ids: np.ndarray, n_frames: int, device) 
     return BodySource("gt", faces, parents, names, np.asarray(object_ids, np.int32), people)
 
 
+def empty_source(name: str, object_ids: np.ndarray, device) -> BodySource:
+    """A source with no person (a body the corpus does not provide, e.g. BEDLAM's frozen)."""
+    faces, parents, names = _topology(load_body(device))
+    return BodySource(name, faces, parents, names, np.asarray(object_ids, np.int32),
+                      [None] * len(object_ids))
+
+
 def frozen_source(params_path: Path, extrinsics: np.ndarray, object_ids: np.ndarray,
                   device) -> BodySource:
     """The frozen SAM 3D Body refit (classic camera-frame params) folded into the world."""

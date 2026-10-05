@@ -42,8 +42,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data.base import longest_valid_run                            # noqa: E402
 from data.climbing_videos import kindyn, scene as scene_io         # noqa: E402
-from model.loss import KINDYN_GROUP_NAMES                          # noqa: E402
+from model.contact_frames import KINDYN_GROUP_NAMES, contact_set  # noqa: E402
 
+#: Every statistic here is scored in the six kindyn groups; a wider dump folds onto them.
+GROUPS = contact_set("kindyn6")
 DATASET_YAML = Path(__file__).resolve().parents[1] / "configs" / "datasets" / "climbing_videos.yaml"
 CONTACT_LEVEL = 1
 EVAL_MAX_FRAMES = 120
@@ -74,13 +76,13 @@ def video_id(scene: str) -> str:
 
 def load_labels(root: Path, scene: str) -> dict:
     """Test contact labels + kindyn SMPL-X and force GT of one scene."""
-    data = scene_io.load_scene(root, scene, "test", CONTACT_LEVEL)
+    data = scene_io.load_scene(root, scene, "test", CONTACT_LEVEL, GROUPS)
     n = len(data["frame_indices"])
     gravity = scene_io.gravity_path(root, scene)
     data.update(kindyn.load_smplx(scene, data["human_dir"], data["object_ids"], n,
                                   gravity_path=gravity))
     data.update(kindyn.load_forces(scene, data["human_dir"], data["object_ids"], n,
-                                   gravity_path=gravity))
+                                   gravity_path=gravity, slots=GROUPS))
     return data
 
 
@@ -265,6 +267,16 @@ def collect(runs: list[Path], root: Path, protocol: str) -> tuple[dict, list[str
                 np.asarray(raw[key]), raw["object_ids"], object_ids, scene, "prediction dump")
                 for key in ("covered", "joints_cam", "contact_probs", "forces_world")
                 if key in raw.files}
+            # Everything here is scored against the corpus SIX-GROUP labels, so a dump
+            # of a wider contact set is folded onto them first (probabilities by MAX,
+            # forces by SUM).
+            slots = contact_set(str(raw["contact_set"]) if "contact_set" in raw.files
+                                else "kindyn6")
+            if slots.count != len(KINDYN_GROUP_NAMES):
+                if "contact_probs" in dump:
+                    dump["contact_probs"] = slots.fold_max(np.nan_to_num(dump["contact_probs"]))
+                if "forces_world" in dump:
+                    dump["forces_world"] = slots.fold_sum(dump["forces_world"])
             dump["stride"] = int(raw["stride"])
             dumps[run.name] = dump
             covered = dump["covered"] if covered is None else covered & dump["covered"]

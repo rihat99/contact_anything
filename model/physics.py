@@ -1,8 +1,8 @@
-"""Root-wrench residual of a world SMPL-X trajectory under six extremity forces.
+"""Root-wrench residual of a world SMPL-X trajectory under the contact set's forces.
 
 The refined world trajectory is a rigid-body motion of a BetterHuman SMPL-X body;
 inverse dynamics (BetterRobot's RNEA) says which root wrench that motion requires
-under gravity, and the six extremity forces are the only external forces available
+under gravity, and the contact slots' forces are the only external forces available
 to supply it. The residual of that balance at the free-flyer root,
 
     tau_root = M(q) a + b(q, v) + g(q) - J^T f_ext          (should be zero)
@@ -19,10 +19,11 @@ refiner (layer k + 1 sees what layer k's forces left unbalanced).
   central differences at the clip's real frame spacing for ``v`` and ``a``
   (``model.difference`` — the free-flyer twist is body-local, as RNEA wants). The
   acceleration is the ±2-frame stencil, so a period-2 wobble does not enter it.
-* **Forces**: world forces in body-weight units, scaled to newtons by ``m g``,
-  rotated into each extremity joint's local frame and applied as a pure force at
-  the joint origin (wrists 20/21, big toes 10/11, heels 7/8 — within ~5–8 cm of the
-  true contact points; the lever's moment is a knowingly accepted error).
+* **Forces**: world forces in body-weight units, scaled to newtons by ``m g``, each
+  applied at its slot's own world point and accumulated on the slot's parent body-22
+  joint as the wrench ``[R_j^T f, R_j^T ((p - p_j) x f)]`` — the force plus the moment
+  of the lever from the joint origin to the contact point. A ``kindyn6`` slot IS its
+  joint, so its moment vanishes and the balance is the round 8-11 one.
 * **Residual**: ``tau[..., :3] / (m g)`` (body weights) and ``tau[..., 3:6] /
   (m g · 1 m)``, both in the root frame; rows need the ±2 stencil inside a valid
   run, clip ends carry none. The 21 body joints' torques ``tau[..., 6:] / (m g · 1 m)``
@@ -40,9 +41,13 @@ from torch import Tensor
 from model.refiner import gaussian_smooth, smooth_rotations, stencil_valid
 from utils.geometry import smplx_q
 
-#: BetterRobot joint names of the six kindyn groups (SMPL-X wrists, big toes, heels).
-GROUP_ROBOT_JOINTS = ("left_wrist", "right_wrist", "left_foot", "right_foot",
-                      "left_ankle", "right_ankle")
+#: The 22 SMPL-X body joints under BetterRobot's names, in SMPL-X order (index 0 = the
+#: pelvis = the free-flyer ``root``); a slot's parent-22 index indexes this tuple.
+BODY_ROBOT_JOINTS = (
+    "root", "left_hip", "right_hip", "spine1", "left_knee", "right_knee", "spine2",
+    "left_ankle", "right_ankle", "spine3", "left_foot", "right_foot", "neck",
+    "left_collar", "right_collar", "head", "left_shoulder", "right_shoulder",
+    "left_elbow", "right_elbow", "left_wrist", "right_wrist")
 GRAVITY = 9.81
 NUM_BODY_JOINTS = 22
 
@@ -78,19 +83,27 @@ class RootWrench:
             model_path=str(model_path), gender="neutral", num_betas=10, use_hands=False,
             use_face=False, compute_mass=True, dtype=dtype, device=self.device)
         robot = self.body.robot
-        self.joint_ids = torch.tensor([robot.joint_id(n) for n in GROUP_ROBOT_JOINTS],
+        names = tuple(robot.joint_names)[1:]
+        if names != BODY_ROBOT_JOINTS:
+            raise AssertionError(
+                f"the dynamics body's joints are {names}, not {BODY_ROBOT_JOINTS}")
+        self.joint_ids = torch.tensor([robot.joint_id(n) for n in BODY_ROBOT_JOINTS],
                                       device=self.device)
         self.njoints = int(robot.njoints)
 
     def residual(self, pelvis: Tensor, root_rot: Tensor, body_rot: Tensor, betas: Tensor,
-                 forces_world_bw: Tensor, gravity_down: Tensor, seconds: Tensor,
-                 valid: Tensor, smooth_sec: float = 0.0) -> tuple[Tensor, Tensor, Tensor]:
+                 forces_world_bw: Tensor, points_world: Tensor, parent22: Tensor,
+                 gravity_down: Tensor, seconds: Tensor, valid: Tensor,
+                 smooth_sec: float = 0.0) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Root-wrench residual of one batch of clips.
 
         :param pelvis: ``(n, T, 3)`` world pelvis; ``root_rot`` ``(n, T, 3, 3)``
             world-from-root; ``body_rot`` ``(n, T, 21, 3, 3)`` parent-local.
         :param betas: ``(n, 10)`` per clip.
-        :param forces_world_bw: ``(n, T, 6, 3)`` world forces in body weights.
+        :param forces_world_bw: ``(n, T, K, 3)`` world forces in body weights.
+        :param points_world: ``(n, T, K, 3)`` world point each force acts at.
+        :param parent22: ``(K,)`` long — the body-22 joint each slot hangs from
+            (:attr:`~model.contact_frames.ContactSet.parent_joint22`).
         :param gravity_down: ``(n, 3)`` unit down vector (world).
         :param seconds: ``(n, T)``; ``valid`` ``(n, T)`` bool.
         :param smooth_sec: Gaussian sigma (s) applied to the motion first (0 = none).
@@ -119,13 +132,16 @@ class RootWrench:
 
         v, a = trajectory_derivatives(robot, q, seconds)
         fk = br.forward_kinematics(robot, q)
-        quat = fk.joint_pose_world[..., self.joint_ids, 3:7]                 # (n, T, 6, 4) xyzw
-        rot_wj = roma.unitquat_to_rotmat(quat)                               # (n, T, 6, 3, 3)
-        f_local = (rot_wj.transpose(-1, -2) @ (forces_world_bw * mass_g[..., None]).unsqueeze(-1)
-                   ).squeeze(-1)                                             # newtons, joint frame
+        slot_ids = self.joint_ids[parent22.to(self.joint_ids.device)]        # (K,) robot ids
+        pose = fk.joint_pose_world[..., slot_ids, :]                         # (n, T, K, 7)
+        rot_wj = roma.unitquat_to_rotmat(pose[..., 3:7])                     # (n, T, K, 3, 3)
+        f_world = forces_world_bw * mass_g[..., None]                        # newtons
+        moment_world = torch.cross(points_world - pose[..., :3], f_world, dim=-1)
+        to_joint = rot_wj.transpose(-1, -2)
+        f_local = (to_joint @ f_world.unsqueeze(-1)).squeeze(-1)             # joint frame
+        m_local = (to_joint @ moment_world.unsqueeze(-1)).squeeze(-1)
         fext = torch.zeros(n, t, self.njoints, 6, dtype=q.dtype, device=q.device)
-        fext = fext.index_copy(2, self.joint_ids, torch.cat(
-            [f_local, torch.zeros_like(f_local)], dim=-1))
+        fext = fext.index_add(2, slot_ids, torch.cat([f_local, m_local], dim=-1))
         tau = br.rnea(robot, q, v, a, fext=fext)                             # (n, T, nv)
         rows = stencil_valid(valid, 2)
         return tau[..., :3] / mass_g, tau[..., 3:6] / mass_g, rows, tau[..., 6:] / mass_g
@@ -150,4 +166,4 @@ class RootWrench:
         return weight
 
 
-__all__ = ["GRAVITY", "GROUP_ROBOT_JOINTS", "RootWrench", "trajectory_derivatives"]
+__all__ = ["BODY_ROBOT_JOINTS", "GRAVITY", "RootWrench", "trajectory_derivatives"]

@@ -16,10 +16,14 @@ The corpus is read directly from its pipeline tree (no exported dataset):
 * ``features/geocalib/<shard>/<scene>/gravity.npz`` — the scene's world down
   vector and the ``source`` that produced it (:func:`gravity_path`).
 
-Labels are folded 52 -> 22 SMPL-X body joints (each hand ORs its wrist and 15
-finger joints) and then onto the six kindyn contact/force groups. Train labels
-are supervised wherever the person is tracked; test labels only where the
-annotator marked the joint.
+Under the ``kindyn6`` contact set labels are folded 52 -> 22 SMPL-X body joints
+(each hand ORs its wrist and 15 finger joints) and then onto the six kindyn
+contact/force groups: train labels are supervised wherever the person is
+tracked, test labels only where the annotator marked the joint. Under
+``frames35`` the file's own 35 contact-frame labels
+(``frame_contact`` / ``frame_label_confidence``) are emitted as they are on BOTH
+splits, and a test scene additionally carries the manual six-group labels as
+``contact_gt_groups`` / ``contact_valid_groups``.
 """
 from __future__ import annotations
 
@@ -27,6 +31,14 @@ import sqlite3
 from pathlib import Path
 
 import numpy as np
+
+from model.contact_frames import (
+    ContactSet,
+    KINDYN_GROUP_NAMES,
+    LEFT_HAND_GROUP_52,
+    NUM_KINDYN_GROUPS,
+    RIGHT_HAND_GROUP_52,
+)
 
 #: Curated-corpus filter: boulder scenes a human kept, VLM-classed as climbing
 #: or bouldering, not rope supported. ``dataset_split`` is the DB's assignment.
@@ -42,8 +54,6 @@ _CAMERA_CLAUSE = {"all": "", "static": " AND static_camera=1", "moving": " AND s
 #: 52 SMPLXMid joints = 22 body (0-21) + 30 fingers (22-51).
 N_JOINTS_52 = 52
 NUM_BODY_22 = 22
-LEFT_HAND_GROUP_52 = (20,) + tuple(range(22, 37))
-RIGHT_HAND_GROUP_52 = (21,) + tuple(range(37, 52))
 _HAND_FOLDS = ((20, LEFT_HAND_GROUP_52), (21, RIGHT_HAND_GROUP_52))
 
 #: Pinned label schema of ``contacts_<level>.npz``.
@@ -51,10 +61,8 @@ CONTACT_LABEL_SCHEMA = 2
 
 #: The six contact/force groups, in kindyn's ``contact_force_joints`` column
 #: order. ``*_foot`` is the big-toe joint, ``*_ankle`` the heel.
-GROUP_NAMES = (
-    "left_hand", "right_hand", "left_foot", "right_foot", "left_ankle", "right_ankle",
-)
-NUM_GROUPS = len(GROUP_NAMES)
+GROUP_NAMES = KINDYN_GROUP_NAMES
+NUM_GROUPS = NUM_KINDYN_GROUPS
 #: Body-22 source joint of each group: hands are the wrists (fingers are folded
 #: there by the 52->22 fold), the toe groups the foot joints, the heels the ankles.
 GROUP_BODY22 = ((20,), (21,), (10,), (11,), (7,), (8,))
@@ -329,14 +337,53 @@ def _load_test_labels(
     return joint_contact, annotated
 
 
-def load_scene(root: Path, scene: str, split: str, contact_level: int) -> dict:
-    """Frames, masks, boxes, cameras and six-group contact labels of one scene.
+def frame_labels(
+    scene: str, contacts, slots: ContactSet, valid_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The file's own 35 contact-frame labels, as the ``frames35`` slots.
+
+    Supervised wherever the person is tracked; a non-finite
+    ``frame_label_confidence`` entry means the frame was not assessed (it is
+    never positive) and becomes confidence ``0``.
+
+    :returns: ``(contact_gt, contact_valid, contact_conf)`` ``(P, N, 35)`` float32.
+    """
+    names = tuple(str(x) for x in contacts["contact_frame_names"])
+    if names != slots.slot_names:
+        raise ValueError(
+            f"{scene}: contact_frame_names {names} are not the {slots.name} slots "
+            f"{slots.slot_names}")
+    contact = np.asarray(contacts["frame_contact"], bool)
+    conf = np.asarray(contacts["frame_label_confidence"], np.float32)
+    if contact.shape != valid_mask.shape + (slots.count,) or conf.shape != contact.shape:
+        raise ValueError(
+            f"{scene}: frame_contact {contact.shape} / frame_label_confidence "
+            f"{conf.shape} do not match {valid_mask.shape + (slots.count,)}")
+    finite = np.isfinite(conf)
+    if bool(((conf < 0.0) | (conf > 1.0))[finite].any()):
+        raise ValueError(f"{scene}: finite frame_label_confidence must be within [0, 1]")
+    return (
+        contact.astype(np.float32),
+        np.broadcast_to(valid_mask[..., None], contact.shape).astype(np.float32),
+        np.where(finite, conf, 0.0).astype(np.float32),
+    )
+
+
+def load_scene(
+    root: Path, scene: str, split: str, contact_level: int, slots: ContactSet,
+) -> dict:
+    """Frames, masks, boxes, cameras and per-slot contact labels of one scene.
 
     :param split: ``"train"`` (automatic ``contacts_<level>`` labels, supervised
         wherever the person is tracked) or ``"test"`` (manual annotation).
+    :param slots: the contact set the labels are emitted in. ``kindyn6`` folds
+        52 -> 22 -> the six groups as above; ``frames35`` passes the file's own
+        35 contact-frame labels through on both splits and adds the manual
+        six-group labels (``contact_gt_groups`` / ``contact_valid_groups``) on
+        the test split.
     :returns: the scene dict :class:`~data.base.ClipDataset` indexes — camera
         arrays, ``valid_mask``, ``fps`` and ``contact_gt``/``contact_valid``/
-        ``contact_conf`` ``(P, N, 6)``.
+        ``contact_conf`` ``(P, N, K)``.
     """
     features = root / "features"
     shard = scene_shard(scene)
@@ -392,24 +439,39 @@ def load_scene(root: Path, scene: str, split: str, contact_level: int) -> dict:
     )
     valid_mask = valid_mask & bbox_good
 
-    if split == "train":
+    if slots.uses_frames or split == "train":
         schema = int(np.asarray(contacts["contact_label_schema"]).item())
         if schema != CONTACT_LABEL_SCHEMA:
             raise ValueError(
                 f"{scene}: contacts_{contact_level} contact_label_schema={schema}, "
                 f"expected {CONTACT_LABEL_SCHEMA}")
+
+    def manual_groups() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        joint_contact, annotated = _load_test_labels(root, scene, object_ids, n)
+        return reduce_body22_to_groups(
+            joint_contact.astype(np.float32),
+            (valid_mask[..., None] & annotated).astype(np.float32),
+            np.ones(joint_contact.shape, np.float32))
+
+    groups: dict[str, np.ndarray] = {}
+    if slots.uses_frames:
+        contact_gt, contact_valid, contact_conf = frame_labels(
+            scene, contacts, slots, valid_mask)
+        if split == "test":
+            group_gt, group_valid, _ = manual_groups()
+            groups = {"contact_gt_groups": group_gt, "contact_valid_groups": group_valid}
+    elif split == "train":
         joint_contact, conf22 = merge_contacts_52_to_22(
             contacts["joint_contact"], contacts["joint_label_confidence"])
-        supervised22 = np.broadcast_to(
-            valid_mask[..., None], joint_contact.shape).astype(np.float32)
+        contact_gt, contact_valid, contact_conf = reduce_body22_to_groups(
+            joint_contact.astype(np.float32),
+            np.broadcast_to(valid_mask[..., None], joint_contact.shape).astype(np.float32),
+            conf22)
     else:
-        joint_contact, annotated = _load_test_labels(root, scene, object_ids, n)
-        conf22 = np.ones(joint_contact.shape, np.float32)
-        supervised22 = (valid_mask[..., None] & annotated).astype(np.float32)
-    contact_gt, contact_valid, contact_conf = reduce_body22_to_groups(
-        joint_contact.astype(np.float32), supervised22, conf22)
+        contact_gt, contact_valid, contact_conf = manual_groups()
 
     return {
+        **groups,
         "human_dir": human_dir,
         "frames_dir": root / "frames" / shard / scene,
         "mask_dir": sam3_dir,
@@ -420,7 +482,7 @@ def load_scene(root: Path, scene: str, split: str, contact_level: int) -> dict:
         "extrinsics": extrinsics,
         "valid_mask": valid_mask,
         "fps": float(contacts["fps"]),
-        "contact_gt": contact_gt,                                     # [P, N, 6]
-        "contact_valid": contact_valid,                               # [P, N, 6]
-        "contact_conf": contact_conf,                                 # [P, N, 6]
+        "contact_gt": contact_gt,                                     # [P, N, K]
+        "contact_valid": contact_valid,                               # [P, N, K]
+        "contact_conf": contact_conf,                                 # [P, N, K]
     }

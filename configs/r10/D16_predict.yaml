@@ -1,3 +1,0 @@
-# Live-inference twin of the control (no pose-token cache), gravity given on measured clips.
-base: configs/r10/D16_given_eval.yaml
-data: {pose_token_cache: false}

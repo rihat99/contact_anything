@@ -1,0 +1,11 @@
+# Ablation — the full model without contact anywhere: no decoder contact tokens, no contact limb
+# tokens (7 slots: body + six force tokens), no contact head or loss, the RNEA forces ungated,
+# no stillness loss. Checkpoints by force MAE.
+base: configs/final/final_full.yaml
+model:
+  contact: {enabled: false}
+  refiner: {outputs: [pose, gravity, force], limb_tokens: false}
+contact_supervision: {enabled: false}
+contact_consistency: {enabled: false}
+force_consistency: {gate_by_contact: false}
+output: {exp_name: final_nocontact, monitor: metric_force/mae}

@@ -4,7 +4,9 @@
 
 One row per run directory (its ``eval.json``; runs without one are listed as
 pending), the headline metrics of every branch in one line, plus the per-group
-contact F1.
+contact F1. The contact and force columns are the SIX-GROUP readings, which a
+``frames35`` run and a ``kindyn6`` run share; ``s_f1`` and ``f_mae`` are the run's own
+per-slot micro F1 and force MAE, which only compare within one contact set.
 """
 from __future__ import annotations
 
@@ -15,12 +17,13 @@ from pathlib import Path
 
 COLUMNS = (
     ("f1", "metric_contact/f1"), ("P", "metric_contact/precision"), ("R", "metric_contact/recall"),
-    ("P@R90", "metric_contact/precision_at_r90"),
+    ("P@R90", "metric_contact/precision_at_r90"), ("s_f1", "metric_contact/slots_f1"),
     ("mpjpe", "metric_pose/mpjpe"), ("pa", "metric_pose/pa_mpjpe"), ("pve", "metric_pose/pve"),
     ("accel", "metric_pose/accel"), ("pelvis", "metric_pose/pelvis_err"),
     ("wa100", "metric_pose/lifted_wa_mpjpe100"), ("w100", "metric_pose/lifted_w_mpjpe100"),
     ("jitter", "metric_pose/lifted_jitter"),
-    ("f_mae", "metric_force/mae"), ("angle", "metric_force/angle_deg"), ("f_off", "metric_force/noncontact_mag"),
+    ("f_mae", "metric_force/mae"), ("g_mae", "metric_force/groups_mae"),
+    ("angle", "metric_force/angle_deg"), ("f_off", "metric_force/noncontact_mag"),
     ("rnea_f", "metric_force_consistency/force"), ("rnea_t", "metric_force_consistency/torque"),
     ("vel_r", "metric_motion/vel_pearson"), ("acc_r", "metric_motion/acc_pearson"),
     ("still", "metric_contact_consistency/speed"),

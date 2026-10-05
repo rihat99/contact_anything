@@ -35,11 +35,13 @@ corrections — again without any reference to the world frame:
    compose, and the corrected trajectory's own rate features go back into the
    residual stream before the next layer (SAM3D's decoder updates its anchored
    tokens with the intermediate keypoint readout the same way). With
-   ``limb_tokens`` a frame carries SEVEN tokens — the body token (whose decoder
-   contact tokens move to the limbs) and one per kindyn group holding that
-   extremity's geometry and its decoder contact token — through alternating
+   ``limb_tokens`` a frame carries ``1 + K`` tokens — the body token (whose decoder
+   contact tokens move to the limbs) and one per slot of the contact set holding
+   that slot's geometry and its decoder contact token — through alternating
    temporal / within-frame attention; the contact and force heads then read the
-   limb tokens, and the limbs get a feedback path of their own.
+   limb tokens, and the limbs get a feedback path of their own. With
+   ``force_tokens`` K more limb tokens carry the decoder FORCE tokens: the
+   force head reads those, the contact head the contact ones (``1 + 2K`` slots).
 5. **Zero-initialised heads**: contact logits; pose offset = 6D rotation deltas
    right-multiplied onto the root (body frame) and the 21 body joints
    (parent-local) plus a root shift in the body frame; motion = world velocity /
@@ -75,15 +77,13 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from model.contact_frames import ContactSet, contact_set
 from model.rope import CrossModalRopeModule
 from utils.geometry import (project_to_crop, rot6d_to_rotmat, rotmat_to_rot6d, smplx_q,
                             translation_to_ray)
 
 OUTPUTS = ("pose", "contact", "motion", "force", "gravity")
 NUM_BODY_JOINTS = 22
-NUM_GROUPS = 6
-#: SMPL-X body joint of each kindyn group (LH, RH, LF toe, RF toe, LA heel, RA heel).
-GROUP_JOINTS = (20, 21, 10, 11, 7, 8)
 #: Heads that read the limb tokens under ``limb_tokens`` (the body token otherwise).
 _LIMB_HEADS = ("contact", "force")
 #: Frames the ``force`` output may be read in (``force_frame``).
@@ -393,11 +393,37 @@ def local_mean(x: Tensor, valid: Tensor, radius: int) -> Tensor:
 
 # ------------------------------------------------------------------ body-relative features
 
-def world_joints(shaped, pelvis_world: Tensor, rot_wr: Tensor, body_rot: Tensor,
-                 hand_rot: Optional[Tensor]) -> Tensor:
-    """FK of a world trajectory with an already-shaped body: world joints ``[n, J, 3]``."""
-    return shaped.fk(smplx_q(pelvis_world, rot_wr, body_rot, hand_rot)
-                     ).joint_pose_world[..., 1:, :3]
+def slot_frame_ids(slots: ContactSet, body) -> Optional[list[int]]:
+    """The BetterRobot frame ids of a set's posed contact frames (``None`` for joint slots).
+
+    Hard-fails when the body's frame set is not the contact set's: every slot tensor in
+    the repository is indexed by :attr:`ContactSet.slot_names`, in that order.
+    """
+    if not slots.uses_frames:
+        return None
+    frames = body.contact_frames
+    if frames is None or tuple(frames.names) != slots.slot_names:
+        raise ValueError(
+            f"the SMPL-X body carries {None if frames is None else tuple(frames.names)}, "
+            f"not the {slots.name} frames")
+    return list(frames.frame_ids)
+
+
+def world_points(shaped, pelvis_world: Tensor, rot_wr: Tensor, body_rot: Tensor,
+                 hand_rot: Optional[Tensor], slots: ContactSet,
+                 frame_ids: Optional[Sequence[int]]) -> tuple[Tensor, Tensor]:
+    """FK of a world trajectory with an already-shaped body.
+
+    :returns: ``(world joints [n, J, 3], the set's slot points [n, K, 3])`` — the posed
+        contact frames when the set has them (``frame_ids`` from :func:`slot_frame_ids`),
+        else the slots' own body joints.
+    """
+    data = shaped.fk(smplx_q(pelvis_world, rot_wr, body_rot, hand_rot),
+                     compute_frames=frame_ids is not None)
+    joints = data.joint_pose_world[..., 1:, :3]
+    points = (data.frame_pose_world[..., frame_ids, :3] if frame_ids is not None
+              else joints[:, list(slots.parent_joint52)])
+    return joints, points
 
 
 def root_frame_joints(joints_world: Tensor, pelvis_world: Tensor, rot_wr: Tensor) -> Tensor:
@@ -427,26 +453,24 @@ def one_sided_root_rates(pelvis_world: Tensor, rot_wr: Tensor, seconds: Tensor,
     return vel_b, ang_b
 
 
-def limb_geometry(joints_world: Tensor, pelvis_world: Tensor, rot_wr: Tensor, seconds: Tensor,
+def limb_geometry(points_world: Tensor, pelvis_world: Tensor, rot_wr: Tensor, seconds: Tensor,
                   valid: Tensor, rates: bool = True) -> Tensor:
-    """The six extremities seen from the body, ``[n, 6, 9]`` (``[n, 6, 3]`` without ``rates``).
+    """The set's slots seen from the body, ``[n, K, 9]`` (``[n, K, 3]`` without ``rates``).
 
-    Per group (:data:`GROUP_JOINTS`): the extremity joint's position in the root
-    frame (3) and the forward AND backward one-sided rates of its world position
-    rotated into the body frame (6) — the limbs' twin of
-    :func:`one_sided_root_rates`, so a rigid re-definition of the world leaves
-    every channel untouched. ``seconds`` / ``valid`` are ``[n_clips, T]``.
+    Per slot: its position in the root frame (3) and the forward AND backward
+    one-sided rates of its world position rotated into the body frame (6) — the
+    limbs' twin of :func:`one_sided_root_rates`, so a rigid re-definition of the
+    world leaves every channel untouched. ``seconds`` / ``valid`` are ``[n_clips, T]``.
     """
     n_clips, seq_len = seconds.shape
-    n_frames = joints_world.shape[0]
-    tips = joints_world[:, list(GROUP_JOINTS)]                                # [n, 6, 3]
-    clip = tips.view(n_clips, seq_len, NUM_GROUPS, 3)
-    parts = [tips - pelvis_world[:, None]]
+    n_frames, n_slots = points_world.shape[:2]
+    clip = points_world.view(n_clips, seq_len, n_slots, 3)
+    parts = [points_world - pelvis_world[:, None]]
     if rates:
-        parts += [forward_difference(clip, seconds, valid).reshape(n_frames, NUM_GROUPS, 3),
-                  backward_difference(clip, seconds, valid).reshape(n_frames, NUM_GROUPS, 3)]
-    world = torch.stack(parts, dim=2)                                         # [n, 6, k, 3]
-    return torch.einsum("bji,bkmj->bkmi", rot_wr, world).reshape(n_frames, NUM_GROUPS, -1)
+        parts += [forward_difference(clip, seconds, valid).reshape(n_frames, n_slots, 3),
+                  backward_difference(clip, seconds, valid).reshape(n_frames, n_slots, 3)]
+    world = torch.stack(parts, dim=2)                                         # [n, K, k, 3]
+    return torch.einsum("bji,bkmj->bkmi", rot_wr, world).reshape(n_frames, n_slots, -1)
 
 
 def joint_rates(body_rot: Tensor, seconds: Tensor, valid: Tensor) -> Tensor:
@@ -475,13 +499,16 @@ class TemporalRefiner(nn.Module):
 
     :param decoder_dim: width of the frozen decoder tokens.
     :param outputs: subset of :data:`OUTPUTS` to build heads for.
+    :param contact_set: name of the contact set (:mod:`model.contact_frames`) whose
+        K slots the contact / force outputs, the limb tokens and the slot points are
+        indexed by.
     :param num_contact_tokens: contact tokens fed as features (0 = none).
     :param dim: transformer width.
     :param num_layers: RoPE blocks.
     :param num_heads: attention heads.
     :param mlp_ratio: FFN expansion.
     :param dropout: dropout inside attention / FFN.
-    :param window: attention half-width per layer, seconds.
+    :param window: attention half-width per layer, seconds (``None`` = the whole clip).
     :param time_scale: RoPE rotation units per second.
     :param root_smooth_sec: input Gaussian sigma (s) of the world pelvis
         position after the lift (0 = off).
@@ -521,11 +548,18 @@ class TemporalRefiner(nn.Module):
     :param force_frame: frame the ``force`` head's three numbers per limb are
         read in — ``body`` (the input body frame) or ``gravity`` (a
         gravity-aligned, body-headed frame; needs the ``gravity`` output).
-    :param limb_tokens: run SEVEN tokens per frame through an alternating
+    :param limb_tokens: run ``1 + K`` tokens per frame through an alternating
         transformer — the body token (without the decoder contact tokens) plus
-        one token per kindyn group carrying that limb's extremity geometry and
-        its decoder contact token; the ``contact`` and ``force`` heads then read
-        the limb tokens instead of the body one.
+        one token per contact slot carrying that slot's geometry and its decoder
+        contact token; the ``contact`` and ``force`` heads then read the limb
+        tokens instead of the body one.
+    :param force_tokens: K FORCE limb tokens (besides the contact ones when
+        ``limb_tokens``: ``1 + 2K`` slots; alone: ``1 + K``): each carries its
+        slot's geometry and its decoder force token (``num_force_tokens``); the
+        ``force`` head reads them, the ``contact`` head the contact tokens, and
+        each set feeds its own head's output back. Needs the ``force`` output.
+    :param num_force_tokens: decoder force tokens fed to the force limb tokens
+        (0 or K; needs ``force_tokens``).
     :param per_frame: NO information between frames — the token carries no
         root velocity / dt channels and the limb tokens no rates, the attention
         keeps every query on its own frame (``window`` is ignored), and the
@@ -539,12 +573,13 @@ class TemporalRefiner(nn.Module):
         decoder_dim: int,
         outputs: Sequence[str],
         num_contact_tokens: int,
+        contact_set_name: str = "kindyn6",
         dim: int = 512,
         num_layers: int = 4,
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
-        window: float = 0.5,
+        window: Optional[float] = 0.5,
         time_scale: float = 25.0,
         root_smooth_sec: float = 0.0,
         pose_smooth_sec: float = 0.0,
@@ -564,6 +599,8 @@ class TemporalRefiner(nn.Module):
         contact_token_dim: int = 64,
         force_frame: str = "body",
         limb_tokens: bool = False,
+        force_tokens: bool = False,
+        num_force_tokens: int = 0,
         per_frame: bool = False,
     ):
         super().__init__()
@@ -571,7 +608,12 @@ class TemporalRefiner(nn.Module):
         if not outputs or any(o not in OUTPUTS for o in outputs) or len(set(outputs)) != len(outputs):
             raise ValueError(f"outputs must be a non-empty subset of {OUTPUTS}; got {outputs}")
         self.outputs = tuple(o for o in OUTPUTS if o in outputs)
+        self.slots = contact_set(str(contact_set_name))
+        self.num_slots = self.slots.count
         self.num_contact_tokens = int(num_contact_tokens)
+        self.register_buffer("slot_parent22",
+                             torch.tensor(self.slots.parent_joint22, dtype=torch.long),
+                             persistent=False)
         self.root_smooth_sec = float(root_smooth_sec)
         self.pose_smooth_sec = float(pose_smooth_sec)
         self.learn_smoothing = bool(learn_smoothing)
@@ -657,10 +699,22 @@ class TemporalRefiner(nn.Module):
             raise ValueError("force_frame 'gravity' aligns the force frame with the clip's "
                              "gravity estimate: list 'gravity' in outputs")
         self.limb_tokens = bool(limb_tokens)
-        if self.limb_tokens and self.num_contact_tokens not in (0, NUM_GROUPS):
+        if self.limb_tokens and self.num_contact_tokens not in (0, self.num_slots):
             raise ValueError(
-                f"limb_tokens gives each of the {NUM_GROUPS} kindyn groups its own decoder "
-                f"contact token; this build has {self.num_contact_tokens}")
+                f"limb_tokens gives each of the {self.num_slots} {self.slots.name} slots its "
+                f"own decoder contact token; this build has {self.num_contact_tokens}")
+        self.force_tokens = bool(force_tokens)
+        self.num_force_tokens = int(num_force_tokens)
+        if self.force_tokens and "force" not in self.outputs:
+            raise ValueError("force_tokens adds force limb tokens: needs the force output")
+        if self.limb_tokens and "contact" not in self.outputs:
+            raise ValueError("limb_tokens adds contact limb tokens: needs the contact output")
+        if self.num_force_tokens not in (0, self.num_slots) or (
+                self.num_force_tokens and not self.force_tokens):
+            raise ValueError(
+                f"decoder force tokens feed the force limb tokens (force_tokens) one per "
+                f"{self.slots.name} slot; this build has {self.num_force_tokens} and "
+                f"force_tokens {self.force_tokens}")
 
         self.proj_pose_token = nn.Linear(decoder_dim, pose_token_dim) if pose_token else None
         self.proj_contact_tokens = (nn.Linear(decoder_dim, contact_token_dim)
@@ -682,31 +736,44 @@ class TemporalRefiner(nn.Module):
         self.geometry_norm = nn.LayerNorm(geometry_dim)
         self.token_norm = nn.LayerNorm(token_dim) if token_dim > 0 else None
         self.input_proj = nn.Linear(geometry_dim + token_dim, dim)
+        #: Any limb tokens at all (contact and / or force): alternating attention, limb geometry.
+        self.any_limb = self.limb_tokens or self.force_tokens
         self.limb_geometry_norm = self.limb_token_norm = self.limb_input_proj = None
         self.limb_output_norm = None
-        if self.limb_tokens:
+        self.proj_force_tokens = self.force_limb_token_norm = self.force_limb_input_proj = None
+        if self.any_limb:
             limb_geometry_dim = (3 if self.per_frame else _LIMB_GEOMETRY_DIM) + (
                 _LIMB_CAMERA_DIM if self.camera_context else 0)
-            limb_token_dim = contact_token_dim if self.num_contact_tokens > 0 else 0
             self.limb_geometry_norm = nn.LayerNorm(limb_geometry_dim)
+            self.limb_output_norm = nn.LayerNorm(dim)
+        if self.limb_tokens:
+            limb_token_dim = contact_token_dim if self.num_contact_tokens > 0 else 0
             self.limb_token_norm = nn.LayerNorm(limb_token_dim) if limb_token_dim > 0 else None
             # One projection shared by the six limbs: the transformer's slot embedding is
             # what tells them apart.
             self.limb_input_proj = nn.Linear(limb_geometry_dim + limb_token_dim, dim)
-            self.limb_output_norm = nn.LayerNorm(dim)
+        if self.force_tokens:
+            force_token_dim = contact_token_dim if self.num_force_tokens > 0 else 0
+            if force_token_dim > 0:
+                self.proj_force_tokens = nn.Linear(decoder_dim, contact_token_dim)
+                self.force_limb_token_norm = nn.LayerNorm(force_token_dim)
+            self.force_limb_input_proj = nn.Linear(limb_geometry_dim + force_token_dim, dim)
+        transformer_slots = (1 + (self.num_slots if self.limb_tokens else 0)
+                             + (self.num_slots if self.force_tokens else 0))
         self.temporal = CrossModalRopeModule(
-            dim=dim, num_slots=(1 + NUM_GROUPS) if self.limb_tokens else 1,
+            dim=dim, num_slots=transformer_slots,
             num_layers=num_layers, num_heads=num_heads,
             mlp_ratio=mlp_ratio, dropout=dropout, window=window, time_scale=time_scale,
-            alternating=self.limb_tokens)
+            alternating=self.any_limb)
         self.output_norm = nn.LayerNorm(dim)
         self.mask_token = nn.Parameter(torch.zeros(dim)) if self.frame_mask_p > 0.0 else None
         self.feedback_norm = self.feedback_proj = None
         self.limb_feedback_norm = self.limb_feedback_proj = None
+        self.force_limb_feedback_norm = self.force_limb_feedback_proj = None
         if self.iterative:
             # Zero-initialised, like the heads: at init the extra path contributes nothing.
             feedback_dim = _FEEDBACK_DIM + (_FEEDBACK_DELTA_DIM if self.feedback_delta else 0)
-            feedback_dim += NUM_GROUPS if "contact" in self.outputs else 0
+            feedback_dim += self.num_slots if "contact" in self.outputs else 0
             feedback_dim += 3 if "gravity" in self.outputs else 0
             feedback_dim += _RESIDUAL_DIM if self.residual_feedback else 0
             self.feedback_norm = nn.LayerNorm(feedback_dim)
@@ -714,18 +781,25 @@ class TemporalRefiner(nn.Module):
             nn.init.zeros_(self.feedback_proj.weight)
             nn.init.zeros_(self.feedback_proj.bias)
             if self.limb_tokens:
-                limb_feedback_dim = _LIMB_GEOMETRY_DIM
-                limb_feedback_dim += 1 if "contact" in self.outputs else 0
-                limb_feedback_dim += 3 if "force" in self.outputs else 0
+                # The contact limb tokens get the contact probability back, and the force too
+                # when the force head reads them (no force tokens of their own).
+                limb_feedback_dim = _LIMB_GEOMETRY_DIM + 1
+                limb_feedback_dim += 3 if "force" in self.outputs and not self.force_tokens else 0
                 self.limb_feedback_norm = nn.LayerNorm(limb_feedback_dim)
                 self.limb_feedback_proj = nn.Linear(limb_feedback_dim, dim)
                 nn.init.zeros_(self.limb_feedback_proj.weight)
                 nn.init.zeros_(self.limb_feedback_proj.bias)
-        sizes = {"pose": 6 * NUM_BODY_JOINTS + 3, "contact": NUM_GROUPS,
-                 "motion": 6 * NUM_BODY_JOINTS + 6, "force": 3 * NUM_GROUPS, "gravity": 3}
+            if self.force_tokens:
+                self.force_limb_feedback_norm = nn.LayerNorm(_LIMB_GEOMETRY_DIM + 3)
+                self.force_limb_feedback_proj = nn.Linear(_LIMB_GEOMETRY_DIM + 3, dim)
+                nn.init.zeros_(self.force_limb_feedback_proj.weight)
+                nn.init.zeros_(self.force_limb_feedback_proj.bias)
+        sizes = {"pose": 6 * NUM_BODY_JOINTS + 3, "contact": self.num_slots,
+                 "motion": 6 * NUM_BODY_JOINTS + 6, "force": 3 * self.num_slots, "gravity": 3}
         if self.limb_tokens:
-            # One head per limb TOKEN, shared by the six: a logit and a force each.
-            sizes.update(contact=1, force=3)
+            sizes["contact"] = 1            # one head per limb TOKEN, shared by all of them
+        if self.any_limb:
+            sizes["force"] = 3              # ... the force head reads limb tokens either way
         self.heads = nn.ModuleDict()
         for name in self.outputs:
             self.heads[name] = self._zero_head(dim, sizes[name])
@@ -807,42 +881,44 @@ class TemporalRefiner(nn.Module):
         feats += list(extra)
         return self.feedback_proj(self.feedback_norm(torch.cat(feats, dim=-1)))
 
-    def _limb_input(self, joints_world: Tensor, pelvis_world: Tensor, rot_wr: Tensor,
-                    joints_cam: Optional[Tensor], contact_proj: Optional[Tensor], batch: dict,
-                    seconds: Tensor, valid: Tensor) -> Tensor:
-        """The six limb tokens ``[B, 6, dim]`` of the smoothed input trajectory.
+    def _limb_features(self, points_world: Tensor, pelvis_world: Tensor, rot_wr: Tensor,
+                       points_cam: Optional[Tensor], pelvis_depth: Optional[Tensor],
+                       batch: dict, seconds: Tensor, valid: Tensor) -> Tensor:
+        """The limbs' input geometry ``[B, K, k]``, LayerNormed.
 
-        :func:`limb_geometry` (the extremity's root-frame position and its one-sided
-        body-frame rates), under ``camera_context`` the extremity's crop-space position
+        :func:`limb_geometry` (the slot's root-frame position and its one-sided
+        body-frame rates), under ``camera_context`` the slot's crop-space position
         and its log depth ratio to the pelvis — camera-relative, like the body token's
-        camera context, never world-relative — and the limb's projected decoder contact
-        token when the build has one. One projection for all six limbs.
+        camera context, never world-relative.
         """
-        feats = [limb_geometry(joints_world, pelvis_world, rot_wr, seconds, valid,
+        feats = [limb_geometry(points_world, pelvis_world, rot_wr, seconds, valid,
                                rates=not self.per_frame)]
         if self.camera_context:
-            _, crop = project_to_crop(joints_cam, batch["cam_int"].float(),
+            _, crop = project_to_crop(points_cam, batch["cam_int"].float(),
                                       batch["affine_trans"].float(), batch["img_size"].float())
-            depth = joints_cam[..., 2].clamp(min=1e-3)
-            log_ratio = torch.log(depth[:, list(GROUP_JOINTS)]) - torch.log(depth[:, :1])
-            feats += [crop[:, list(GROUP_JOINTS)], log_ratio[..., None]]
-        parts = [self.limb_geometry_norm(torch.cat(feats, dim=-1))]
-        if self.limb_token_norm is not None:
-            parts.append(self.limb_token_norm(contact_proj))
-        return self.limb_input_proj(torch.cat(parts, dim=-1))
+            log_ratio = (torch.log(points_cam[..., 2].clamp(min=1e-3))
+                         - torch.log(pelvis_depth.clamp(min=1e-3))[:, None])
+            feats += [crop, log_ratio[..., None]]
+        return self.limb_geometry_norm(torch.cat(feats, dim=-1))
 
-    def _limb_feedback(self, joints_world: Tensor, pelvis_world: Tensor, rot_wr: Tensor,
-                       seconds: Tensor, valid: Tensor,
-                       extra: Sequence[Tensor] = ()) -> Tensor:
-        """The corrected trajectory's per-limb features, projected into the limb tokens.
+    @staticmethod
+    def _limb_input(geometry: Tensor, token_proj: Optional[Tensor], norm, proj) -> Tensor:
+        """The limb tokens ``[B, K, dim]``: the geometry plus the limbs' projected decoder
+        tokens when the build has them. One projection for all the limbs (the
+        transformer's slot embedding tells them apart)."""
+        parts = [geometry] if norm is None else [geometry, norm(token_proj)]
+        return proj(torch.cat(parts, dim=-1))
+
+    @staticmethod
+    def _limb_feedback(geometry: Tensor, extra: Sequence[Tensor], norm, proj) -> Tensor:
+        """The corrected trajectory's per-limb features, projected into six limb tokens.
 
         The limbs' twin of :meth:`_feedback`: :func:`limb_geometry` recomputed on the
         trajectory as the layers so far left it, plus the layer's own per-limb head
-        outputs (``extra``, each ``[B, 6, k]`` and body-relative: the contact probability
-        and the force). Returns ``[B, 6, dim]``.
+        outputs (``extra``, each ``[B, K, k]`` and body-relative: the contact probability
+        and / or the force). Returns ``[B, K, dim]``.
         """
-        feats = [limb_geometry(joints_world, pelvis_world, rot_wr, seconds, valid), *extra]
-        return self.limb_feedback_proj(self.limb_feedback_norm(torch.cat(feats, dim=-1)))
+        return proj(norm(torch.cat([geometry, *extra], dim=-1)))
 
     def _scale_grad(self, x: Tensor) -> Tensor:
         """``x`` unchanged in value, its gradient scaled by ``head_grad_scale``."""
@@ -938,8 +1014,8 @@ class TemporalRefiner(nn.Module):
         return self._wrenches[device]
 
     def _residual(self, pelvis_world: Tensor, rot_wr: Tensor, body_rot: Tensor,
-                  betas_clip: Tensor, forces_b: Tensor, frame_in: Tensor, probs: Tensor,
-                  gravity_w: Tensor, seconds: Tensor, valid: Tensor) -> Tensor:
+                  betas_clip: Tensor, points_world: Tensor, forces_b: Tensor, frame_in: Tensor,
+                  probs: Tensor, gravity_w: Tensor, seconds: Tensor, valid: Tensor) -> Tensor:
         """The layer's root-wrench residual ``[B, 6]`` (root frame; 0 outside the stencil).
 
         Body, betas, gravity and the contact gate are detached; the forces are live.
@@ -955,7 +1031,8 @@ class TemporalRefiner(nn.Module):
             pelvis_world.detach().view(n_clips, seq_len, 3),
             rot_wr.detach().view(n_clips, seq_len, 3, 3),
             body_rot.detach().view(n_clips, seq_len, NUM_BODY_JOINTS - 1, 3, 3),
-            betas_clip.detach(), forces_world.view(n_clips, seq_len, NUM_GROUPS, 3),
+            betas_clip.detach(), forces_world.view(n_clips, seq_len, self.num_slots, 3),
+            points_world.detach().view(n_clips, seq_len, self.num_slots, 3), self.slot_parent22,
             gravity_w.detach().view(n_clips, seq_len, 3)[:, 0], seconds, valid)
         residual = torch.cat([res_f, res_t], dim=-1) * rows.to(res_f.dtype)[..., None]
         return residual.reshape(n_frames, _RESIDUAL_DIM)
@@ -976,10 +1053,12 @@ class TemporalRefiner(nn.Module):
         :param body: the head's BetterHuman SMPL-X body (22 or 52 joints).
         :returns: ``{"smplx", "contact", "force", "motion", "gravity"}`` — ``smplx`` in the
             SmplxHead layout plus ``pelvis_world`` / ``root_rot_world`` /
-            ``joints_world``, the per-layer world joints ``joints_world_layers``
-            (one entry unless ``iterative``, the last one IS ``joints_world``)
+            ``joints_world``, the contact set's ``slot_points_world`` ``[B, K, 3]``,
+            the per-layer ``joints_world_layers`` / ``slot_points_world_layers``
+            (one entry unless ``iterative``, the last one IS the final tensor)
             and the smoothed, un-refined ``pelvis_world_in`` /
-            ``root_rot_world_in`` / ``body_rot_in`` / ``joints_world_in``;
+            ``root_rot_world_in`` / ``body_rot_in`` / ``joints_world_in`` /
+            ``slot_points_world_in``;
             absent heads are ``None``.
         """
         n_frames = tokens.shape[0]
@@ -1019,7 +1098,9 @@ class TemporalRefiner(nn.Module):
         betas_mean = (betas if self.per_frame
                       else betas_clip[:, None].expand(n_clips, seq_len, -1).reshape(n_frames, -1))
         shaped = body.with_shape(betas=betas_mean)
-        joints_world_in = world_joints(shaped, p_w, rot_wr, body_rot, hand_rot)
+        frame_ids = slot_frame_ids(self.slots, body)
+        joints_world_in, points_world_in = world_points(
+            shaped, p_w, rot_wr, body_rot, hand_rot, self.slots, frame_ids)
 
         # 3. world-independent per-frame features.
         joints_root = root_frame_joints(joints_world_in, p_w, rot_wr)
@@ -1101,14 +1182,28 @@ class TemporalRefiner(nn.Module):
             dropped = torch.rand(n_frames, device=device) < self.frame_mask_p
             x = torch.where(dropped[:, None], self.mask_token[None].to(x.dtype), x)
         stream = x[:, None]                                        # [B, 1, dim]
-        if self.limb_tokens:
-            joints_cam_in = None
+        if self.any_limb:
+            points_cam_in = None
             if self.camera_context:
-                joints_cam_in = torch.einsum(
-                    "bij,bkj->bki", rot_cw, joints_world_in) + t_cw[:, None]
-            stream = torch.cat([stream, self._limb_input(
-                joints_world_in, p_w, rot_wr, joints_cam_in, contact_proj, batch,
-                seconds, valid)], dim=1)                           # [B, 7, dim]
+                points_cam_in = torch.einsum(
+                    "bij,bkj->bki", rot_cw, points_world_in) + t_cw[:, None]
+            geometry_in = self._limb_features(points_world_in, p_w, rot_wr, points_cam_in,
+                                              pelvis_s[:, 2], batch, seconds, valid)
+            slots = [stream]
+            if self.limb_tokens:
+                slots.append(self._limb_input(geometry_in, contact_proj, self.limb_token_norm,
+                                              self.limb_input_proj))
+            if self.force_tokens:
+                force_proj = None
+                if self.proj_force_tokens is not None:
+                    lo, hi = blocks["force"]
+                    if hi - lo != self.num_force_tokens:
+                        raise AssertionError(
+                            f"force block has {hi - lo} tokens; refiner built for {self.num_force_tokens}")
+                    force_proj = self.proj_force_tokens(tokens[:, lo:hi].float())   # [B, 6, C]
+                slots.append(self._limb_input(geometry_in, force_proj, self.force_limb_token_norm,
+                                              self.force_limb_input_proj))
+            stream = torch.cat(slots, dim=1)                        # [B, 7 | 13, dim]
 
         # 4. temporal transformer (one slot per frame, seven under `limb_tokens`), 5. the
         #    pose offset in the body / parent-local frames and 6. FK in the world. Under
@@ -1116,7 +1211,8 @@ class TemporalRefiner(nn.Module):
         #    trajectory the previous layers left and its rate features go back into the
         #    residual stream.
         n_layers = self.temporal.num_layers
-        states: list[tuple[Tensor, Tensor, Tensor, Tensor]] = []
+        # Per layer: (pelvis, world-from-root, parent-local joints, world joints, slot points).
+        states: list[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]] = []
         rot_wr2, body_rot2, p_w2 = rot_wr, body_rot, p_w
         head_names = [name for name in self.outputs if name != "pose"]
         per_layer: dict[str, list[Tensor]] = {name: [] for name in head_names}
@@ -1127,9 +1223,20 @@ class TemporalRefiner(nn.Module):
             # the gravity loss would still reach the pose path through the lift.
             hidden, rot = self._scale_grad(hidden), self._scale_grad(rot_wr2)
             limb = None if limb is None else self._scale_grad(limb)
-            raw = {name: (self.heads[name](limb).reshape(n_frames, -1)
-                          if limb is not None and name in _LIMB_HEADS
-                          else self.heads[name](hidden))
+
+            def slots_of(name: str) -> Optional[Tensor]:
+                """The limb tokens a head reads: contact ones first, force ones after."""
+                if limb is None or name not in _LIMB_HEADS:
+                    return None
+                if name == "contact":
+                    return limb[:, :self.num_slots] if self.limb_tokens else None
+                if self.force_tokens:
+                    return (limb[:, self.num_slots:] if self.limb_tokens
+                            else limb[:, :self.num_slots])
+                return limb[:, :self.num_slots]
+
+            raw = {name: (self.heads[name](slots_of(name)).reshape(n_frames, -1)
+                          if slots_of(name) is not None else self.heads[name](hidden))
                    for name in head_names}
             if "gravity" in raw:
                 pooled = self.pool_gravity(raw["gravity"], rot, down_cam_w,
@@ -1154,12 +1261,12 @@ class TemporalRefiner(nn.Module):
             for layer in range(n_layers):
                 h = self.temporal.run_block(layer, h, tables)
                 hidden = self.output_norm(h[:, 0])
-                if self.limb_tokens:
+                if self.any_limb:
                     limb_hidden = self.limb_output_norm(h[:, 1:])
                 p_w2, rot_wr2, body_rot2 = self._apply_pose_delta(
                     self.heads["pose"](hidden), p_w2, rot_wr2, body_rot2)
-                states.append((p_w2, rot_wr2, body_rot2,
-                               world_joints(shaped, p_w2, rot_wr2, body_rot2, hand_rot)))
+                states.append((p_w2, rot_wr2, body_rot2, *world_points(
+                    shaped, p_w2, rot_wr2, body_rot2, hand_rot, self.slots, frame_ids)))
                 raw = read_heads(hidden, limb_hidden)
                 if layer + 1 < n_layers:
                     fed = {k: self._scale_grad(v) for k, v in raw.items()}
@@ -1170,42 +1277,50 @@ class TemporalRefiner(nn.Module):
                         extra.append((rot_wr2.transpose(1, 2) @ fed["gravity"][..., None])[..., 0])
                     if self.residual_feedback:
                         extra.append(self._residual(
-                            p_w2, rot_wr2, body_rot2, betas_clip,
-                            fed["force"].reshape(n_frames, NUM_GROUPS, 3), force_frames[-1],
+                            p_w2, rot_wr2, body_rot2, betas_clip, states[-1][4],
+                            fed["force"].reshape(n_frames, self.num_slots, 3), force_frames[-1],
                             torch.sigmoid(fed["contact"]), fed["gravity"], seconds, valid))
-                    update = self._feedback(*states[-1], p_w, rot_wr, body_rot,
+                    update = self._feedback(*states[-1][:4], p_w, rot_wr, body_rot,
                                             seconds, valid, extra)[:, None]
-                    if self.limb_tokens:
-                        limb_extra = []
-                        if "contact" in fed:
+                    if self.any_limb:
+                        geometry = limb_geometry(states[-1][4], p_w2, rot_wr2, seconds, valid)
+                        limb_extra, force_extra = [], []
+                        if self.limb_tokens:
                             limb_extra.append(torch.sigmoid(fed["contact"])[..., None])
                         if "force" in fed:
                             # The token stream is body-relative: a force read in the
                             # gravity frame comes back into the input body frame.
-                            force_b = fed["force"].reshape(n_frames, NUM_GROUPS, 3)
+                            force_b = fed["force"].reshape(n_frames, self.num_slots, 3)
                             if self.force_frame != "body":
                                 force_b = torch.einsum(
                                     "bij,bkj->bki", rot_wr.transpose(1, 2) @ force_frames[-1],
                                     force_b)
-                            limb_extra.append(force_b)
-                        update = torch.cat([update, self._limb_feedback(
-                            states[-1][3], p_w2, rot_wr2, seconds, valid, limb_extra)], dim=1)
+                            (force_extra if self.force_tokens else limb_extra).append(force_b)
+                        updates = [update]
+                        if self.limb_tokens:
+                            updates.append(self._limb_feedback(
+                                geometry, limb_extra, self.limb_feedback_norm, self.limb_feedback_proj))
+                        if self.force_tokens:
+                            updates.append(self._limb_feedback(
+                                geometry, force_extra, self.force_limb_feedback_norm,
+                                self.force_limb_feedback_proj))
+                        update = torch.cat(updates, dim=1)
                     h = h + update
         else:
             h = self.temporal(stream, seq_len, batch["frame_pos_sec"], batch["frame_valid"])
             hidden = self.output_norm(h[:, 0])
-            if self.limb_tokens:
+            if self.any_limb:
                 limb_hidden = self.limb_output_norm(h[:, 1:])
             if "pose" in self.outputs:
                 p_w2, rot_wr2, body_rot2 = self._apply_pose_delta(
                     self.heads["pose"](hidden), p_w2, rot_wr2, body_rot2)
-            states.append((p_w2, rot_wr2, body_rot2,
-                           world_joints(shaped, p_w2, rot_wr2, body_rot2, hand_rot)))
+            states.append((p_w2, rot_wr2, body_rot2, *world_points(
+                shaped, p_w2, rot_wr2, body_rot2, hand_rot, self.slots, frame_ids)))
             raw = read_heads(hidden, limb_hidden)
 
         # 7. back into every camera — the intermediate layers too (deep supervision reads
         #    them; with one layer the lists are the final tensors and nothing extra runs).
-        joints_world = states[-1][3]
+        joints_world, slot_points_world = states[-1][3], states[-1][4]
         joints_cam2 = torch.einsum("bij,bkj->bki", rot_cw, joints_world) + t_cw[:, None]
         pelvis_cam2 = (rot_cw @ p_w2[..., None])[..., 0] + t_cw
         root_rot_cam2 = rot_cw @ rot_wr2
@@ -1214,13 +1329,13 @@ class TemporalRefiner(nn.Module):
             batch["img_size"].float())
         root_6d, body_6d = rotmat_to_rot6d(root_rot_cam2), rotmat_to_rot6d(body_rot2)
         layers = [
-            {"pelvis_world": p, "root_rot_world": r, "joints_world": j,
+            {"pelvis_world": p, "root_rot_world": r, "joints_world": j, "slot_points_world": s,
              "joints_cam": torch.einsum("bij,bkj->bki", rot_cw, j) + t_cw[:, None],
              "root_6d": rotmat_to_rot6d(rot_cw @ r), "body_6d": rotmat_to_rot6d(b)}
-            for p, r, b, j in states[:-1]]
+            for p, r, b, j, s in states[:-1]]
         layers.append({"pelvis_world": p_w2, "root_rot_world": rot_wr2,
-                       "joints_world": joints_world, "joints_cam": joints_cam2,
-                       "root_6d": root_6d, "body_6d": body_6d})
+                       "joints_world": joints_world, "slot_points_world": slot_points_world,
+                       "joints_cam": joints_cam2, "root_6d": root_6d, "body_6d": body_6d})
         smplx = {
             "root_6d": root_6d, "body_6d": body_6d,
             "hand_6d": None if hand_rot is None else rotmat_to_rot6d(hand_rot),
@@ -1230,8 +1345,9 @@ class TemporalRefiner(nn.Module):
             "q_cam": smplx_q(pelvis_cam2, root_rot_cam2, body_rot2, hand_rot),
             "joints_cam": joints_cam2, "kp2d_full": kp2d_full, "kp2d_crop": kp2d_crop,
             "pelvis_world": p_w2, "root_rot_world": rot_wr2, "joints_world": joints_world,
+            "slot_points_world": slot_points_world,
             "pelvis_world_in": p_w, "root_rot_world_in": rot_wr, "body_rot_in": body_rot,
-            "joints_world_in": joints_world_in,
+            "joints_world_in": joints_world_in, "slot_points_world_in": points_world_in,
             **{f"{key}_layers": [layer[key] for layer in layers] for key in layers[0]},
         }
         contact = force = motion = gravity = None
@@ -1242,14 +1358,14 @@ class TemporalRefiner(nn.Module):
             # Forces live in the INPUT body frame, or (`force_frame: gravity`) in the final
             # layer's gravity-aligned frame; `frame` is world-from-that, which lets the loss
             # rotate the kindyn GT (given in the GT root frame) into it.
-            layer_forces = [f.reshape(n_frames, NUM_GROUPS, 3) for f in per_layer["force"]]
+            layer_forces = [f.reshape(n_frames, self.num_slots, 3) for f in per_layer["force"]]
             if self.force_frame != "body":
                 # Deep supervision compares the layers in ONE frame, and each layer's frame
                 # follows its own gravity estimate.
                 to_final = force_frames[-1].detach().transpose(1, 2)
                 layer_forces = [torch.einsum("bij,bkj->bki", to_final @ frame.detach(), value)
                                 for frame, value in zip(force_frames, layer_forces)]
-            force = {"forces": raw["force"].reshape(n_frames, NUM_GROUPS, 3),
+            force = {"forces": raw["force"].reshape(n_frames, self.num_slots, 3),
                      "frame": force_frames[-1], "forces_layers": layer_forces}
         if "gravity" in raw:
             rot = self._scale_grad(rot_wr2)
@@ -1271,8 +1387,9 @@ class TemporalRefiner(nn.Module):
                 "gravity": gravity}
 
 
-__all__ = ["TemporalRefiner", "OUTPUTS", "GROUP_JOINTS", "SMOOTHING_PARAM_NAMES", "world_joints",
-           "root_frame_joints", "one_sided_root_rates", "joint_rates", "limb_geometry",
+__all__ = ["TemporalRefiner", "OUTPUTS", "SMOOTHING_PARAM_NAMES", "world_points",
+           "slot_frame_ids", "root_frame_joints", "one_sided_root_rates", "joint_rates",
+           "limb_geometry",
            "gaussian_smooth", "smooth_rotations", "project_rotation", "time_derivative",
            "second_difference", "angular_velocity", "angular_acceleration", "local_dt",
            "stencil_valid", "neighbours", "local_mean", "forward_difference",

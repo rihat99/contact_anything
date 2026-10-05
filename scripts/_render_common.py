@@ -28,7 +28,7 @@ import numpy as np
 import torch
 import yaml
 
-from data import make_collate
+from data import DATASETS, make_collate
 from data.base import Clip, ClipDataset
 from data.climbing_videos import ClimbingVideosDataset
 from data.transforms import crop_size
@@ -37,6 +37,39 @@ from train.predict import run_clip
 REPO = Path(__file__).resolve().parents[1]
 #: Opacity of a drawn mesh over the frame.
 MESH_ALPHA = 0.55
+
+
+def dataset_class_spec(cfg: dict) -> tuple[type[ClipDataset], dict]:
+    """The config's single dataset: its class (``data.DATASETS``) and its yaml spec."""
+    entries = list(cfg["data"]["datasets"])
+    if len(entries) != 1:
+        raise ValueError(f"one dataset per config here; config lists {entries}")
+    path = Path(entries[0])
+    spec = yaml.safe_load((path if path.is_absolute() else REPO / path).read_text())
+    return DATASETS[spec["name"]], spec
+
+
+def build_scene_dataset(cfg: dict, scene: str, max_frames: int) -> ClipDataset:
+    """One scene of the config's dataset as its whole-scene eval clips, any corpus.
+
+    The whole-scene protocol is the test one (``split="test"``), so a ClimbingVideos
+    scene needs its manual annotation; a BEDLAM scene reads the same ground truth on
+    either split. A refiner whose token carries the gravity channel or takes the gravity
+    as an input needs the ``smplx`` group loaded.
+    """
+    cls, spec = dataset_class_spec(cfg)
+    refiner = cfg["model"]["refiner"]
+    load = ({"smplx"} if refiner["enabled"] and (bool(refiner["token"]["gravity"])
+                                                 or bool(refiner["gravity_input"]["enabled"]))
+            else set())
+    clip = cfg["data"]["clip"]
+    return cls.from_spec(
+        spec, scenes=[scene], split="test", clip_frames=int(clip["frames"]),
+        stride=clip["stride"], jitter=False, seed=int(cfg["data"]["seed"]),
+        contact_set=str(cfg["data"]["contact_set"]), load=load,
+        full_scenes=True, max_frames=int(max_frames),
+        embedding_cache=bool(cfg["data"]["embedding_cache"]),
+        pose_token_cache=bool(cfg["data"]["pose_token_cache"]))
 
 
 def dataset_spec(cfg: dict) -> tuple[Path, int]:
@@ -121,6 +154,7 @@ def build_dataset(
         jitter=False,
         seed=int(cfg["data"]["seed"]),
         contact_level=contact_level,
+        contact_set=str(cfg["data"]["contact_set"]),
         load=load,
         embedding_dir=(root / "features" / "embedding"
                        if bool(cfg["data"]["embedding_cache"]) and not pose_tokens else None),
@@ -128,6 +162,21 @@ def build_dataset(
         full_scenes=split == "test",
         max_frames=int(max_frames),
     )
+
+
+def slot_points_cam(output: dict, batch: dict) -> torch.Tensor:
+    """``[B, K, 3]`` CAMERA-frame slot points of one forward output.
+
+    The per-frame head returns them directly; behind a refiner the output carries the
+    world points only, which the batch's ``cam_from_world`` brings back into the camera.
+    """
+    smplx = output["smplx"]
+    points = smplx.get("slot_points_cam")
+    if points is not None:
+        return points
+    world = smplx["slot_points_world"]
+    ext = batch["cam_from_world"].to(world)
+    return torch.einsum("bij,bkj->bki", ext[:, :3, :3], world) + ext[:, None, :3, 3]
 
 
 def clip_batches(
@@ -183,7 +232,7 @@ def nan_means():
 
 
 def draw_mesh(img: np.ndarray, verts2d: np.ndarray, verts_cam: np.ndarray,
-              faces: np.ndarray, colour) -> None:
+              faces: np.ndarray, colour, alpha: float = MESH_ALPHA) -> None:
     """Painter-sorted, lambert-shaded solid mesh alpha-blended onto ``img`` (BGR)."""
     tri2d = verts2d[faces].astype(np.float32)                   # [F, 3, 2]
     tricam = verts_cam[faces].astype(np.float32)                # [F, 3, 3]
@@ -201,7 +250,7 @@ def draw_mesh(img: np.ndarray, verts2d: np.ndarray, verts_cam: np.ndarray,
     overlay = img.copy()
     for points, factor in zip(tri2d[keep][order].astype(np.int32), shade[keep][order]):
         cv2.fillConvexPoly(overlay, points, tuple(float(c) for c in colour * factor))
-    cv2.addWeighted(overlay, MESH_ALPHA, img, 1.0 - MESH_ALPHA, 0.0, dst=img)
+    cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0.0, dst=img)
 
 
 def draw_keypoints(img: np.ndarray, points: np.ndarray, colour, radius: int) -> None:

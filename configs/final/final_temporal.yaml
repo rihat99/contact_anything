@@ -1,0 +1,18 @@
+# Ladder rung 2 — + a temporal block over the pose token: one RoPE transformer across the clip's
+# frames (model.cross_modal_temporal on the pose token alone); every head reads the mixed token.
+# Still no camera or world machinery in the network, and no temporal losses: every loss that reads
+# a metric motion off the world-lifted per-frame body (velocity matching, in-contact stillness)
+# collapsed the CLIFF depth (-336 mm bias; anchoring the root stopped the collapse but not the
+# pose damage, 102 vs 58 mm), so those losses join with the refiner at rung 3. Receptive field
+# +-0.25 s in total: 3 layers x 0.0833 s.
+base: configs/final/final_base.yaml
+model:
+  cross_modal_temporal:
+    enabled: true
+    modalities: [pose]
+    num_layers: 3
+    num_heads: 16
+    mlp_ratio: 2.0
+    dropout: 0.1
+    window: 0.0833
+output: {exp_name: final_temporal}

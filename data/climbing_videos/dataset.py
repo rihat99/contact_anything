@@ -23,6 +23,8 @@ import numpy as np
 import torch
 from PIL import Image
 
+from model.contact_frames import contact_set as contact_set_of
+
 from ..base import SIGNAL_GROUPS, ClipDataset
 from . import kindyn, scene as scene_io
 
@@ -36,6 +38,8 @@ class ClimbingVideosDataset(ClipDataset):
     :param split: ``"train"`` (automatic labels, jittered windows) or ``"test"``
         (manual annotation, fixed windows).
     :param contact_level: label readout level — ``contacts_1`` or ``contacts_2``.
+    :param contact_set: ``kindyn6`` | ``frames35`` — the slots the contact labels
+        and forces are emitted in (:mod:`model.contact_frames`).
     :param load: signal groups to emit, a subset of ``{"forces", "smplx"}``.
     :param embedding_dir: precomputed-embedding root (``features/embedding``).
     :param camera_filter: ``all`` | ``static`` | ``moving`` (the DB's
@@ -56,6 +60,35 @@ class ClimbingVideosDataset(ClipDataset):
         return (scene_io.list_train_scenes(root, camera) if split == "train"
                 else scene_io.list_test_scenes(root, camera))
 
+    @staticmethod
+    def video_of(scene: str) -> str:
+        """Source video of a scene id ``<video_id>_<idx:04d>``."""
+        return scene.rsplit("_", 1)[0]
+
+    @classmethod
+    def scene_ids(cls, spec: dict, split: str) -> list[str]:
+        """Scene ids of ``split`` for a dataset yaml ``spec``."""
+        return cls.list_scenes(Path(spec["root"]), split, str(spec["camera"]))
+
+    @classmethod
+    def from_spec(
+        cls, spec: dict, *, embedding_cache: bool, pose_token_cache: bool, **kwargs,
+    ) -> "ClimbingVideosDataset":
+        """Build from a dataset yaml plus the run's cache flags.
+
+        The pose-token cache supersedes the embedding cache: the frozen base
+        never runs, so no embedding, image or mask is loaded.
+        """
+        root = Path(spec["root"])
+        return cls(
+            root,
+            contact_level=int(spec["contact_level"]),
+            camera_filter=str(spec["camera"]),
+            embedding_dir=(root / "features" / "embedding"
+                           if embedding_cache and not pose_token_cache else None),
+            pose_token_dir=root / "features" / "pose_token" if pose_token_cache else None,
+            **kwargs)
+
     def __init__(
         self,
         root: str | Path,
@@ -67,6 +100,7 @@ class ClimbingVideosDataset(ClipDataset):
         jitter: bool = True,
         seed: int = 42,
         contact_level: int = 1,
+        contact_set: str = "kindyn6",
         load: Iterable[str] = (),
         embedding_dir: Optional[str | Path] = None,
         pose_token_dir: Optional[str | Path] = None,
@@ -78,6 +112,7 @@ class ClimbingVideosDataset(ClipDataset):
         if int(contact_level) not in (1, 2):
             raise ValueError(f"contact_level must be 1 or 2; got {contact_level!r}")
         self.contact_level = int(contact_level)
+        self.slots = contact_set_of(contact_set)
         self.load = frozenset(load)
         unknown = self.load - SIGNAL_GROUPS
         if unknown:
@@ -97,7 +132,8 @@ class ClimbingVideosDataset(ClipDataset):
     # ------------------------------------------------------------------ loading
 
     def _load_scene(self, scene: str) -> dict:
-        data = scene_io.load_scene(self.root, scene, self.split, self.contact_level)
+        data = scene_io.load_scene(
+            self.root, scene, self.split, self.contact_level, self.slots)
         human_dir, object_ids = data["human_dir"], data["object_ids"]
         n = len(data["frame_indices"])
         if self.pose_token_dir is not None:
@@ -105,7 +141,7 @@ class ClimbingVideosDataset(ClipDataset):
         gravity_path = scene_io.gravity_path(self.root, scene)
         if "forces" in self.load:
             data.update(kindyn.load_forces(scene, human_dir, object_ids, n,
-                                           gravity_path=gravity_path))
+                                           gravity_path=gravity_path, slots=self.slots))
         if "smplx" in self.load:
             data.update(kindyn.load_smplx(scene, human_dir, object_ids, n,
                                           gravity_path=gravity_path))
@@ -174,10 +210,13 @@ class ClimbingVideosDataset(ClipDataset):
             "frame_index": int(data["frame_indices"][position]),
             "frame_valid": valid,
             "key": f"{scene}#{oid}@{position}",
-            "contact_gt": data["contact_gt"][person, position],         # [6]
-            "contact_valid": data["contact_valid"][person, position],   # [6]
-            "contact_conf": data["contact_conf"][person, position],     # [6]
+            "contact_gt": data["contact_gt"][person, position],         # [K]
+            "contact_valid": data["contact_valid"][person, position],   # [K]
+            "contact_conf": data["contact_conf"][person, position],     # [K]
         }
+        if "contact_gt_groups" in data:                 # frames35 test: manual labels
+            frame["contact_gt_groups"] = data["contact_gt_groups"][person, position]
+            frame["contact_valid_groups"] = data["contact_valid_groups"][person, position]
         if self.pose_token_dir is not None:
             frame["geometry_only"] = True
             frame["pose_token"] = torch.from_numpy(
@@ -188,9 +227,9 @@ class ClimbingVideosDataset(ClipDataset):
                 scene_io.embedding_path(self.embedding_dir, scene, oid, position))
             frame["embedding"] = torch.from_numpy(bits).view(torch.bfloat16)
         if "forces" in self.load:
-            frame["force_gt"] = data["force_gt"][person, position]           # [6, 3]
-            frame["force_contact"] = data["force_contact"][person, position]  # [6]
-            frame["force_lever"] = data["force_lever"][person, position]     # [6, 3]
+            frame["force_gt"] = data["force_gt"][person, position]           # [K, 3]
+            frame["force_contact"] = data["force_contact"][person, position]  # [K]
+            frame["force_lever"] = data["force_lever"][person, position]     # [K, 3]
             frame["force_conf"] = float(data["force_conf"][person, position])
             frame["force_valid"] = valid and bool(data["force_valid"][person, position])
             frame["gravity_world"] = data["gravity_world"]                    # [3] per scene

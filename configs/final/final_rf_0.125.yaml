@@ -1,0 +1,5 @@
+# Ablation — receptive field +-0.125 s in total (3 layers x 0.0417 s: one 25-fps frame per layer).
+base: configs/final/final_full.yaml
+model:
+  refiner: {window: 0.0417}
+output: {exp_name: final_rf_0.125}

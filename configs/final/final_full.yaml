@@ -1,0 +1,6 @@
+# Ladder rung 8 = THE MODEL — + the strength-weighted joint-torque term (BVR's multiplier table:
+# a load the forces may put on either the arms or the legs lands on the legs).
+base: configs/final/final_rnea.yaml
+force_consistency:
+  loss: {joint_torque: 0.3}
+output: {exp_name: final_full}

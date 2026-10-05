@@ -1,0 +1,13 @@
+# The BEDLAM2_our corpus read straight from its pipeline tree: frames/ JPEGs,
+# per-frame instance masks + person boxes, per-frame metric cameras, the renderer's
+# 35 contact-frame labels and the inverse-dynamics forces. The corpus DB has no split,
+# so the split is ours: `test_fraction` of every render job's scenes (`split_seed`),
+# which keeps every environment / camera style in the test set.
+# WHICH ground-truth signals load is derived from the enabled losses, not set here.
+name: bedlam2
+root: /home/rikhat.akizhanov/better/data/BEDLAM2_our
+test_fraction: 0.02     # test scenes per render job = max(1, round(fraction * n))
+split_seed: 0
+allow_missing_labels: false   # true = train on the scenes whose boxes / masks exist while
+                              # the generation job is still running (else > 1 % missing raises)
+embedding_cache: false   # no backbone cache: the live path, whatever data.embedding_cache says

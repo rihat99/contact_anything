@@ -7,17 +7,17 @@ model:
   mhr_model_path: /home/rikhat.akizhanov/.cache/huggingface/hub/models--facebook--sam-3d-body-dinov3/snapshots/11aaa346c7204874a1cbafe3d39a979080b2c55a/assets/mhr_model.pt
   decoder_bf16: false                 # run the frozen decoder under bf16 autocast (MHR / keypoint readouts stay fp32)
   decoder_checkpointing: false        # recompute the decoder layers in the backward (activation checkpointing)
-  warm_start: null                    # run checkpoint whose TRAINABLE weights initialise this run (fresh optimizer /
-                                      # schedule; strict name+shape match) — e.g. phase 2 of a staged run
-  contact:                            # six learned tokens anchored at the kindyn groups + a shared per-token head
+  contact:                            # learned decoder tokens, one per slot of data.contact_set, + a shared per-token head
     enabled: true
-    keypoint_indices: [62, 41, 15, 18, 17, 20]   # MHR70 anchors, kindyn_6 order (LH, RH, LF toe, RF toe, LA heel, RA heel)
+    keypoint_indices: [62, 41, 15, 18, 17, 20]   # kindyn6 only: MHR70 anchors in group order (LH, RH, LF toe, RF toe, LA heel,
+                                      # RA heel); under frames35 every token anchors at ITS frame's vertex projected through
+                                      # the MHR body (model/contact_frames.py) and this list is ignored
     mlp_depth: 2
     mlp_channel_div_factor: 4
     dropout: 0.0
     grid_size: 5                      # K x K feature grid sampled around each anchor (1 = a point sample)
     grid_radius: 0.1                  # grid spacing in normalized [-1, 1] sample coordinates
-  force:                              # six force tokens (same anchors) -> one 3D force per group, body-weight units, body-root frame
+  force:                              # force tokens (same anchors) -> one 3D force per slot, body-weight units, body-root frame
     enabled: false
     keypoint_indices: [62, 41, 15, 18, 17, 20]
     mlp_depth: 2
@@ -45,9 +45,12 @@ model:
     camera: cliff                     # cliff (CLIFF crop weak-perspective (s, tx, ty), lifted with the crop side and the focal) |
                                       # ray (pelvis bearing x/z, y/z + log depth about a fixed 3.5 m: the crop box never enters
                                       # the lift; needs the depth / bearing or root anchors below instead of `cam`)
-    checkpoint: null                  # run checkpoint whose head_smplx weights initialise this head (stage 2: the stage-1 run)
-    frozen: false                     # freeze the head: its per-frame body is then a fixed INPUT of the refiner
-  refiner:                            # stage 2 (docs/old/refiner.md): world-space temporal refiner behind the per-frame model
+  token_heads:                        # contact / force / gravity heads on the (mixed) pose token itself — the
+    enabled: false                    # temporal-model-free readout (no refiner): zero-init FFNs, one per output
+    outputs: [contact, force, gravity]   # subset of contact / force / gravity, each needs its supervision section;
+                                      # forces in the per-frame body's root frame, gravity = the camera's down axis
+                                      # plus a body-frame correction, per frame (no clip pooling: no world model)
+  refiner:                            # world-space temporal refiner behind the per-frame model (docs/architecture.md)
     enabled: false
     outputs: [pose, contact, motion, force]   # heads to build (subset of pose / contact / motion / force / gravity, >= 1);
                                       # `contact` / `force` here replace the decoder-level heads; each listed output needs
@@ -59,12 +62,13 @@ model:
     num_heads: 8
     mlp_ratio: 4.0
     dropout: 0.1
-    window: 0.5                       # attention half-width in SECONDS per layer (receptive field ~ num_layers x window)
+    window: 0.5                       # attention half-width in SECONDS per layer (null = the whole clip); the receptive
+                                      # field of the block is num_layers x window on each side
     time_scale: 25.0                  # RoPE rotation units per second
     root_smooth_sec: 0.0              # Gaussian sigma (s) of the WORLD pelvis position AFTER the lift (0 = off). Never in
                                       # camera coordinates: those carry the camera's motion, which the lift then fails to cancel
     pose_smooth_sec: 0.0              # Gaussian sigma (s) of the root-rotation / joint-rotation smoothing of the per-frame
-                                      # body (0 = off; scripts/analyze_stage1.py --pose-sigmas calibrates it)
+                                      # body (0 = off)
     learn_smoothing: false            # train the widths: one log-sigma for the root position + one per rotation (root and
                                       # the 21 joints), initialised from the two *_smooth_sec values (both must be > 0);
                                       # their optimizer group runs at optim.lr x optim.smoothing_lr_scale
@@ -139,6 +143,11 @@ model:
                                       # each slot with attention across the seven slots of a frame; the contact and
                                       # force heads read the limb tokens (one logit / one force each) and the limbs
                                       # get their own zero-init feedback path under `iterative`
+    force_tokens: false               # six FORCE limb tokens (13 slots with limb_tokens, 7 alone): the force head
+                                      # reads the force tokens, the contact head the contact tokens; each limb token
+                                      # carries its extremity geometry plus its own decoder token (the force ones the
+                                      # model.force block's, which then has no decoder-level head). Needs the force
+                                      # output; limb_tokens needs the contact output
     per_frame: false                  # NO information between frames: each frame is refined on its own — the token
                                       # drops the root velocity / dt channels and the limb tokens their rates, the
                                       # attention sees the query frame only (`window` is ignored), the betas and the
@@ -147,14 +156,31 @@ model:
 
 data:
   datasets: [configs/datasets/climbing_videos.yaml]
+  epoch_dataset: null                 # with several datasets: the `name` of the one whose clips define an epoch. The
+                                      # train loader then alternates micro-batches over the listed datasets in order
+                                      # (each from its own video-interleaved stream; the others are cut to that
+                                      # dataset's count, a fresh subset every epoch), so every optimizer step of
+                                      # accumulate_steps (a multiple of the dataset count) holds equal clip shares.
+                                      # Null = one concatenated pool. The test split is always scored per dataset:
+                                      # the epoch dataset (else the first listed) under the plain metric tags — the
+                                      # monitor's — and every other one under `<name>/`
+  contact_set: kindyn6                # kindyn6 | frames35: the slots every contact / force tensor is indexed by
+                                      # (model/contact_frames.py) — the six kindyn groups (wrists, big toes, heels; the
+                                      # round 5-11 protocol) or the 35 named contact frames of the BetterVideoReconstruction
+                                      # body (mesh vertices posed by FK). The loaders emit labels / forces per slot, the
+                                      # decoder builds one token per slot, the refiner one limb token per slot; frames35
+                                      # predictions are ALSO folded onto the six groups (max / sum over a group's frames)
+                                      # for the six-group metrics and the manual test labels
+  epoch_fraction: 1.0                 # fraction of the train clips one epoch draws — a different seeded subset per epoch
+                                      # (1 = every clip every epoch)
   embedding_cache: false              # corpus loaders emit a cached bf16 backbone embedding (features/embedding, built by
-                                      # scripts/data/precompute_embeddings.py) and skip the backbone; the cache was deleted
-                                      # 2026-09-11 (753 GB), so live-decoder runs decode frames and run the backbone
+                                      # scripts/data/precompute_embeddings.py) and skip the backbone — on the corpora whose
+                                      # dataset yaml declares a cache (`embedding_cache: true`); the others run live
   pose_token_cache: false             # read the cached frozen FINAL pose token instead (features/pose_token, built by the
                                       # GVHMR worktree's scripts/data/precompute_pose_tokens.py) and never run the frozen
                                       # base: no image, mask or embedding is loaded (supersedes embedding_cache). Legal only
                                       # for builds whose decoder carries no learned token block (model.contact / model.force
-                                      # off, no cross_modal) — those tokens would need the live decoder
+                                      # off; a pose-only cross_modal block is fine — it reads the cached token)
   frames_per_batch: 240               # per GPU; clips per batch = frames_per_batch // clip.frames
   num_workers: 8
   seed: 42
@@ -163,11 +189,11 @@ data:
                                       # global batch draws from as many videos as it has clips (else uniform shuffle)
   eval_max_frames: 360                # row cap of the one-clip-per-(scene, person) evaluation protocol
 
-contact_supervision:                  # confidence-weighted BCE on the six contact logits
+contact_supervision:                  # confidence-weighted BCE on the K contact logits, normalised per slot
   enabled: true
   confidence_weights: true
   weight: 1.0
-  class_weights: null                 # per-group row multipliers {positive: [6], negative: [6]} in kindyn group order
+  class_weights: null                 # per-slot row multipliers {positive: [K], negative: [K]} in contact-set slot order
                                       # (LH, RH, L toe, R toe, L heel, R heel): positive = the false-NEGATIVE penalty,
                                       # negative = the false-POSITIVE penalty (null = uniform BCE)
   layer_weight: 0.0                   # deep supervision (iterative refiner `contact` output): the BCE repeated on the
@@ -193,17 +219,22 @@ force_supervision:                    # kindyn GT forces (bw units, body-root fr
     sum_force: 0.0                    # Huber on the net force over the six groups
     sum_torque: 0.0                   # Huber on the net torque (bw*m lever arms about the pelvis)
     huber_delta_bwm: 0.1
-    group_weights: null               # per-group multipliers of the `force` term (null = uniform)
+    group_weights: null               # per-slot multipliers of the `force` term (K entries; null = uniform)
 
 smplx_supervision:                    # kindyn SMPL-X GT (camera frame) for model.smplx; metrics in metric_pose/*
-  enabled: false
+  enabled: false                      # (always the FINAL body: the refined one under model.refiner)
   joint_weights: {fingers: 0.1}       # weight of each finger joint in kp2d / kp3d (body joints 1.0)
   kp2d_space: crop                    # crop (SAM3D's crop-normalized [-0.5, 0.5]) | image (full image in bearing units px / f)
-  layer_weight: 0.0                   # deep supervision (model.refiner.iterative only, >= 2 layers): the body terms that a
-                                      # world trajectory carries (kp3d, orient, pose, root_bias, root_shape) are ALSO
-                                      # evaluated on each INTERMEDIATE layer and added as `<term>_layer` with this weight
-                                      # x the term's own (mass = rows x layers). Metrics stay the final layer's
-  loss:
+  layer_weight: 0.0                   # deep supervision (model.refiner.iterative only, >= 2 layers): the `refined` terms
+                                      # are ALSO evaluated on each INTERMEDIATE layer and added as `refined_<term>_layer`
+                                      # with this weight x the term's own (mass = rows x layers)
+  refined:                            # the terms on the REFINED body (model.refiner only; the `loss` block below always
+    kp3d: 0.0                         # scores the PER-FRAME head's own body, which is the final body without a refiner):
+    orient: 0.0                       # the same definitions as their `loss` twins, reported as `refined_<term>`
+    pose: 0.0
+    root_bias: 0.0
+    root_shape: 0.0
+  loss:                               # the PER-FRAME SMPL-X + camera heads' body
     kp2d: 10.0                        # Huber; crop units (kp2d_space crop) | bearing units (image)
     kp3d: 5.0                         # Huber, pelvis-relative camera metres (22 | 52 joints)
     orient: 1.0                       # MSE on the root 6D
@@ -313,12 +344,12 @@ gaussian_reference:                   # annealed pull of the REFINED body toward
 
 optim:
   lr: 1.0e-4
+  init_from: null                     # checkpoint whose trainable (EMA) weights initialise the run — a fine-tune: fresh
+                                      # optimizer, schedule and counters (--resume restores those from its own checkpoint)
   weight_decay: 1.0e-4                # AdamW; never applied to biases / norm weights (ndim <= 1)
   epochs: 20
   accumulate_steps: 1                 # micro-batches (of frames_per_batch per GPU) summed into one optimizer step
   smoothing_lr_scale: 1.0             # lr multiplier of the refiner's learnable smoothing widths (model.refiner.learn_smoothing)
-  head_lr_scale: 1.0                  # lr multiplier of a trainable SMPL-X head (model.smplx.frozen false): the stage-1
-                                      # warm start fine-tunes at a fraction of the refiner's lr
   warmup_steps: 500                   # linear ramp over this many optimizer steps, then per-step cosine to lr_min
   lr_min: 1.0e-5
   grad_clip: 1.0                      # per trainable top-level module (0 = off)

@@ -1,10 +1,12 @@
 """The refiner's predicted gravity against the corpus gravity.
 
-Reads ``out["gravity"]["world"] (B, 3)`` — the refiner's unit down vector per
-clip, expanded to its frames — and scores it per CLIP against the collated
-``gravity_world``: ``1 − cos`` (the ``cos`` term). A rotation of the world rotates
-both vectors, so the term is frame-independent like everything else in the
-refiner.
+Reads ``out["gravity"]["world"] (B, 3)`` — the unit down vector per frame (the
+refiner's one vote per clip expanded to its frames, or the token heads' per-frame
+estimates) — and scores it against the collated ``gravity_world``: ``1 − cos``
+averaged over the clip's valid frames, one unit of mass per CLIP (the ``cos``
+term; identical to the per-clip score when every frame carries the clip's
+vote). A rotation of the world rotates both vectors, so the term is
+frame-independent like everything else in the refiner.
 
 The corpus gravity is a measurement on the ``ground`` / ``geocalib`` scenes and
 the first camera's down axis on the ``fallback_down`` ones (``gravity_measured``
@@ -47,46 +49,52 @@ class GravityLoss(Loss):
         if self.layer_weight > 0.0:
             self.term_names = ("cos", "cos_layer")
 
-    def _clips(self, out: dict, batch: dict) -> tuple[Tensor, Tensor, Tensor]:
-        """Per-clip ``(gravity (n, 3), scored (n,), measured (n,))`` from the frame rows.
+    def _clips(self, out: dict, batch: dict) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Per-clip ``(gravity (n, 3), scored (n,), measured (n,), frame weights (n, T))``.
 
-        A clip is scored when it is valid and the refiner had to GUESS its gravity.
+        A clip is scored when it is valid and the model had to GUESS its gravity; its
+        frame weights are its valid frames normalised to sum to one.
         """
         seq_len = int(batch["seq_len"])
         n_clips = batch["frame_valid"].shape[0] // seq_len
-        valid = batch["frame_valid"].to(self.device).view(n_clips, seq_len).any(dim=1)
+        frame_valid = batch["frame_valid"].to(self.device).view(n_clips, seq_len)
+        valid = frame_valid.any(dim=1)
         given = out["gravity"]["given"].to(self.device).view(n_clips, seq_len)[:, 0]
         gravity = batch["gravity_world"].to(self.device, self.dtype).view(n_clips, seq_len, 3)[:, 0]
         measured = batch["gravity_measured"].to(self.device).view(n_clips, seq_len)[:, 0]
-        return gravity, valid & ~given, measured
+        frames = frame_valid.to(self.dtype)
+        frames = frames / frames.sum(dim=1, keepdim=True).clamp(min=1.0)
+        return gravity, valid & ~given, measured, frames
 
     def _cos_term(self, predicted: Tensor, gravity: Tensor, weight: Tensor,
-                  seq_len: int) -> Tensor:
-        pred = predicted.view(-1, seq_len, 3)[:, 0]
-        return ((1.0 - (pred * gravity).sum(dim=-1)) * weight).sum()
+                  frames: Tensor) -> Tensor:
+        """``sum_clips weight * mean_frames (1 - cos)`` of one prediction ``(B, 3)``."""
+        pred = predicted.view(frames.shape[0], frames.shape[1], 3)
+        cos = (pred * gravity[:, None]).sum(dim=-1)
+        return (((1.0 - cos) * frames).sum(dim=1) * weight).sum()
 
     def __call__(self, out: dict, batch: dict, *, train: bool) -> LossResult:
         pred = out["gravity"]
         world = pred["world"].to(self.device, self.dtype)
         anchor = world.sum() * 0.0
-        seq_len = int(batch["seq_len"])
-        gravity, scored, measured = self._clips(out, batch)
+        gravity, scored, measured, frames = self._clips(out, batch)
         weight = scored.to(self.dtype)
         if self.measured_only:
             weight = weight * measured.to(self.dtype)
         mass = float(weight.sum())
-        raw = {"cos": (self.weight * self._cos_term(world, gravity, weight, seq_len), mass)}
+        raw = {"cos": (self.weight * self._cos_term(world, gravity, weight, frames), mass)}
         if self.layer_weight > 0.0:
             layers = pred["world_layers"][:-1]
-            numerator = sum(self._cos_term(w.to(self.device, self.dtype), gravity, weight, seq_len)
+            numerator = sum(self._cos_term(w.to(self.device, self.dtype), gravity, weight, frames)
                             for w in layers)
             raw["cos_layer"] = (self.layer_weight * self.weight * numerator, mass * len(layers))
 
         with torch.no_grad():
             def angles(vectors: Tensor) -> Tensor:
-                v = vectors.view(-1, seq_len, 3)[:, 0]
-                cos = (v * gravity).sum(dim=-1).clamp(-1.0, 1.0)
-                return torch.rad2deg(torch.acos(cos))
+                """Per-clip mean angle (deg) over the valid frames."""
+                v = vectors.view(frames.shape[0], frames.shape[1], 3)
+                cos = (v * gravity[:, None]).sum(dim=-1).clamp(-1.0, 1.0)
+                return (torch.rad2deg(torch.acos(cos)) * frames).sum(dim=1)
             angle = angles(world)
             prior = angles(pred["prior_world"].to(self.device, self.dtype))
             is_measured = (scored & measured).to(torch.float64)

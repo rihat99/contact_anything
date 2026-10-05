@@ -1,0 +1,5 @@
+# Round 12 ablation — the frames35 model's receptive field: +-0.125 s in total (3 layers x 0.0417 s: one 25-fps frame per layer).
+base: configs/frames/climbing_frames35.yaml
+model:
+  refiner: {window: 0.0417}
+output: {dir: ./output_8, exp_name: frames_rf_0.125}

@@ -33,6 +33,14 @@ Terms (every one a per-frame MEAN over its elements, mass = supervised frames):
   the LIFTED pelvis (any camera parametrization): the log depth and the
   bearing separately — the crop-free absolute anchors a ``ray`` head needs.
 
+The ``loss`` block always scores the PER-FRAME head's own body
+(``out["smplx_per_frame"]`` under a refiner, else ``out["smplx"]``). Under a
+refiner the ``refined`` block scores the refined body with the terms a world
+trajectory carries (:data:`REFINED_TERM_NAMES`: ``kp3d`` / ``orient`` /
+``pose`` / ``root_bias`` / ``root_shape``, reported as ``refined_<term>``), and
+``layer_weight`` repeats those on the intermediate layers. Metrics are always
+the FINAL body's.
+
 The keypoint terms run over every joint the head emits (22, or 52 with hands)
 as a WEIGHTED mean: body joints at 1, finger joints at
 ``joint_weights.fingers``.
@@ -111,9 +119,9 @@ from utils.metrics import mean_from_stats
 
 _TERM_NAMES = ("kp2d", "kp3d", "orient", "pose", "hand_pose", "betas", "cam", "root_bias",
                "root_shape", "depth", "bearing")
-#: The terms that read nothing but ONE world trajectory's body, so deep supervision
-#: (``layer_weight``) can repeat them on the refiner's intermediate layers.
-LAYER_TERM_NAMES = ("kp3d", "orient", "pose", "root_bias", "root_shape")
+#: The terms that read nothing but ONE world trajectory's body: the ``refined`` block, which
+#: deep supervision (``layer_weight``) repeats on the refiner's intermediate layers.
+REFINED_TERM_NAMES = ("kp3d", "orient", "pose", "root_bias", "root_shape")
 #: Camera-frame body metrics, in the order of the statistics vector (the ``dlogz_*``
 #: statistics are sums of SQUARES; :func:`pose_metrics_from_stats` takes the root).
 POSE_METRICS = ("mpjpe", "pa_mpjpe", "pve", "accel", "pelvis_err", "depth_err", "depth_bias",
@@ -440,15 +448,19 @@ class SmplxLoss(Loss):
         self.weights = {name: float(loss_cfg[name]) for name in _TERM_NAMES}
         if self.weights["hand_pose"] > 0.0 and not self.hands:
             raise ValueError("smplx_supervision.loss.hand_pose needs model.smplx.hands")
+        self.refined_weights = {name: float(section["refined"][name]) for name in REFINED_TERM_NAMES}
+        #: The refined body's terms (a refiner only), and the subset deep supervision repeats.
+        self.refined_terms = tuple(n for n in REFINED_TERM_NAMES if self.refined_weights[n] > 0.0)
+        if self.refined_terms and self.model.refiner is None:
+            raise ValueError("smplx_supervision.refined scores the refined body: needs model.refiner")
         self.term_names = tuple(n for n in _TERM_NAMES if self.weights[n] > 0.0)
+        self.term_names += tuple(f"refined_{n}" for n in self.refined_terms)
         if not self.term_names:
             raise ValueError(
                 "smplx_supervision: every loss weight is 0 — disable the section instead")
         self.layer_weight = float(section["layer_weight"])
-        #: The subset deep supervision repeats on every intermediate layer.
-        self.layer_terms = tuple(n for n in LAYER_TERM_NAMES if self.weights[n] > 0.0)
         if self.layer_weight > 0.0:
-            self.term_names += tuple(f"{n}_layer" for n in self.layer_terms)
+            self.term_names += tuple(f"refined_{n}_layer" for n in self.refined_terms)
         self.delta = {name: float(loss_cfg[f"huber_delta_{name}"])
                       for name in ("2d", "3d", "cam", "root_bias", "root_shape", "depth",
                                    "bearing")}
@@ -468,24 +480,27 @@ class SmplxLoss(Loss):
                                 for key in metric_names(self.hands, self.world_diag)
                                 for part in ("sum", "count"))
 
-    def _body_terms(self, joints: Tensor, root_6d: Tensor, body_6d: Tensor,
-                    pelvis_world, gt_joints: Tensor, gt_root_6d: Tensor, gt_body_6d: Tensor,
-                    mask: Tensor, mass: float, batch: dict) -> dict[str, tuple[Tensor, float]]:
-        """The terms ONE body carries (:data:`LAYER_TERM_NAMES`), numerators un-weighted.
+    def _body_terms(self, weights: dict[str, float], joints: Tensor, root_6d: Tensor,
+                    body_6d: Tensor, pelvis_world, gt_joints: Tensor, gt_root_6d: Tensor,
+                    gt_body_6d: Tensor, mask: Tensor, mass: float, batch: dict
+                    ) -> dict[str, tuple[Tensor, float]]:
+        """The terms ONE body carries (:data:`REFINED_TERM_NAMES`), numerators un-weighted.
 
-        :param pelvis_world: the body's world root — ``None`` lifts its own camera pelvis
-            (the final body); an intermediate layer passes its ``pelvis_world_layers`` entry.
+        :param weights: which terms to build (``> 0``): the ``loss`` block's for the
+            per-frame body, the ``refined`` block's for a refined one.
+        :param pelvis_world: the body's world root — ``None`` lifts its own camera pelvis;
+            a refined body / intermediate layer passes its ``pelvis_world`` entry.
         """
         raw: dict[str, tuple[Tensor, float]] = {}
-        if self.weights["kp3d"] > 0.0:
+        if weights["kp3d"] > 0.0:
             huber = F.smooth_l1_loss(joints - joints[:, :1], gt_joints - gt_joints[:, :1],
                                      reduction="none", beta=self.delta["3d"])
             raw["kp3d"] = (((huber.mean(dim=-1) * self.joint_w).sum(dim=1) * mask).sum(), mass)
-        if self.weights["orient"] > 0.0:
+        if weights["orient"] > 0.0:
             raw["orient"] = (((root_6d - gt_root_6d).square().mean(dim=-1) * mask).sum(), mass)
-        if self.weights["pose"] > 0.0:
+        if weights["pose"] > 0.0:
             raw["pose"] = (((body_6d - gt_body_6d).square().mean(dim=(1, 2)) * mask).sum(), mass)
-        if self.weights["root_bias"] > 0.0 or self.weights["root_shape"] > 0.0:
+        if weights["root_bias"] > 0.0 or weights["root_shape"] > 0.0:
             # World root error, split per clip into its mean over the supervised rows (the
             # absolute anchor) and the per-frame deviation from it (the trajectory shape).
             seq_len = int(batch["seq_len"])
@@ -498,11 +513,11 @@ class SmplxLoss(Loss):
             bias = err.sum(dim=1, keepdim=True) / rows.sum(dim=1, keepdim=True).clamp(min=1.0)
             bias_norm = bias.norm(dim=-1).expand(n_clips, seq_len).reshape(-1)
             shape_norm = ((err - bias) * rows).norm(dim=-1).reshape(-1)
-            if self.weights["root_bias"] > 0.0:
+            if weights["root_bias"] > 0.0:
                 huber = F.smooth_l1_loss(bias_norm, torch.zeros_like(bias_norm),
                                          reduction="none", beta=self.delta["root_bias"])
                 raw["root_bias"] = ((huber * mask).sum(), mass)
-            if self.weights["root_shape"] > 0.0:
+            if weights["root_shape"] > 0.0:
                 huber = F.smooth_l1_loss(shape_norm, torch.zeros_like(shape_norm),
                                          reduction="none", beta=self.delta["root_shape"])
                 raw["root_shape"] = ((huber * mask).sum(), mass)
@@ -510,29 +525,31 @@ class SmplxLoss(Loss):
 
     def layer_raw(self, pred: dict, gt_joints: Tensor, gt_root_6d: Tensor, gt_body_6d: Tensor,
                   mask: Tensor, mass: float, batch: dict) -> dict[str, tuple[Tensor, float]]:
-        """Deep supervision (``layer_weight``): :meth:`_body_terms` on the INTERMEDIATE layers.
+        """Deep supervision (``layer_weight``): the ``refined`` terms on the INTERMEDIATE layers.
 
-        One ``<term>_layer`` per term, the layers pooled (numerators and masses summed), at
-        ``layer_weight`` times the term's own weight.
+        One ``refined_<term>_layer`` per term, the layers pooled (numerators and masses
+        summed), at ``layer_weight`` times the term's own weight.
         """
         sums = {name: torch.zeros((), device=self.device, dtype=self.dtype)
-                for name in self.layer_terms}
-        masses = {name: 0.0 for name in self.layer_terms}
+                for name in self.refined_terms}
+        masses = {name: 0.0 for name in self.refined_terms}
         layers = zip(pred["joints_cam_layers"][:-1], pred["root_6d_layers"][:-1],
                      pred["body_6d_layers"][:-1], pred["pelvis_world_layers"][:-1])
         for joints, root_6d, body_6d, pelvis_world in layers:
-            raw = self._body_terms(joints.to(self.device, self.dtype)[:, :gt_joints.shape[1]],
+            raw = self._body_terms(self.refined_weights,
+                                   joints.to(self.device, self.dtype)[:, :gt_joints.shape[1]],
                                    root_6d.to(self.device, self.dtype),
                                    body_6d.to(self.device, self.dtype), pelvis_world,
                                    gt_joints, gt_root_6d, gt_body_6d, mask, mass, batch)
             for name, (numerator, term_mass) in raw.items():
-                sums[name] = sums[name] + self.weights[name] * numerator
+                sums[name] = sums[name] + self.refined_weights[name] * numerator
                 masses[name] += term_mass
-        return {f"{name}_layer": (self.layer_weight * sums[name], masses[name])
-                for name in self.layer_terms}
+        return {f"refined_{name}_layer": (self.layer_weight * sums[name], masses[name])
+                for name in self.refined_terms}
 
     def __call__(self, out: dict, batch: dict, *, train: bool) -> LossResult:
-        pred = out["smplx"]
+        final = out["smplx"]
+        pred = out["smplx_per_frame"] if out["smplx_per_frame"] is not None else final
         root_6d = pred["root_6d"].to(self.device, self.dtype)            # (B,6)
         body_6d = pred["body_6d"].to(self.device, self.dtype)            # (B,21,6)
         betas = pred["betas"].to(self.device, self.dtype)                # (B,10)
@@ -575,8 +592,8 @@ class SmplxLoss(Loss):
                 huber = F.smooth_l1_loss(kp2d_full / focal, gt_full / focal, reduction="none",
                                          beta=self.delta["2d"])
             raw["kp2d"] = (((huber.mean(dim=-1) * self.joint_w).sum(dim=1) * mask).sum(), mass)
-        raw.update(self._body_terms(joints, root_6d, body_6d, None, gt_joints, gt_root_6d,
-                                    gt_body_6d, mask, mass, batch))
+        raw.update(self._body_terms(self.weights, joints, root_6d, body_6d, None, gt_joints,
+                                    gt_root_6d, gt_body_6d, mask, mass, batch))
         if self.weights["hand_pose"] > 0.0:
             gt_hand_6d = rotmat_to_rot6d(gt["hand_rot"])
             raw["hand_pose"] = (
@@ -596,23 +613,36 @@ class SmplxLoss(Loss):
                                      beta=self.delta["bearing"])
             raw["bearing"] = ((huber.mean(dim=-1) * mask).sum(), mass)
 
-        stats = self.empty_stats()
-        if not train:
-            # Vertices only at evaluation: the metrics are their sole consumer.
-            # Flat hands on both sides (the 22-joint body at the body part of q)
-            # keep PVE comparable across hands / no-hands runs.
-            body = self.model.head_smplx.body_flat(self.device)
-            pred_verts = smplx_vertices(
-                body, betas.detach(), pred["q_cam"].detach()[:, :BODY_Q_DIM])
-            gt_verts = smplx_vertices(body, gt["betas"], gt["q"][:, :BODY_Q_DIM])
-            stats = eval_stats(joints.detach(), pred_verts, gt_joints, gt_verts,
-                               gt["valid"], batch,
-                               world=pred if self.world_diag else None).to(self.device)
         weighted = {name: (self.weights[name] * numerator, term_mass)
                     for name, (numerator, term_mass) in raw.items()}
+        if self.refined_terms:
+            refined = self._body_terms(
+                self.refined_weights,
+                final["joints_cam"].to(self.device, self.dtype)[:, :gt_joints.shape[1]],
+                final["root_6d"].to(self.device, self.dtype),
+                final["body_6d"].to(self.device, self.dtype), final["pelvis_world"],
+                gt_joints, gt_root_6d, gt_body_6d, mask, mass, batch)
+            weighted.update({f"refined_{name}": (self.refined_weights[name] * numerator, term_mass)
+                             for name, (numerator, term_mass) in refined.items()})
+            anchor = anchor + (final["joints_cam"].sum() + final["root_6d"].sum()
+                               + final["body_6d"].sum()) * 0.0
         if self.layer_weight > 0.0:
-            weighted.update(self.layer_raw(pred, gt_joints, gt_root_6d, gt_body_6d,
+            weighted.update(self.layer_raw(final, gt_joints, gt_root_6d, gt_body_6d,
                                            mask, mass, batch))
+        stats = self.empty_stats()
+        if not train:
+            # Vertices only at evaluation: the metrics are their sole consumer, and they
+            # score the FINAL body. Flat hands on both sides (the 22-joint body at the body
+            # part of q) keep PVE comparable across hands / no-hands runs.
+            body = self.model.head_smplx.body_flat(self.device)
+            final_joints = final["joints_cam"].detach().to(self.device, self.dtype)
+            final_betas = final["betas"].detach().to(self.device, self.dtype)
+            pred_verts = smplx_vertices(
+                body, final_betas, final["q_cam"].detach().to(self.device, self.dtype)[:, :BODY_Q_DIM])
+            gt_verts = smplx_vertices(body, gt["betas"], gt["q"][:, :BODY_Q_DIM])
+            stats = eval_stats(final_joints, pred_verts, gt_joints, gt_verts,
+                               gt["valid"], batch,
+                               world=final if self.world_diag else None).to(self.device)
         return LossResult(terms=self._terms(weighted, anchor), scalars={"n_rows": mass},
                           stats=stats)
 
@@ -620,7 +650,7 @@ class SmplxLoss(Loss):
         return pose_metrics_from_stats(stats, self.hands, self.world_diag)
 
 
-__all__ = ["SmplxLoss", "POSE_METRICS", "LIFTED_METRICS", "HAND_METRICS", "DIAG_METRICS",
+__all__ = ["SmplxLoss", "REFINED_TERM_NAMES", "POSE_METRICS", "LIFTED_METRICS", "HAND_METRICS", "DIAG_METRICS",
            "SMPLX_HIPS", "BODY_Q_DIM", "metric_names", "gt_smplx_camera", "smplx_q",
            "smplx_vertices", "eval_stats", "pose_metric_stats", "lifted_metric_stats",
            "world_diag_stats", "pose_metrics_from_stats"]

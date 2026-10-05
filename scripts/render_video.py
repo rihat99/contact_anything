@@ -3,15 +3,16 @@
 Every test scene is run under the evaluation protocol (one clip per person,
 see :mod:`scripts._render_common`) and written as an mp4. The panel carries the
 SMPL-X head's mesh (painter-sorted, lambert-shaded, alpha-blended), its 22 body
-joints and one disk per kindyn group at that group's joint
-(:data:`SMPLX_GROUP_JOINTS`): red in contact, green free. ``--overlay-labels``
+joints and one disk per contact SLOT of the run's set (``data.contact_set``) at that
+slot's own point — the group joint under ``kindyn6``, the posed contact frame under
+``frames35``: red in contact, green free. ``--overlay-labels``
 splits each disk — the outer ring is the prediction, the inner disk the corpus
 label (blank where the label is not supervised). ``--gt-panel`` adds a second
 panel on the left carrying the kindyn SMPL-X GT — its mesh, its joints and its
 label disks. Two panels are twice as wide as the frame, so ``--scale 0.5`` keeps
 the canvas at one frame's width.
 
-With a force head the predicted 3D force of every group (body-weight units,
+With a force head the predicted 3D force of every slot (body-weight units,
 body-root frame) is rotated into the camera with the head's OWN predicted root
 rotation and drawn as an arrow of :data:`METERS_PER_BW` metres per body weight
 from the group joint, perspective-projected through the scene's intrinsics.
@@ -21,9 +22,9 @@ thinner white arrow at the same joint.
 Under ``torchrun`` the scenes are sharded over ranks; every rank writes its own
 files, no process group needed.
 
-    python scripts/render_video.py --config configs/r10/L_limb.yaml \\
-        --checkpoint output_5/<run>/best.pth --scenes 5 \\
-        --out output_5/<run>/render_contact --overlay-labels --gt-panel --scale 0.5
+    python scripts/render_video.py --config configs/final/final_full.yaml \\
+        --checkpoint output_6/<run>/best.pth --scenes 5 \\
+        --out output_6/<run>/render_contact --overlay-labels --gt-panel --scale 0.5
 """
 from __future__ import annotations
 
@@ -39,8 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import _render_common as rc                                     # noqa: E402
 from _render_common import draw_keypoints, draw_mesh            # noqa: E402
-from data.climbing_videos.scene import GROUP_BODY22             # noqa: E402
-from model.loss import KINDYN_GROUP_NAMES, NUM_KINDYN_GROUPS    # noqa: E402
+from model.contact_frames import contact_set                    # noqa: E402
 from model.loss.smplx import gt_smplx_camera, smplx_vertices    # noqa: E402
 from train.predict import load_model                            # noqa: E402
 
@@ -49,9 +49,6 @@ CONTACT_BGR = (45, 45, 235)
 FREE_BGR = (55, 185, 75)
 OUTLINE_BGR = (245, 245, 245)
 
-#: SMPL-X body-22 joint anchoring each kindyn group, in group order — the very
-#: joints the corpus folds its 52-joint labels onto (wrists, big toes, ankles).
-SMPLX_GROUP_JOINTS = tuple(joints[0] for joints in GROUP_BODY22)
 PANEL_LABELS = {
     "gt": "kindyn SMPL-X GT",
     "pred": "SMPL-X head + contact (outer = pred, inner = label)",
@@ -61,7 +58,7 @@ KP_BGR = {"gt": (80, 220, 80), "pred": (200, 80, 220)}
 BANNER_BGR = (25, 25, 25)
 BANNER_TEXT_BGR = (240, 240, 240)
 
-#: One arrow colour per kindyn group (LH, RH, LF, RF, LA, RA), BGR.
+#: Arrow colours, cycled over the slots (kindyn6: LH, RH, LF, RF, LA, RA), BGR.
 FORCE_BGR = ((15, 83, 224), (0, 165, 240), (216, 114, 28),
              (173, 179, 47), (201, 65, 139), (127, 54, 209))
 FORCE_OUTLINE_BGR = (25, 25, 25)
@@ -78,6 +75,7 @@ def predict_scene(model, ds, cfg: dict, device: str, arms: tuple[str, ...]) -> d
     Rows the evaluation clips do not cover stay NaN and are never drawn. Forces
     (predicted and, when loaded, GT) are stored already rotated into the camera.
     """
+    n_slots = contact_set(cfg["data"]["contact_set"]).count
     data = ds.scene_data(ds.clips[0].scene)
     n_people, n_frames = data["valid_mask"].shape
     body = model.head_smplx.body(torch.device(device))
@@ -85,11 +83,16 @@ def predict_scene(model, ds, cfg: dict, device: str, arms: tuple[str, ...]) -> d
     n_verts = int(faces.max()) + 1
     out: dict = {
         "faces": faces,
-        "probs": np.full((n_people, n_frames, NUM_KINDYN_GROUPS), np.nan, np.float32),
+        "probs": np.full((n_people, n_frames, n_slots), np.nan, np.float32),
+        # Where the disks and arrows sit: the slot's own camera-frame point.
+        "anchor_cam": np.full((n_people, n_frames, n_slots, 3), np.nan, np.float32),
+        "anchor_2d": np.full((n_people, n_frames, n_slots, 2), np.nan, np.float32),
+        "gt_anchor_cam": np.full((n_people, n_frames, n_slots, 3), np.nan, np.float32),
+        "gt_anchor_2d": np.full((n_people, n_frames, n_slots, 2), np.nan, np.float32),
         "covered": np.zeros((n_people, n_frames), bool),
     }
     if model.head_force is not None:
-        out["forces_cam"] = np.full((n_people, n_frames, NUM_KINDYN_GROUPS, 3), np.nan, np.float32)
+        out["forces_cam"] = np.full((n_people, n_frames, n_slots, 3), np.nan, np.float32)
         if "force_gt" in data:
             out["gt_forces_cam"] = np.full_like(out["forces_cam"], np.nan)
     for arm in arms:
@@ -100,6 +103,7 @@ def predict_scene(model, ds, cfg: dict, device: str, arms: tuple[str, ...]) -> d
         out[f"{arm}_kp2d"] = np.full((n_people, n_frames, 22, 2), np.nan, np.float32)
         out[f"{arm}_kp3d"] = np.full((n_people, n_frames, 22, 3), np.nan, np.float32)
 
+    parent_joint = contact_set(cfg["data"]["contact_set"]).parent_joint52
     for clip, batch, output in rc.clip_batches(ds, cfg, model, device):
         rows = batch["frame_index"].tolist()
         person = clip.person
@@ -110,9 +114,12 @@ def predict_scene(model, ds, cfg: dict, device: str, arms: tuple[str, ...]) -> d
         bodies = {"pred": (rc.to_numpy(smplx_vertices(body, smplx["betas"], smplx["q_cam"])),
                            rc.to_numpy(smplx["joints_cam"][:, :22]),
                            np.ones(len(rows), bool))}
+        anchor_cam = rc.to_numpy(rc.slot_points_cam(output, batch))
         gt = None
         if "gt" in arms or "gt_forces_cam" in out:
             gt = gt_smplx_camera(batch, torch.device(device), hands=model.head_smplx.hands)
+        gt_anchor_cam = (rc.to_numpy(gt["joints"][:, list(parent_joint)]) if gt is not None
+                         else None)
         if "gt" in arms:
             bodies["gt"] = (rc.to_numpy(smplx_vertices(body, gt["betas"], gt["q"])),
                             rc.to_numpy(gt["joints"][:, :22]), rc.to_numpy(gt["valid"]) > 0)
@@ -130,6 +137,12 @@ def predict_scene(model, ds, cfg: dict, device: str, arms: tuple[str, ...]) -> d
                 gt_forces_cam = np.einsum("bij,bkj->bki", rc.to_numpy(gt["root_rot"]), gt_force)
         for row, position in enumerate(rows):
             out["covered"][person, position] = True
+            out["anchor_cam"][person, position] = anchor_cam[row]
+            out["anchor_2d"][person, position] = rc.project(anchor_cam[row], cam_int[row])
+            if gt_anchor_cam is not None:
+                out["gt_anchor_cam"][person, position] = gt_anchor_cam[row]
+                out["gt_anchor_2d"][person, position] = rc.project(
+                    gt_anchor_cam[row], cam_int[row])
             if probs is not None:
                 out["probs"][person, position] = probs[row]
             if forces_cam is not None:
@@ -229,7 +242,7 @@ def panel(frame: np.ndarray, preds: dict, data: dict, position: int, arm: str, a
     ``gt`` disks are the corpus labels, drawn only where they are supervised.
     """
     img = frame.copy()
-    groups = list(SMPLX_GROUP_JOINTS)
+    prefix = "gt_" if arm == "gt" else ""
     for person in range(preds["covered"].shape[0]):
         if not preds["covered"][person, position]:
             continue
@@ -240,7 +253,7 @@ def panel(frame: np.ndarray, preds: dict, data: dict, position: int, arm: str, a
                       preds["faces"], MESH_BGR[arm])
         kp2d = preds[f"{arm}_kp2d"][person, position]
         draw_keypoints(img, kp2d, KP_BGR[arm], 2)
-        anchors = kp2d[groups]
+        anchors = preds[f"{prefix}anchor_2d"][person, position]
         labels = data["contact_gt"][person, position]
         valid = data["contact_valid"][person, position]
         if arm == "gt":
@@ -252,14 +265,14 @@ def panel(frame: np.ndarray, preds: dict, data: dict, position: int, arm: str, a
         key = "forces_cam" if arm == "pred" else "gt_forces_cam"
         if key in preds:
             cam_int = data["intrinsics"][position]
-            anchors_cam = preds[f"{arm}_kp3d"][person, position][groups]
+            anchors_cam = preds[f"{prefix}anchor_cam"][person, position]
             colours, thick, tip = ((FORCE_BGR, FORCE_THICKNESS, 32.0) if arm == "pred"
-                                   else ((GT_FORCE_BGR,) * 6, GT_FORCE_THICKNESS, 24.0))
+                                   else ((GT_FORCE_BGR,), GT_FORCE_THICKNESS, 24.0))
             draw_forces(img, anchors, anchors_cam, preds[key][person, position], cam_int,
                         colours, thick, tip)
             if arm == "pred" and args.overlay_labels and "gt_forces_cam" in preds:
                 draw_forces(img, anchors, anchors_cam, preds["gt_forces_cam"][person, position],
-                            cam_int, (GT_FORCE_BGR,) * 6, GT_FORCE_THICKNESS, 24.0)
+                            cam_int, (GT_FORCE_BGR,), GT_FORCE_THICKNESS, 24.0)
     return banner(img, PANEL_LABELS[arm])
 
 
@@ -327,8 +340,6 @@ def main() -> int:
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
 
     checkpoint = None if str(args.checkpoint).lower() == "none" else args.checkpoint
     model, cfg = load_model(args.config, checkpoint, args.device)
@@ -345,7 +356,8 @@ def main() -> int:
         rc.resolve_scenes(root, "test", args.scenes, rc.dataset_camera(cfg)))
     print(f"[rank {rank}/{world_size}] {len(scenes)} scene(s) on {args.device}; "
           f"checkpoint {checkpoint or 'none (untrained)'}; "
-          f"groups {list(KINDYN_GROUP_NAMES)}")
+          f"slots ({cfg['data']['contact_set']}) "
+          f"{list(contact_set(cfg['data']['contact_set']).slot_names)}")
     for index, scene in enumerate(scenes, start=1):
         ds = rc.build_dataset(cfg, root, contact_level, scene, "test", load, max_frames)
         preds = predict_scene(model, ds, cfg, args.device, arms)

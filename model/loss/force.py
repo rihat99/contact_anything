@@ -1,13 +1,13 @@
-"""Supervised six-group force loss against the kindyn ground truth.
+"""Supervised per-slot force loss against the kindyn ground truth.
 
-Reads ``out["force"]["forces"] (B, 6, 3)`` — body-weight units in the
+Reads ``out["force"]["forces"] (B, K, 3)`` — one force per slot of the run's
+contact set (``data.contact_set``) — body-weight units in the
 **body-root frame**, which is the frame the loader rotates the GT into (by the
 kindyn root quaternion), so a decoder-token head learns that frame directly and
 no camera extrinsics enter this objective at all. A head that predicts in its
 OWN body frame (the refiner: ``out["force"]["frame"]`` = world-from-body) has
 the GT and the lever arms rotated into that frame first (needs the ``smplx``
-GT group for the kindyn root rotation). Groups are in
-:data:`~model.loss.KINDYN_GROUP_NAMES` order.
+GT group for the kindyn root rotation). Slots are in the contact set's order.
 
 Six terms, every one a ``loss.*`` weight:
 
@@ -33,16 +33,16 @@ Six terms, every one a ``loss.*`` weight:
   where its own contact mask said contact). L1's constant slope at ``|f| -> 0``
   admits exact zeros, which a quadratic never reaches. The model's contact gate
   does this job in the forward pass instead, so gated builds set this to 0.
-* ``sum_force`` — Huber on the NET force ``sum_i f_i`` over all six groups
+* ``sum_force`` — Huber on the NET force ``sum_i f_i`` over all K slots
   regardless of the contact mask (GT is exactly zero off-contact, and a gated
-  prediction is ~0 there). A row is skipped when force-invalid or when ANY group
-  is an outlier: one blown-up group poisons the whole sum.
+  prediction is ~0 there). A row is skipped when force-invalid or when ANY slot
+  is an outlier: one blown-up slot poisons the whole sum.
 * ``sum_torque`` — the same on the net torque ``sum_i r_i x f_i`` (bw*m, its own
   ``huber_delta_bwm``) with the loader's root-frame lever arms. The SAME arms
   enter both sides, so the choice of origin is a consistency statement, not a
   physics claim.
 
-``group_weights`` turns the per-limb terms (``force`` / ``magnitude`` /
+``group_weights`` (K entries, slot order) turns the per-limb terms (``force`` / ``magnitude`` /
 ``direction``) into per-group weighted means — the weights enter numerator AND
 mass, so an upweighted group gets proportionally more gradient without changing
 the term's scale. That knob exists because with uniform weights the legs
@@ -66,7 +66,13 @@ the exponent only matters for the low tail; 0 = flat) — into numerator and
 mass both, so it reweights rows without changing any term's scale. The reported
 metrics stay unweighted: ``mae`` and ``rmse`` (vector error, in-contact rows),
 ``mag_mae`` (``||f_pred| - |f_gt||``, same rows), ``angle_deg`` (on the direction
-rows) and ``noncontact_mag``.
+rows) and ``noncontact_mag`` — all over the K slots.
+
+``groups_mae`` reads the same error after the SIX-GROUP fold
+(:meth:`~model.contact_frames.ContactSet.fold_sum`: the member slots' forces summed
+into one group vector, both sides), on the (row, group) pairs where at least one
+member slot is in contact. It is the number a frames35 run and a kindyn6 run compare
+on; under kindyn6 the fold is the identity and ``groups_mae`` IS ``mae``.
 """
 from __future__ import annotations
 
@@ -76,7 +82,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from model.loss import Loss, LossResult
+from model.loss import NUM_KINDYN_GROUPS, Loss, LossResult
 from utils.metrics import mean_from_stats
 
 _TERM_NAMES = ("force", "magnitude", "direction", "noncontact", "sum_force", "sum_torque")
@@ -94,16 +100,21 @@ def _norm(x: Tensor) -> Tensor:
 
 
 class ForceLoss(Loss):
-    """Kindyn GT-force supervision for the six-token force branch."""
+    """Kindyn GT-force supervision for the force branch's K slots."""
 
     name = "force"
     stat_names = ("mae_num", "mae_mass", "noncontact_num", "noncontact_mass",
-                  "mag_num", "angle_num", "angle_mass", "sq_num")
+                  "mag_num", "angle_num", "angle_mass", "sq_num",
+                  "groups_mae_num", "groups_mae_mass")
 
     def __init__(self, cfg: dict, model, device: torch.device | str) -> None:
         super().__init__(cfg, model, device)
         section = cfg["force_supervision"]
         loss_cfg = section["loss"]
+        #: ``(6, K)`` fold matrix of the six-group force sum (``groups_mae``).
+        self.group_matrix = (
+            torch.as_tensor(self.contact_set.group_of, device=self.device)[None, :]
+            == torch.arange(NUM_KINDYN_GROUPS, device=self.device)[:, None]).to(self.dtype)
         self.use_confidence = bool(section["confidence"])
         self.confidence_power = float(section["confidence_power"])
         self.weights = {name: float(loss_cfg[name]) for name in _TERM_NAMES}
@@ -189,8 +200,8 @@ class ForceLoss(Loss):
         if pred.shape != gt.shape:
             raise ValueError(
                 f"force prediction {tuple(pred.shape)} does not match the GT "
-                f"{tuple(gt.shape)} — model.force.keypoint_indices and the "
-                f"dataset's force groups must agree")
+                f"{tuple(gt.shape)} — the force head's token count and the "
+                f"dataset's data.contact_set slot count must agree")
         contact = batch["force_contact"].to(self.device)                 # (B,K)
         valid = (batch["force_valid"] & batch["frame_valid"]).to(self.device)
         if self.use_confidence:
@@ -217,7 +228,7 @@ class ForceLoss(Loss):
                 raise ValueError(
                     f"force_supervision.loss.group_weights has "
                     f"{self.group_weights.numel()} entries but the model "
-                    f"predicts {pred.shape[1]} force groups")
+                    f"predicts {pred.shape[1]} force slots")
             w_contact = w_contact * self.group_weights[None, :]
             w_direction = w_direction * self.group_weights[None, :]
 
@@ -226,7 +237,7 @@ class ForceLoss(Loss):
         raw: dict[str, tuple[Tensor, float]] = self._limb_terms(
             pred, gt, unit_gt, mag_gt, row_weights)
 
-        # Net force / net torque over ALL six groups per eligible row.
+        # Net force / net torque over ALL K slots per eligible row.
         sum_rows = valid & ~outlier.any(dim=-1)
         w_sum = sum_rows.to(self.dtype) * conf
         sum_huber = F.smooth_l1_loss(
@@ -251,12 +262,19 @@ class ForceLoss(Loss):
             mag_err = (mag_pred - mag_gt).abs()
             angle = torch.rad2deg(torch.acos(
                 ((pred * unit_gt).sum(dim=-1) / mag_pred.clamp(min=1e-6)).clamp(-1.0, 1.0)))
+            # The six-group reading: the member slots' forces summed on both sides,
+            # on the (row, group) pairs with at least one in-contact member.
+            fold = self.group_matrix                                     # (6, K)
+            group_err = torch.linalg.vector_norm(
+                torch.einsum("gk,bkc->bgc", fold, pred - gt), dim=-1)     # (B, 6)
+            group_rows = (in_contact.to(self.dtype) @ fold.t()) > 0       # (B, 6)
             stats = torch.tensor([
                 float((err * in_contact).sum()), float(in_contact.sum()),
                 float((mag_pred * off_contact).sum()), float(off_contact.sum()),
                 float((mag_err * in_contact).sum()),
                 float((angle * direction_rows).sum()), float(direction_rows.sum()),
                 float((err.square() * in_contact).sum()),
+                float((group_err * group_rows).sum()), float(group_rows.sum()),
             ], dtype=torch.float64, device=self.device)
         scalars = {
             "mae": mean_from_stats(float(stats[0]), float(stats[1])),
@@ -282,6 +300,7 @@ class ForceLoss(Loss):
             "mag_mae": mean_from_stats(float(stats[4]), float(stats[1])),
             "angle_deg": mean_from_stats(float(stats[5]), float(stats[6])),
             "rmse": mean_from_stats(float(stats[7]), float(stats[1])) ** 0.5,
+            "groups_mae": mean_from_stats(float(stats[8]), float(stats[9])),
         }
 
 

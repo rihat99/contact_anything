@@ -38,6 +38,7 @@ sys.path.insert(0, str(REPO))
 from data.climbing_videos.scene import (                              # noqa: E402
     embedding_path, list_scenes, load_scene)
 from data.transforms import build_transform, process_frame            # noqa: E402
+from model.contact_frames import contact_set                          # noqa: E402
 from model.wrapper import SAM3DBodyWrapper                            # noqa: E402
 from train.config import load_config                                  # noqa: E402
 
@@ -86,7 +87,7 @@ def collect_entries(
     failed: list[str] = []
     for scene in tqdm(scenes, desc="index scenes"):
         try:
-            data = load_scene(corpus_root, scene, "train", 1)
+            data = load_scene(corpus_root, scene, "train", 1, contact_set("kindyn6"))
         except Exception as exc:                      # noqa: BLE001
             failed.append(f"{scene}: {exc}")
             continue

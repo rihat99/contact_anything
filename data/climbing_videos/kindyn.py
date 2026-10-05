@@ -3,15 +3,16 @@
 ``features/human_optim/<shard>/<scene>/kindyn_1.npz`` is the per-scene inverse
 dynamics solve. Two products are read here.
 
-**Forces.** The solve places wrenches on ~35 named contact frames (world-frame
-newtons). Each frame maps to one of the six groups through its PARENT JOINT:
-the hand groups aggregate the wrist plus every finger frame, the foot groups
-the big-toe/ball frames, the ankle groups the heels. Frames whose parent
+**Forces.** The solve places wrenches on the 35 named contact frames (world-frame
+newtons). Under the ``frames35`` contact set they are emitted per frame; under
+``kindyn6`` each frame maps to one of the six groups through its PARENT JOINT
+(the hand groups aggregate the wrist plus every finger frame, the foot groups
+the big-toe/ball frames, the ankle groups the heels) and frames whose parent
 belongs to no group (knees, elbows, back, ...) are dropped — corpus-wide they
 carry ~4 % of the total force magnitude. Forces are divided by ``total_mass *
 g`` (body-weight units) and rotated into the body-root frame by the kindyn root
 quaternion, so no extrinsics enter the objective. ``force_lever`` is each
-group joint's offset from the pelvis in the same frame (metres).
+slot's PARENT joint's offset from the pelvis in the same frame (metres).
 
 **SMPL-X body.** The fitted ``q`` trajectory of BetterHuman's
 ``SMPLX(use_face=False, use_hands=True, num_betas=10)`` — root = pelvis pose,
@@ -27,14 +28,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .scene import (
-    GROUP_NAMES,
-    LEFT_HAND_GROUP_52,
-    N_JOINTS_52,
-    NUM_GROUPS,
-    RIGHT_HAND_GROUP_52,
-    rows_by_object_id,
-)
+from model.contact_frames import KINDYN_GROUPS_52, ContactSet
+
+from .scene import GROUP_NAMES, N_JOINTS_52, NUM_GROUPS, rows_by_object_id
 
 GRAVITY_MAG = 9.81
 #: ``source`` values of ``features/geocalib/<shard>/<scene>/gravity.npz``.
@@ -47,7 +43,7 @@ KINDYN_FORCE_JOINTS = (
     "left_wrist", "right_wrist", "left_foot", "right_foot", "left_ankle", "right_ankle",
 )
 #: 52-joint membership per group (hands aggregate wrist + fingers).
-GROUPS_52 = (LEFT_HAND_GROUP_52, RIGHT_HAND_GROUP_52, (10,), (11,), (7,), (8,))
+GROUPS_52 = KINDYN_GROUPS_52
 
 
 def quat_xyzw_to_matrix(quat: np.ndarray) -> np.ndarray:
@@ -108,13 +104,15 @@ def _gravity_fields(scene: str, kindyn, gravity_path: Path) -> dict:
 
 
 def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int, *,
-                gravity_path: Path) -> dict:
-    """Six-group GT contact forces in body-weight units, body-root frame.
+                gravity_path: Path, slots: ContactSet) -> dict:
+    """Per-slot GT contact forces in body-weight units, body-root frame.
 
     :param gravity_path: the scene's geocalib ``gravity.npz``
         (:func:`data.climbing_videos.scene.gravity_path`).
-    :returns: ``force_gt (P, N, 6, 3)``, ``force_contact (P, N, 6)`` bool,
-        ``force_lever (P, N, 6, 3)`` metres, ``force_valid (P, N)``,
+    :param slots: the contact set (``kindyn6`` folds the 35 solved frames onto
+        the six groups, ``frames35`` emits them as they are).
+    :returns: ``force_gt (P, N, K, 3)``, ``force_contact (P, N, K)`` bool,
+        ``force_lever (P, N, K, 3)`` metres, ``force_valid (P, N)``,
         ``force_conf (P, N)``, ``gravity_world (3,)`` the scene's fitted unit
         DOWN vector in world coordinates, ``gravity_measured`` bool.
     """
@@ -128,13 +126,19 @@ def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int, *,
             parents >= N_JOINTS_52).any():
         raise ValueError(
             f"{scene}: contact_frame_parents is not {n_cframes} valid 52-joint indices")
-    group_of = np.full(n_cframes, -1, np.int64)
-    for g, members in enumerate(GROUPS_52):
-        group_of[np.isin(parents, list(members))] = g
-    for g, name in enumerate(GROUP_NAMES):
-        if not (group_of == g).any():
+    if slots.uses_frames:
+        if tuple(frame_names) != slots.slot_names:
             raise ValueError(
-                f"{scene}: no kindyn contact frame maps to force group {name!r}")
+                f"{scene}: kindyn contact_frame_names {tuple(frame_names)} are not the "
+                f"{slots.name} slots {slots.slot_names}")
+    else:
+        group_of = np.full(n_cframes, -1, np.int64)
+        for g, members in enumerate(GROUPS_52):
+            group_of[np.isin(parents, list(members))] = g
+        for g, name in enumerate(GROUP_NAMES):
+            if not (group_of == g).any():
+                raise ValueError(
+                    f"{scene}: no kindyn contact frame maps to force group {name!r}")
 
     def _rows(key, dtype):
         return rows_by_object_id(
@@ -177,27 +181,31 @@ def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int, *,
             or not np.isfinite(np.asarray(kindyn["betas"])).all()):
         raise ValueError(f"{scene}: kindyn total_mass/betas are not sane")
 
-    # Fold frames -> groups: forces sum, contact ORs, over the member frames.
-    forces_n = np.stack(
-        [frame_forces[:, :, group_of == g].sum(axis=2) for g in range(NUM_GROUPS)],
-        axis=2)                                               # [P, N, 6, 3] world newtons
-    group_contact = np.stack(
-        [frame_contact[:, :, group_of == g].any(axis=2) for g in range(NUM_GROUPS)],
-        axis=2)                                               # [P, N, 6]
+    if slots.uses_frames:
+        forces_n, slot_contact = frame_forces, frame_contact
+        lever_joints = list(slots.parent_joint52)
+    else:
+        # Fold frames -> groups: forces sum, contact ORs, over the member frames.
+        forces_n = np.stack(
+            [frame_forces[:, :, group_of == g].sum(axis=2) for g in range(NUM_GROUPS)],
+            axis=2)                                           # [P, N, 6, 3] world newtons
+        slot_contact = np.stack(
+            [frame_contact[:, :, group_of == g].any(axis=2) for g in range(NUM_GROUPS)],
+            axis=2)                                           # [P, N, 6]
+        lever_joints = [joint_names.index(name) for name in KINDYN_FORCE_JOINTS]
     # Forces are only ever solved under the contact mask: a nonzero force on an
-    # uncontacted group means corrupted data. (Zero force during contact is
+    # uncontacted slot means corrupted data. (Zero force during contact is
     # possible in principle, so the converse is not asserted.)
-    if bool((np.linalg.norm(forces_n, axis=-1) > 0)[~group_contact].any()):
+    if bool((np.linalg.norm(forces_n, axis=-1) > 0)[~slot_contact].any()):
         raise ValueError(
-            f"{scene}: nonzero contact force on a group with no contact label")
+            f"{scene}: nonzero contact force on a slot with no contact label")
 
     forces_out = forces_n / (total_mass[:, None, None, None] * GRAVITY_MAG)
-    # Lever arms for the net-torque term: the six group joints' offsets from the
-    # pelvis. Not checked for finiteness — uncovered frames may hold garbage and
-    # the loss skips them.
+    # Lever arms for the net-torque term: each slot's parent joint's offset from
+    # the pelvis. Not checked for finiteness — uncovered frames may hold garbage
+    # and the loss skips them.
     pelvis = joint_names.index("pelvis")
-    group_joints = [joint_names.index(name) for name in KINDYN_FORCE_JOINTS]
-    lever = joints_world[:, :, group_joints] - joints_world[:, :, [pelvis]]
+    lever = joints_world[:, :, lever_joints] - joints_world[:, :, [pelvis]]
     # q[3:7] is the root quaternion, xyzw, R(q) = world-from-root (verified
     # against the stored axis-angle global_orient); rotate world -> root.
     rot = quat_xyzw_to_matrix(q[..., 3:7])                    # [P, N, 3, 3]
@@ -205,7 +213,7 @@ def load_forces(scene: str, human_dir: Path, object_ids: np.ndarray, n: int, *,
     lever = np.einsum("pnji,pnkj->pnki", rot, lever)
     return {
         "force_gt": forces_out.astype(np.float32),
-        "force_contact": group_contact,
+        "force_contact": slot_contact,
         "force_lever": lever.astype(np.float32),
         "force_valid": force_valid,
         "force_conf": force_conf,
@@ -266,14 +274,30 @@ def load_smplx(scene: str, human_dir: Path, object_ids: np.ndarray, n: int, *,
     valid = _rows("valid_mask", bool)                         # [P, N]
     joints = _rows("joints_world", np.float32)                # [P, N, 52, 3]
     betas = _rows("betas", np.float32)                        # [P, 10]
-    n_people = len(object_ids)
+    return {
+        **_gravity_fields(scene, kindyn, gravity_path),
+        **smplx_fields(scene, q, valid, joints, betas, n),
+    }
+
+
+def smplx_fields(
+    scene: str, q: np.ndarray, valid: np.ndarray, joints: np.ndarray,
+    betas: np.ndarray, n: int,
+) -> dict:
+    """The ``smplx_*`` batch keys from a ``q`` trajectory (shared by both corpora).
+
+    ``q`` is BetterHuman's convention (:data:`SMPLX_Q_DIM`); rows the caller
+    marked invalid — or that hold a non-finite pose — are zeroed / set to the
+    identity so nothing downstream multiplies a NaN by a zero mask.
+    """
+    n_people = len(betas)
     if q.shape != (n_people, n, SMPLX_Q_DIM):
-        raise ValueError(f"{scene}: kindyn q {q.shape} != ({n_people}, {n}, {SMPLX_Q_DIM})")
+        raise ValueError(f"{scene}: q {q.shape} != ({n_people}, {n}, {SMPLX_Q_DIM})")
     if joints.shape != (n_people, n, NUM_SMPLX_JOINTS, 3):
         raise ValueError(
-            f"{scene}: kindyn joints_world {joints.shape} is not (P, N, {NUM_SMPLX_JOINTS}, 3)")
+            f"{scene}: joints_world {joints.shape} is not (P, N, {NUM_SMPLX_JOINTS}, 3)")
     if betas.shape != (n_people, NUM_SMPLX_BETAS) or not np.isfinite(betas).all():
-        raise ValueError(f"{scene}: kindyn betas {betas.shape} are not (P, 10) finite")
+        raise ValueError(f"{scene}: betas {betas.shape} are not (P, 10) finite")
     valid = valid & np.isfinite(q).all(axis=-1) & np.isfinite(joints).all(axis=(2, 3))
 
     q = np.where(valid[..., None], q, 0.0).astype(np.float32)
@@ -283,16 +307,14 @@ def load_smplx(scene: str, human_dir: Path, object_ids: np.ndarray, n: int, *,
     hand_rot = quat_xyzw_to_matrix(
         q[..., _SMPLX_HAND_Q].reshape(n_people, n, NUM_SMPLX_HAND_JOINTS, 4))
     eye = np.eye(3, dtype=np.float32)
-    root_rot = np.where(valid[..., None, None], root_rot, eye)
-    body_rot = np.where(valid[..., None, None, None], body_rot, eye)
-    hand_rot = np.where(valid[..., None, None, None], hand_rot, eye)
-    joints = np.where(valid[..., None, None], joints, 0.0)
     return {
-        **_gravity_fields(scene, kindyn, gravity_path),
-        "smplx_joints_world": joints.astype(np.float32),
-        "smplx_root_rot": root_rot.astype(np.float32),
-        "smplx_body_rot": body_rot.astype(np.float32),
-        "smplx_hand_rot": hand_rot.astype(np.float32),
+        "smplx_joints_world": np.where(
+            valid[..., None, None], joints, 0.0).astype(np.float32),
+        "smplx_root_rot": np.where(valid[..., None, None], root_rot, eye).astype(np.float32),
+        "smplx_body_rot": np.where(
+            valid[..., None, None, None], body_rot, eye).astype(np.float32),
+        "smplx_hand_rot": np.where(
+            valid[..., None, None, None], hand_rot, eye).astype(np.float32),
         "smplx_betas": betas,
         "smplx_valid": valid,
     }

@@ -1,5 +1,8 @@
 """Clip datasets: the windowing contract and the per-frame schema.
 
+Two corpora implement it — :mod:`data.climbing_videos` and :mod:`data.bedlam2` —
+and emit exactly the same keys, so a run can concatenate them.
+
 A dataset **item** is a *clip*: a list of ``T`` per-frame dicts of one
 ``(scene, person)`` at a fixed source-frame stride. :class:`ClipDataset` owns
 everything that does not depend on what a scene contains — how a scene is cut
@@ -31,17 +34,24 @@ key                  type / shape                meaning
 ``pose_token``       bf16 ``(1024,)``            frozen final pose-token cache (optional;
                                                  the frozen base never runs, so the frame
                                                  carries no image / mask / embedding)
-``contact_gt``       float ``(6,)``              six-group contact label (0/1)
-``contact_valid``    float ``(6,)``              1 where the label is supervised
-``contact_conf``     float ``(6,)``              label confidence in ``[0, 1]``
+``contact_gt``       float ``(K,)``              per-slot contact label (0/1)
+``contact_valid``    float ``(K,)``              1 where the label is supervised
+``contact_conf``     float ``(K,)``              label confidence in ``[0, 1]``
 ===================  ==========================  =================================
+
+``K`` is the slot count of the run's contact set (``data.contact_set``,
+:mod:`model.contact_frames`): 6 kindyn groups or 35 named contact frames. Under
+``frames35`` a ClimbingVideos TEST frame additionally carries the manual
+six-group labels as ``contact_gt_groups`` / ``contact_valid_groups`` ``(6,)``,
+which is what the six-group metrics score the folded prediction against.
 
 plus, per requested signal group (``load``):
 
 ``forces``
-    ``force_gt`` ``(6, 3)`` body-weight units in the body-root frame,
-    ``force_contact`` ``(6,)`` bool, ``force_lever`` ``(6, 3)`` metres in the
-    same frame, ``force_conf`` float, ``force_valid`` bool, ``gravity_world``
+    ``force_gt`` ``(K, 3)`` body-weight units in the body-root frame,
+    ``force_contact`` ``(K,)`` bool, ``force_lever`` ``(K, 3)`` metres in the
+    same frame (each slot's PARENT joint's offset from the pelvis),
+    ``force_conf`` float, ``force_valid`` bool, ``gravity_world``
     ``(3,)`` the scene's fitted unit down vector (world), ``gravity_measured``
     bool — whether that vector is a MEASUREMENT (geocalib's ``ground`` /
     ``geocalib`` source) rather than the first camera's down axis
@@ -55,7 +65,8 @@ plus, per requested signal group (``load``):
     parent-local, ``smplx_betas`` ``(10,)`` per person, ``smplx_valid`` bool.
 
 The six contact/force groups are ``left_hand, right_hand, left_foot (toe),
-right_foot, left_ankle (heel), right_ankle`` in that fixed order everywhere.
+right_foot, left_ankle (heel), right_ankle`` in that fixed order everywhere; the
+35 contact frames are in :data:`model.contact_frames.FRAMES35` order.
 
 An inference-only dataset (:mod:`data.reconstruction`) emits the input half of
 the table and no label at all; the collate stacks whatever is there, so long as
@@ -135,6 +146,11 @@ class ClipDataset(Dataset, ABC):
     """
 
     name: str = "clips"
+
+    @staticmethod
+    def video_of(scene: str) -> str:
+        """Source video of a scene id — the unit ``interleave_videos`` spreads over."""
+        return scene
 
     def __init__(
         self,

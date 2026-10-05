@@ -20,6 +20,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from paired_ci import load_labels, protocol_rows, THRESHOLD, CONTACT_LEVEL   # noqa: E402
 from data.climbing_videos import scene as scene_io
 from data.climbing_videos.scene import GROUP_BODY22, GROUP_NAMES, list_train_scenes
+from model.contact_frames import NUM_KINDYN_GROUPS, contact_set
+
+#: The six-group reading: a dump of a wider contact set folds onto it by MAX.
+GROUPS = contact_set("kindyn6")
 
 ROOT = Path("/home/rikhat.akizhanov/better/data/ClimbingVideos")
 runs = dict(a.split("=", 1) for a in sys.argv[1:])
@@ -29,13 +33,16 @@ BINS = [0, 0.2, 0.5, 0.8, 1.01]
 rows = []   # per active row: group, manual, auto, auto_conf, still, {run: pred}
 for scene in scenes:
     lab = load_labels(ROOT, scene)
-    auto = scene_io.load_scene(ROOT, scene, "train", CONTACT_LEVEL)
+    auto = scene_io.load_scene(ROOT, scene, "train", CONTACT_LEVEL, GROUPS)
     oids = lab["object_ids"]
     dumps, covered = {}, None
     for name, run in runs.items():
         raw = np.load(Path(run) / "predictions" / f"{scene}.npz", allow_pickle=True)
         d = {k: scene_io.rows_by_object_id(np.asarray(raw[k]), raw["object_ids"], oids, scene, "dump")
              for k in ("covered", "contact_probs")}
+        slots = contact_set(str(raw["contact_set"]) if "contact_set" in raw.files else "kindyn6")
+        if slots.count != NUM_KINDYN_GROUPS:
+            d["contact_probs"] = slots.fold_max(np.nan_to_num(d["contact_probs"]))
         d["stride"] = int(raw["stride"]); dumps[name] = d
         covered = d["covered"] if covered is None else covered & d["covered"]
     stride = dumps[next(iter(runs))]["stride"]
@@ -99,7 +106,7 @@ print("\n== TRAIN confidence mass (150 scenes): per group, share of rows / of we
 tr = list_train_scenes(ROOT)[::len(list_train_scenes(ROOT)) // 150][:150]
 C, L, V = [], [], []
 for scene in tr:
-    d = scene_io.load_scene(ROOT, scene, "train", CONTACT_LEVEL)
+    d = scene_io.load_scene(ROOT, scene, "train", CONTACT_LEVEL, GROUPS)
     v = d["contact_valid"] > 0
     C.append(d["contact_conf"][v.any(-1)]); L.append(d["contact_gt"][v.any(-1)] > 0.5); V.append(v[v.any(-1)])
 C = np.concatenate(C); L = np.concatenate(L); V = np.concatenate(V)

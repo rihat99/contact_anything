@@ -4,7 +4,9 @@ Reads a raw pipeline output tree directly: ``sam3/bboxes.npz`` (per-person xyxy
 boxes), ``sam3/<oid:02d>/frame_*.png`` person masks,
 ``geometry/transform.npz`` (per-frame ``intrinsics_px_orig`` and metric
 ``cam_from_world``), ``human_optim/contacts_1.npz`` for ``valid_mask``/``fps`` and ``human_optim/kindyn_1.npz`` for ``gravity_world`` (when present)
-(falling back to ``sam3d/params.npz`` when the contacts stage has not run), with
+(falling back to ``sam3d/params.npz`` when the contacts stage has not run; a tree
+with neither — an in-the-wild video prepared by ``scripts/prepare_wild.py`` — takes every
+tracked person on the frames its box exists), with
 ``geocalib/gravity.npz`` saying whether that gravity was measured (absent = not).
 Video frames are extracted with the same sequential OpenCV decode + JPEG-95
 re-encode the corpus tree uses (:func:`extract_frames`), so frame ``k`` of the
@@ -101,18 +103,24 @@ class ReconstructionSceneDataset(ClipDataset):
         intrinsics = np.asarray(transform["intrinsics_px_orig"], np.float32)
         extrinsics = np.asarray(transform["extrinsics"], np.float32)
 
-        contacts_path = self.out_dir / "human_optim" / "contacts_1.npz"
-        source = np.load(
-            contacts_path if contacts_path.is_file()
-            else self.out_dir / "sam3d" / "params.npz", allow_pickle=True)
-        valid_mask = np.asarray(source["valid_mask"], bool)               # [P, N]
-        fps = (float(source["fps"]) if "fps" in source.files
-               else float(transform["fps"]))
-
-        # SAM 3 may track more objects than the human stages kept (bystanders
-        # dropped by sam3d/human_optim). Predict for the kept people only.
         box_ids = [int(x) for x in np.asarray(boxes["object_ids"]).reshape(-1)]
-        object_ids = np.asarray(source["object_ids"], np.int64).reshape(-1)
+        contacts_path = self.out_dir / "human_optim" / "contacts_1.npz"
+        params_path = self.out_dir / "sam3d" / "params.npz"
+        if contacts_path.is_file() or params_path.is_file():
+            # SAM 3 may track more objects than the human stages kept (bystanders
+            # dropped by sam3d/human_optim). Predict for the kept people only.
+            source = np.load(contacts_path if contacts_path.is_file() else params_path,
+                             allow_pickle=True)
+            valid_mask = np.asarray(source["valid_mask"], bool)           # [P, N]
+            object_ids = np.asarray(source["object_ids"], np.int64).reshape(-1)
+            fps = (float(source["fps"]) if "fps" in source.files
+                   else float(transform["fps"]))
+        else:
+            # A tree with the tracker and the cameras only (an in-the-wild video,
+            # scripts/prepare_wild.py): every tracked person, on the frames its box exists.
+            object_ids = np.asarray(box_ids, np.int64)
+            valid_mask = (bbox[..., 2] > bbox[..., 0]) & (bbox[..., 3] > bbox[..., 1])
+            fps = float(transform["fps"])
         missing = [i for i in object_ids.tolist() if i not in box_ids]
         if missing:
             raise ValueError(

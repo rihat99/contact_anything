@@ -33,17 +33,8 @@ from typing import NamedTuple
 import torch
 from torch import Tensor
 
-#: The six contact / force groups, in kindyn's ``contact_force_joints`` column
-#: order. ``*_foot`` is the big-toe joint, ``*_ankle`` the heel. This order is
-#: the contract between the loaders, the six contact/force tokens and every
-#: loss and metric here.
-KINDYN_GROUP_NAMES = (
-    "left_hand", "right_hand", "left_foot", "right_foot",
-    "left_ankle", "right_ankle",
-)
-#: MHR70 keypoint anchoring each group, same order — wrists, big-toe tips, heels.
-KINDYN_GROUP_KEYPOINTS = (62, 41, 15, 18, 17, 20)
-NUM_KINDYN_GROUPS = len(KINDYN_GROUP_NAMES)
+from model.contact_frames import (  # noqa: F401  (re-exported: the kindyn six-group fold)
+    KINDYN_GROUP_KEYPOINTS, KINDYN_GROUP_NAMES, NUM_KINDYN_GROUPS, ContactSet, contact_set)
 
 
 class LossTerm(NamedTuple):
@@ -108,6 +99,8 @@ class Loss(ABC):
         self.model = getattr(model, "module", model)
         self.device = torch.device(device)
         self.dtype = torch.float32
+        #: The run's contact set: the K slots every contact / force tensor is indexed by.
+        self.contact_set: ContactSet = contact_set(cfg["data"]["contact_set"])
         if not self.metric_group:
             self.metric_group = self.name
 
@@ -171,20 +164,21 @@ def build_losses(cfg: dict, model, device: torch.device | str) -> list[Loss]:
             _require(net.has_motion, "motion_supervision",
                      "a refiner 'motion' output for its head terms")
         else:
-            _require(_refines(net, "pose"), "motion_supervision",
-                     "a refiner 'pose' output (only the pose_* terms are weighted)")
+            _require(net.head_smplx is not None, "motion_supervision",
+                     "model.smplx (only the pose_* terms are weighted)")
         losses.append(MotionLoss(cfg, model, device))
     if cfg["contact_consistency"]["enabled"]:
-        _require(_refines(net, "pose"),
-                 "contact_consistency", "a refiner 'pose' output (the refined world joints)")
+        _require(net.head_smplx is not None, "contact_consistency",
+                 "model.smplx (the predicted world joints)")
         from model.loss.contact_consistency import ContactConsistencyLoss
         losses.append(ContactConsistencyLoss(cfg, model, device))
     if cfg["force_consistency"]["enabled"]:
-        _require(_refines(net, "force"), "force_consistency", "a refiner 'force' output")
+        _require(net.has_force and net.head_smplx is not None, "force_consistency",
+                 "a force output and model.smplx")
         from model.loss.force_consistency import ForceConsistencyLoss
         losses.append(ForceConsistencyLoss(cfg, model, device))
     if cfg["gravity_supervision"]["enabled"]:
-        _require(_refines(net, "gravity"), "gravity_supervision", "a refiner 'gravity' output")
+        _require(net.has_gravity, "gravity_supervision", "a refiner or token-head 'gravity' output")
         from model.loss.gravity import GravityLoss
         losses.append(GravityLoss(cfg, model, device))
     if cfg["gaussian_reference"]["enabled"]:
@@ -204,5 +198,5 @@ def _require(condition: bool, section: str, requirement: str) -> None:
         raise ValueError(f"{section} is enabled but requires {requirement}")
 
 
-__all__ = ["Loss", "LossResult", "LossTerm", "build_losses",
+__all__ = ["ContactSet", "Loss", "LossResult", "LossTerm", "build_losses", "contact_set",
            "KINDYN_GROUP_NAMES", "KINDYN_GROUP_KEYPOINTS", "NUM_KINDYN_GROUPS"]

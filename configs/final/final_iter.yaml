@@ -1,0 +1,13 @@
+# Ladder rung 4 — + iterative refinement: the layers run one at a time, the shared pose head
+# applies after each, the corrected trajectory's own rates (and the layer's contact probabilities
+# and gravity) feed back into the residual stream, and every head reads every layer (deep
+# supervision at half weight on the intermediate layers).
+base: configs/final/final_world.yaml
+model:
+  refiner: {iterative: true}
+contact_supervision: {layer_weight: 0.5}
+force_supervision: {layer_weight: 0.5}
+smplx_supervision: {layer_weight: 0.5}
+motion_supervision: {layer_weight: 0.5}
+gravity_supervision: {layer_weight: 0.5}
+output: {exp_name: final_iter}

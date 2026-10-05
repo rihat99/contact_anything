@@ -86,6 +86,18 @@ def build_scheduler(optimizer: torch.optim.Optimizer, optim_cfg: dict,
         optimizer, [factor_for(float(g["lr"])) for g in optimizer.param_groups])
 
 
+def evaluate_tests(module, tests: Sequence[tuple[str, object]], losses: Sequence[Loss],
+                   device, **kwargs) -> dict:
+    """Score every named test loader: the first one's metrics under the plain tags
+    (``loss_test/*``, ``metric_*``), every other one's under ``<name>/``."""
+    metrics: dict[str, float] = {}
+    for index, (name, loader) in enumerate(tests):
+        prefix = "" if index == 0 else f"{name}/"
+        for tag, value in evaluate_losses(module, loader, losses, device, **kwargs).items():
+            metrics[prefix + tag] = value
+    return metrics
+
+
 @torch.no_grad()
 def evaluate_losses(module, loader, losses: Sequence[Loss], device,
                     *, distributed: bool = False, is_main: bool = True,
@@ -143,7 +155,8 @@ class Trainer:
     :param model: the model to train (already on ``device``).
     :param losses: the enabled losses, in ``build_losses`` order.
     :param train_loader: clip loader over the train scenes.
-    :param test_loader: one-clip-per-(scene, person) loader over the test scenes.
+    :param tests: named one-clip-per-(scene, person) loaders over the test scenes,
+        the monitored dataset first (:func:`evaluate_tests`).
     :param device: training device.
     :param out_dir: run directory (checkpoints + tensorboard).
     :param resume: checkpoint to restore weights/optimizer/scheduler/counters from.
@@ -155,7 +168,7 @@ class Trainer:
         model: torch.nn.Module,
         losses: Sequence[Loss],
         train_loader,
-        test_loader,
+        tests: Sequence[tuple[str, object]],
         device: torch.device | str,
         *,
         out_dir: str | Path,
@@ -165,7 +178,7 @@ class Trainer:
         self.model = model
         self.losses = list(losses)
         self.train_loader = train_loader
-        self.test_loader = test_loader
+        self.tests = list(tests)
         self.device = device
         self.out_dir = Path(out_dir)
 
@@ -252,26 +265,18 @@ class Trainer:
         ``param_groups[0]`` (the decayed weights) is the logged lr. The refiner's
         learnable smoothing widths (log-sigmas) form a third group at ``lr x
         optim.smoothing_lr_scale``: Adam moves a log-width by ~lr per step, and at
-        the base lr a 600-step run could not change a width by more than ~20 %. A
-        trainable SMPL-X head (``model.smplx.frozen: false``) gets its own groups at
-        ``lr x optim.head_lr_scale`` (a warm-started head fine-tunes, it does not relearn).
+        the base lr a 600-step run could not change a width by more than ~20 %.
         """
         named = [(n, p) for n, p in self.model.named_parameters() if p.requires_grad]
         smoothing = [p for n, p in named if n.rsplit(".", 1)[-1] in SMOOTHING_PARAM_NAMES]
-        head = [p for n, p in named if n.rsplit(".", 1)[-1] not in SMOOTHING_PARAM_NAMES
-                and n.startswith("head_smplx.")]
-        rest = [p for n, p in named if n.rsplit(".", 1)[-1] not in SMOOTHING_PARAM_NAMES
-                and not n.startswith("head_smplx.")]
+        rest = [p for n, p in named if n.rsplit(".", 1)[-1] not in SMOOTHING_PARAM_NAMES]
         lr = float(optim_cfg["lr"])
         wd = float(optim_cfg["weight_decay"])
-        head_lr = lr * float(optim_cfg["head_lr_scale"])
         groups = [
             {"params": [p for p in rest if p.ndim > 1], "lr": lr, "weight_decay": wd},
             {"params": [p for p in rest if p.ndim <= 1], "lr": lr, "weight_decay": 0.0},
             {"params": smoothing, "lr": lr * float(optim_cfg["smoothing_lr_scale"]),
              "weight_decay": 0.0},
-            {"params": [p for p in head if p.ndim > 1], "lr": head_lr, "weight_decay": wd},
-            {"params": [p for p in head if p.ndim <= 1], "lr": head_lr, "weight_decay": 0.0},
         ]
         return torch.optim.AdamW(
             [g for g in groups if g["params"]], lr=lr, weight_decay=wd,
@@ -472,9 +477,8 @@ class Trainer:
         """Full-scene test evaluation; returns the flat ``loss_test/*`` + ``metric_*`` dict."""
         self.model.eval()
         with self._ema_weights():
-            return evaluate_losses(self.module, self.test_loader, self.losses,
-                                   self.device, distributed=self.distributed,
-                                   is_main=self.is_main)
+            return evaluate_tests(self.module, self.tests, self.losses, self.device,
+                                  distributed=self.distributed, is_main=self.is_main)
 
     # -------------------------------------------------------------------- fit
 
@@ -502,13 +506,18 @@ class Trainer:
             if self.is_main:
                 print(f"epoch {epoch:3d}  train loss {train_loss:.4f}  "
                       f"({elapsed:.1f}s)   test loss {metrics['loss_test/total']:.4f}")
-                for loss in self.losses:
-                    prefix = f"metric_{loss.metric_group}/"
-                    body = "  ".join(
-                        f"{tag[len(prefix):]} {value:.4f}"
-                        for tag, value in metrics.items()
-                        if tag.startswith(prefix) and "/" not in tag[len(prefix):])
-                    print(f"           {loss.metric_group:<10s} {body}")
+                for index, (name, _) in enumerate(self.tests):
+                    dataset = "" if index == 0 else f"{name}/"
+                    if index:
+                        print(f"           [{name}]  test loss "
+                              f"{metrics[dataset + 'loss_test/total']:.4f}")
+                    for loss in self.losses:
+                        prefix = f"{dataset}metric_{loss.metric_group}/"
+                        body = "  ".join(
+                            f"{tag[len(prefix):]} {value:.4f}"
+                            for tag, value in metrics.items()
+                            if tag.startswith(prefix) and "/" not in tag[len(prefix):])
+                        print(f"           {loss.metric_group:<10s} {body}")
             self.logger.log({"optim/epoch_time_sec": elapsed, **metrics}, self.step)
             self.logger.log_frozen(self.step)
 

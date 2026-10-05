@@ -1,0 +1,14 @@
+# BetterVideoReconstruction's SAM 3 tracker stage (scripts/stages/track_sam3.py) on in-the-wild
+# videos (scripts/prepare_wild.py): the stage's defaults except that only the LARGEST frame-0
+# "person" detection is tracked — the athlete, not the bystanders (the grounding sorts its
+# detections by mask area, so top_k = 1 keeps the biggest one).
+[runtime]
+device = "cuda"
+
+[sam3]
+text = "person"
+top_k = 1
+confidence = 0.5
+min_area_frac = 0.01
+part_length = 200
+overlay = true

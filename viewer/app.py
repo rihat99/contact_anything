@@ -17,8 +17,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .loading import SOURCES, SceneData, list_runs, list_scenes, load_scene
-from .scene import SceneView, onboard_target
+from .loading import (SOURCES, SceneData, decode_pane, list_runs, list_scenes,
+                      list_wild_runs, list_wild_scenes, load_scene, load_wild_scene)
+from .scene import FORCE_MODES, SceneView, onboard_target
 
 _REGIMES = ("camera", "world")
 #: Scenes kept in memory (a 400-frame scene with its video pane is ~100 MB).
@@ -33,18 +34,18 @@ def _blank_image() -> np.ndarray:
 class Viewer:
     """Owns the GUI state and swaps the active :class:`SceneView`."""
 
-    def __init__(self, server, runs: list[Path], *, corpus: Path, device: str,
+    def __init__(self, server, runs: list[Path], *, device: str,
                  video: bool, opacity: float, point_size: float, camera_scale: float,
-                 run: str | None = None) -> None:
+                 run: str | None = None, wild: Path | None = None) -> None:
         self.server = server
         self.runs = runs
-        self.corpus = corpus
+        self.wild = wild
         self.device = device
         self.video = video
         self.cache: dict[tuple[str, str], SceneData] = {}    # insertion-ordered LRU
         self.view: SceneView | None = None
         self._switching = False
-        self.layers = {"scene": True, "cameras": True, "gravity": True,
+        self.layers = {"scene": True, "cameras": True, "gravity": True, "ground": True,
                        "contact_predicted": True, "force_predicted": True,
                        "contact_gt": False, "force_gt": False}
         # One toggle per body source (mesh + skeleton together) and one global
@@ -57,16 +58,19 @@ class Viewer:
         # set invokes its callback synchronously on the same thread).
         self._lock = threading.RLock()
         self._std_fov: float | None = None
+        # The one frame every scene's nodes hang off; it outlives the scenes (see SceneView).
+        self.clip_root = server.scene.add_frame("/clip", show_axes=False)
 
         g = server.gui
         g.add_markdown("### contact_anything · results viewer")
         with g.add_folder("model"):
-            names = tuple(r.name for r in runs)
+            names = (tuple(list_wild_runs(wild)) if wild is not None
+                     else tuple(r.name for r in runs))
             initial = run if run in names else names[0]
             self.run = g.add_dropdown("run", names, initial_value=initial)
             self.run.on_update(lambda _: self._on_run())
         with g.add_folder("scene"):
-            scenes = tuple(list_scenes(self._run_dir()))
+            scenes = self._scene_options()
             self.scene = g.add_dropdown("scene", scenes, initial_value=scenes[0])
             self.scene.on_update(lambda _: self._on_scene())
             g.add_button("◀ prev").on_click(lambda _: self._nav(-1))
@@ -101,19 +105,22 @@ class Viewer:
             self.opacity.on_update(lambda _: self._with_view(
                 lambda v: v.set_opacity(float(self.opacity.value))))
         with g.add_folder("contacts & forces"):
-            for key, label in (("contact_predicted", "contacts (predicted)"),
+            for key, label in (("contact_predicted", "contact frames (predicted)"),
                                ("force_predicted", "forces (predicted)"),
-                               ("contact_gt", "contacts (GT labels)"),
+                               ("contact_gt", "contact frames (GT labels)"),
                                ("force_gt", "forces (GT kindyn)")):
                 c = g.add_checkbox(label, self.layers[key])
                 c.on_update(self._overlay_cb(key))
                 self.checks[key] = c
+            self.force_mode = g.add_dropdown("force display", FORCE_MODES, initial_value=FORCE_MODES[0])
+            self.force_mode.on_update(lambda _: self._with_view(
+                lambda v: v.set_force_mode(str(self.force_mode.value))))
             self.force_scale = g.add_slider("force scale (m per body weight)", 0.05, 1.5, 0.05, 0.3)
             self.force_scale.on_update(lambda _: self._with_view(
                 lambda v: v.set_force_scale(float(self.force_scale.value))))
         with g.add_folder("layers"):
             for key, label in (("scene", "scene points"), ("cameras", "cameras"),
-                               ("gravity", "gravity (world)")):
+                               ("gravity", "gravity (world)"), ("ground", "ground plane (GT)")):
                 c = g.add_checkbox(label, self.layers[key])
                 c.on_update(self._layer_cb(key))
                 self.checks[key] = c
@@ -124,6 +131,15 @@ class Viewer:
             self.cam_size = g.add_slider("camera frustum", 0.02, 0.6, 0.02, float(camera_scale))
             self.cam_size.on_update(lambda _: self._with_view(
                 lambda v: v.set_camera_scale(float(self.cam_size.value))))
+        if wild is not None:
+            # An in-the-wild tree has only the predicted body: no GT, no frozen refit,
+            # no scene cloud and no ground plane.
+            for name in ("gt", "frozen"):
+                self.source_checks[name].value = False
+                self.source_checks[name].visible = False
+            for key in ("contact_gt", "force_gt", "scene", "ground"):
+                self.checks[key].value = False
+                self.checks[key].visible = False
         self.info = g.add_markdown("")
         server.on_client_connect(self._on_client_connect)
         self.load(self.scene.value)
@@ -131,6 +147,12 @@ class Viewer:
     # -- helpers --
     def _run_dir(self) -> Path:
         return next(r for r in self.runs if r.name == self.run.value)
+
+    def _scene_options(self) -> tuple:
+        """The scenes the selected run has predictions for, in either mode."""
+        if self.wild is not None:
+            return tuple(list_wild_scenes(self.wild, self.run.value))
+        return tuple(list_scenes(self._run_dir()))
 
     def _cur(self) -> int:
         return int(self.frame.value) if self.frame is not None else 0
@@ -172,7 +194,7 @@ class Viewer:
 
     # -- selection --
     def _on_run(self) -> None:
-        scenes = tuple(list_scenes(self._run_dir()))
+        scenes = self._scene_options()
         keep = self.scene.value if self.scene.value in scenes else scenes[0]
         # Re-listing the options may reset the dropdown and fire its callback;
         # suppress that and load exactly once.
@@ -275,7 +297,7 @@ class Viewer:
                 self.view.apply_frame(f)
             if self.video_img is not None and self.view is not None and self.view.data.video is not None:
                 video = self.view.data.video
-                self.video_img.image = video[min(f, len(video) - 1)]
+                self.video_img.image = decode_pane(video[min(f, len(video) - 1)])
             if self.follow.value:
                 for client in self.server.get_clients().values():
                     self._drive(client, f)
@@ -296,7 +318,7 @@ class Viewer:
                 lines.append(f"{_SOURCE_LABELS[name]} vs GT: MPJPE **{met['mpjpe_mm']:.1f} mm** · "
                              f"pelvis {met['pelvis_mm']:.0f} mm ({met['frames']} frames)")
         spread = {name: [p.betas_std for p in data.sources[name].people if p is not None]
-                  for name in ("predicted", "frozen")}
+                  for name in ("predicted", "frozen") if name in data.sources}
         lines.append("betas per-frame std: " + " · ".join(
             f"{name} {np.mean(v):.3f}" for name, v in spread.items() if v)
             + " (meshes at the median identity)")
@@ -304,7 +326,8 @@ class Viewer:
             parts = []
             if name in data.contacts:
                 c = data.contacts[name]
-                parts.append(f"contact rate {np.nanmean(c > 0.5):.2f} on {int(np.isfinite(c).sum())} labels")
+                parts.append(f"contact rate {np.nanmean(c > 0.5):.2f} on {int(np.isfinite(c).sum())} "
+                             f"slot labels ({c.shape[-1]} slots)")
             if name in data.forces:
                 mag = np.linalg.norm(data.forces[name], axis=-1)
                 parts.append(f"mean |f| {np.nanmean(mag):.2f} bw (max {np.nanmax(mag):.1f})")
@@ -313,24 +336,26 @@ class Viewer:
         return "\n\n".join(lines)
 
     def load(self, scene: str) -> None:
-        run = self._run_dir()
-        print(f"[viewer] loading {run.name} / {scene} …", flush=True)
+        run = str(self.run.value)
+        print(f"[viewer] loading {run} / {scene} …", flush=True)
         with self._lock:
             if self.view is not None:
                 self.view.dispose()
                 self.view = None
-            key = (run.name, scene)
+            key = (run, scene)
             data = self.cache.pop(key, None)
             if data is None:
-                data = load_scene(run, scene, self.corpus, self.device, video=self.video)
+                data = (load_wild_scene(self.wild, scene, run, self.device, video=self.video)
+                        if self.wild is not None
+                        else load_scene(self._run_dir(), scene, self.device, video=self.video))
             self.cache[key] = data
             while len(self.cache) > _CACHE_SCENES:
                 self.cache.pop(next(iter(self.cache)))
             self.view = SceneView(
-                self.server, data, self.layers, regime=self.regime.value,
+                self.server, self.clip_root, data, self.layers, regime=self.regime.value,
                 opacity=float(self.opacity.value), point_size=float(self.point_size.value),
                 camera_scale=float(self.cam_size.value),
-                force_scale=float(self.force_scale.value))
+                force_scale=float(self.force_scale.value), force_mode=str(self.force_mode.value))
             if self.frame is not None:
                 self.frame.remove()
             with self.play_folder:
@@ -358,23 +383,27 @@ class Viewer:
             time.sleep(1.0 / float(self.fps.value) if playing else 0.05)
 
 
-def view_results(output: Path, corpus: Path, *, port: int = 8090, device: str = "cuda",
-                 video: bool = True, run: str | None = None, opacity: float = 0.85,
-                 point_size: float = 0.02, camera_scale: float = 0.15) -> None:
-    """Serve every run with predictions under ``output`` in one viser viewer."""
+def view_results(output: Path, *, port: int = 8090, device: str = "cuda",
+                 video: bool = True, run: str | None = None, opacity: float = 0.7,
+                 point_size: float = 0.02, camera_scale: float = 0.15,
+                 wild: Path | None = None) -> None:
+    """Serve the test-set predictions under ``output`` — or, with ``wild``, the
+    in-the-wild trees under that root — in one viser viewer."""
     import torch
     import viser
 
-    runs = list_runs(output)
-    if not runs:
+    runs: list[Path] = [] if wild is not None else list_runs(output)
+    names = list_wild_runs(wild) if wild is not None else [r.name for r in runs]
+    if not names:
         raise FileNotFoundError(
-            f"no <run>/predictions/*.npz under {output} — run scripts/predict_test.py first")
+            f"no predictions under {wild if wild is not None else output} — run "
+            f"scripts/predict_reconstruction.py / scripts/predict_test.py first")
     dev = device if torch.cuda.is_available() or device == "cpu" else "cpu"
     server = viser.ViserServer(port=port)
     server.gui.configure_theme(control_width="large")
     server.scene.set_background_image(_blank_image())
-    print(f"[viewer] {len(runs)} run(s) at http://localhost:{port} — "
-          f"{', '.join(r.name for r in runs)}", flush=True)
-    viewer = Viewer(server, runs, corpus=corpus, device=dev, video=video, opacity=opacity,
-                    point_size=point_size, camera_scale=camera_scale, run=run)
+    print(f"[viewer] {len(names)} run(s) at http://localhost:{port} — {', '.join(names)}",
+          flush=True)
+    viewer = Viewer(server, runs, device=dev, video=video, opacity=opacity,
+                    point_size=point_size, camera_scale=camera_scale, run=run, wild=wild)
     viewer.run_loop()

@@ -1,0 +1,5 @@
+# Ablation — receptive field: no window at all, every frame of the clip sees every other.
+base: configs/final/final_full.yaml
+model:
+  refiner: {window: null}
+output: {exp_name: final_rf_full}

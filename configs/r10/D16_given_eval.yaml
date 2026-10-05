@@ -1,5 +1,0 @@
-# Evaluation / inference twin of the control: every measured clip is GIVEN its gravity.
-base: configs/r10/D16.yaml
-model:
-  refiner:
-    gravity_input: {eval_given: true}

@@ -1,0 +1,13 @@
+# Ladder rung 5 — + six contact limb tokens: SEVEN tokens per frame (the body token plus one per
+# kindyn group carrying that extremity's geometry and its DECODER contact token — six learned
+# tokens appended to the frozen SAM3D decoder, model.contact), alternating per-slot temporal
+# attention with within-frame attention across the slots; the contact and force heads read the
+# limb tokens. The decoder tokens need the live decoder: runs off the embedding cache on two GPUs
+# (4 clips x 4 accumulated x 2 = the same 32 clips per step).
+base: configs/final/final_iter.yaml
+model:
+  contact: {enabled: true}
+  refiner: {limb_tokens: true, contact_token_dim: 256}
+data: {pose_token_cache: false, embedding_cache: true, frames_per_batch: 480}
+optim: {accumulate_steps: 4}
+output: {exp_name: final_limb}

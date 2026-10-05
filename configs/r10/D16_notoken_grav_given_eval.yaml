@@ -1,5 +1,0 @@
-# Evaluation twin of D16_notoken_grav: every measured clip is GIVEN its gravity.
-base: configs/r10/D16_notoken_grav.yaml
-model:
-  refiner:
-    gravity_input: {eval_given: true}

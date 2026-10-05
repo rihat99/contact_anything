@@ -1,0 +1,15 @@
+# Round 12 — the same 35-frame model trained on BEDLAM2_our (18,076 synthetic scenes, 30 fps,
+# floor contacts labelled from the ground-truth body, forces solved at the frozen GT pose): the
+# live backbone (no embedding cache), six GPUs, five epochs of a different seeded THIRD of the
+# clips each (data.epoch_fraction). Test = 2 % of the scenes, stratified over the render jobs
+# (configs/datasets/bedlam2.yaml). frames_per_batch: 600 measured 71 GB on one GPU but hit the
+# 96 GB ceiling under DDP on six (2026-09-20); 480 is the working value.
+base: configs/frames/climbing_frames35.yaml
+data:
+  datasets: [configs/datasets/bedlam2.yaml]
+  embedding_cache: false
+  epoch_fraction: 0.3333
+  frames_per_batch: 480
+  num_workers: 6
+optim: {accumulate_steps: 1}
+output: {exp_name: bedlam_frames35}

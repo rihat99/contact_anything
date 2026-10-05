@@ -83,21 +83,6 @@ def _check_spec(path, saved_state: dict, model: nn.Module) -> None:
             f"  shape mismatches ({len(reshaped)}): {reshaped}")
 
 
-def load_weights(path: str | Path, model: nn.Module) -> dict:
-    """Load a checkpoint's trainable weights into ``model`` (a warm start).
-
-    The same strict ``(name, shape)`` check as :func:`load`; the optimizer,
-    schedule and counters are NOT restored — the caller starts a fresh run
-    from these weights (the checkpoint's weights are its EMA weights).
-    """
-    ckpt = torch.load(Path(path), map_location="cpu", weights_only=False)
-    if not isinstance(ckpt, dict) or "state_dict" not in ckpt:
-        raise RuntimeError(f"{path}: not a training checkpoint (no state_dict).")
-    _check_spec(path, ckpt["state_dict"], model)
-    model.load_state_dict(ckpt["state_dict"], strict=False)
-    return ckpt
-
-
 def load(
     path: str | Path,
     model: nn.Module,

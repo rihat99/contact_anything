@@ -1,0 +1,22 @@
+# Round 12 — the round-11 model (final_full) with contact and force predicted on the 35 named
+# contact frames of the BetterVideoReconstruction body instead of the six kindyn groups
+# (data.contact_set: frames35, model/contact_frames.py). ONE set of 35 learned decoder tokens is
+# read by both heads (no separate force tokens: rung 6 of the ladder moved nothing), each token
+# anchored at its frame's vertex projected through the MHR body; the refiner runs the body token
+# plus 35 limb tokens; the RNEA residual applies each frame's force at its parent joint with the
+# lever moment. The per-slot BCE at weight 35/6 gives every frame the per-slot gradient the six
+# groups had at weight 1; uniform force weights (the per-group weights of the six-group recipe do
+# not carry over). Ten epochs; the schedule is otherwise the ladder's.
+# ClimbingVideos off the embedding cache on two GPUs (4 clips x 4 accumulated x 2 = 32 per step).
+base: configs/final/final_full.yaml
+model:
+  force: {enabled: false}
+  refiner: {force_tokens: false}
+data:
+  contact_set: frames35
+contact_supervision:
+  weight: 5.8333                        # 35 / 6
+force_supervision:
+  loss: {group_weights: null}
+optim: {epochs: 10}
+output: {dir: ./output_7, exp_name: climbing_frames35}

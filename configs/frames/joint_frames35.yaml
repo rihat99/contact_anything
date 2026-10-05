@@ -1,0 +1,22 @@
+# Round 12 — the BEDLAM-trained 35-frame model fine-tuned on ClimbingVideos AND BEDLAM2 together,
+# to keep BEDLAM's floor contacts and forces while (re)learning the climbing corpus. Initialised
+# from the BEDLAM run's weights (optim.init_from), fresh optimizer: a third of the scratch peak lr,
+# no warm-up, cosine to lr_min over five epochs. An epoch = the ClimbingVideos clips once
+# (data.epoch_dataset); every optimizer step is 16 climbing clips (embedding cache) + 16 BEDLAM
+# clips (live backbone, a fresh ~7 % subset per epoch): 240-frame micro-batches alternating over
+# the two corpora on each of eight GPUs, accumulated in pairs. Test = both corpora, reported
+# separately; best.pth by the climbing contact F1.
+base: configs/frames/climbing_frames35.yaml
+data:
+  datasets: [configs/datasets/climbing_videos.yaml, configs/datasets/bedlam2.yaml]
+  epoch_dataset: climbing_videos
+  embedding_cache: true                 # read on ClimbingVideos only (bedlam2.yaml declares none)
+  frames_per_batch: 240
+  num_workers: 6
+optim:
+  init_from: output_7/bedlam_frames35_20260920_124113/last.pth
+  lr: 1.0e-4
+  warmup_steps: 0
+  epochs: 5
+  accumulate_steps: 2
+output: {exp_name: joint_frames35}

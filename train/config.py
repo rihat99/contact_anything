@@ -25,23 +25,23 @@ SCHEMA_PATH = REPO_ROOT / "configs" / "base.yaml"
 
 _MODALITY_ORDER = ("pose", "contact", "force")
 _REFINER_OUTPUTS = ("pose", "contact", "motion", "force", "gravity")
+_TOKEN_HEAD_OUTPUTS = ("contact", "force", "gravity")
 #: Frames the refiner's ``force`` output may be read in (:data:`model.refiner.FORCE_FRAMES`).
 _FORCE_FRAMES = ("body", "gravity")
 #: Finite-difference stencils of ``motion_supervision`` (:data:`model.loss.motion.STENCILS`).
 _STENCILS = ("legacy", "aligned", "forward")
-#: ``smplx_supervision`` terms deep supervision repeats per refiner layer
-#: (:data:`model.loss.smplx.LAYER_TERM_NAMES`).
-_LAYER_TERMS = ("kp3d", "orient", "pose", "root_bias", "root_shape")
-#: The six kindyn contact / force groups (:data:`model.loss.NUM_KINDYN_GROUPS`, not imported:
-#: the model package is heavy and the config layer stays import-light).
-NUM_KINDYN_GROUPS = 6
+#: ``smplx_supervision.refined`` terms — the ones a refined body carries — which deep
+#: supervision repeats per refiner layer (:data:`model.loss.smplx.REFINED_TERM_NAMES`).
+_REFINED_TERMS = ("kp3d", "orient", "pose", "root_bias", "root_shape")
+#: The contact sets (:mod:`model.contact_frames`, import-light) and their slot counts.
+from model.contact_frames import CONTACT_SETS, contact_set  # noqa: E402
 _MONITOR_MAX = ("f1", "iou", "precision", "recall", "pearson")
 _MONITOR_MIN = ("mae", "err", "loss", "mpjpe", "pve", "accel", "rte", "jitter", "bias",
                 "mag", "dlogz", "rmse", "angle")
 #: Tensorboard metric section of every loss (``metric_<group>/...``); a loss
 #: whose group is not its own name is listed here.
 METRIC_GROUPS = {"smplx": "pose"}
-#: MHR70 anchors the six kindyn groups are supervised at (contact AND force).
+#: MHR70 anchors of the ``kindyn6`` set (one per group; ``frames35`` anchors at its vertices).
 NUM_GROUPS = 6
 
 
@@ -111,7 +111,7 @@ def signal_needs(cfg: dict) -> set[str]:
     if (cfg["smplx_supervision"]["enabled"] or cfg["motion_supervision"]["enabled"]
             or cfg["contact_consistency"]["enabled"] or cfg["force_consistency"]["enabled"]):
         needs.add("smplx")
-    if "force" in refiner_outputs(cfg):
+    if "force" in head_outputs(cfg):
         needs.add("smplx")          # the kindyn root rotation re-frames the force GT
     if cfg["gravity_supervision"]["enabled"]:
         needs.add("smplx")          # the corpus gravity loads with the smplx GT group
@@ -148,6 +148,13 @@ def refiner_outputs(cfg: dict) -> set[str]:
     return {str(o) for o in refiner["outputs"]} if refiner["enabled"] else set()
 
 
+def head_outputs(cfg: dict) -> set[str]:
+    """Every post-decoder head output: the refiner's plus the token heads' (they never coexist)."""
+    token_heads = cfg["model"]["token_heads"]
+    listed = {str(o) for o in token_heads["outputs"]} if token_heads["enabled"] else set()
+    return refiner_outputs(cfg) | listed
+
+
 def _check_anchors(section: str, indices) -> None:
     indices = [int(i) for i in indices]
     if len(indices) != NUM_GROUPS or len(set(indices)) != NUM_GROUPS or any(
@@ -163,10 +170,40 @@ def validate(cfg: dict) -> None:
     contact_on = bool(model["contact"]["enabled"])
     force_on = bool(model["force"]["enabled"])
     smplx = model["smplx"]
-    if contact_on:
-        _check_anchors("model.contact", model["contact"]["keypoint_indices"])
-    if force_on:
-        _check_anchors("model.force", model["force"]["keypoint_indices"])
+    set_name = str(cfg["data"]["contact_set"])
+    if set_name not in CONTACT_SETS:
+        raise ValueError(f"data.contact_set must be one of {CONTACT_SETS}; got {set_name!r}")
+    slots = contact_set(set_name)
+    if set_name == "kindyn6":
+        if contact_on:
+            _check_anchors("model.contact", model["contact"]["keypoint_indices"])
+        if force_on:
+            _check_anchors("model.force", model["force"]["keypoint_indices"])
+    elif (contact_on or force_on) and not smplx["hands"]:
+        raise ValueError(
+            "data.contact_set frames35 poses finger-parented contact frames: model.smplx.hands "
+            "must be on")
+    fraction = float(cfg["data"]["epoch_fraction"])
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("data.epoch_fraction must be in (0, 1]")
+    epoch_dataset = cfg["data"]["epoch_dataset"]
+    if epoch_dataset is not None:
+        names = [str(yaml.safe_load((REPO_ROOT / entry).read_text())["name"])
+                 for entry in cfg["data"]["datasets"]]
+        if names.count(str(epoch_dataset)) != 1:
+            raise ValueError(
+                f"data.epoch_dataset {epoch_dataset!r} must name exactly one of the "
+                f"listed datasets {names}")
+        if not bool(cfg["data"]["interleave_videos"]):
+            raise ValueError("data.epoch_dataset alternates video-interleaved streams: "
+                             "data.interleave_videos must be on")
+        if int(cfg["optim"]["accumulate_steps"]) % len(names):
+            raise ValueError(
+                f"data.epoch_dataset: optim.accumulate_steps must be a multiple of the "
+                f"{len(names)} datasets so every optimizer step holds one micro-batch of each")
+    init_from = cfg["optim"]["init_from"]
+    if init_from is not None and not Path(init_from).exists():
+        raise ValueError(f"optim.init_from: {init_from} does not exist")
 
     cross_modal = model["cross_modal_temporal"]
     modalities = [str(m) for m in cross_modal["modalities"]] if cross_modal["enabled"] else []
@@ -197,18 +234,18 @@ def validate(cfg: dict) -> None:
     if cfg["data"]["pose_token_cache"]:
         # The cache replaces the whole frozen pass: nothing that needs the live
         # decoder (learned token blocks, the cross-modal block) can be built.
-        if contact_on or force_on or cross_modal["enabled"]:
+        if contact_on or force_on:
             raise ValueError(
-                "data.pose_token_cache skips the frozen decoder: model.contact, "
-                "model.force and model.cross_modal_temporal must be off")
-        if not (smplx["enabled"] and model["refiner"]["enabled"]):
+                "data.pose_token_cache skips the frozen decoder: model.contact and "
+                "model.force must be off")
+        if not smplx["enabled"]:
             raise ValueError(
-                "data.pose_token_cache needs a consumer of the pose token: enable "
-                "model.smplx and model.refiner")
+                "data.pose_token_cache needs a consumer of the pose token: enable model.smplx")
     sup = cfg["smplx_supervision"]
     if sup["kp2d_space"] not in ("crop", "image"):
         raise ValueError(
             f"smplx_supervision.kp2d_space must be 'crop' or 'image'; got {sup['kp2d_space']!r}")
+    refined_on = any(float(sup["refined"][n]) > 0.0 for n in _REFINED_TERMS)
     if sup["enabled"]:
         if not smplx["enabled"]:
             raise ValueError("smplx_supervision.enabled requires model.smplx.enabled")
@@ -220,20 +257,33 @@ def validate(cfg: dict) -> None:
             raise ValueError(
                 "smplx_supervision.loss.cam supervises the CLIFF (s, tx, ty) proxy, which "
                 "model.smplx.camera: ray does not produce — set it to 0")
+        if refined_on and "pose" not in refiner_outputs(cfg):
+            raise ValueError(
+                "smplx_supervision.refined scores the REFINED body: it needs a refiner 'pose' "
+                "output (the `loss` block is the per-frame head's)")
         _validate_layer_weight(
-            "smplx_supervision", float(sup["layer_weight"]), model["refiner"],
-            any(float(sup["loss"][n]) > 0.0 for n in _LAYER_TERMS),
-            "the " + " / ".join(_LAYER_TERMS) + " terms")
-    if smplx["frozen"] and not smplx["enabled"]:
-        raise ValueError("model.smplx.frozen requires model.smplx.enabled")
-    if smplx["checkpoint"] is not None and not smplx["enabled"]:
-        raise ValueError("model.smplx.checkpoint requires model.smplx.enabled")
-    if smplx["frozen"] and smplx["checkpoint"] is None:
-        raise ValueError(
-            "model.smplx.frozen without model.smplx.checkpoint would freeze a random head")
+            "smplx_supervision", float(sup["layer_weight"]), model["refiner"], refined_on,
+            "the refined " + " / ".join(_REFINED_TERMS) + " terms")
 
+    token_heads = model["token_heads"]
+    if token_heads["enabled"]:
+        listed = [str(o) for o in token_heads["outputs"]]
+        if not listed or len(set(listed)) != len(listed) or any(
+                o not in _TOKEN_HEAD_OUTPUTS for o in listed):
+            raise ValueError(
+                "model.token_heads.outputs must be a non-empty duplicate-free subset of "
+                f"{list(_TOKEN_HEAD_OUTPUTS)}; got {listed!r}")
+        if not smplx["enabled"]:
+            raise ValueError(
+                "model.token_heads read the per-frame body's root frame: enable model.smplx")
+        if model["refiner"]["enabled"]:
+            raise ValueError("model.token_heads and model.refiner are two readouts of the same "
+                             "token: enable one")
+        if "force" in listed and force_on:
+            raise ValueError(
+                "model.token_heads lists force AND model.force is enabled: two force heads")
     refiner = model["refiner"]
-    outputs = refiner_outputs(cfg)
+    outputs = head_outputs(cfg)
     if refiner["enabled"]:
         listed = [str(o) for o in refiner["outputs"]]
         if not listed or len(set(listed)) != len(listed) or any(
@@ -243,10 +293,6 @@ def validate(cfg: dict) -> None:
                 f"{list(_REFINER_OUTPUTS)}; got {listed!r}")
         if not smplx["enabled"]:
             raise ValueError("model.refiner needs the per-frame body: enable model.smplx")
-        if smplx["checkpoint"] is None:
-            raise ValueError(
-                "model.refiner needs a stage-1 per-frame body: set model.smplx.checkpoint "
-                "(frozen, or trainable at optim.head_lr_scale)")
         if bool(refiner["token"]["gravity"]) and not cfg["smplx_supervision"]["enabled"]:
             raise ValueError(
                 "model.refiner.token.gravity reads the kindyn gravity, which loads with the smplx "
@@ -256,11 +302,16 @@ def validate(cfg: dict) -> None:
         if cross_modal["enabled"]:
             raise ValueError(
                 "model.refiner IS the temporal model — disable model.cross_modal_temporal")
-        if "force" in outputs and force_on:
+        if "force" in outputs and force_on and not bool(refiner["force_tokens"]):
             raise ValueError(
-                "model.refiner.outputs lists force AND model.force is enabled: two force heads")
-        if not float(refiner["window"]) > 0.0:
-            raise ValueError("model.refiner.window must be positive")
+                "model.refiner.outputs lists force AND model.force is enabled: two force heads "
+                "(model.refiner.force_tokens feeds the decoder force tokens to the refiner instead)")
+        if bool(refiner["force_tokens"]) and "force" not in outputs:
+            raise ValueError("model.refiner.force_tokens adds six force limb tokens: needs the force output")
+        if bool(refiner["limb_tokens"]) and "contact" not in outputs:
+            raise ValueError("model.refiner.limb_tokens adds six contact limb tokens: needs the contact output")
+        if refiner["window"] is not None and not float(refiner["window"]) > 0.0:
+            raise ValueError("model.refiner.window must be positive or null (the whole clip)")
         if not float(refiner["time_scale"]) > 0.0:
             raise ValueError("model.refiner.time_scale must be positive")
         if float(refiner["root_smooth_sec"]) < 0.0:
@@ -299,7 +350,7 @@ def validate(cfg: dict) -> None:
         needs = {"pose": "smplx_supervision", "contact": "contact_supervision",
                  "motion": "motion_supervision", "force": "force_supervision",
                  "gravity": "gravity_supervision"}
-        for output in sorted(outputs):
+        for output in sorted(refiner_outputs(cfg)):
             if not cfg[needs[output]]["enabled"]:
                 raise ValueError(
                     f"model.refiner.outputs lists {output!r} but {needs[output]} is disabled")
@@ -347,10 +398,6 @@ def validate(cfg: dict) -> None:
                 raise ValueError(
                     "model.refiner.per_frame needs root_smooth_sec and pose_smooth_sec 0 (the "
                     "input smoothing mixes the frames)")
-        if sup["enabled"] and float(sup["loss"]["cam"]) > 0.0:
-            raise ValueError(
-                "smplx_supervision.loss.cam supervises the CLIFF proxy, which the refined "
-                "body does not carry — set it to 0 under model.refiner")
 
     if cfg["contact_supervision"]["enabled"] and not (contact_on or "contact" in outputs):
         raise ValueError(
@@ -360,7 +407,14 @@ def validate(cfg: dict) -> None:
         raise ValueError(
             "force_supervision.enabled requires model.force.enabled or a refiner 'force' output")
     if cfg["gravity_supervision"]["enabled"] and "gravity" not in outputs:
-        raise ValueError("gravity_supervision.enabled requires a refiner 'gravity' output")
+        raise ValueError("gravity_supervision.enabled requires a refiner or token-head 'gravity' output")
+    if token_heads["enabled"]:
+        needs = {"contact": "contact_supervision", "force": "force_supervision",
+                 "gravity": "gravity_supervision"}
+        for output in sorted(str(o) for o in token_heads["outputs"]):
+            if not cfg[needs[output]]["enabled"]:
+                raise ValueError(
+                    f"model.token_heads.outputs lists {output!r} but {needs[output]} is disabled")
     for section, terms_on, terms in (
             ("contact_supervision", True, "the BCE"),
             ("force_supervision", any(float(cfg["force_supervision"]["loss"][k]) > 0.0 for k in
@@ -370,7 +424,7 @@ def validate(cfg: dict) -> None:
         weight = float(cfg[section]["layer_weight"])
         if cfg[section]["enabled"] and weight > 0.0:
             output = section.split("_")[0]
-            if output not in outputs:
+            if output not in refiner_outputs(cfg):
                 raise ValueError(
                     f"{section}.layer_weight supervises the refiner's intermediate {output} "
                     f"outputs: list {output!r} in model.refiner.outputs")
@@ -392,10 +446,16 @@ def validate(cfg: dict) -> None:
     if cfg["contact_supervision"]["enabled"] and class_weights is not None:
         for side in ("positive", "negative"):
             values = class_weights[side]
-            if len(values) != NUM_KINDYN_GROUPS or any(float(v) < 0.0 for v in values):
+            if len(values) != slots.count or any(float(v) < 0.0 for v in values):
                 raise ValueError(
-                    f"contact_supervision.class_weights.{side} must be {NUM_KINDYN_GROUPS} "
-                    "non-negative values (kindyn group order)")
+                    f"contact_supervision.class_weights.{side} must be {slots.count} "
+                    f"non-negative values ({set_name} slot order)")
+    group_weights = cfg["force_supervision"]["loss"]["group_weights"]
+    if cfg["force_supervision"]["enabled"] and group_weights is not None and (
+            len(group_weights) != slots.count):
+        raise ValueError(
+            f"force_supervision.loss.group_weights must have {slots.count} entries "
+            f"({set_name} slot order)")
     # A decoder-level head with no loss never receives a gradient (DDP hard-errors).
     if contact_on and "contact" not in outputs and not cfg["contact_supervision"]["enabled"]:
         raise ValueError(
@@ -422,10 +482,10 @@ def validate(cfg: dict) -> None:
         weights = {k: float(v) for k, v in motion["loss"].items() if k != "huber_delta"}
         if any(w < 0.0 for w in weights.values()) or not any(w > 0.0 for w in weights.values()):
             raise ValueError("motion_supervision.loss weights must be >= 0 with at least one > 0")
-        if any(w > 0.0 for k, w in weights.items() if k.startswith("pose_")) and "pose" not in outputs:
+        if any(w > 0.0 for k, w in weights.items() if k.startswith("pose_")) and not smplx["enabled"]:
             raise ValueError(
-                "motion_supervision.loss.pose_* match the derivatives of the REFINED pose: they "
-                "need a refiner 'pose' output")
+                "motion_supervision.loss.pose_* match the derivatives of the predicted body: "
+                "enable model.smplx")
         if int(cfg["data"]["clip"]["frames"]) < 5:
             raise ValueError(
                 "motion_supervision needs data.clip.frames >= 5 (acceleration rows need two "
@@ -437,15 +497,16 @@ def validate(cfg: dict) -> None:
     physics = cfg["force_consistency"]
     if physics["enabled"]:
         if "force" not in outputs:
-            raise ValueError("force_consistency needs a refiner 'force' output")
+            raise ValueError("force_consistency needs a 'force' output (refiner or token heads)")
         if "contact" not in outputs and bool(physics["gate_by_contact"]):
-            raise ValueError("force_consistency.gate_by_contact needs a refiner 'contact' output")
+            raise ValueError("force_consistency.gate_by_contact needs a 'contact' output")
         if float(physics["smooth_sec"]) < 0.0:
             raise ValueError("force_consistency.smooth_sec must be >= 0")
         weights = {k: float(physics["loss"][k]) for k in ("force", "torque", "joint_torque")}
-        if any(w < 0.0 for w in weights.values()) or not any(w > 0.0 for w in weights.values()):
+        if any(w < 0.0 for w in weights.values()):
             raise ValueError(
-                "force_consistency.loss.force / torque / joint_torque must be >= 0 with one > 0")
+                "force_consistency.loss.force / torque / joint_torque must be >= 0 (all 0 = the "
+                "residual metrics only)")
         if any(float(m) < 0.0 for m in physics["joint_torque_multipliers"].values()):
             raise ValueError("force_consistency.joint_torque_multipliers must be >= 0")
         if int(cfg["data"]["clip"]["frames"]) < 5:
@@ -469,8 +530,8 @@ def validate(cfg: dict) -> None:
 
     consistency = cfg["contact_consistency"]
     if consistency["enabled"]:
-        if "pose" not in outputs:
-            raise ValueError("contact_consistency needs a refiner 'pose' output")
+        if not smplx["enabled"]:
+            raise ValueError("contact_consistency stills the predicted body's extremities: enable model.smplx")
         if not float(consistency["weight"]) > 0.0:
             raise ValueError("contact_consistency.weight must be positive")
         if int(cfg["data"]["clip"]["frames"]) < 3:
@@ -488,8 +549,6 @@ def validate(cfg: dict) -> None:
         raise ValueError("optim.accumulate_steps must be >= 1")
     if not float(optim["smoothing_lr_scale"]) > 0.0:
         raise ValueError("optim.smoothing_lr_scale must be positive")
-    if not float(optim["head_lr_scale"]) > 0.0:
-        raise ValueError("optim.head_lr_scale must be positive")
 
     monitor = str(cfg["output"]["monitor"])
     groups = sorted({METRIC_GROUPS.get(name, name) for name in enabled_losses(cfg)})

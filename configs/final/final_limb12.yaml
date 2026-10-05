@@ -1,0 +1,8 @@
+# Ladder rung 6 — + six FORCE limb tokens (13 slots): the force head reads its own six tokens,
+# each carrying the extremity geometry and a DECODER force token (model.force), the contact head
+# the six contact tokens; each set feeds its own head's output back.
+base: configs/final/final_limb.yaml
+model:
+  force: {enabled: true}
+  refiner: {force_tokens: true}
+output: {exp_name: final_limb12}

@@ -9,8 +9,8 @@ lives in the sibling modules:
 * :mod:`model.rope`     — RoPE temporal transformers (pose + cross-modal)
 * :mod:`model.heads`    — contact / force / motion prediction heads
 * :mod:`model.network`  — :class:`ContactAnything`, the composed model
-"""
-from model.network import ContactAnything
-from model.wrapper import SAM3DBodyWrapper
+* :mod:`model.contact_frames` — the contact sets (import-light: the config layer and
+  the loaders read it without pulling the vendored fork in)
 
-__all__ = ["ContactAnything", "SAM3DBodyWrapper"]
+The package itself imports nothing: ``import model.contact_frames`` stays light.
+"""

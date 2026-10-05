@@ -5,14 +5,22 @@ The two force numbers of the climb_wall_2 board comparison
 same way on the annotated corpus test scenes from a run's ``predictions/<scene>.npz`` dumps
 (``scripts/predict_test.py``: whole scenes at the evaluation stride):
 
+* a dump of a wider contact set (``data.contact_set: frames35``) is folded onto the six
+  kindyn groups first, by VECTOR SUM over each group's member slots;
 * the six kindyn groups are folded into the four limbs of the board rig — hand = hand,
   foot = toe + heel (vector sum) — and each limb's force SIZE is taken per frame;
 * rows = every predicted (``covered``) person-frame the kindyn solve marks valid, pooled over
   all scenes and people;
 * ``corr`` = Pearson correlation of the pooled per-limb sizes (prediction vs GT, all four
   limbs flattened together);
-* ``share`` = each limb's share of the mean total force, in per cent, and the reported error is
-  the mean absolute deviation from the GT shares in percentage points.
+* ``share pp`` = the load-share error read PER FRAME: in every row each limb's size is taken
+  as a share of THAT row's total (prediction and GT separately), and the error is
+  ``|predicted share - GT share|`` averaged over the four limbs and then over the rows.
+  Rows whose GT total is ~0 carry no share and are skipped. An error that swaps limbs back
+  and forth does not cancel here, unlike in a clip-averaged reading.
+
+The mean shares printed beside it are each limb's share of the MEAN total (per cent), kept as
+context — they are not what ``share pp`` measures.
 
 Both are unit-free (body weights here, newtons on the boards) and use ALL rows, in contact or
 not, exactly like the board table.
@@ -31,11 +39,17 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from data.climbing_videos import kindyn, scene as scene_io      # noqa: E402
+from model.contact_frames import NUM_KINDYN_GROUPS, contact_set  # noqa: E402
+
+#: This script reads the GT in the six kindyn groups; a wider dump is folded onto them.
+GROUPS = contact_set("kindyn6")
 
 #: Kindyn group indices of the four board limbs (LH, RH, L foot = toe + heel, R foot).
 LIMBS = ((0,), (1,), (2, 4), (3, 5))
 LIMB_NAMES = ("left_hand", "right_hand", "left_foot", "right_foot")
 DATASET_YAML = Path(__file__).resolve().parents[1] / "configs" / "datasets" / "climbing_videos.yaml"
+#: A row whose GT total force is below this (body weights) has no meaningful share.
+MIN_TOTAL_BW = 1e-6
 
 
 def limb_sizes(forces: np.ndarray) -> np.ndarray:
@@ -50,15 +64,20 @@ def pooled_sizes(run: Path, root: Path) -> tuple[np.ndarray, np.ndarray, int]:
         dump = np.load(path, allow_pickle=True)
         if "forces_world" not in dump.files:
             raise ValueError(f"{path.name}: the dump carries no forces")
-        data = scene_io.load_scene(root, path.stem, "test", 1)
+        data = scene_io.load_scene(root, path.stem, "test", 1, GROUPS)
         object_ids = data["object_ids"]
         n = len(data["frame_indices"])
         forces = kindyn.load_forces(
             path.stem, data["human_dir"], object_ids, n,
-            gravity_path=scene_io.gravity_path(root, path.stem))
+            gravity_path=scene_io.gravity_path(root, path.stem), slots=GROUPS)
         pred_forces = scene_io.rows_by_object_id(
             np.asarray(dump["forces_world"], np.float32), dump["object_ids"], object_ids,
-            path.stem, "prediction dump")                                   # [P, N, 6, 3]
+            path.stem, "prediction dump")                                   # [P, N, K, 3]
+        # The GT is the six kindyn groups: fold a wider contact set onto them by SUM.
+        slots = contact_set(str(dump["contact_set"]) if "contact_set" in dump.files
+                            else "kindyn6")
+        if slots.count != NUM_KINDYN_GROUPS:
+            pred_forces = slots.fold_sum(pred_forces)
         covered = scene_io.rows_by_object_id(
             np.asarray(dump["covered"], bool), dump["object_ids"], object_ids,
             path.stem, "prediction dump")                                   # [P, N]
@@ -70,11 +89,18 @@ def pooled_sizes(run: Path, root: Path) -> tuple[np.ndarray, np.ndarray, int]:
 
 
 def corr_and_share(pred: np.ndarray, gt: np.ndarray) -> tuple[float, float, np.ndarray, np.ndarray]:
-    """Pearson correlation of the pooled sizes and the load-share error (pp) + the two share vectors."""
+    """Pearson correlation of the pooled sizes and the PER-FRAME load-share error (pp).
+
+    Also returns the two mean-share vectors (per cent of the mean total), printed as context.
+    """
     corr = float(np.corrcoef(pred.reshape(-1), gt.reshape(-1))[0, 1])
+    rows = gt.sum(1) > MIN_TOTAL_BW
+    pred_share = pred[rows] / pred[rows].sum(1, keepdims=True).clip(min=MIN_TOTAL_BW)
+    gt_share = gt[rows] / gt[rows].sum(1, keepdims=True)
+    share_err = 100.0 * float(np.abs(pred_share - gt_share).mean())
     share = 100.0 * pred.mean(0) / pred.mean(0).sum()
-    gt_share = 100.0 * gt.mean(0) / gt.mean(0).sum()
-    return corr, float(np.abs(share - gt_share).mean()), share, gt_share
+    gt_mean_share = 100.0 * gt.mean(0) / gt.mean(0).sum()
+    return corr, share_err, share, gt_mean_share
 
 
 def main() -> None:
@@ -84,7 +110,8 @@ def main() -> None:
                         help="corpus root (default: the dataset yaml's)")
     args = parser.parse_args()
     root = args.root or Path(yaml.safe_load(DATASET_YAML.read_text())["root"])
-    print(f"{'run':<44s} {'scenes':>6s} {'rows':>7s} {'corr':>6s} {'share pp':>8s}   shares pred | gt ({', '.join(LIMB_NAMES)})")
+    print(f"{'run':<44s} {'scenes':>6s} {'rows':>7s} {'corr':>6s} {'share pp':>8s}   "
+          f"mean shares pred | gt ({', '.join(LIMB_NAMES)})")
     for run in args.runs:
         pred, gt, scenes = pooled_sizes(run, root)
         corr, share_err, share, gt_share = corr_and_share(pred, gt)

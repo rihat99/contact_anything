@@ -19,6 +19,7 @@ import roma
 import torch
 import torch.nn as nn
 
+from model.contact_frames import ContactSet
 from model.sam_3d_body.models.modules.transformer import FFN
 from utils.geometry import (cliff_cam_to_translation, project_to_crop, ray_to_translation,
                             rot6d_to_rotmat, translation_to_ray)
@@ -106,6 +107,10 @@ class SmplxHead(nn.Module):
     models are plain tensor holders (not modules) built lazily on the input
     device; :meth:`body_flat` is always the 22-joint build (the metric
     protocol's flat-hand vertices).
+
+    The head also reads the contact set's SLOT POINTS off the same FK pass
+    (``slot_points_cam``): the posed contact frames of a ``frames35`` build (the
+    head's body then carries the frame set) or the group joints of ``kindyn6``.
     """
 
     NUM_BODY_JOINTS = 21
@@ -125,10 +130,15 @@ class SmplxHead(nn.Module):
         dropout: float = 0.0,
         hands: bool = False,
         camera: str = "cliff",
+        slots: ContactSet | None = None,
     ):
         super().__init__()
         self.model_path = str(model_path)
         self.hands = bool(hands)
+        self.slots = slots
+        if slots is not None and slots.uses_frames and not self.hands:
+            raise ValueError(f"the {slots.name} contact frames hang off finger joints: "
+                             "the SMPL-X head needs hands")
         if camera not in ("cliff", "ray"):
             raise ValueError(f"smplx.camera must be cliff | ray, got {camera!r}")
         self.camera = camera
@@ -157,23 +167,41 @@ class SmplxHead(nn.Module):
         """Joints in ``joints_cam``: 22, or 52 with hands."""
         return 1 + self.NUM_BODY_JOINTS + self.num_hand_joints
 
-    def _body(self, device: torch.device, hands: bool):
-        key = (device, hands)
+    def _body(self, device: torch.device, hands: bool, frames: str | None):
+        key = (device, hands, frames)
         if key not in self._bodies:
             import better_human as bh
             self._bodies[key] = bh.SMPLX(
                 model_path=self.model_path, gender="neutral", num_betas=self.NUM_BETAS,
                 use_hands=hands, use_face=False, compute_mass=False,
-                dtype=torch.float32, device=device)
+                contact_frames=frames, dtype=torch.float32, device=device)
         return self._bodies[key]
+
+    @property
+    def frame_json(self) -> str | None:
+        """The contact-frame file the head's body carries (``None`` without posed frames)."""
+        if self.slots is None or not self.slots.uses_frames:
+            return None
+        return str(self.slots.frame_json)
 
     def body(self, device: torch.device):
         """The head's BetterHuman SMPL-X body on ``device`` (22 or 52 joints; built once)."""
-        return self._body(device, self.hands)
+        return self._body(device, self.hands, self.frame_json)
 
     def body_flat(self, device: torch.device):
         """The 22-joint body on ``device`` — flat-hand vertices for the metrics."""
-        return self._body(device, False)
+        return self._body(device, False, None)
+
+    def slot_points(self, data, joints_cam: torch.Tensor, body) -> torch.Tensor | None:
+        """``[B, K, 3]`` camera-frame slot points of one FK result (``None`` without a set).
+
+        The posed contact frames of a ``frames35`` body, else the set's body joints.
+        """
+        if self.slots is None:
+            return None
+        if not self.slots.uses_frames:
+            return joints_cam[:, list(self.slots.parent_joint52)]
+        return data.frame_pose_world[..., list(body.contact_frames.frame_ids), :3]
 
     def forward(
         self,
@@ -234,8 +262,10 @@ class SmplxHead(nn.Module):
             hand_rot = rot6d_to_rotmat(hand_6d)
             quats.append(roma.rotmat_to_unitquat(hand_rot).reshape(batch, -1))
         q_cam = torch.cat(quats, dim=-1)                                  # [B, 91 | 211]
-        shaped = self.body(pose_token.device).with_shape(betas=betas)
-        joints_cam = shaped.fk(q_cam).joint_pose_world[..., 1:, :3]      # drop the universe row
+        body = self.body(pose_token.device)
+        data = body.with_shape(betas=betas).fk(q_cam, compute_frames=self.frame_json is not None)
+        joints_cam = data.joint_pose_world[..., 1:, :3]                  # drop the universe row
+        slot_points_cam = self.slot_points(data, joints_cam, body)
         kp2d_full, kp2d_crop = project_to_crop(
             joints_cam, cam_int.float(), affine_trans.float(), img_size.float())
         return {
@@ -244,4 +274,5 @@ class SmplxHead(nn.Module):
             "betas": betas, "cam": cam, "ray": translation_to_ray(pelvis_cam),
             "pelvis_cam": pelvis_cam, "q_cam": q_cam,
             "joints_cam": joints_cam, "kp2d_full": kp2d_full, "kp2d_crop": kp2d_crop,
+            "slot_points_cam": slot_points_cam,
         }

@@ -1,0 +1,40 @@
+# Ladder rung 1 — the base model: no temporal model at all. The from-scratch SMPL-X + camera heads
+# read the frozen pose token (as before), and contact, force and gravity are read off that SAME
+# token (model.token_heads). No camera motion, no world lift anywhere in the network: the forces
+# are in the per-frame body's root frame, the gravity estimate is the camera's down axis plus a
+# per-frame correction. Every later rung inherits this file, so the schedule, the supervised
+# losses and the data protocol are set ONCE here: 10 epochs, 120-frame clips, 32 clips per
+# optimizer step, lr 3e-4 with 300 warm-up steps and a cosine to 1e-6, EMA, eval every epoch.
+# The residual metrics (force_consistency at zero weight) are reported on every rung.
+base: configs/base.yaml
+model:
+  decoder_checkpointing: false
+  contact: {enabled: false}                # no learned decoder tokens until rung 5
+  smplx: {enabled: true, hands: true}
+  token_heads: {enabled: true, outputs: [contact, force, gravity]}
+data:
+  pose_token_cache: true                   # the frozen FINAL pose token: no image, no decoder
+  frames_per_batch: 3840                   # 32 x 120-frame clips per GPU, one GPU
+  interleave_videos: true
+  clip: {frames: 120}
+  eval_max_frames: 120
+contact_supervision: {enabled: true}
+force_supervision:                         # the round-10 supervised set, on every rung
+  enabled: true
+  loss:
+    magnitude: 1.0
+    sum_force: 1.0
+    group_weights: [1.0, 1.0, 2.5, 2.5, 1.0, 1.0]
+smplx_supervision:                         # the per-frame heads' own body: the stage-1 set
+  enabled: true
+  loss: {hand_pose: 0.5}
+gravity_supervision: {enabled: true, weight: 5.0}
+force_consistency:                         # residual METRICS only (linear bw, angular bw*m)
+  enabled: true
+  loss: {force: 0.0, torque: 0.0, joint_torque: 0.0}
+optim: {lr: 3.0e-4, weight_decay: 0.01, epochs: 10, warmup_steps: 300, lr_min: 1.0e-6}
+output:
+  dir: ./output_6
+  exp_name: final_base
+  monitor: metric_contact/f1
+  frozen_metrics: checkpoints/round3_refiner_eval.json

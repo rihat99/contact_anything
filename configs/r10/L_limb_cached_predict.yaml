@@ -1,3 +1,0 @@
-# Live-inference twin of arm L_cached (no pose-token cache), gravity given on measured clips.
-base: configs/r10/L_limb_cached_given_eval.yaml
-data: {pose_token_cache: false}

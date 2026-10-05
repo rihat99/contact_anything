@@ -29,6 +29,8 @@ dependencies = [
     "matplotlib",
     # viewer/
     "viser>=1.0",
+    "termcolor>=3.3.0",
+    "tensorboard>=2.21.0",
 ]
 
 [dependency-groups]

@@ -9,29 +9,38 @@ the config's clip stride (``auto`` = the per-scene ~25 fps stride), tiled into
 window it sits deepest inside. Rows no window covers (source frames between stride
 steps) stay NaN. Labels are not needed — the tree only has to carry cameras and boxes.
 
-Files written into ``<stem>/predictions/`` (arrays ``[P, N, ...]`` over the tree's
+Files written into ``<stem>/predictions/<--pred-dir>/`` — one subfolder per run, so
+several runs live side by side in the same tree (arrays ``[P, N, ...]`` over the tree's
 people and frames, NaN / False where not predicted):
 
 ``contacts.npz``
-    six-group probabilities, thresholded booleans and the anchors' pixels.
-``forces.npz`` (``--force-name``)
+    per-slot probabilities, thresholded booleans and the anchors' pixels.
+``forces_sup.npz`` (``--force-name``)
     ``forces`` in the refiner's body frame and ``forces_world`` — rotated with the
     model's OWN world-from-body root, i.e. into the world of ``geometry/transform.npz``
     (a decoder-level force head is rotated with the per-frame SMPL-X root instead) —
     plus the camera-frame anchors, body-weight units.
 ``smplx.npz``
     the refined body in the ``predict_test.py`` layout: ``q_cam``, ``betas``,
-    ``joints_cam``, ``joints_world``, ``pelvis_cam``, ``covered``.
+    ``joints_cam``, ``joints_world``, ``pelvis_cam``, ``covered``; with a gravity head
+    also the model's own unit DOWN vector per frame, ``gravity_world`` (the tree's world)
+    and ``gravity_body`` (the refiner's body frame) — one estimate per window, held on
+    every row the window kept.
 
-Group order is the kindyn one everywhere: ``left_hand, right_hand, left_foot (toe),
-right_foot, left_ankle (heel), right_ankle``; the anchors are the refined body's
-SMPL-X wrist / toe / ankle joints.
+Slot order is the run's contact set (``data.contact_set``), written into every file as
+``limbs`` (the slot names) and ``contact_set``: ``kindyn6`` is the six kindyn groups
+``left_hand, right_hand, left_foot (toe), right_foot, left_ankle (heel), right_ankle``
+and its anchors are the refined body's SMPL-X wrist / toe / ankle joints; ``frames35``
+is the 35 named contact frames and its anchors are those frames' posed positions. Either
+way the anchor of a slot is the point its force is applied at
+(``out["smplx"]["slot_points_world"]``, brought back into the camera).
 
     python scripts/predict_reconstruction.py --config configs/stage2_v2_force.yaml \
         --checkpoint output_5/<run>/last.pth \
         --out-root ../BetterVideoReconstruction-dev/peter/out_climb_wall_2_single \
         --videos ../BetterVideoReconstruction-dev/peter/climb_wall_2 \
-        --video-pattern "{scene}/cam_left.mp4" --force-name forces_sup.npz
+        --video-pattern "{scene}/cam_left.mp4" \
+        --pred-dir <run name> --force-name forces_sup.npz
 """
 from __future__ import annotations
 
@@ -49,12 +58,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import _render_common as rc                                     # noqa: E402
 from data.base import Clip                                      # noqa: E402
 from data.reconstruction import ReconstructionSceneDataset, extract_frames  # noqa: E402
-from model.loss import KINDYN_GROUP_NAMES                       # noqa: E402
-from model.loss.contact_consistency import GROUP_JOINTS         # noqa: E402
+from model.contact_frames import contact_set                    # noqa: E402
 from predict_test import Q_FULL, pad_hands, windows             # noqa: E402
 from train.predict import load_model                            # noqa: E402
-
-NUM_GROUPS = len(KINDYN_GROUP_NAMES)
 
 
 def checkpoint_epoch(path: str | None) -> int:
@@ -75,6 +81,8 @@ def project_rows(points_cam: np.ndarray, cam_int: np.ndarray) -> np.ndarray:
 def predict_scene(model, ds: ReconstructionSceneDataset, cfg: dict, device: str,
                   max_rows: int, overlap: int) -> dict:
     """Run the tiled windows of one out-tree; scatter the rows into per-frame arrays."""
+    slots = contact_set(cfg["data"]["contact_set"])
+    n_slots = slots.count
     scene = ds.scene
     data = ds.scene_data(scene)
     n_people, n_frames = data["valid_mask"].shape
@@ -85,14 +93,16 @@ def predict_scene(model, ds: ReconstructionSceneDataset, cfg: dict, device: str,
     out = {
         "q_cam": nan(Q_FULL), "betas": nan(10), "joints_cam": nan(n_joints, 3),
         "joints_world": nan(n_joints, 3), "pelvis_cam": nan(3),
-        "anchor_cam": nan(NUM_GROUPS, 3), "anchor_2d": nan(NUM_GROUPS, 2),
+        "anchor_cam": nan(n_slots, 3), "anchor_2d": nan(n_slots, 2),
         "covered": np.zeros((n_people, n_frames), bool),
         "stride": np.int32(stride),
     }
     if has_contact:
-        out["probs"] = nan(NUM_GROUPS)
+        out["probs"] = nan(n_slots)
     if has_force:
-        out["forces"], out["forces_world"] = nan(NUM_GROUPS, 3), nan(NUM_GROUPS, 3)
+        out["forces"], out["forces_world"] = nan(n_slots, 3), nan(n_slots, 3)
+    if model.has_gravity:
+        out["gravity_world"], out["gravity_body"] = nan(3), nan(3)
     # Distance of the kept prediction from its window's edge (rows); a later window
     # overwrites a row only from deeper inside itself.
     depth = np.full((n_people, n_frames), -1, np.int64)
@@ -113,7 +123,7 @@ def predict_scene(model, ds: ReconstructionSceneDataset, cfg: dict, device: str,
             rot_wc = ext[:, :3, :3].transpose(1, 2)
             joints_world = rc.to_numpy(torch.einsum(
                 "bij,bkj->bki", rot_wc, sx["joints_cam"] - ext[:, None, :3, 3]))
-        anchor_cam = joints[:, list(GROUP_JOINTS)]
+        anchor_cam = rc.to_numpy(rc.slot_points_cam(output, batch))
         anchor_2d = project_rows(anchor_cam, rc.to_numpy(batch["cam_int"]))
         probs = rc.to_numpy(output["contact"]["probs"]) if has_contact else None
         forces = forces_world = None
@@ -124,6 +134,8 @@ def predict_scene(model, ds: ReconstructionSceneDataset, cfg: dict, device: str,
                 frame = ext[:, :3, :3].transpose(1, 2) @ sx["root_rot"]
             forces = rc.to_numpy(fr["forces"])
             forces_world = np.einsum("bij,bkj->bki", rc.to_numpy(frame), forces)
+        gravity = (None if not model.has_gravity else
+                   {k: rc.to_numpy(output["gravity"][k]) for k in ("world", "body")})
         rows = batch["frame_index"].tolist()
         p = clip.person
         for row, position in enumerate(rows):
@@ -144,6 +156,9 @@ def predict_scene(model, ds: ReconstructionSceneDataset, cfg: dict, device: str,
             if forces is not None:
                 out["forces"][p, position] = forces[row]
                 out["forces_world"][p, position] = forces_world[row]
+            if gravity is not None:
+                out["gravity_world"][p, position] = gravity["world"][row]
+                out["gravity_body"][p, position] = gravity["body"][row]
     out["windows"] = np.array([(c.person, c.start, c.frames) for c in clips], np.int32)
     return out
 
@@ -157,7 +172,8 @@ def provenance(ds, preds: dict, video: Path, checkpoint: str, epoch: int, cfg: d
     """
     data = ds.scene_data(ds.scene)
     return {
-        "limbs": np.asarray(list(KINDYN_GROUP_NAMES)),
+        "limbs": np.asarray(list(contact_set(cfg["data"]["contact_set"]).slot_names)),
+        "contact_set": str(cfg["data"]["contact_set"]),
         "object_ids": data["object_ids"].astype(np.int32),
         "frame_indices": data["frame_indices"].astype(np.int32),
         "valid_mask": preds["covered"],
@@ -177,7 +193,7 @@ def provenance(ds, preds: dict, video: Path, checkpoint: str, epoch: int, cfg: d
 def run_scene(args, model, cfg: dict, scene: str, video: Path, work_root: Path,
               epoch: int) -> None:
     out_dir = args.out_root / scene
-    pred_dir = out_dir / "predictions"
+    pred_dir = out_dir / "predictions" / args.pred_dir
     targets = {"contact": pred_dir / "contacts.npz", "force": pred_dir / args.force_name,
                "smplx": pred_dir / "smplx.npz"}
     wanted = [targets["smplx"]] + ([targets["contact"]] if model.has_contact else []) + \
@@ -201,11 +217,13 @@ def run_scene(args, model, cfg: dict, scene: str, video: Path, work_root: Path,
     print(f"  {covered}/{int(ds.scene_data(scene)['valid_mask'].sum())} tracked person-frames "
           f"predicted (stride {int(preds['stride'])}, {len(preds['windows'])} windows)")
 
+    gravity = ({"gravity_world": preds["gravity_world"], "gravity_body": preds["gravity_body"]}
+               if model.has_gravity else {})
     np.savez_compressed(
         targets["smplx"], q_cam=preds["q_cam"], betas=preds["betas"],
         joints_cam=preds["joints_cam"], joints_world=preds["joints_world"],
         pelvis_cam=preds["pelvis_cam"], covered=preds["covered"],
-        hands=np.bool_(model.head_smplx.hands), **identity)
+        hands=np.bool_(model.head_smplx.hands), **gravity, **identity)
 
     if model.has_contact:
         probs = preds["probs"]
@@ -250,8 +268,11 @@ def main() -> int:
                         help="source video relative to --videos ({scene} placeholder)")
     parser.add_argument("--scenes", nargs="*", default=None,
                         help="scene subset (default: every out-tree with pipeline inputs)")
-    parser.add_argument("--force-name", default="forces.npz",
-                        help="filename of the force predictions inside predictions/")
+    parser.add_argument("--pred-dir", required=True,
+                        help="subfolder of predictions/ this run writes into (the run's name); "
+                             "required, so a run is never dumped into the bare folder by accident")
+    parser.add_argument("--force-name", default="forces_sup.npz",
+                        help="filename of the force predictions inside predictions/<--pred-dir>/")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--max-frames", type=int, default=240,
                         help="window length in rows (~18 GiB peak at 240)")
@@ -263,8 +284,6 @@ def main() -> int:
     parser.add_argument("--skip-existing", action="store_true")
     args = parser.parse_args()
 
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
     if not 0 <= args.overlap < args.max_frames:
         raise SystemExit(f"--overlap {args.overlap} must be in [0, --max-frames {args.max_frames})")
 

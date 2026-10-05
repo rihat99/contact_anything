@@ -35,7 +35,12 @@
   gravity estimates that differ — every layer's transported force is the same
   WORLD vector as its raw output in its own frame;
 * the video-interleaved sampler visits every clip once and spreads a step's
-  block over distinct videos.
+  block over distinct videos;
+* the ``frames35`` contact set: a 35-slot refiner (with and without limb tokens)
+  is still the identity at init and still world-frame independent, its
+  ``slot_points_world`` ARE the body's posed contact frames, ``kindyn6``'s are the
+  group joints, and a slot point away from its parent joint adds exactly the
+  lever's moment to the RNEA root wrench (so ``kindyn6`` is numerically unchanged).
 """
 from __future__ import annotations
 
@@ -48,7 +53,7 @@ import roma
 import torch
 import yaml
 
-from data.loaders import VideoInterleavedSampler
+from data.loaders import AlternatingSampler, VideoInterleavedSampler
 from model.loss.motion import MotionLoss
 from model.loss.reference import GaussianReferenceLoss
 from model.loss.smplx import SmplxLoss
@@ -138,9 +143,11 @@ def make_refiner(randomize: bool, root_smooth_sec: float = 0.0, pose_smooth_sec:
                  residual_feedback: bool = False,
                  frame_mask_p: float = 0.0, head_grad_scale: float = 1.0,
                  limb_tokens: bool = False, num_contact_tokens: int = 6,
-                 force_frame: str = "body", per_frame: bool = False) -> TemporalRefiner:
+                 force_frame: str = "body", per_frame: bool = False,
+                 force_tokens: bool = False, num_force_tokens: int = 0,
+                 contact_set_name: str = "kindyn6") -> TemporalRefiner:
     torch.manual_seed(1)
-    refiner = TemporalRefiner(DECODER_DIM, outputs,
+    refiner = TemporalRefiner(DECODER_DIM, outputs, contact_set_name=contact_set_name,
                               num_contact_tokens=num_contact_tokens, dim=64, num_layers=2,
                               num_heads=4,
                               window=0.5, root_smooth_sec=root_smooth_sec,
@@ -152,7 +159,8 @@ def make_refiner(randomize: bool, root_smooth_sec: float = 0.0, pose_smooth_sec:
                               head_grad_scale=head_grad_scale,
                               smplx_model_path=smplx_model_path() if residual_feedback else None,
                               dropout=0.0, limb_tokens=limb_tokens, force_frame=force_frame,
-                              per_frame=per_frame)
+                              per_frame=per_frame, force_tokens=force_tokens,
+                              num_force_tokens=num_force_tokens)
     if randomize:
         for head in refiner.heads.values():
             torch.nn.init.normal_(head[2].weight, std=0.02)
@@ -163,7 +171,8 @@ def make_refiner(randomize: bool, root_smooth_sec: float = 0.0, pose_smooth_sec:
                 if name.startswith("proj") and isinstance(module, torch.nn.Linear):
                     torch.nn.init.normal_(module.weight, std=0.02)
             torch.nn.init.normal_(block.ffn[3].weight, std=0.02)
-        for projection in (refiner.feedback_proj, refiner.limb_feedback_proj):
+        for projection in (refiner.feedback_proj, refiner.limb_feedback_proj,
+                           refiner.force_limb_feedback_proj):
             if projection is not None:
                 torch.nn.init.normal_(projection.weight, std=0.02)
     return refiner.eval()
@@ -401,6 +410,28 @@ def test_video_interleaved_sampler():
     assert list(samplers[0]) != per_rank[0]                     # a new epoch, a new deal
 
 
+def test_alternating_sampler_holds_one_micro_batch_of_each_part_per_step():
+    small = [f"a{i % 5}" for i in range(40)]           # the epoch dataset: 40 clips
+    large = [f"b{i % 50}" for i in range(400)]         # cut to the small one's length
+    world, batch = 2, 4
+    blocks = VideoInterleavedSampler(small, batch, num_replicas=world, rank=0).num_blocks
+    per_rank = []
+    for r in range(world):
+        parts = [VideoInterleavedSampler(v, batch, num_replicas=world, rank=r, seed=3,
+                                         max_blocks=blocks) for v in (small, large)]
+        per_rank.append(list(AlternatingSampler(parts, [0, len(small)], batch)))
+    assert all(len(idx) == 2 * blocks * batch for idx in per_rank)
+    for idx in per_rank:
+        micro = [idx[k:k + batch] for k in range(0, len(idx), batch)]
+        assert all(max(m) < len(small) for m in micro[0::2])          # even = small part
+        assert all(min(m) >= len(small) for m in micro[1::2])         # odd = large part
+    seen_small = sorted(i for idx in per_rank for i in idx if i < len(small))
+    assert len(seen_small) == len(set(seen_small)) == blocks * world * batch
+    sampler = AlternatingSampler(parts, [0, len(small)], batch)
+    sampler.set_epoch(1)
+    assert list(sampler) != per_rank[-1]                        # a new epoch, a new subset
+
+
 def test_receptive_field_is_local(body):
     """A frame far outside the window x layers horizon cannot influence a frame."""
     smplx_out, tokens, blocks, batch = synthetic(body, n_clips=1, seq_len=60)
@@ -634,22 +665,24 @@ def test_smplx_layer_terms_repeat_the_body_terms(body):
 
     cfg = base_cfg()
     cfg["smplx_supervision"].update(enabled=True, layer_weight=0.5)
-    cfg["smplx_supervision"]["loss"].update(kp2d=0.0, kp3d=5.0, orient=1.0, pose=1.0,
-                                            betas=0.0, cam=0.0, root_bias=2.0, root_shape=2.0)
+    cfg["smplx_supervision"]["loss"].update(kp2d=0.0, kp3d=0.0, orient=0.0, pose=0.0,
+                                            betas=0.0, cam=0.0)
+    cfg["smplx_supervision"]["refined"].update(kp3d=5.0, orient=1.0, pose=1.0,
+                                               root_bias=2.0, root_shape=2.0)
     stub = SimpleNamespace(
         head_smplx=SimpleNamespace(hands=True, num_joints=pred["joints_cam"].shape[1],
                                    camera="ray"),
         refiner=refiner)
     loss = SmplxLoss(cfg, stub, "cpu")
-    assert loss.layer_terms == ("kp3d", "orient", "pose", "root_bias", "root_shape")
+    assert loss.refined_terms == ("kp3d", "orient", "pose", "root_bias", "root_shape")
 
     # Three layers, the two intermediate ones equal to the final body.
     for key in ("joints_cam", "root_6d", "body_6d", "pelvis_world"):
         pred[f"{key}_layers"] = [pred[key]] * 3
-    result = loss({"smplx": pred}, batch, train=True)
+    result = loss({"smplx": pred, "smplx_per_frame": pred}, batch, train=True)
     assert set(result.terms) == set(loss.term_names)
-    for name in loss.layer_terms:
-        base, layer = result.terms[name], result.terms[f"{name}_layer"]
+    for name in loss.refined_terms:
+        base, layer = result.terms[f"refined_{name}"], result.terms[f"refined_{name}_layer"]
         assert base.mass > 0
         assert layer.mass == pytest.approx(2.0 * base.mass)
         assert (float(layer.numerator) / layer.mass
@@ -758,9 +791,10 @@ def test_residual_feedback_detaches_the_body_and_keeps_the_forces_live(body):
     gravity = out["gravity"]["world"].detach().clone().requires_grad_(True)
     forces = (0.3 * torch.randn(n, 6, 3)).requires_grad_(True)
     probs = torch.full((n, 6), 0.8).requires_grad_(True)
+    points = out["smplx"]["slot_points_world"].detach().clone().requires_grad_(True)
     seconds = batch["frame_pos_sec"].view(-1, seq_len)
     valid = batch["frame_valid"].view(-1, seq_len)
-    residual = refiner._residual(pelvis, rot_wr, body_rot, betas, forces, frame_in, probs,
+    residual = refiner._residual(pelvis, rot_wr, body_rot, betas, points, forces, frame_in, probs,
                                  gravity, seconds, valid)
     rows = valid.clone()
     rows[:, :2] = rows[:, -2:] = False
@@ -771,12 +805,13 @@ def test_residual_feedback_detaches_the_body_and_keeps_the_forces_live(body):
     assert forces.grad is not None and forces.grad.abs().sum() > 0     # forces live
     for name, tensor in (("pelvis", pelvis), ("rot_wr", rot_wr), ("body_rot", body_rot),
                          ("betas", betas), ("frame_in", frame_in), ("gravity", gravity),
-                         ("probs", probs)):
+                         ("probs", probs), ("points", points)):
         assert tensor.grad is None, name                                # everything else detached
     rot_wr, body_rot, betas = rot_wr.detach(), body_rot.detach(), betas.detach()
     # Too short for the +-2 stencil: a graph-connected zero.
-    short = refiner._residual(pelvis[:8].detach(), rot_wr[:8], body_rot[:8], betas[:2], forces[:8],
-                              frame_in[:8].detach(), probs[:8].detach(), gravity[:8].detach(),
+    short = refiner._residual(pelvis[:8].detach(), rot_wr[:8], body_rot[:8], betas[:2],
+                              points[:8].detach(), forces[:8], frame_in[:8].detach(),
+                              probs[:8].detach(), gravity[:8].detach(),
                               seconds[:, :4].reshape(2, 4), valid[:, :4].reshape(2, 4))
     assert short.shape == (8, 6) and short.abs().max() == 0 and short.requires_grad
     # A still body under gravity needs one body weight along -g at the root (the loss's
@@ -785,15 +820,16 @@ def test_residual_feedback_detaches_the_body_and_keeps_the_forces_live(body):
     p0 = out["smplx"]["pelvis_world"].detach().view(-1, seq_len, 3)[:, :1].expand(-1, seq_len, 3).reshape(n, 3)
     r0 = rot_wr.view(-1, seq_len, 3, 3)[:, :1].expand(-1, seq_len, 3, 3).reshape(n, 3, 3)
     b0 = body_rot.view(-1, seq_len, 21, 3, 3)[:, :1].expand(-1, seq_len, 21, 3, 3).reshape(n, 21, 3, 3)
-    res0 = refiner._residual(p0, r0, b0, betas, still, r0, probs, out["gravity"]["world"].detach(),
-                             seconds, valid)
+    points0 = points.detach()
+    res0 = refiner._residual(p0, r0, b0, betas, points0, still, r0, probs,
+                             out["gravity"]["world"].detach(), seconds, valid)
     assert torch.allclose(res0.view(-1, seq_len, 6)[rows][:, :3].norm(dim=-1), torch.ones(int(rows.sum())), atol=5e-3)
     # The forces enter in the INPUT body frame `frame_in` and the residual is read in the
     # CURRENT root frame: on the still body the force part moves by exactly the gated sum
     # transported between the two frames (a wrong frame would fail this).
     torch.manual_seed(5)
     frame_in = roma.random_rotmat(1).expand(n, 3, 3)
-    with_forces = refiner._residual(p0, r0, b0, betas, forces.detach(), frame_in, probs,
+    with_forces = refiner._residual(p0, r0, b0, betas, points0, forces.detach(), frame_in, probs,
                                     out["gravity"]["world"].detach(), seconds, valid)
     transported = -torch.einsum("bij,bj->bi", r0.transpose(1, 2) @ frame_in,
                                 (forces.detach() * probs[..., None]).sum(dim=1))
@@ -1382,3 +1418,289 @@ def test_layer_forces_are_transported_into_the_final_gravity_frame(body):
         world = to_world(out["force"]["frame"], first)
         world2 = to_world(out2["force"]["frame"], second)
         assert torch.allclose(world2, torch.einsum("ij,bkj->bki", rot0, world), atol=1e-4), key
+
+
+# ------------------------------------------------------------------ ladder: force limb tokens, token heads
+
+def force_token_inputs(body, seed: int = 0):
+    """:func:`synthetic` with a decoder force block behind the contact one (13 tokens)."""
+    smplx_out, tokens, blocks, batch = synthetic(body, seed=seed)
+    tokens = torch.cat([tokens, torch.randn(tokens.shape[0], 6, DECODER_DIM)], dim=1)
+    return smplx_out, tokens, {**blocks, "force": (7, 13)}, batch
+
+
+def make_force_token_refiner(randomize: bool, limb_tokens: bool = True) -> TemporalRefiner:
+    outputs = LIMB_OUTPUTS if limb_tokens else ("pose", "gravity", "force")
+    return make_refiner(randomize=randomize, iterative=True, token=ONE_SIDED_TOKEN,
+                        outputs=outputs, camera_context=True, camera_axes=True,
+                        limb_tokens=limb_tokens, num_contact_tokens=6 if limb_tokens else 0,
+                        force_tokens=True, num_force_tokens=6)
+
+
+@pytest.mark.parametrize("limb_tokens", [True, False])
+def test_force_tokens_identity_at_init(body, limb_tokens):
+    smplx_out, tokens, blocks, batch = force_token_inputs(body)
+    refiner = make_force_token_refiner(randomize=False, limb_tokens=limb_tokens)
+    assert refiner.temporal.num_slots == (13 if limb_tokens else 7) and refiner.temporal.alternating
+    assert refiner.proj_force_tokens is not None and refiner.force_limb_feedback_proj is not None
+    assert (refiner.limb_input_proj is None) == (not limb_tokens)
+    out = refiner(smplx_out, tokens, blocks, batch, body)
+    assert torch.allclose(out["smplx"]["joints_cam"], smplx_out["joints_cam"], atol=1e-4)
+    assert out["force"]["forces"].shape == (tokens.shape[0], 6, 3)
+    assert torch.count_nonzero(out["force"]["forces"]) == 0
+    assert (out["contact"] is not None) == limb_tokens
+
+
+def test_force_token_gradients_reach_the_force_path_only_through_the_force_slots(body):
+    """The force head reads the force slots: a force loss trains the force limb path (input
+    projection, decoder-token projection, feedback) and, through attention, the rest."""
+    smplx_out, tokens, blocks, batch = force_token_inputs(body)
+    refiner = make_force_token_refiner(randomize=True)
+    out = refiner(smplx_out, tokens, blocks, batch, body)
+    out["force"]["forces"].square().sum().backward()
+    named = dict(refiner.named_parameters())
+    for name in ("force_limb_input_proj.weight", "proj_force_tokens.weight",
+                 "force_limb_feedback_proj.weight", "limb_input_proj.weight",
+                 "proj_contact_tokens.weight", "temporal.slot_embed"):
+        grad = named[name].grad
+        assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0, name
+    # A force-slot change moves the forces; a contact-slot decoder token does not reach the
+    # forces except through attention (so a within-frame path exists): perturb and compare.
+    tokens2 = tokens.clone()
+    tokens2[:, 7:] += 1.0
+    out2 = refiner(smplx_out, tokens2, blocks, batch, body)
+    assert (out2["force"]["forces"] - out["force"]["forces"]).abs().max() > 1e-4
+
+
+def test_force_tokens_world_frame_independence(body):
+    smplx_out, tokens, blocks, batch = force_token_inputs(body)
+    refiner = make_force_token_refiner(randomize=True)
+    out = refiner(smplx_out, tokens, blocks, batch, body)
+    torch.manual_seed(7)
+    rot0 = roma.random_rotmat(1)[0]
+    t0 = torch.tensor([3.0, -2.0, 5.0])
+    g_inv = torch.eye(4)
+    g_inv[:3, :3] = rot0.T
+    g_inv[:3, 3] = -rot0.T @ t0
+    moved = dict(batch)
+    moved["cam_from_world"] = batch["cam_from_world"] @ g_inv
+    moved["gravity_world"] = batch["gravity_world"] @ rot0.T
+    out2 = refiner(smplx_out, tokens, blocks, moved, body)
+    assert out["force"]["forces"].abs().max() > 0
+    assert torch.allclose(out["force"]["forces"], out2["force"]["forces"], atol=1e-4)
+    assert torch.allclose(out["contact"]["logits"], out2["contact"]["logits"], atol=1e-4)
+    assert torch.allclose(out["smplx"]["joints_cam"], out2["smplx"]["joints_cam"], atol=1e-4)
+
+
+def test_force_tokens_need_the_force_output_and_limb_tokens_the_contact_one():
+    with pytest.raises(ValueError):
+        make_refiner(randomize=False, outputs=("pose", "contact"), force_tokens=True)
+    with pytest.raises(ValueError):
+        make_refiner(randomize=False, outputs=("pose", "force"), limb_tokens=True)
+    with pytest.raises(ValueError):
+        make_refiner(randomize=False, outputs=("pose", "force"), num_force_tokens=6)
+
+
+def test_token_heads_are_zero_at_init_and_read_the_camera_axis(body):
+    from model.token_heads import PoseTokenHeads
+    smplx_out, tokens, _, batch = synthetic(body)
+    n = tokens.shape[0]
+    torch.manual_seed(0)
+    heads = PoseTokenHeads(DECODER_DIM, ["contact", "force", "gravity"], 6)
+    ext = batch["cam_from_world"]
+    root_rot_world = ext[:, :3, :3].transpose(1, 2) @ smplx_out["root_rot"]
+    out = heads(tokens[:, 0], root_rot_world, ext)
+    assert out["contact"]["logits"].shape == (n, 6) and torch.count_nonzero(out["contact"]["logits"]) == 0
+    assert out["force"]["forces"].shape == (n, 6, 3) and torch.count_nonzero(out["force"]["forces"]) == 0
+    assert torch.equal(out["force"]["frame"], root_rot_world)
+    down = ext[:, :3, :3].transpose(1, 2)[:, :, 1]
+    assert torch.allclose(out["gravity"]["world"], down, atol=1e-6)
+    assert torch.allclose(out["gravity"]["prior_world"], down, atol=1e-6)
+    assert not out["gravity"]["given"].any()
+    assert torch.allclose(out["gravity"]["body"],
+                          (root_rot_world.transpose(1, 2) @ down[..., None])[..., 0], atol=1e-6)
+    # A live gravity head varies per frame (no clip pooling) and stays a unit vector.
+    torch.nn.init.normal_(heads.heads["gravity"][2].weight, std=0.5)
+    world = heads(tokens[:, 0], root_rot_world, ext)["gravity"]["world"]
+    assert torch.allclose(world.norm(dim=-1), torch.ones(n), atol=1e-5)
+    assert (world[0] - world[1]).abs().max() > 1e-3
+    # Each frame reads its own token and camera only.
+    other = heads(torch.cat([tokens[:1, 0], torch.randn(n - 1, DECODER_DIM)]), root_rot_world, ext)
+    assert torch.allclose(other["gravity"]["world"][0], world[0])
+
+
+def test_gravity_loss_averages_per_frame_estimates_over_the_clip():
+    from model.loss.gravity import GravityLoss
+    cfg = base_cfg()
+    cfg["gravity_supervision"].update({"enabled": True, "weight": 1.0, "measured_only": False})
+    loss = GravityLoss(cfg, None, "cpu")
+    seq_len, n_clips = 4, 2
+    n = seq_len * n_clips
+    torch.manual_seed(3)
+    gravity = torch.nn.functional.normalize(torch.randn(n_clips, 3), dim=-1)
+    world = torch.nn.functional.normalize(torch.randn(n, 3), dim=-1)          # per frame
+    valid = torch.ones(n, dtype=torch.bool)
+    valid[3] = False                                                          # clip 0 has 3 frames
+    batch = {"seq_len": seq_len, "frame_valid": valid,
+             "gravity_world": gravity.repeat_interleave(seq_len, 0),
+             "gravity_measured": torch.ones(n, dtype=torch.bool)}
+    out = {"gravity": {"world": world, "prior_world": gravity.repeat_interleave(seq_len, 0),
+                       "given": torch.zeros(n, dtype=torch.bool), "world_layers": [world]}}
+    result = loss(out, batch, train=True)
+    cos = 1.0 - (world * gravity.repeat_interleave(seq_len, 0)).sum(-1)
+    expected = cos[:3].mean() + cos[4:].mean()
+    assert result.terms["cos"].mass == 2.0
+    assert torch.allclose(result.terms["cos"].numerator, expected, atol=1e-6)
+    angle = torch.rad2deg(torch.acos((world * gravity.repeat_interleave(seq_len, 0)).sum(-1).clamp(-1, 1)))
+    assert math.isclose(loss.metrics(result.stats)["angle_measured"],
+                        float((angle[:3].mean() + angle[4:].mean()) / 2), rel_tol=1e-5)
+
+
+# ------------------------------------------------------- frames35: the 35 contact frames
+
+@pytest.fixture(scope="module")
+def body35():
+    """The head's 52-joint body carrying the 35 contact frames."""
+    import better_human as bh
+    from model.contact_frames import FRAMES35_JSON
+    cfg = yaml.safe_load((REPO / "configs" / "base.yaml").read_text())
+    return bh.SMPLX(model_path=cfg["model"]["smplx"]["model_path"], gender="neutral",
+                    num_betas=10, use_hands=True, use_face=False, compute_mass=False,
+                    contact_frames=str(FRAMES35_JSON), dtype=torch.float32, device="cpu")
+
+
+def synthetic35(body35, n_clips: int = 2, seq_len: int = 12):
+    """:func:`synthetic` with 35 decoder contact tokens instead of six."""
+    smplx_out, _, _, batch = synthetic(body35, n_clips, seq_len)
+    n = n_clips * seq_len
+    tokens = torch.randn(n, 1 + FRAMES35_COUNT, DECODER_DIM)
+    return smplx_out, tokens, {"pose": (0, 1), "contact": (1, 1 + FRAMES35_COUNT)}, batch
+
+
+FRAMES35_COUNT = 35
+
+
+def make_frames35_refiner(randomize: bool, limb_tokens: bool = False,
+                          num_contact_tokens: int = FRAMES35_COUNT) -> TemporalRefiner:
+    return make_refiner(randomize=randomize, iterative=True, token=ONE_SIDED_TOKEN,
+                        outputs=LIMB_OUTPUTS, camera_context=True, camera_axes=True,
+                        limb_tokens=limb_tokens, num_contact_tokens=num_contact_tokens,
+                        contact_set_name="frames35")
+
+
+@pytest.mark.parametrize("limb_tokens", [False, True])
+def test_frames35_identity_at_init(body35, limb_tokens):
+    smplx_out, tokens, blocks, batch = synthetic35(body35)
+    refiner = make_frames35_refiner(randomize=False, limb_tokens=limb_tokens)
+    n = len(batch["frame_valid"])
+    assert refiner.num_slots == FRAMES35_COUNT
+    assert refiner.temporal.num_slots == (1 + FRAMES35_COUNT if limb_tokens else 1)
+    out = refiner(smplx_out, tokens, blocks, batch, body35)
+    assert torch.allclose(out["smplx"]["joints_cam"], smplx_out["joints_cam"], atol=1e-4)
+    assert torch.allclose(out["smplx"]["body_rot"], smplx_out["body_rot"], atol=1e-5)
+    assert out["contact"]["logits"].shape == (n, FRAMES35_COUNT)
+    assert out["force"]["forces"].shape == (n, FRAMES35_COUNT, 3)
+    assert torch.count_nonzero(out["contact"]["logits"]) == 0
+    assert torch.count_nonzero(out["force"]["forces"]) == 0
+
+    # The slot points ARE the posed contact frames of the identical body.
+    points = out["smplx"]["slot_points_world"]
+    assert points.shape == (n, FRAMES35_COUNT, 3)
+    assert torch.allclose(points, out["smplx"]["slot_points_world_in"], atol=1e-5)
+    assert torch.allclose(points, out["smplx"]["slot_points_world_layers"][-1])
+    ext = batch["cam_from_world"]
+    rot_wc, t_cw = ext[:, :3, :3].transpose(1, 2), ext[:, :3, 3]
+    reference = body35.with_shape(betas=out["smplx"]["betas"]).fk(
+        out["smplx"]["q_cam"], compute_frames=True).frame_pose_world[
+            ..., list(body35.contact_frames.frame_ids), :3]
+    assert torch.allclose(
+        torch.einsum("bij,bkj->bki", rot_wc, reference - t_cw[:, None]), points, atol=1e-4)
+    # Every slot sits within 40 cm of its parent joint (the frames are on the skin).
+    parents = torch.tensor(refiner.slots.parent_joint52)
+    assert (points - out["smplx"]["joints_world"][:, parents]).norm(dim=-1).max() < 0.4
+
+
+@pytest.mark.parametrize("limb_tokens", [False, True])
+def test_frames35_world_frame_independence(body35, limb_tokens):
+    smplx_out, tokens, blocks, batch = synthetic35(body35)
+    refiner = make_frames35_refiner(randomize=True, limb_tokens=limb_tokens)
+    torch.nn.init.normal_(refiner.heads["gravity"][2].weight, std=0.5)
+    out = refiner(smplx_out, tokens, blocks, batch, body35)
+    assert torch.count_nonzero(out["contact"]["logits"]) > 0
+    assert out["force"]["forces"].abs().max() > 0
+    assert (out["smplx"]["joints_cam"] - smplx_out["joints_cam"]).abs().max() > 1e-4
+
+    torch.manual_seed(7)
+    rot0 = roma.random_rotmat(1)[0]
+    t0 = torch.tensor([3.0, -2.0, 5.0])
+    g_inv = torch.eye(4)
+    g_inv[:3, :3] = rot0.T
+    g_inv[:3, 3] = -rot0.T @ t0
+    moved = dict(batch)
+    moved["cam_from_world"] = batch["cam_from_world"] @ g_inv
+    moved["gravity_world"] = batch["gravity_world"] @ rot0.T
+    out2 = refiner(smplx_out, tokens, blocks, moved, body35)
+    for key in ("joints_cam", "pelvis_cam", "root_rot", "body_rot", "kp2d_crop"):
+        assert torch.allclose(out["smplx"][key], out2["smplx"][key], atol=1e-4), key
+    assert torch.allclose(out["contact"]["logits"], out2["contact"]["logits"], atol=1e-4)
+    assert torch.allclose(out["force"]["forces"], out2["force"]["forces"], atol=1e-4)
+    assert torch.allclose(out["gravity"]["body"], out2["gravity"]["body"], atol=1e-4)
+    expected = torch.einsum("ij,bkj->bki", rot0, out["smplx"]["slot_points_world"]) + t0
+    assert torch.allclose(out2["smplx"]["slot_points_world"], expected, atol=1e-4)
+
+
+def test_kindyn6_slot_points_are_the_group_joints(body):
+    smplx_out, tokens, blocks, batch = synthetic(body)
+    refiner = make_limb_refiner(randomize=True)
+    out = refiner(smplx_out, tokens, blocks, batch, body)
+    groups = torch.tensor(refiner.slots.parent_joint52)
+    assert torch.equal(out["smplx"]["slot_points_world"], out["smplx"]["joints_world"][:, groups])
+
+
+def test_slot_lever_adds_exactly_its_moment_and_nothing_else(body):
+    """A slot point away from its parent joint adds the lever's moment, and only that.
+
+    ``kindyn6`` slots sit ON their joints, so the round 8-11 balance is unchanged; a
+    ``frames35`` slot hangs a few centimetres off the skin and the moment is real.
+    """
+    from model.physics import GRAVITY, RootWrench
+
+    slots = TemporalRefiner(DECODER_DIM, ("pose",), num_contact_tokens=0, dim=8,
+                            num_layers=1, num_heads=2).slots
+    wrench = RootWrench(smplx_model_path(), "cpu")
+    n_clips, seq_len = 1, 9
+    torch.manual_seed(0)
+    root_rot = roma.random_rotmat(n_clips)[:, None].expand(n_clips, seq_len, 3, 3).contiguous()
+    body_rot = roma.rotvec_to_rotmat(0.2 * torch.randn(n_clips, 21, 3))[:, None].expand(
+        n_clips, seq_len, 21, 3, 3).contiguous()
+    pelvis = torch.tensor([0.3, 1.0, 2.0]).expand(n_clips, seq_len, 3).contiguous()
+    betas = 0.3 * torch.randn(n_clips, 10)
+    seconds = (torch.arange(seq_len, dtype=torch.float32) / 25.0)[None].expand(
+        n_clips, seq_len).contiguous()
+    valid = torch.ones(n_clips, seq_len, dtype=torch.bool)
+    down = torch.tensor([0.0, -1.0, 0.0]).expand(n_clips, 3).contiguous()
+    parent22 = torch.tensor(slots.parent_joint22)
+
+    q = smplx_q(pelvis.reshape(-1, 3), root_rot.reshape(-1, 3, 3), body_rot.reshape(-1, 21, 3, 3))
+    shaped = wrench.body.with_shape(
+        betas=betas[:, None].expand(n_clips, seq_len, 10).reshape(-1, 10))
+    joints = shaped.fk(q).joint_pose_world[..., 1:, :3]
+    points = joints[:, list(slots.parent_joint52)].view(n_clips, seq_len, slots.count, 3)
+    forces = torch.zeros(n_clips, seq_len, slots.count, 3)
+    forces[..., 2, :] = torch.tensor([0.3, 1.0, -0.2])                      # bw at the left toe
+
+    at_joint = wrench.residual(pelvis, root_rot, body_rot, betas, forces, points, parent22,
+                               down, seconds, valid)
+    lever = torch.tensor([0.05, -0.03, 0.12])
+    moved = points.clone()
+    moved[:, :, 2] += lever
+    offset = wrench.residual(pelvis, root_rot, body_rot, betas, forces, moved, parent22,
+                             down, seconds, valid)
+    rows = at_joint[2]
+    assert rows[:, 2:-2].all()
+    assert torch.equal(at_joint[0], offset[0])                              # forces untouched
+    mass = wrench.body.with_shape(betas=betas).robot.values.body_inertias[..., 0].sum(-1)
+    mg = (mass * GRAVITY).view(n_clips, 1, 1)
+    moment_world = torch.cross(lever.expand(n_clips, seq_len, 3), forces[:, :, 2] * mg, dim=-1)
+    expected = -torch.einsum("ntji,ntj->nti", root_rot, moment_world) / mg
+    assert torch.allclose((offset[1] - at_joint[1])[rows], expected[rows], atol=1e-4)

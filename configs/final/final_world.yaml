@@ -1,0 +1,35 @@
+# Ladder rung 3 — the world-space refiner replaces the token-level temporal block: the per-frame
+# body is lifted with the camera extrinsics, re-encoded per frame as a world-independent token
+# (root-frame joints, parent-local rotations, one-sided root and joint rates, the projected pose
+# token, the camera seen from the body + its axes), run through the same 3-layer RoPE block
+# (+-0.25 s total) and corrected ONCE by an offset head at the end (iterative off, no deep
+# supervision). Contact, force and gravity heads read the refined token; the gravity votes pool
+# per clip in the world. The refined body gets its own SMPL-X terms (smplx_supervision.refined);
+# the per-frame heads keep theirs. The temporal losses start here, on the REFINED body: forward-
+# difference velocity matching of the world joints / root (motion_supervision pose_vel /
+# pose_ang_vel) and the in-contact stillness of the extremities (contact_consistency).
+base: configs/final/final_temporal.yaml
+model:
+  cross_modal_temporal: {enabled: false}
+  token_heads: {enabled: false}
+  refiner:
+    enabled: true
+    outputs: [pose, gravity, contact, force]
+    num_layers: 3
+    window: 0.0833
+    token: {local_rotations: true, one_sided_velocity: true, joint_velocity: true}
+    iterative: false
+    camera_context: true
+    camera_axes: true
+    head_grad_scale: 0.3
+    force_frame: body
+smplx_supervision:
+  refined: {kp3d: 10.0, pose: 2.0, root_bias: 2.0, root_shape: 2.0}
+motion_supervision:
+  enabled: true
+  label_smooth_sec: 0.0                    # the target is the RAW kindyn trajectory
+  stencil: forward
+  scale: {vel: 0.4, acc: 1.2, ang_vel: 0.57, ang_acc: 1.8}
+  loss: {vel: 0.0, acc: 0.0, ang_vel: 0.0, ang_acc: 0.0, pose_vel: 1.0, pose_ang_vel: 1.0}
+contact_consistency: {enabled: true}
+output: {exp_name: final_world}

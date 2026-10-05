@@ -1,5 +1,0 @@
-# Evaluation / inference twin of L_body_notorque: every measured clip is GIVEN its gravity.
-base: configs/r10/L_body_notorque.yaml
-model:
-  refiner:
-    gravity_input: {eval_given: true}

@@ -1,6 +1,6 @@
 """Score the frozen SAM 3D Body, as SMPL-X, on the test protocol (the `frozen` line).
 
-    python scripts/eval_frozen_smplx.py --config configs/r10/D16.yaml \
+    python scripts/eval_frozen_smplx.py --config configs/final/final_full.yaml \
         --out checkpoints/frozen_sam3d_smplx.json
 
 The corpus ships the frozen model's per-frame output refit to SMPL-X
@@ -92,7 +92,7 @@ def main() -> None:
 
     cfg = load_config(args.config)
     _, test_sets = build_datasets(cfg, {"smplx"}, limit_scenes=args.limit_scenes)
-    _, loader = build_loaders(cfg, [], test_sets)
+    _, [(_, loader)] = build_loaders(cfg, [], test_sets)     # one dataset
     device = torch.device(args.device)
 
     import better_human as bh

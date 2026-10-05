@@ -1,0 +1,14 @@
+# Round 12 ladder, rung 6 — configs/final/final_rnea.yaml (+ the RNEA root-wrench residual as a loss,
+# no force tokens) on the 35 contact frames (the climbing_frames35 recipe, see frames_base.yaml).
+# Rung 7 = configs/frames/climbing_frames35.yaml itself (+ joint torques), run output_7/climbing_frames35_*.
+base: configs/final/final_rnea.yaml
+data:
+  contact_set: frames35
+model:
+  force: {enabled: false}
+  refiner: {force_tokens: false}
+contact_supervision:
+  weight: 5.8333                        # 35 / 6: the per-slot gradient of the six-group recipe
+force_supervision:
+  loss: {group_weights: null}
+output: {dir: ./output_8, exp_name: frames_rnea}

@@ -1,0 +1,5 @@
+# Round 12 ablation — the frames35 model's receptive field: no window at all, every frame of the clip sees every other.
+base: configs/frames/climbing_frames35.yaml
+model:
+  refiner: {window: null}
+output: {dir: ./output_8, exp_name: frames_rf_full}

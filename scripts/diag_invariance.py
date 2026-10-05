@@ -1,7 +1,7 @@
 """Invariance diagnostics of a trained model on the test clips (plan Phase 4).
 
-    python scripts/diag_invariance.py --config configs/r10/L_limb.yaml \
-        --checkpoint output_5/<run>/last.pth --json output_5/audits/invariance/<run>.json
+    python scripts/diag_invariance.py --config configs/final/final_full.yaml \
+        --checkpoint output_6/<run>/last.pth --json output_5/audits/invariance/<run>.json
 
 Each row re-scores the SAME checkpoint on the SAME test clips under one perturbation of the
 model's input, always against the unperturbed GT:
@@ -39,6 +39,7 @@ from data import build_datasets                        # noqa: E402
 from data.collate import batch_to_device               # noqa: E402
 from data.loaders import build_loaders                 # noqa: E402
 from evaluate import ContactCurve                      # noqa: E402
+from model.contact_frames import contact_set            # noqa: E402
 from model.loss import KINDYN_GROUP_NAMES, build_losses  # noqa: E402
 from train.config import signal_needs                  # noqa: E402
 from train.predict import load_model                   # noqa: E402
@@ -84,11 +85,12 @@ def permutation(mode: str, n: int, generator: torch.Generator) -> torch.Tensor:
 class Scorer:
     """Sums every loss's sufficient statistics + the contact threshold curve."""
 
-    def __init__(self, losses, device, threshold: float):
+    def __init__(self, losses, device, threshold: float, slots=None):
         self.losses = losses
         self.stats = {loss.name: torch.zeros(len(loss.stat_names), dtype=torch.float64,
                                              device=device) for loss in losses}
-        self.curve = ContactCurve((threshold,))
+        # The curve's `counts` are the SIX-GROUP fold whatever the run's contact set is.
+        self.curve = ContactCurve((threshold,), slots)
         self.threshold = threshold
 
     def add(self, out: dict, batch: dict) -> None:
@@ -108,14 +110,14 @@ class Scorer:
 
 @torch.no_grad()
 def score(model, loader, losses, device, modes: list[str], threshold: float,
-          seed: int) -> dict[str, dict[str, float]]:
+          seed: int, slots=None) -> dict[str, dict[str, float]]:
     scorers = {}
     for mode in modes:
-        scorers[mode] = Scorer(losses, device, threshold)
+        scorers[mode] = Scorer(losses, device, threshold, slots)
         if mode.startswith("decimate"):
-            scorers[mode + "/ref"] = Scorer(losses, device, threshold)
+            scorers[mode + "/ref"] = Scorer(losses, device, threshold, slots)
         if mode.startswith("shuffle"):
-            scorers[mode + "/slot"] = Scorer(losses, device, threshold)
+            scorers[mode + "/slot"] = Scorer(losses, device, threshold, slots)
     generator = torch.Generator().manual_seed(seed)
     trained_window = model.refiner.temporal.window
     for batch in tqdm(loader, desc="clips"):
@@ -185,17 +187,15 @@ def main() -> None:
     parser.add_argument("--json", type=Path, default=None)
     parser.add_argument("--limit-scenes", type=int, default=None)
     args = parser.parse_args()
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
 
     model, cfg = load_model(args.config, args.checkpoint, args.device)
     if model.refiner is None:
         raise SystemExit("the diagnostics need a refiner build")
     _, test_sets = build_datasets(cfg, signal_needs(cfg), limit_scenes=args.limit_scenes)
-    _, loader = build_loaders(cfg, [], test_sets)
+    _, [(_, loader)] = build_loaders(cfg, [], test_sets)     # one dataset
     losses = build_losses(cfg, model, args.device)
     results = score(model, loader, losses, args.device, args.modes.split(","),
-                    args.threshold, args.seed)
+                    args.threshold, args.seed, contact_set(cfg["data"]["contact_set"]))
 
     columns = [c for c in REPORT if any(c in m for m in results.values())]
     print(f"\ncheckpoint {args.checkpoint}  trained window {model.refiner.temporal.window} s")

@@ -1,0 +1,7 @@
+# Ladder rung 7 — + the RNEA root-wrench residual as a LOSS: the refined motion under the predicted
+# forces (gated by the predicted contact) must balance at the free-flyer root, linear (bw) and
+# angular (bw*m) parts. Until here the residual was reported only.
+base: configs/final/final_limb12.yaml
+force_consistency:
+  loss: {force: 5.0, torque: 20.0, huber_delta_force: 0.2}
+output: {exp_name: final_rnea}

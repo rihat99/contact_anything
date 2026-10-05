@@ -1,8 +1,9 @@
-"""Contact stillness: the refined extremities must not move while labelled in contact.
+"""Contact stillness: the refined contact points must not move while labelled in contact.
 
-Reads ``out["smplx"]["joints_world"]`` (the refiner's world joints) at the six
-extremity joints of the kindyn groups — wrists 20 / 21, big toes 10 / 11, heels
-7 / 8 in :data:`~model.loss.KINDYN_GROUP_NAMES` order — and penalises their
+Reads ``out["smplx"]["slot_points_world"] (B, K, 3)`` — the world position of every
+slot of the run's contact set, which the body's forward kinematics produces
+(``kindyn6``: the six extremity joints, wrists 20 / 21, big toes 10 / 11, heels
+7 / 8; ``frames35``: the posed contact frames) — and penalises their
 world SPEED over the clip's real frame spacing (m/s) on limb-frames whose
 contact label is positive: an L1 weighted by
 ``contact_valid * contact_conf`` (confidence off with ``confidence_weights:
@@ -22,8 +23,12 @@ Gradient reaches the pose path only (the labels are data, not the contact
 head), so this is a stillness prior on the refined pose, never a way to lower
 the loss by predicting less contact.
 
-Metrics: ``speed`` — mean predicted in-contact extremity speed (m/s, unweighted
-by confidence), ``gt_speed`` — the same stencil on the kindyn GT joints.
+Metrics: ``speed`` — mean predicted in-contact slot speed (m/s, unweighted by
+confidence), ``gt_speed`` — the floor, the same stencil on the GT PARENT JOINT of
+every slot (``smplx_joints_world[:, parent_joint52]``): the batch carries the GT's
+52 joints, never its posed contact frames, and a frame is rigidly attached to its
+parent joint, so the parent's speed is the GT reading of that slot's motion up to
+the joint's own angular velocity times the frame offset.
 """
 from __future__ import annotations
 
@@ -31,7 +36,7 @@ import torch
 from torch import Tensor
 
 from model.loss import Loss, LossResult
-from model.refiner import (GROUP_JOINTS, forward_difference, forward_valid, stencil_valid,
+from model.refiner import (forward_difference, forward_valid, stencil_valid,
                            time_derivative)
 from utils.metrics import mean_from_stats
 
@@ -56,15 +61,17 @@ class ContactConsistencyLoss(Loss):
             raise ValueError(
                 f"contact_consistency.stencil must be one of {list(STENCILS)}; "
                 f"got {self.stencil!r}")
+        #: 52-joint parent of every slot — where the GT floor is read.
+        self.parent_joint = list(self.contact_set.parent_joint52)
 
-    def _speed(self, joints_world: Tensor, batch: dict) -> tuple[Tensor, Tensor]:
-        """``(speed (B, 6) m/s, rows (B,) bool)`` of the six extremity joints."""
+    def _speed(self, points: Tensor, batch: dict) -> tuple[Tensor, Tensor]:
+        """``(speed (B, K) m/s, rows (B,) bool)`` of ``(B, K, 3)`` world points."""
         seq_len = int(batch["seq_len"])
-        n_frames = joints_world.shape[0]
+        n_frames = points.shape[0]
         n_clips = n_frames // seq_len
         seconds = batch["frame_pos_sec"].to(self.device, self.dtype).view(n_clips, seq_len)
         valid = batch["frame_valid"].to(self.device).view(n_clips, seq_len)
-        points = joints_world[:, list(GROUP_JOINTS)].view(n_clips, seq_len, len(GROUP_JOINTS), 3)
+        points = points.view(n_clips, seq_len, points.shape[1], 3)
         if self.stencil == "forward":
             rate, rows = forward_difference(points, seconds, valid), forward_valid(valid)
         else:
@@ -72,9 +79,9 @@ class ContactConsistencyLoss(Loss):
         return rate.norm(dim=-1).reshape(n_frames, -1), rows.reshape(n_frames)
 
     def __call__(self, out: dict, batch: dict, *, train: bool) -> LossResult:
-        joints = out["smplx"]["joints_world"].to(self.device, self.dtype)
-        anchor = joints.sum() * 0.0
-        speed, rows = self._speed(joints, batch)
+        points = out["smplx"]["slot_points_world"].to(self.device, self.dtype)
+        anchor = points.sum() * 0.0
+        speed, rows = self._speed(points, batch)
         contact = (batch["contact_gt"].to(self.device, self.dtype) > 0.5)
         weight = batch["contact_valid"].to(self.device, self.dtype) * contact.to(self.dtype)
         if self.use_confidence:
@@ -85,7 +92,9 @@ class ContactConsistencyLoss(Loss):
         with torch.no_grad():
             count = (contact & batch["contact_valid"].to(self.device).bool() & rows[:, None]).to(self.dtype)
             gt_rows = count * (batch["smplx_valid"].to(self.device).to(self.dtype))[:, None]
-            gt_speed, _ = self._speed(batch["smplx_joints_world"].to(self.device, self.dtype), batch)
+            gt_speed, _ = self._speed(
+                batch["smplx_joints_world"].to(self.device, self.dtype)[:, self.parent_joint],
+                batch)
             stats = torch.tensor([
                 float((speed.detach() * count).sum()), float(count.sum()),
                 float((gt_speed * gt_rows).sum()), float(gt_rows.sum()),
@@ -98,4 +107,4 @@ class ContactConsistencyLoss(Loss):
                 "gt_speed": mean_from_stats(float(stats[2]), float(stats[3]))}
 
 
-__all__ = ["ContactConsistencyLoss", "GROUP_JOINTS"]
+__all__ = ["ContactConsistencyLoss", "STENCILS"]

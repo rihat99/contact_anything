@@ -1,13 +1,17 @@
 """Evaluate a checkpoint on the annotated test scenes (one clip per scene/person).
 
-    python scripts/evaluate.py --config configs/r10/L_limb.yaml \
-        --checkpoint output_5/<run>/best.pth
-    python scripts/evaluate.py --config configs/r10/L_limb.yaml \
+    python scripts/evaluate.py --config configs/final/final_full.yaml \
+        --checkpoint output_6/<run>/best.pth
+    python scripts/evaluate.py --config configs/final/final_full.yaml \
         --checkpoint none            # the untrained (frozen-baseline) arm
 
-Prints every ``loss_test/*`` term and ``metric_*/*`` metric the enabled losses report, and — when the contact
-branch is on — a precision/recall/F1 threshold curve plus per-group scores at
-``--threshold``. The report is mirrored to ``<output.dir>/logs/<run>_eval.log``
+Prints every ``loss_test/*`` term and ``metric_*/*`` metric the enabled losses report,
+and — when the contact branch is on — a precision/recall/F1 threshold curve over the SIX
+KINDYN GROUPS plus per-group scores at ``--threshold``, and, when the run predicts more
+slots than that (``data.contact_set: frames35``), the same per-SLOT table. A group's
+prediction is the max over its member slots and its label the fold of theirs (or the
+manual six-group annotation when the test batch carries one) — see
+:mod:`model.loss.contact`. The report is mirrored to ``<output.dir>/logs/<run>_eval.log``
 (``untrained_eval.log`` for ``--checkpoint none``).
 """
 from __future__ import annotations
@@ -26,9 +30,11 @@ from data.loaders import build_loaders                 # noqa: E402
 from train.config import signal_needs                  # noqa: E402
 from train.logger import tee_output                    # noqa: E402
 from train.predict import load_model                   # noqa: E402
-from train.trainer import evaluate_losses              # noqa: E402
-from model.loss import KINDYN_GROUP_NAMES, build_losses  # noqa: E402
-from model.loss.contact import CURVE_THRESHOLDS       # noqa: E402
+from train.trainer import evaluate_tests              # noqa: E402
+from model.contact_frames import contact_set                    # noqa: E402
+from model.loss import KINDYN_GROUP_NAMES, build_losses         # noqa: E402
+from model.loss.contact import (CURVE_THRESHOLDS, fold_to_groups,  # noqa: E402
+                                group_members)
 
 GROUPS = KINDYN_GROUP_NAMES
 CURVE = CURVE_THRESHOLDS
@@ -36,25 +42,40 @@ _EPS = 1e-8
 
 
 class ContactCurve:
-    """Per-group confusion counts at several thresholds, over the test split."""
+    """Confusion counts at several thresholds over the test split, on both levels.
 
-    def __init__(self, thresholds):
+    :attr:`counts` is the SIX-GROUP table (the headline scores, and the level the
+    manual test labels live on); :attr:`slot_counts` the run's own K slots. Under
+    ``kindyn6`` the fold is the identity and the two are equal.
+    """
+
+    def __init__(self, thresholds, slots=None):
         self.thresholds = tuple(thresholds)
-        self.counts = torch.zeros(len(self.thresholds), len(GROUPS), 4,
-                                  dtype=torch.float64)
+        self.slots = slots or contact_set("kindyn6")
+        self.members = group_members(self.slots)
+        self.counts = torch.zeros(len(self.thresholds), len(GROUPS), 4, dtype=torch.float64)
+        self.slot_counts = torch.zeros(len(self.thresholds), self.slots.count, 4,
+                                       dtype=torch.float64)
 
     def __call__(self, out: dict, batch: dict) -> None:
         if out["contact"] is None:
             return
         probs = out["contact"]["probs"].detach().float().cpu()
-        gt = batch["contact_gt"].detach().float().cpu() > 0.5
-        valid = batch["contact_valid"].detach().float().cpu() > 0
-        for i, threshold in enumerate(self.thresholds):
-            pred = probs > threshold
-            for j, counts in enumerate(
-                    (pred & gt & valid, pred & ~gt & valid,
-                     ~pred & gt & valid, ~pred & ~gt & valid)):
-                self.counts[i, :, j] += counts.sum(dim=0).to(torch.float64)
+        gt = batch["contact_gt"].detach().float().cpu()
+        valid = batch["contact_valid"].detach().float().cpu()
+        cpu_batch = {key: batch[key].detach().float().cpu()
+                     for key in ("contact_gt_groups", "contact_valid_groups") if key in batch}
+        group_probs, group_gt, group_valid = fold_to_groups(
+            probs, gt, valid, self.members, cpu_batch)
+        for table, score, truth, mask in (
+                (self.counts, group_probs, group_gt > 0.5, group_valid > 0),
+                (self.slot_counts, probs, gt > 0.5, valid > 0)):
+            for i, threshold in enumerate(self.thresholds):
+                pred = score > threshold
+                for j, counts in enumerate(
+                        (pred & truth & mask, pred & ~truth & mask,
+                         ~pred & truth & mask, ~pred & ~truth & mask)):
+                    table[i, :, j] += counts.sum(dim=0).to(torch.float64)
 
     @staticmethod
     def _prf1(tp, fp, fn):
@@ -74,12 +95,20 @@ class ContactCurve:
         if threshold not in self.thresholds:
             return
         index = self.thresholds.index(threshold)
-        print(f"\nper group at threshold {threshold}")
-        print(f"  {'group':>12s} {'P':>7s} {'R':>7s} {'F1':>7s} {'pos':>8s}")
-        for j, name in enumerate(GROUPS):
-            tp, fp, fn, _ = self.counts[index, j].tolist()
+        self._table(f"per group at threshold {threshold}", "group", GROUPS,
+                    self.counts[index])
+        if self.slots.count != len(GROUPS):
+            self._table(f"per {self.slots.name} slot at threshold {threshold}", "slot",
+                        self.slots.slot_names, self.slot_counts[index])
+
+    def _table(self, title: str, label: str, names, counts) -> None:
+        width = max(12, max(len(name) for name in names))
+        print(f"\n{title}")
+        print(f"  {label:>{width}s} {'P':>7s} {'R':>7s} {'F1':>7s} {'pos':>8s}")
+        for j, name in enumerate(names):
+            tp, fp, fn, _ = counts[j].tolist()
             precision, recall, f1 = self._prf1(tp, fp, fn)
-            print(f"  {name:>12s} {precision:7.4f} {recall:7.4f} {f1:7.4f} "
+            print(f"  {name:>{width}s} {precision:7.4f} {recall:7.4f} {f1:7.4f} "
                   f"{tp + fn:8.0f}")
 
 
@@ -96,8 +125,6 @@ def main() -> None:
                         help="also write the metrics as json (output.frozen_metrics format)")
     args = parser.parse_args()
 
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
 
     checkpoint = None if args.checkpoint.lower() == "none" else args.checkpoint
     model, cfg = load_model(args.config, checkpoint, args.device)
@@ -105,12 +132,13 @@ def main() -> None:
     tee_output(Path(cfg["output"]["dir"]) / "logs" / f"{run}_eval.log")
     print(f"config: {args.config}   checkpoint: {checkpoint or 'none (untrained)'}")
     _, test_sets = build_datasets(cfg, signal_needs(cfg), limit_scenes=args.limit_scenes)
-    _, test_loader = build_loaders(cfg, [], test_sets)
+    _, tests = build_loaders(cfg, [], test_sets)
     losses = build_losses(cfg, model, args.device)
 
-    curve = ContactCurve(sorted({*CURVE, float(args.threshold)}))
-    metrics = evaluate_losses(model, test_loader, losses, args.device,
-                              hook=curve if model.has_contact else None)
+    curve = ContactCurve(sorted({*CURVE, float(args.threshold)}),
+                         contact_set(cfg["data"]["contact_set"]))
+    metrics = evaluate_tests(model, tests, losses, args.device,
+                             hook=curve if model.has_contact else None)
 
     print(f"\ncheckpoint: {checkpoint or 'none (untrained)'}")
     for tag in sorted(metrics):

@@ -112,9 +112,10 @@ def test_contact_class_weights_scale_rows_not_metrics(base_cfg):
     pos, neg = weighted_loss.class_weights
     w = gt * pos + (1 - gt) * neg
     bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, gt, reduction="none")
-    assert abs(float(weighted.terms["bce"].numerator) - float((bce * w).sum())) < 1e-4
-    assert abs(weighted.terms["bce"].mass - float(w.sum())) < 1e-4
-    assert abs(plain.terms["bce"].mass - 60.0) < 1e-6
+    per_slot = (bce * w).sum(dim=0) / w.sum(dim=0)
+    assert abs(float(weighted.terms["bce"].numerator) - float(per_slot.sum())) < 1e-4
+    assert abs(weighted.terms["bce"].mass - 6.0) < 1e-6
+    assert abs(plain.terms["bce"].mass - 6.0) < 1e-6
     assert torch.equal(plain.stats, weighted.stats)          # metrics ignore the class weights
     with pytest.raises(ValueError):
         bad = copy.deepcopy(cfg)

@@ -1,5 +1,0 @@
-# Evaluation twin of arm L_cached: every measured clip is GIVEN its gravity.
-base: configs/r10/L_limb_cached.yaml
-model:
-  refiner:
-    gravity_input: {eval_given: true}

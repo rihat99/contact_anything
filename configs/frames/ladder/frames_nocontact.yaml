@@ -1,0 +1,13 @@
+# Round 12 ablation — the frames35 model without contact anywhere: no decoder contact tokens, no
+# contact head or loss, the RNEA forces ungated, no stillness loss. Each frame keeps its own limb
+# token through 35 decoder FORCE tokens and 35 force limb tokens (model.force + refiner.force_tokens),
+# as the six-group no-contact ablation kept its six. Checkpoints by force MAE.
+base: configs/frames/climbing_frames35.yaml
+model:
+  contact: {enabled: false}
+  force: {enabled: true}
+  refiner: {outputs: [pose, gravity, force], limb_tokens: false, force_tokens: true}
+contact_supervision: {enabled: false}
+contact_consistency: {enabled: false}
+force_consistency: {gate_by_contact: false}
+output: {dir: ./output_8, exp_name: frames_nocontact, monitor: metric_force/mae}

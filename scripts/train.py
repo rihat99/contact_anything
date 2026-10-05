@@ -1,8 +1,11 @@
-"""Train the contact / force / SMPL-X branches on the climbing corpus.
+"""Train the contact / force / SMPL-X branches on the configured corpora.
 
-    python scripts/train.py --config configs/r10/L_limb.yaml
+    python scripts/train.py --config configs/final/final_full.yaml
     CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
-        scripts/train.py --config configs/r10/L_limb.yaml
+        scripts/train.py --config configs/final/final_full.yaml
+
+A fine-tune starts from ``optim.init_from`` (weights only); ``--resume`` continues
+a run of this config from its own checkpoint (optimizer, schedule, counters).
 
 Rank 0's console output is mirrored to ``<output.dir>/logs/<run>.log`` (appended
 on resume), so no shell redirect is needed to keep a transcript.
@@ -26,6 +29,7 @@ from data import build_datasets                        # noqa: E402
 from data.loaders import build_loaders                 # noqa: E402
 from model.build import build_model                    # noqa: E402
 from model.loss import build_losses                    # noqa: E402
+from train import checkpoint as ckpt_io                # noqa: E402
 from train.config import load_config, signal_needs     # noqa: E402
 from train.logger import tee_output                    # noqa: E402
 from train.trainer import Trainer                      # noqa: E402
@@ -85,8 +89,6 @@ def main() -> None:
                         help="smoke runs: use only the first N scenes of each split")
     args = parser.parse_args()
 
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -106,10 +108,24 @@ def main() -> None:
         out_dir = run_dir(cfg, resume, rank == 0, world_size > 1)
 
         model = build_model(cfg, device)
+        # Training only: TF32 in the frozen decoder is 15 % faster per step; its per-frame
+        # noise is a training regime, not a measurement (build_model turns it off for
+        # every evaluation / prediction entry point, and the in-training test jitter here
+        # is inflated by it).
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         train_sets, test_sets = build_datasets(
             cfg, signal_needs(cfg), limit_scenes=args.limit_scenes)
-        train_loader, test_loader = build_loaders(
+        train_loader, tests = build_loaders(
             cfg, train_sets, test_sets, rank=rank, world_size=world_size)
+        if cfg["optim"]["init_from"] is not None:
+            # A fine-tune: the checkpoint's (EMA) weights only; the Trainer builds a
+            # fresh optimizer, schedule and EMA on them (--resume, if also given,
+            # restores its own checkpoint on top).
+            state = ckpt_io.load(cfg["optim"]["init_from"], model, map_location=device)
+            if rank == 0:
+                print(f"Initialised from {cfg['optim']['init_from']} "
+                      f"(epoch {state['epoch']}, step {state['step']})")
         losses = build_losses(cfg, model, device)
         if rank == 0:
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -117,7 +133,7 @@ def main() -> None:
             print(f"Trainable: {trainable:,} / {total:,} "
                   f"({100 * trainable / total:.2f}%)")
             print(f"Losses: {[loss.name for loss in losses]}")
-        Trainer(cfg, model, losses, train_loader, test_loader, device,
+        Trainer(cfg, model, losses, train_loader, tests, device,
                 out_dir=out_dir, resume=resume).fit()
     finally:
         if dist.is_initialized():
